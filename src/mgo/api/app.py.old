@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import FastAPI
 
 from mgo.core.config import load_config
@@ -29,6 +27,6 @@ def root() -> dict[str, str]:
 
 
 @app.get("/health")
-def health() -> dict[str, Any]:
+def health() -> dict:
     """Return live system-health information."""
     return collect_health(config)
