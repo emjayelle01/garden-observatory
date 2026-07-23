@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
 from typing import Any
 
-from mgo.core.config import MgoConfig
+from mgo.core.config import MGOConfig
 from mgo.core.health import collect_health
 from mgo.core.observations import Observation, record_observation
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -22,19 +20,14 @@ def _normalise_payload(value: Any) -> Any:
             str(key): _normalise_payload(item)
             for key, item in value.items()
         }
-
     if isinstance(value, tuple | list):
         return [_normalise_payload(item) for item in value]
-
     if isinstance(value, str | int | float | bool) or value is None:
         return value
-
     return str(value)
 
 
-def record_health_observation(
-    config: MgoConfig,
-) -> Observation:
+def record_health_observation(config: MGOConfig) -> Observation:
     """Collect and persist one system-health observation."""
     health = collect_health(config)
     status = str(health.get("status", "unknown"))
@@ -50,20 +43,16 @@ def record_health_observation(
 
 
 async def run_health_monitor(
-    config: MgoConfig,
+    config: MGOConfig,
     stop_event: asyncio.Event,
 ) -> None:
     """Record health until the supplied stop event is set."""
-    interval = config.health.collection_interval_seconds
-
     if not config.health.enabled:
         LOGGER.info("Health monitoring is disabled")
         return
 
-    LOGGER.info(
-        "Health monitoring started with a %s-second interval",
-        interval,
-    )
+    interval = config.health.collection_interval_seconds
+    LOGGER.info("Health monitoring started with a %s-second interval", interval)
 
     while not stop_event.is_set():
         try:
@@ -72,10 +61,7 @@ async def run_health_monitor(
             LOGGER.exception("Health snapshot collection failed")
 
         try:
-            await asyncio.wait_for(
-                stop_event.wait(),
-                timeout=interval,
-            )
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except TimeoutError:
             continue
 
