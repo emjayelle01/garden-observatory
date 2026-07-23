@@ -104,10 +104,4 @@ def collect_health(config: MGOConfig) -> dict[str, Any]:
             "celsius": temperature,
             "status": temperature_status,
         },
-        "camera": {
-            "enabled": config.camera.enabled,
-            "status": (
-                "waiting_for_hardware" if not config.camera.enabled else "not_tested"
-            ),
-        },
     }

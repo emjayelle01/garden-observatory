@@ -16,14 +16,15 @@ def test_health_response_contains_core_fields() -> None:
     assert "memory" in health
     assert "disk" in health
     assert "temperature" in health
-    assert "camera" in health
 
 
-def test_camera_is_waiting_for_hardware() -> None:
-    """Disabled camera configuration should report a waiting state."""
+def test_camera_is_not_calculated_in_health_collection() -> None:
+    """Camera readiness is composed at the API layer, not in collect_health.
+
+    There must be a single source of camera-readiness truth (the camera
+    monitor's runtime state), so system-health collection no longer computes
+    its own camera section.
+    """
     health = collect_health(load_config())
 
-    assert health["camera"] == {
-        "enabled": False,
-        "status": "waiting_for_hardware",
-    }
+    assert "camera" not in health

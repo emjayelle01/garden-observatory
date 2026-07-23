@@ -1,0 +1,111 @@
+# Matt's Garden Observatory (MGO)
+
+A small, Raspberry Pi–hosted observatory service. It persists system-health
+snapshots and other events as immutable **observations**, and exposes a
+FastAPI API for inspecting current state.
+
+The project is built and validated on a Windows development machine and
+deployed to a Raspberry Pi. All functionality must degrade safely when
+Raspberry Pi–specific hardware or tooling is absent.
+
+## Requirements
+
+- Python 3.13
+- [uv](https://docs.astral.sh/uv/) for dependency management
+
+## Getting started
+
+```bash
+uv sync
+```
+
+Run the development API (auto-reload):
+
+```bash
+uv run uvicorn mgo.api.app:app --reload
+```
+
+Or bind explicitly for local checks:
+
+```bash
+uv run uvicorn mgo.api.app:app --host 127.0.0.1 --port 8000
+```
+
+## Validation
+
+```bash
+uv run ruff check .
+uv run mypy src
+uv run pytest
+```
+
+## API
+
+| Endpoint             | Description                                             |
+| -------------------- | ------------------------------------------------------- |
+| `GET /`              | Application identity.                                   |
+| `GET /health`        | System health plus the current camera readiness state. |
+| `GET /camera/status` | The latest monitored camera readiness result.          |
+| `GET /observations`  | Recent observation timeline (`?limit=`, `?kind=`).      |
+
+## Configuration
+
+Configuration is loaded and validated from `config/mgo.toml`. Invalid values
+(for example a non-positive interval or an unsupported backend) are rejected at
+startup with a clear error.
+
+### Camera section
+
+```toml
+[camera]
+enabled = false            # camera functionality is off unless enabled
+backend = "rpicam"         # "rpicam", "libcamera", or "null"/"none"
+# device_index = 0         # optional preferred device; unset = no preference
+detection_interval_seconds = 60
+capture_directory = "data/captures"
+```
+
+Defaults are deliberately safe: the camera is **disabled**, no hardware is
+assumed to exist, and no image capture is ever attempted.
+
+## Camera readiness
+
+This project currently implements **camera capability detection only**. It does
+**not** capture images, stream video, run inference, or perform motion
+detection. The goal is a truthful, hardware-safe readiness signal that a later
+capture layer can build on.
+
+A background monitor evaluates readiness at startup and then every
+`detection_interval_seconds`, keeping the latest result in application state.
+The API endpoints read that state and never run detection commands themselves.
+
+### Statuses
+
+| Status                 | Meaning                                                      | `available` |
+| ---------------------- | ------------------------------------------------------------ | ----------- |
+| `disabled`             | Camera functionality is disabled by configuration.           | `false`     |
+| `waiting_for_hardware` | Enabled, but no supported/usable camera was detected.        | `false`     |
+| `available`            | Enabled and a supported camera device was detected.          | `true`      |
+| `error`                | Detection hit an unexpected runtime/software/parsing error.  | `false`     |
+
+`available` never implies that image capture has succeeded — only that a
+supported device was enumerated.
+
+### Detection and how it behaves off-Pi
+
+The `rpicam`/`libcamera` adapters run a bounded, non-shell
+`... --list-cameras` command (argument array, timeout, safe output capture) and
+require positive evidence — an enumerated device — before reporting
+`available`. The presence of a command alone is never treated as a camera.
+
+On **Windows and CI** (no Raspberry Pi camera tooling):
+
+- with the camera **disabled** (the default), readiness is `disabled`;
+- with the camera **enabled**, a missing command is reported as
+  `waiting_for_hardware` — an expected environment condition, not an
+  application error.
+
+Either way the application starts and serves normally. A `camera_status`
+observation is persisted only when the readiness **materially changes**
+(a change of `status` or `available`); repeated identical checks do not create
+duplicate observations.
