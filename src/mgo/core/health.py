@@ -30,21 +30,30 @@ def _temperature_c() -> float | None:
         return None
 
 
-def _temperature_status(
-    temperature: float | None,
-    config: MGOConfig,
-) -> str:
+def _temperature_status(temperature: float | None, config: MGOConfig) -> str:
     """Classify the current temperature."""
     if temperature is None:
         return "unknown"
-
-    if temperature >= config.health.temperature_critical_c:
+    if temperature >= config.health.temperature_critical_celsius:
         return "critical"
-
-    if temperature >= config.health.temperature_warning_c:
+    if temperature >= config.health.temperature_warning_celsius:
         return "warning"
-
     return "healthy"
+
+
+def _usage_status(value: float, warning: float, critical: float) -> str:
+    """Classify a percentage-based resource measurement."""
+    if value >= critical:
+        return "critical"
+    if value >= warning:
+        return "warning"
+    return "healthy"
+
+
+def _worst_status(*statuses: str) -> str:
+    """Return the most severe known status."""
+    severity = {"unknown": 0, "healthy": 1, "warning": 2, "critical": 3}
+    return max(statuses, key=lambda status: severity.get(status, 0))
 
 
 def collect_health(config: MGOConfig) -> dict[str, Any]:
@@ -54,21 +63,22 @@ def collect_health(config: MGOConfig) -> dict[str, Any]:
     temperature = _temperature_c()
     disk_used_percent = round((disk.used / disk.total) * 100, 1)
 
-    overall_status = "healthy"
-
-    if temperature is not None:
-        if temperature >= config.health.temperature_critical_c:
-            overall_status = "critical"
-        elif temperature >= config.health.temperature_warning_c:
-            overall_status = "warning"
-
-    if disk_used_percent >= config.health.disk_critical_percent:
-        overall_status = "critical"
-    elif (
-        disk_used_percent >= config.health.disk_warning_percent
-        and overall_status == "healthy"
-    ):
-        overall_status = "warning"
+    temperature_status = _temperature_status(temperature, config)
+    disk_status = _usage_status(
+        disk_used_percent,
+        config.health.disk_warning_percent,
+        config.health.disk_critical_percent,
+    )
+    memory_status = _usage_status(
+        float(memory.percent),
+        config.health.memory_warning_percent,
+        config.health.memory_critical_percent,
+    )
+    overall_status = _worst_status(
+        temperature_status,
+        disk_status,
+        memory_status,
+    )
 
     return {
         "status": overall_status,
@@ -82,20 +92,22 @@ def collect_health(config: MGOConfig) -> dict[str, Any]:
             "total_bytes": memory.total,
             "available_bytes": memory.available,
             "used_percent": memory.percent,
+            "status": memory_status,
         },
         "disk": {
             "total_bytes": disk.total,
             "free_bytes": disk.free,
             "used_percent": disk_used_percent,
+            "status": disk_status,
         },
         "temperature": {
             "celsius": temperature,
-            "status": _temperature_status(temperature, config),
+            "status": temperature_status,
         },
         "camera": {
             "enabled": config.camera.enabled,
-            "status": "waiting_for_hardware"
-            if not config.camera.enabled
-            else "not_tested",
+            "status": (
+                "waiting_for_hardware" if not config.camera.enabled else "not_tested"
+            ),
         },
     }
