@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Environment
+.env
+
+# Logs
+logs/*
+!logs/.gitkeep
+
+# Runtime data
+data/*
+!data/.gitkeep
+
+# SQLite
+*.db
+*.sqlite
+*.sqlite3
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Temporary
+*.tmp
