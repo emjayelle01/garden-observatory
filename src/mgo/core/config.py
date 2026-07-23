@@ -39,12 +39,16 @@ class CameraConfig:
 
 @dataclass(frozen=True)
 class HealthConfig:
-    """System-health thresholds."""
+    """Configuration for health monitoring."""
 
-    temperature_warning_c: float
-    temperature_critical_c: float
+    enabled: bool
+    collection_interval_seconds: int
+    temperature_warning_celsius: float
+    temperature_critical_celsius: float
     disk_warning_percent: float
     disk_critical_percent: float
+    memory_warning_percent: float
+    memory_critical_percent: float
 
 
 @dataclass(frozen=True)
@@ -93,9 +97,24 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> MGOConfig:
             capture_directory=_project_path(str(camera["capture_directory"])),
         ),
         health=HealthConfig(
-            temperature_warning_c=float(health["temperature_warning_c"]),
-            temperature_critical_c=float(health["temperature_critical_c"]),
-            disk_warning_percent=float(health["disk_warning_percent"]),
-            disk_critical_percent=float(health["disk_critical_percent"]),
+            enabled=bool(health_data.get("enabled", True)),
+    	    collection_interval_seconds=int(
+                health_data.get("collection_interval_seconds", 60)
+            ),
+            temperature_warning_celsius=float(
+                health_data["temperature_warning_celsius"]
+            ),
+            temperature_critical_celsius=float(
+                health_data["temperature_critical_celsius"]
+            ),
+            disk_warning_percent=float(health_data["disk_warning_percent"]),
+            disk_critical_percent=float(health_data["disk_critical_percent"]),
+            memory_warning_percent=float(health_data["memory_warning_percent"]),
+            memory_critical_percent=float(health_data["memory_critical_percent"]),
         ),
+    )
+
+if health.collection_interval_seconds < 10:
+    raise ValueError(
+        "Health collection interval must be at least 10 seconds"
     )

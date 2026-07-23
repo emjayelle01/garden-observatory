@@ -14,7 +14,11 @@ enabled = false
 capture_directory = "data/captures"
 
 [health]
-temperature_warning_c = 70.0
-temperature_critical_c = 80.0
+enabled = true
+collection_interval_seconds = 60
+temperature_warning_celsius = 70.0
+temperature_critical_celsius = 80.0
 disk_warning_percent = 80.0
 disk_critical_percent = 90.0
+memory_warning_percent = 85.0
+memory_critical_percent = 95.0
