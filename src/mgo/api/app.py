@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -11,6 +12,7 @@ from fastapi import FastAPI, Query
 from mgo.core.config import load_config
 from mgo.core.database import apply_migrations
 from mgo.core.health import collect_health
+from mgo.core.health_monitor import run_health_monitor
 from mgo.core.observations import list_observations, record_observation
 
 config = load_config()
@@ -40,16 +42,25 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         payload={"version": "0.1.0"},
     )
 
-    yield
-
-    record_observation(
-        config.storage.database_path,
-        kind="application_stop",
-        source="mgo-api",
-        status="success",
-        summary="MGO API stopped",
-        payload={"version": "0.1.0"},
+    stop_event = asyncio.Event()
+    health_task = asyncio.create_task(
+        run_health_monitor(config, stop_event),
+        name="mgo-health-monitor",
     )
+
+    try:
+        yield
+    finally:
+        stop_event.set()
+        await health_task
+        record_observation(
+            config.storage.database_path,
+            kind="application_stop",
+            source="mgo-api",
+            status="success",
+            summary="MGO API stopped",
+            payload={"version": "0.1.0"},
+        )
 
 
 app = FastAPI(
