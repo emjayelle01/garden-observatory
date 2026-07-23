@@ -27,3 +27,14 @@ def test_configured_paths_are_absolute() -> None:
     )
 
     assert all(path.is_absolute() for path in paths)
+
+
+def test_health_monitor_configuration_is_valid() -> None:
+    """Health monitoring should use safe default settings."""
+    health = load_config().health
+
+    assert health.enabled is True
+    assert health.collection_interval_seconds >= 10
+    assert health.temperature_warning_celsius < health.temperature_critical_celsius
+    assert health.disk_warning_percent < health.disk_critical_percent
+    assert health.memory_warning_percent < health.memory_critical_percent
