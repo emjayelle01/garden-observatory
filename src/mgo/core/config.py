@@ -29,11 +29,23 @@ class StorageConfig:
     database_path: Path
 
 
+SUPPORTED_CAMERA_BACKENDS = frozenset({"rpicam", "libcamera", "null", "none"})
+
+
 @dataclass(frozen=True)
 class CameraConfig:
-    """Camera runtime settings."""
+    """Camera runtime settings.
+
+    ``enabled`` gates all camera behaviour. ``backend`` selects the detection
+    adapter. ``device_index`` optionally narrows detection to a specific
+    device (``None`` means "no preference"). ``detection_interval_seconds``
+    controls how often the background readiness monitor re-checks hardware.
+    """
 
     enabled: bool
+    backend: str
+    device_index: int | None
+    detection_interval_seconds: int
     capture_directory: Path
 
 
@@ -82,6 +94,24 @@ def _validate_health_config(health: HealthConfig) -> None:
         raise ValueError("Memory warning threshold must be below critical")
 
 
+def _validate_camera_config(camera: CameraConfig) -> None:
+    """Validate camera settings, rejecting unsafe or unsupported values."""
+    if camera.detection_interval_seconds <= 0:
+        raise ValueError(
+            "Camera detection interval must be a positive number of seconds"
+        )
+
+    if camera.backend.strip().lower() not in SUPPORTED_CAMERA_BACKENDS:
+        supported = ", ".join(sorted(SUPPORTED_CAMERA_BACKENDS))
+        raise ValueError(
+            f"Unsupported camera backend {camera.backend!r}; "
+            f"supported backends: {supported}"
+        )
+
+    if camera.device_index is not None and camera.device_index < 0:
+        raise ValueError("Camera device index must be zero or positive")
+
+
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> MGOConfig:
     """Load and validate MGO configuration from TOML."""
     if not path.exists():
@@ -113,6 +143,20 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> MGOConfig:
     )
     _validate_health_config(health)
 
+    device_index_raw = camera_data.get("device_index")
+    camera = CameraConfig(
+        enabled=bool(camera_data["enabled"]),
+        backend=str(camera_data.get("backend", "rpicam")),
+        device_index=(
+            int(device_index_raw) if device_index_raw is not None else None
+        ),
+        detection_interval_seconds=int(
+            camera_data.get("detection_interval_seconds", 60)
+        ),
+        capture_directory=_project_path(str(camera_data["capture_directory"])),
+    )
+    _validate_camera_config(camera)
+
     return MGOConfig(
         application=ApplicationConfig(
             name=str(application_data["name"]),
@@ -125,9 +169,6 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> MGOConfig:
             log_directory=_project_path(str(storage_data["log_directory"])),
             database_path=_project_path(str(storage_data["database_path"])),
         ),
-        camera=CameraConfig(
-            enabled=bool(camera_data["enabled"]),
-            capture_directory=_project_path(str(camera_data["capture_directory"])),
-        ),
+        camera=camera,
         health=health,
     )

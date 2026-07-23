@@ -7,8 +7,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 
+from mgo.core.camera import CameraReadiness, CameraState, default_readiness
+from mgo.core.camera_detection import build_detector
+from mgo.core.camera_monitor import perform_camera_check, run_camera_monitor
 from mgo.core.config import load_config
 from mgo.core.database import apply_migrations
 from mgo.core.health import collect_health
@@ -18,8 +21,15 @@ from mgo.core.observations import list_observations, record_observation
 config = load_config()
 
 
+def _current_camera_readiness(app: FastAPI) -> CameraReadiness:
+    """Return the latest monitored readiness, or a safe startup default."""
+    state: CameraState | None = getattr(app.state, "camera_state", None)
+    readiness = state.get() if state is not None else None
+    return readiness if readiness is not None else default_readiness(config.camera)
+
+
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Initialise persistent MGO services during application startup."""
     applied_versions = apply_migrations(config.storage.database_path)
 
@@ -48,11 +58,32 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         name="mgo-health-monitor",
     )
 
+    camera_state = CameraState()
+    app.state.camera_state = camera_state
+    camera_detector = build_detector(config.camera.backend)
+    # Evaluate readiness once before serving so /camera/status and /health
+    # report a truthful state immediately after startup.
+    await perform_camera_check(config, camera_state, detector=camera_detector)
+    camera_stop_event = asyncio.Event()
+    # The initial check already ran above; the monitor waits one interval
+    # before its first periodic recheck to avoid a duplicate startup probe.
+    camera_task = asyncio.create_task(
+        run_camera_monitor(
+            config,
+            camera_state,
+            camera_stop_event,
+            detector=camera_detector,
+            run_initial=False,
+        ),
+        name="mgo-camera-monitor",
+    )
+
     try:
         yield
     finally:
         stop_event.set()
-        await health_task
+        camera_stop_event.set()
+        await asyncio.gather(health_task, camera_task)
         record_observation(
             config.storage.database_path,
             kind="application_stop",
@@ -82,9 +113,21 @@ def root() -> dict[str, str]:
 
 
 @app.get("/health")
-def health() -> dict[str, Any]:
-    """Return live system-health information."""
-    return collect_health(config)
+def health(request: Request) -> dict[str, Any]:
+    """Return live system-health information plus current camera readiness."""
+    result = collect_health(config)
+    result["camera"] = _current_camera_readiness(request.app).as_dict()
+    return result
+
+
+@app.get("/camera/status")
+def camera_status(request: Request) -> dict[str, Any]:
+    """Return the latest monitored camera readiness result.
+
+    This never triggers hardware detection; it reflects the most recent state
+    recorded by the background camera monitor.
+    """
+    return _current_camera_readiness(request.app).as_dict()
 
 
 @app.get("/observations")

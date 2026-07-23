@@ -10,7 +10,14 @@ log_directory = "logs"
 database_path = "data/mgo.db"
 
 [camera]
+# Camera functionality is disabled by default. No hardware is assumed to
+# exist and no capture is attempted until this is explicitly enabled.
 enabled = false
+# Detection backend: "rpicam", "libcamera", "null"/"none".
+backend = "rpicam"
+# Optional preferred device index; leave unset for no preference.
+# device_index = 0
+detection_interval_seconds = 60
 capture_directory = "data/captures"
 
 [health]
