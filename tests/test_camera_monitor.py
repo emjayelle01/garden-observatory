@@ -271,3 +271,78 @@ def test_monitor_cancellation_exits_cleanly(tmp_path: Path) -> None:
         return False
 
     assert asyncio.run(_run()) is True
+
+
+def test_startup_runs_single_detection_before_interval(tmp_path: Path) -> None:
+    """The lifespan sequence probes hardware exactly once before an interval.
+
+    Mirrors the application lifespan: one pre-serve check, then a monitor
+    started with ``run_initial=False``. With a long interval, no second probe
+    occurs until that interval elapses -- so only one detector invocation
+    happens at startup.
+    """
+    config, _ = _prepared(tmp_path, interval=3600)
+    state = CameraState()
+    detector = _Detector(
+        DetectionEvidence(DetectionOutcome.NOT_DETECTED, "no camera")
+    )
+
+    async def _run() -> int:
+        # Lifespan performs the single initial check before serving.
+        await perform_camera_check(config, state, detector=detector)
+        assert detector.calls == 1
+
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(
+            run_camera_monitor(
+                config,
+                state,
+                stop_event,
+                detector=detector,
+                run_initial=False,
+            )
+        )
+        # Give the monitor time to start and reach its interval wait.
+        await asyncio.sleep(0.05)
+        calls_before_interval = detector.calls
+
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=5)
+        assert task.done()
+        assert not task.cancelled()
+        return calls_before_interval
+
+    assert asyncio.run(_run()) == 1
+
+
+def test_monitor_rechecks_after_interval(tmp_path: Path) -> None:
+    """After the interval elapses the monitor performs a periodic recheck."""
+    config, _ = _prepared(tmp_path, interval=0)
+    state = CameraState()
+    detector = _Detector(
+        DetectionEvidence(DetectionOutcome.NOT_DETECTED, "no camera")
+    )
+
+    async def _run() -> int:
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(
+            run_camera_monitor(
+                config,
+                state,
+                stop_event,
+                detector=detector,
+                run_initial=False,
+            )
+        )
+        # With run_initial=False the first probe only happens after the
+        # (here immediate) interval elapses.
+        while detector.calls < 1:
+            await asyncio.sleep(0)
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=5)
+        assert task.done()
+        assert not task.cancelled()
+        return detector.calls
+
+    assert asyncio.run(_run()) >= 1
+    assert state.get() is not None

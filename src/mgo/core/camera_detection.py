@@ -31,7 +31,7 @@ from mgo.core.config import CameraConfig
 LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 5.0
-_CAMERA_ENTRY_PATTERN = re.compile(r"^\s*\d+\s*:\s*\S")
+_CAMERA_ENTRY_PATTERN = re.compile(r"^\s*(?P<index>\d+)\s*:\s*\S")
 _NO_CAMERA_MARKERS = ("no cameras available", "no cameras found")
 
 
@@ -102,8 +102,28 @@ def _first_line(text: str) -> str:
     return ""
 
 
-def _interpret_output(command_label: str, stdout: str) -> DetectionEvidence:
-    """Translate successful command output into detection evidence."""
+def _parse_camera_entries(text: str) -> list[tuple[int, str]]:
+    """Return ``(index, line)`` pairs for each enumerated camera device."""
+    entries: list[tuple[int, str]] = []
+    for line in text.splitlines():
+        match = _CAMERA_ENTRY_PATTERN.match(line)
+        if match is not None:
+            entries.append((int(match.group("index")), line.strip()))
+    return entries
+
+
+def _interpret_output(
+    command_label: str,
+    stdout: str,
+    device_index: int | None,
+) -> DetectionEvidence:
+    """Translate successful command output into detection evidence.
+
+    When ``device_index`` is ``None`` any enumerated camera counts as
+    available. When a specific index is configured, availability requires that
+    exact index to be enumerated; otherwise readiness waits for hardware and
+    the detail reports which indexes were actually present.
+    """
     text = stdout.strip()
     if not text:
         return DetectionEvidence(
@@ -118,20 +138,34 @@ def _interpret_output(command_label: str, stdout: str) -> DetectionEvidence:
             "No cameras available; waiting for hardware.",
         )
 
-    entries = [
-        line.strip()
-        for line in text.splitlines()
-        if _CAMERA_ENTRY_PATTERN.match(line)
-    ]
-    if entries:
+    cameras = _parse_camera_entries(text)
+    if not cameras:
         return DetectionEvidence(
-            DetectionOutcome.DETECTED,
-            f"Detected camera device(s): {'; '.join(entries)}",
+            DetectionOutcome.ERROR,
+            f"{command_label} output could not be parsed for camera devices.",
         )
 
+    if device_index is None:
+        summary = "; ".join(line for _, line in cameras)
+        return DetectionEvidence(
+            DetectionOutcome.DETECTED,
+            f"Detected camera device(s): {summary}",
+        )
+
+    for index, line in cameras:
+        if index == device_index:
+            return DetectionEvidence(
+                DetectionOutcome.DETECTED,
+                f"Configured camera device_index {device_index} is present: {line}",
+            )
+
+    enumerated = ", ".join(str(index) for index, _ in cameras)
     return DetectionEvidence(
-        DetectionOutcome.ERROR,
-        f"{command_label} output could not be parsed for camera devices.",
+        DetectionOutcome.NOT_DETECTED,
+        (
+            f"Configured camera device_index {device_index} was not found; "
+            f"enumerated indexes: {enumerated}."
+        ),
     )
 
 
@@ -188,7 +222,7 @@ class CommandCameraDetector:
                 ),
             )
 
-        return _interpret_output(self._label, result.stdout)
+        return _interpret_output(self._label, result.stdout, config.device_index)
 
 
 class NullCameraDetector:

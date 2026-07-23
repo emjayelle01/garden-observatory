@@ -65,12 +65,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # report a truthful state immediately after startup.
     await perform_camera_check(config, camera_state, detector=camera_detector)
     camera_stop_event = asyncio.Event()
+    # The initial check already ran above; the monitor waits one interval
+    # before its first periodic recheck to avoid a duplicate startup probe.
     camera_task = asyncio.create_task(
         run_camera_monitor(
             config,
             camera_state,
             camera_stop_event,
             detector=camera_detector,
+            run_initial=False,
         ),
         name="mgo-camera-monitor",
     )

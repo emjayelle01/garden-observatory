@@ -98,6 +98,12 @@ The `rpicam`/`libcamera` adapters run a bounded, non-shell
 require positive evidence — an enumerated device — before reporting
 `available`. The presence of a command alone is never treated as a camera.
 
+`device_index` narrows what counts as ready. When it is **unset**, any
+enumerated camera makes readiness `available`. When it is **set**, that exact
+index must be enumerated to report `available`; if it is absent while other
+cameras are present, readiness is `waiting_for_hardware` and the detail reports
+which indexes were actually enumerated.
+
 On **Windows and CI** (no Raspberry Pi camera tooling):
 
 - with the camera **disabled** (the default), readiness is `disabled`;

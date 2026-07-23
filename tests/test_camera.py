@@ -26,12 +26,17 @@ from mgo.core.camera_detection import (
 from mgo.core.config import CameraConfig
 
 
-def _camera_config(*, enabled: bool = True, backend: str = "rpicam") -> CameraConfig:
+def _camera_config(
+    *,
+    enabled: bool = True,
+    backend: str = "rpicam",
+    device_index: int | None = None,
+) -> CameraConfig:
     """Build a camera configuration for tests."""
     return CameraConfig(
         enabled=enabled,
         backend=backend,
-        device_index=None,
+        device_index=device_index,
         detection_interval_seconds=30,
         capture_directory=Path("data/captures"),
     )
@@ -252,6 +257,80 @@ def test_enumerated_camera_is_available() -> None:
     assert readiness.status is CameraStatus.AVAILABLE
     assert readiness.available is True
     assert "imx708" in readiness.detail
+
+
+_MULTI_CAMERA_OUTPUT = (
+    "Available cameras\n"
+    "-----------------\n"
+    "0 : imx708 [4608x2592] (/base/soc/i2c0mux/i2c@1/imx708@1a)\n"
+    "1 : imx500 [4056x3040] (/base/soc/i2c0mux/i2c@0/imx500@1a)\n"
+)
+
+
+def _multi_camera_detector(device_index: int | None) -> CommandCameraDetector:
+    """A command detector serving two enumerated cameras (indexes 0 and 1)."""
+    return CommandCameraDetector(
+        ("rpicam-hello", "--list-cameras"),
+        runner=_fixed_runner(
+            CommandResult(CommandOutcome.COMPLETED, 0, _MULTI_CAMERA_OUTPUT, "")
+        ),
+    )
+
+
+def test_unset_device_index_reports_available() -> None:
+    """With no configured index, any enumerated camera is available."""
+    readiness = detect_camera_readiness(
+        _camera_config(device_index=None),
+        _multi_camera_detector(None),
+    )
+
+    assert readiness.status is CameraStatus.AVAILABLE
+    assert readiness.available is True
+
+
+def test_configured_device_index_present_is_available() -> None:
+    """A configured index that is enumerated reports available."""
+    readiness = detect_camera_readiness(
+        _camera_config(device_index=1),
+        _multi_camera_detector(1),
+    )
+
+    assert readiness.status is CameraStatus.AVAILABLE
+    assert readiness.available is True
+    assert "device_index 1" in readiness.detail
+    assert "imx500" in readiness.detail
+
+
+def test_configured_device_index_absent_is_waiting() -> None:
+    """A configured index that is not enumerated waits for hardware."""
+    readiness = detect_camera_readiness(
+        _camera_config(device_index=3),
+        _multi_camera_detector(3),
+    )
+
+    assert readiness.status is CameraStatus.WAITING_FOR_HARDWARE
+    assert readiness.available is False
+    assert "device_index 3" in readiness.detail
+    # Detail should truthfully report which indexes were present.
+    assert "0" in readiness.detail
+    assert "1" in readiness.detail
+
+
+def test_multiple_devices_select_configured_index() -> None:
+    """With multiple devices, the configured index selects the right one."""
+    readiness_zero = detect_camera_readiness(
+        _camera_config(device_index=0),
+        _multi_camera_detector(0),
+    )
+    readiness_one = detect_camera_readiness(
+        _camera_config(device_index=1),
+        _multi_camera_detector(1),
+    )
+
+    assert readiness_zero.available is True
+    assert "imx708" in readiness_zero.detail
+    assert readiness_one.available is True
+    assert "imx500" in readiness_one.detail
 
 
 def test_nonzero_exit_is_error() -> None:

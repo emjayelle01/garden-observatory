@@ -105,6 +105,28 @@ async def perform_camera_check(
     return readiness
 
 
+async def _safe_check(
+    config: MGOConfig,
+    state: CameraState,
+    *,
+    detector: CameraDetector,
+    recorder: ObservationRecorder,
+) -> None:
+    """Run one readiness check, isolating failures from the monitor loop."""
+    try:
+        await perform_camera_check(
+            config,
+            state,
+            detector=detector,
+            recorder=recorder,
+        )
+    except asyncio.CancelledError:
+        LOGGER.info("Camera monitoring cancelled")
+        raise
+    except Exception:
+        LOGGER.exception("Camera readiness check failed")
+
+
 async def run_camera_monitor(
     config: MGOConfig,
     state: CameraState,
@@ -112,35 +134,34 @@ async def run_camera_monitor(
     *,
     detector: CameraDetector,
     recorder: ObservationRecorder = record_observation,
+    run_initial: bool = True,
 ) -> None:
     """Monitor camera readiness until the supplied stop event is set.
 
-    Performs an initial check immediately so runtime state is populated, then
-    repeats at the configured interval. Exceptions from a single check are
-    logged and swallowed so the monitor -- and the application -- survive.
+    When ``run_initial`` is true the monitor performs one immediate check so
+    runtime state is populated (useful for standalone use). The application
+    lifespan already runs the initial check before serving, so it starts the
+    monitor with ``run_initial=False`` to avoid a duplicate back-to-back probe:
+    the monitor then waits one interval before its first periodic recheck.
+    Exceptions from a single check are logged and swallowed so the monitor --
+    and the application -- survive.
     """
     interval = config.camera.detection_interval_seconds
     LOGGER.info(
         "Camera monitoring started with a %s-second interval", interval
     )
 
-    while not stop_event.is_set():
-        try:
-            await perform_camera_check(
-                config,
-                state,
-                detector=detector,
-                recorder=recorder,
-            )
-        except asyncio.CancelledError:
-            LOGGER.info("Camera monitoring cancelled")
-            raise
-        except Exception:
-            LOGGER.exception("Camera readiness check failed")
+    if run_initial:
+        await _safe_check(config, state, detector=detector, recorder=recorder)
 
+    while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except TimeoutError:
-            continue
+            await _safe_check(
+                config, state, detector=detector, recorder=recorder
+            )
+        else:
+            break
 
     LOGGER.info("Camera monitoring stopped")
