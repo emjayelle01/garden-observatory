@@ -164,12 +164,35 @@ class PreviewService:
             return None
 
     def start(self) -> PreviewStatus:
-        """Start preview, or return the running status if already active.
+        """Start preview, validating that the process stays up, or return status.
 
-        Idempotent: a second call while running never launches a duplicate
-        process. Raises :class:`PreviewUnavailableError` when preview is
-        disabled and :class:`PreviewStartError` when the process cannot start.
+        Startup is not considered successful merely because the process was
+        created: the child is validated for stability before ``RUNNING`` is
+        reported, because a preview process can pass creation and then exit
+        during camera/encoder setup. Concretely, after launch the service waits
+        up to ``startup_timeout_seconds`` for the process to exit; if it exits in
+        that window the start fails (``FAILED``), otherwise it is ``RUNNING``.
+
+        Idempotent: a second call while already running (or while a start is in
+        progress) never launches a duplicate process. Raises
+        :class:`PreviewUnavailableError` when preview is disabled and
+        :class:`PreviewStartError` when the process fails to start or stay up.
         """
+        result = self._begin_start()
+        if isinstance(result, PreviewStatus):
+            # Already running, or a start is already in progress: return status.
+            return result
+
+        # Validate stability OUTSIDE the lock so status()/stop()/capture calls
+        # are never blocked during the (bounded) startup window. This uses the
+        # process's own exit signal -- it does not read stdout, so it never
+        # steals frames from the streaming reader.
+        process = result
+        exit_code = process.wait(self._config.startup_timeout_seconds)
+        return self._finish_start(process, exit_code)
+
+    def _begin_start(self) -> PreviewProcess | PreviewStatus:
+        """Launch phase (locked). Return the process, or a status to short-circuit."""
         with self._lock:
             if not self._config.enabled:
                 raise PreviewUnavailableError(
@@ -177,11 +200,17 @@ class PreviewService:
                 )
 
             self._reconcile_locked()
-            if self._state is PreviewState.RUNNING and self._process is not None:
+            if self._process is not None and self._state in (
+                PreviewState.RUNNING,
+                PreviewState.STARTING,
+            ):
+                # Already running, or a startup is already validating: never
+                # launch a second camera process.
                 return self._snapshot_locked()
 
             self._state = PreviewState.STARTING
             self._last_error = None
+            self._started_at = None
             LOGGER.info(
                 "Preview starting (backend=%s, %dx%d @ %dfps)",
                 self._backend.name,
@@ -202,23 +231,43 @@ class PreviewService:
                     f"Preview backend failed unexpectedly: {exc}"
                 ) from exc
 
-            exit_code = process.poll()
+            self._process = process
+            LOGGER.info(
+                "Preview process launched (backend=%s, pid=%s); validating "
+                "startup for up to %.1fs",
+                self._backend.name,
+                process.pid,
+                self._config.startup_timeout_seconds,
+            )
+            return process
+
+    def _finish_start(
+        self, process: PreviewProcess, exit_code: int | None
+    ) -> PreviewStatus:
+        """Finalise phase (locked). Promote to RUNNING or settle FAILED."""
+        with self._lock:
+            if self._process is not process:
+                # A concurrent stop/capture superseded this start during
+                # validation; make sure our process is fully reaped.
+                self._discard_process(process)
+                return self._snapshot_locked()
+
             if exit_code is not None:
                 detail = process.read_error()
                 process.close()
                 message = (
-                    f"Preview process exited immediately with code {exit_code}"
-                    + (f": {detail}" if detail else ".")
+                    f"Preview process exited during startup with code "
+                    f"{exit_code}" + (f": {detail}" if detail else ".")
                 )
                 self._fail_locked(message)
                 LOGGER.error("%s", message)
+                LOGGER.info("Preview resources released after failed startup")
                 raise PreviewStartError(message)
 
-            self._process = process
             self._started_at = self._clock()
             self._state = PreviewState.RUNNING
             LOGGER.info(
-                "Preview running (backend=%s, pid=%s)",
+                "Preview startup validated; running (backend=%s, pid=%s)",
                 self._backend.name,
                 process.pid,
             )
@@ -301,6 +350,20 @@ class PreviewService:
             )
             process.kill()
             process.wait(_FORCE_KILL_REAP_SECONDS)
+        process.close()
+
+    def _discard_process(self, process: PreviewProcess) -> None:
+        """Fully reap a process this start no longer owns (superseded mid-start).
+
+        Idempotent with a concurrent :meth:`stop` that already terminated it:
+        a dead process is only closed, a still-live one is terminated first, so
+        the camera is always released and no stray process survives.
+        """
+        if process.poll() is None:
+            process.terminate()
+            if process.wait(self._config.shutdown_timeout_seconds) is None:
+                process.kill()
+                process.wait(_FORCE_KILL_REAP_SECONDS)
         process.close()
 
     def _fail_locked(self, message: str) -> None:

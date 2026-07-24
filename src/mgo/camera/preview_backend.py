@@ -34,9 +34,15 @@ from mgo.core.config import PreviewConfig
 
 LOGGER = logging.getLogger(__name__)
 
-#: Preview frames are discarded in Task 2D (no streaming yet); ``--output -``
-#: plus a discarded stdout keeps the pipeline running without buffering to disk.
+#: ``--timeout 0`` runs the preview process continuously until it is stopped.
 _PREVIEW_RUN_FOREVER_MS = "0"
+#: Explicit encoder: emit Motion-JPEG (a concatenation of complete JPEG frames)
+#: to stdout. This is required because rpicam-vid otherwise defaults to H.264
+#: written through libav, which cannot infer an output container from the ``-``
+#: (stdout) filename and fails with "Unable to choose an output format for '-'".
+#: MJPEG needs no container: each frame is a standalone JPEG, which is exactly
+#: what the streaming layer's SOI/EOI demultiplexer expects.
+_PREVIEW_CODEC = "mjpeg"
 _MAX_ERROR_CHARS = 2000
 
 
@@ -210,8 +216,10 @@ class RPiCamPreviewBackend:
 
     The command is run as an argument array (never a shell) that requests the
     configured resolution and frame rate and runs until stopped. No preview
-    window is opened (``--nopreview``): Task 2D manages the pipeline only, and
-    browser streaming is deferred to a later task.
+    window is opened (``--nopreview``). Output is an explicit Motion-JPEG stream
+    on stdout (``--codec mjpeg --output -``): a sequence of complete JPEG frames
+    that the streaming layer's SOI/EOI demultiplexer consumes directly, with no
+    libav container and no transcoding stage.
     """
 
     def __init__(
@@ -228,16 +236,26 @@ class RPiCamPreviewBackend:
         return self._command
 
     def _build_args(self, config: PreviewConfig) -> Sequence[str]:
-        """Assemble the preview command's argument array."""
+        """Assemble the preview command's argument array.
+
+        ``--codec mjpeg`` makes stdout an explicit MJPEG frame stream (see
+        :data:`_PREVIEW_CODEC`). ``--flush`` writes each encoded frame to the
+        pipe as soon as it is produced instead of letting rpicam-vid buffer
+        output, so frames reach the streaming reader (and the browser) promptly
+        and the SOI/EOI demultiplexer is never starved behind a full buffer.
+        """
         return (
             self._command,
             "--nopreview",
+            "--codec",
+            _PREVIEW_CODEC,
             "--width",
             str(config.width),
             "--height",
             str(config.height),
             "--framerate",
             str(config.fps),
+            "--flush",
             "--timeout",
             _PREVIEW_RUN_FOREVER_MS,
             "--output",

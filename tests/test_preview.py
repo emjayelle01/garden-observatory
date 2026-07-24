@@ -201,17 +201,20 @@ def test_unexpected_backend_error_is_wrapped_as_start_error() -> None:
     assert service.status().state is PreviewState.FAILED
 
 
-def test_immediate_process_exit_is_start_failure() -> None:
-    """A process that exits immediately after launch is a start failure."""
+def test_process_exit_during_startup_is_start_failure() -> None:
+    """A process that exits during the startup window is a start failure."""
     backend = MockPreviewBackend(launched_dead=True)
     service = _service(backend)
 
-    with pytest.raises(PreviewStartError, match="exited immediately"):
+    with pytest.raises(PreviewStartError, match="exited during startup"):
         service.start()
 
     status = service.status()
     assert status.state is PreviewState.FAILED
     assert status.last_error is not None
+    # The dead process was reaped and its resources released.
+    assert backend.last_process is not None
+    assert backend.last_process.closed is True
 
 
 def test_unexpected_exit_reconciles_to_failed() -> None:
@@ -428,6 +431,11 @@ def test_rpicam_preview_backend_builds_expected_args() -> None:
     assert "600" in args
     assert "24" in args
     assert "--output" in args
+    # Explicit MJPEG output to stdout (the streaming contract), not libav.
+    assert "--codec" in args
+    assert args[args.index("--codec") + 1] == "mjpeg"
+    assert args[args.index("--output") + 1] == "-"
+    assert not any("libav" in arg for arg in args)
 
 
 def test_launch_subprocess_missing_command_is_unavailable() -> None:
