@@ -41,12 +41,19 @@ uv run pytest
 
 ## API
 
-| Endpoint             | Description                                             |
-| -------------------- | ------------------------------------------------------- |
-| `GET /`              | Application identity.                                   |
-| `GET /health`        | System health plus the current camera readiness state. |
-| `GET /camera/status` | The latest monitored camera readiness result.          |
-| `GET /observations`  | Recent observation timeline (`?limit=`, `?kind=`).      |
+| Endpoint              | Description                                             |
+| --------------------- | ------------------------------------------------------- |
+| `GET /`               | Application identity.                                   |
+| `GET /health`         | System health plus the current camera readiness state. |
+| `GET /camera/status`  | The latest monitored camera readiness result.          |
+| `POST /camera/capture`| Capture one still image; returns its stored metadata.   |
+| `GET /observations`   | Recent observation timeline (`?limit=`, `?kind=`).      |
+
+`POST /camera/capture` writes a timestamped JPEG beneath
+`camera.capture_directory` and returns `200` with capture metadata (filename,
+absolute path, UTC timestamp, dimensions, filesize). Expected failures map to
+meaningful statuses: `503` when the camera is disabled/unavailable, `504` on a
+capture timeout, `502` on a backend failure, and `500` on a write failure.
 
 ## Configuration
 
@@ -105,10 +112,11 @@ committed to the repository.
 
 ## Camera readiness
 
-This project currently implements **camera capability detection only**. It does
-**not** capture images, stream video, run inference, or perform motion
-detection. The goal is a truthful, hardware-safe readiness signal that a later
-capture layer can build on.
+This project implements camera **readiness detection** (described here) and a
+first **still-image capture** layer (see `POST /camera/capture` above and the
+`mgo.camera` package). It does **not** yet stream video, run inference, or
+perform motion detection. The goal is a truthful, hardware-safe foundation that
+later capture and analysis features build on.
 
 A background monitor evaluates readiness at startup and then every
 `detection_interval_seconds`, keeping the latest result in application state.

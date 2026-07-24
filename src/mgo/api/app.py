@@ -7,8 +7,16 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 
+from mgo.camera import (
+    CameraUnavailableError,
+    CaptureService,
+    CaptureTimeoutError,
+    CaptureWriteError,
+    build_capture_backend,
+)
+from mgo.camera.exceptions import BackendCaptureError, CameraCaptureError
 from mgo.core.camera import CameraReadiness, CameraState, default_readiness
 from mgo.core.camera_detection import build_detector
 from mgo.core.camera_monitor import perform_camera_check, run_camera_monitor
@@ -26,6 +34,18 @@ def _current_camera_readiness(app: FastAPI) -> CameraReadiness:
     state: CameraState | None = getattr(app.state, "camera_state", None)
     readiness = state.get() if state is not None else None
     return readiness if readiness is not None else default_readiness(config.camera)
+
+
+def _capture_service(app: FastAPI) -> CaptureService:
+    """Return the capture service, building a default if none was attached.
+
+    The lifespan attaches a service to ``app.state``; tests can attach one
+    backed by a mock so the endpoint is exercised without camera hardware.
+    """
+    service: CaptureService | None = getattr(app.state, "capture_service", None)
+    if service is not None:
+        return service
+    return CaptureService(config.camera, build_capture_backend(config.camera))
 
 
 @asynccontextmanager
@@ -60,6 +80,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     camera_state = CameraState()
     app.state.camera_state = camera_state
+    app.state.capture_service = CaptureService(
+        config.camera,
+        build_capture_backend(config.camera),
+    )
     camera_detector = build_detector(config.camera.backend)
     # Evaluate readiness once before serving so /camera/status and /health
     # report a truthful state immediately after startup.
@@ -128,6 +152,32 @@ def camera_status(request: Request) -> dict[str, Any]:
     recorded by the background camera monitor.
     """
     return _current_camera_readiness(request.app).as_dict()
+
+
+@app.post("/camera/capture")
+async def camera_capture(request: Request) -> dict[str, Any]:
+    """Capture a single still image and return its metadata.
+
+    Returns HTTP 200 with the capture metadata on success. Expected failures
+    are mapped to meaningful status codes: an unavailable camera to 503, a
+    capture timeout to 504, and backend/write failures to 502/500. Detection
+    runs in a worker thread so the capture subprocess never blocks the loop.
+    """
+    service = _capture_service(request.app)
+    try:
+        result = await asyncio.to_thread(service.capture_image)
+    except CameraUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except CaptureTimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except BackendCaptureError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except CaptureWriteError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except CameraCaptureError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return result.as_dict()
 
 
 @app.get("/observations")
