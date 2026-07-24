@@ -33,6 +33,17 @@ backend = "rpicam"
 detection_interval_seconds = 60
 capture_directory = "/home/pi/Projects/garden-observatory/data/captures"
 
+[preview]
+# Live camera preview. Preview shares the camera with capture; only one may own
+# it at a time and capture always takes priority. Enable when a preview
+# consumer is in use.
+enabled = true
+width = 1280
+height = 720
+fps = 15
+startup_timeout_seconds = 5.0
+shutdown_timeout_seconds = 5.0
+
 [health]
 enabled = true
 collection_interval_seconds = 60

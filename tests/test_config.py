@@ -110,6 +110,86 @@ def test_negative_camera_device_index_is_rejected(tmp_path: Path) -> None:
         load_config(_write_config(tmp_path, extra="device_index = -1"))
 
 
+# --- preview configuration -------------------------------------------------
+
+_PREVIEW_SECTION = """
+[preview]
+enabled = true
+width = 640
+height = 480
+fps = 30
+startup_timeout_seconds = 3.0
+shutdown_timeout_seconds = 4.0
+"""
+
+
+def _write_config_with_preview(tmp_path: Path, preview: str) -> Path:
+    """Write a base config with an appended ``[preview]`` section."""
+    path = tmp_path / "mgo.toml"
+    base = _BASE_CONFIG.format(
+        enabled="false", backend="rpicam", interval="60", extra=""
+    )
+    path.write_text(base + preview, encoding="utf-8")
+    return path
+
+
+def test_default_configuration_includes_preview_defaults() -> None:
+    """The repository default config exposes safe preview settings."""
+    preview = load_config().preview
+
+    assert preview.enabled is False
+    assert preview.width == 1280
+    assert preview.height == 720
+    assert preview.fps == 15
+    assert preview.startup_timeout_seconds == 5.0
+    assert preview.shutdown_timeout_seconds == 5.0
+
+
+def test_preview_defaults_apply_when_section_absent(tmp_path: Path) -> None:
+    """A config without a [preview] section still loads with safe defaults."""
+    preview = load_config(_write_config(tmp_path)).preview
+
+    assert preview.enabled is False
+    assert preview.width == 1280
+    assert preview.height == 720
+    assert preview.fps == 15
+
+
+def test_preview_section_is_loaded(tmp_path: Path) -> None:
+    """A provided [preview] section overrides the defaults."""
+    preview = load_config(
+        _write_config_with_preview(tmp_path, _PREVIEW_SECTION)
+    ).preview
+
+    assert preview.enabled is True
+    assert preview.width == 640
+    assert preview.height == 480
+    assert preview.fps == 30
+    assert preview.startup_timeout_seconds == 3.0
+    assert preview.shutdown_timeout_seconds == 4.0
+
+
+def test_invalid_preview_fps_is_rejected(tmp_path: Path) -> None:
+    """A non-positive preview fps must raise a clear error."""
+    section = "\n[preview]\nenabled = true\nfps = 0\n"
+    with pytest.raises(ValueError, match="fps must be positive"):
+        load_config(_write_config_with_preview(tmp_path, section))
+
+
+def test_invalid_preview_dimensions_are_rejected(tmp_path: Path) -> None:
+    """Non-positive preview dimensions must raise a clear error."""
+    section = "\n[preview]\nenabled = true\nwidth = 0\n"
+    with pytest.raises(ValueError, match="width and height must be positive"):
+        load_config(_write_config_with_preview(tmp_path, section))
+
+
+def test_invalid_preview_timeout_is_rejected(tmp_path: Path) -> None:
+    """A non-positive preview timeout must raise a clear error."""
+    section = "\n[preview]\nenabled = true\nshutdown_timeout_seconds = 0\n"
+    with pytest.raises(ValueError, match="shutdown timeout must be positive"):
+        load_config(_write_config_with_preview(tmp_path, section))
+
+
 def test_configured_paths_are_absolute() -> None:
     """Configured project paths should resolve to absolute filesystem paths."""
     config = load_config()

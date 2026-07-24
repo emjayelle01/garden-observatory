@@ -20,6 +20,7 @@ def _config_with_database(database_path: Path) -> MGOConfig:
             database_path=database_path,
         ),
         camera=config.camera,
+        preview=config.preview,
         health=config.health,
     )
 

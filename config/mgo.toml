@@ -20,6 +20,19 @@ backend = "rpicam"
 detection_interval_seconds = 60
 capture_directory = "data/captures"
 
+[preview]
+# Live camera preview. Disabled by default: no preview process is started until
+# this is explicitly enabled. Preview shares the camera with capture — only one
+# may own it at a time, and capture always takes priority.
+enabled = false
+width = 1280
+height = 720
+fps = 15
+# Bounds for confirming process start and for graceful shutdown before a
+# forced kill (seconds).
+startup_timeout_seconds = 5.0
+shutdown_timeout_seconds = 5.0
+
 [health]
 enabled = true
 collection_interval_seconds = 60

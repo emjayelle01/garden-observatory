@@ -15,9 +15,16 @@ from mgo.camera import (
     CaptureService,
     CaptureTimeoutError,
     CaptureWriteError,
+    PreviewService,
     build_capture_backend,
+    build_preview_backend,
 )
-from mgo.camera.exceptions import BackendCaptureError, CameraCaptureError
+from mgo.camera.exceptions import (
+    BackendCaptureError,
+    CameraCaptureError,
+    PreviewStartError,
+    PreviewUnavailableError,
+)
 from mgo.captures import (
     CaptureArchive,
     CaptureArchiveError,
@@ -73,6 +80,24 @@ def _capture_archive(app: FastAPI) -> CaptureArchive:
     return archive
 
 
+def _preview_service(app: FastAPI) -> PreviewService:
+    """Return the preview service, building a default if none was attached.
+
+    The lifespan attaches a service to ``app.state``; a lazily built fallback
+    keeps the endpoints usable in contexts (such as direct unit tests) that
+    never ran startup, mirroring :func:`_capture_service`.
+    """
+    service: PreviewService | None = getattr(app.state, "preview_service", None)
+    if service is not None:
+        return service
+    service = PreviewService(
+        config.preview,
+        build_preview_backend(config.camera.backend),
+    )
+    app.state.preview_service = service
+    return service
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Initialise persistent MGO services during application startup."""
@@ -115,6 +140,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         config.camera,
         build_capture_backend(config.camera),
     )
+    # Preview shares the camera with capture; it starts STOPPED and is only ever
+    # started explicitly via the API. It is attached here so the endpoints and
+    # /health reflect a single, canonical preview service.
+    app.state.preview_service = PreviewService(
+        config.preview,
+        build_preview_backend(config.camera.backend),
+    )
     camera_detector = build_detector(config.camera.backend)
     # Evaluate readiness once before serving so /camera/status and /health
     # report a truthful state immediately after startup.
@@ -139,6 +171,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stop_event.set()
         camera_stop_event.set()
         await asyncio.gather(health_task, camera_task)
+        # Ensure no preview process is left running (no orphans) on shutdown.
+        await asyncio.to_thread(app.state.preview_service.shutdown)
         record_observation(
             config.storage.database_path,
             kind="application_stop",
@@ -169,9 +203,14 @@ def root() -> dict[str, str]:
 
 @app.get("/health")
 def health(request: Request) -> dict[str, Any]:
-    """Return live system-health information plus current camera readiness."""
+    """Return live system health, camera readiness and preview status.
+
+    A stopped preview is not an error: preview is reported for visibility only
+    and never changes the overall health status.
+    """
     result = collect_health(config)
     result["camera"] = _current_camera_readiness(request.app).as_dict()
+    result["preview"] = _preview_service(request.app).status().health_dict()
     return result
 
 
@@ -195,6 +234,10 @@ async def camera_capture(request: Request) -> dict[str, Any]:
     runs in a worker thread so the capture subprocess never blocks the loop.
     """
     service = _capture_service(request.app)
+    # Camera ownership is exclusive and capture is authoritative: release any
+    # active preview first so the capture never contends for the camera. Preview
+    # is left stopped; the caller may restart it explicitly afterwards.
+    await asyncio.to_thread(_preview_service(request.app).release_for_capture)
     try:
         result = await asyncio.to_thread(service.capture_image)
     except CameraUnavailableError as exc:
@@ -221,6 +264,43 @@ async def camera_capture(request: Request) -> dict[str, Any]:
     response = result.as_dict()
     response["capture_id"] = str(record.id)
     return response
+
+
+@app.get("/camera/preview/status")
+def camera_preview_status(request: Request) -> dict[str, Any]:
+    """Return the current live-preview status.
+
+    Read-only: it reconciles an unexpected process exit but never starts or
+    stops the preview.
+    """
+    return _preview_service(request.app).status().as_dict()
+
+
+@app.post("/camera/preview/start")
+async def camera_preview_start(request: Request) -> dict[str, Any]:
+    """Start the live preview and return its status.
+
+    Idempotent: if preview is already running this returns HTTP 200 with the
+    current status and never launches a duplicate process. A disabled preview
+    maps to 503; a process that cannot start maps to 502. Runs in a worker
+    thread so process management never blocks the event loop.
+    """
+    service = _preview_service(request.app)
+    try:
+        status = await asyncio.to_thread(service.start)
+    except PreviewUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except PreviewStartError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return status.as_dict()
+
+
+@app.post("/camera/preview/stop")
+async def camera_preview_stop(request: Request) -> dict[str, Any]:
+    """Stop the live preview and return the final status. Idempotent."""
+    service = _preview_service(request.app)
+    status = await asyncio.to_thread(service.stop)
+    return status.as_dict()
 
 
 @app.get("/captures")

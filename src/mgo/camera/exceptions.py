@@ -52,3 +52,29 @@ class CaptureWriteError(CameraCaptureError):
     reported success without producing a file, and empty or unreadable output
     files.
     """
+
+
+class PreviewError(Exception):
+    """Base class for all live-preview failures.
+
+    Kept separate from :class:`CameraCaptureError`: preview and capture are
+    distinct camera operations with different lifecycles, even though only one
+    may own the camera at a time.
+    """
+
+
+class PreviewUnavailableError(PreviewError):
+    """Preview cannot run because it is disabled or has no usable backend.
+
+    Raised when preview is disabled by configuration, the selected backend
+    never provides hardware (null backend), or the preview tool is not
+    installed. Maps to an HTTP 503 at the API boundary.
+    """
+
+
+class PreviewStartError(PreviewError):
+    """The preview process could not be started, or died immediately.
+
+    Covers an operating-system failure launching the process and a process that
+    exited before it could be considered running. Maps to an HTTP 500/502.
+    """

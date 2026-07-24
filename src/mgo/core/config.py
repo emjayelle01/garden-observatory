@@ -54,6 +54,25 @@ class CameraConfig:
 
 
 @dataclass(frozen=True)
+class PreviewConfig:
+    """Live camera preview settings.
+
+    ``enabled`` gates all preview behaviour. ``width``/``height``/``fps`` shape
+    the preview pipeline. ``startup_timeout_seconds`` and
+    ``shutdown_timeout_seconds`` bound process start confirmation and graceful
+    shutdown respectively. Preview shares the camera hardware with capture; only
+    one may own the camera at a time.
+    """
+
+    enabled: bool
+    width: int
+    height: int
+    fps: int
+    startup_timeout_seconds: float
+    shutdown_timeout_seconds: float
+
+
+@dataclass(frozen=True)
 class HealthConfig:
     """Configuration for health monitoring."""
 
@@ -74,6 +93,7 @@ class MGOConfig:
     application: ApplicationConfig
     storage: StorageConfig
     camera: CameraConfig
+    preview: PreviewConfig
     health: HealthConfig
 
 
@@ -96,6 +116,33 @@ def _validate_health_config(health: HealthConfig) -> None:
 
     if health.memory_warning_percent >= health.memory_critical_percent:
         raise ValueError("Memory warning threshold must be below critical")
+
+
+#: Sensible defaults for preview when the ``[preview]`` section is absent, so
+#: pre-existing configuration files keep loading unchanged.
+_PREVIEW_DEFAULTS = {
+    "enabled": False,
+    "width": 1280,
+    "height": 720,
+    "fps": 15,
+    "startup_timeout_seconds": 5.0,
+    "shutdown_timeout_seconds": 5.0,
+}
+
+
+def _validate_preview_config(preview: PreviewConfig) -> None:
+    """Validate preview settings, rejecting non-positive dimensions/timings."""
+    if preview.width <= 0 or preview.height <= 0:
+        raise ValueError("Preview width and height must be positive")
+
+    if preview.fps <= 0:
+        raise ValueError("Preview fps must be positive")
+
+    if preview.startup_timeout_seconds <= 0:
+        raise ValueError("Preview startup timeout must be positive")
+
+    if preview.shutdown_timeout_seconds <= 0:
+        raise ValueError("Preview shutdown timeout must be positive")
 
 
 def _validate_camera_config(camera: CameraConfig) -> None:
@@ -208,6 +255,29 @@ def load_config(path: Path | None = None) -> MGOConfig:
     )
     _validate_camera_config(camera)
 
+    # The ``[preview]`` section is optional so pre-Task-2D configuration files
+    # continue to load; absent keys fall back to safe defaults.
+    preview_data = raw.get("preview", {})
+    preview = PreviewConfig(
+        enabled=bool(preview_data.get("enabled", _PREVIEW_DEFAULTS["enabled"])),
+        width=int(preview_data.get("width", _PREVIEW_DEFAULTS["width"])),
+        height=int(preview_data.get("height", _PREVIEW_DEFAULTS["height"])),
+        fps=int(preview_data.get("fps", _PREVIEW_DEFAULTS["fps"])),
+        startup_timeout_seconds=float(
+            preview_data.get(
+                "startup_timeout_seconds",
+                _PREVIEW_DEFAULTS["startup_timeout_seconds"],
+            )
+        ),
+        shutdown_timeout_seconds=float(
+            preview_data.get(
+                "shutdown_timeout_seconds",
+                _PREVIEW_DEFAULTS["shutdown_timeout_seconds"],
+            )
+        ),
+    )
+    _validate_preview_config(preview)
+
     return MGOConfig(
         application=ApplicationConfig(
             name=str(application_data["name"]),
@@ -221,5 +291,6 @@ def load_config(path: Path | None = None) -> MGOConfig:
             database_path=_project_path(str(storage_data["database_path"])),
         ),
         camera=camera,
+        preview=preview,
         health=health,
     )

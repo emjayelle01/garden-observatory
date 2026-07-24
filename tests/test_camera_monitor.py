@@ -64,6 +64,7 @@ def _config(database_path: Path, *, interval: int = 30) -> MGOConfig:
             detection_interval_seconds=interval,
             capture_directory=database_path.parent / "captures",
         ),
+        preview=base.preview,
         health=base.health,
     )
 
@@ -194,6 +195,7 @@ def test_disabled_state_records_once(tmp_path: Path) -> None:
         application=config.application,
         storage=config.storage,
         camera=replace(config.camera, enabled=False),
+        preview=config.preview,
         health=config.health,
     )
     state = CameraState()
