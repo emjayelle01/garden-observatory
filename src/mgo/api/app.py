@@ -58,15 +58,17 @@ def _capture_service(app: FastAPI) -> CaptureService:
 def _capture_archive(app: FastAPI) -> CaptureArchive:
     """Return the capture archive, building a default if none was attached.
 
-    The lifespan attaches an initialised archive to ``app.state``; a lazily
-    built fallback keeps the endpoints usable in contexts (such as direct unit
-    tests) that never ran startup, mirroring :func:`_capture_service`.
+    The lifespan attaches an archive to ``app.state`` after running migrations;
+    a lazily built fallback keeps the endpoints usable in contexts (such as
+    direct unit tests) that never ran startup. The fallback applies the existing
+    numbered migrations first -- the same idempotent runner used at startup -- so
+    the ``captures`` table exists before use, mirroring :func:`_capture_service`.
     """
     archive: CaptureArchive | None = getattr(app.state, "capture_archive", None)
     if archive is not None:
         return archive
+    apply_migrations(config.storage.database_path)
     archive = CaptureArchive(config.storage.database_path)
-    archive.initialize()
     app.state.capture_archive = archive
     return archive
 
@@ -76,12 +78,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Initialise persistent MGO services during application startup."""
     applied_versions = apply_migrations(config.storage.database_path)
 
-    # Provision the capture archive alongside the migration runner. Table
-    # creation is idempotent: new installations gain the ``captures`` table
-    # automatically while existing databases are left untouched.
-    capture_archive = CaptureArchive(config.storage.database_path)
-    capture_archive.initialize()
-    app.state.capture_archive = capture_archive
+    # The numbered migration runner creates the ``captures`` table (migration
+    # 002) alongside the observation schema in the shared database. The archive
+    # only needs the shared path; it opens bounded connections per operation and
+    # never manages its own engine or schema.
+    app.state.capture_archive = CaptureArchive(config.storage.database_path)
 
     if applied_versions:
         record_observation(

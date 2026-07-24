@@ -22,6 +22,7 @@ from mgo.api.app import camera_capture, capture, captures
 from mgo.camera import CaptureService, MockBackend
 from mgo.captures.archive import CaptureArchive
 from mgo.core.config import CameraConfig
+from mgo.core.database import apply_migrations
 
 
 def _capture_config(capture_directory: Path, *, enabled: bool = True) -> CameraConfig:
@@ -36,10 +37,10 @@ def _capture_config(capture_directory: Path, *, enabled: bool = True) -> CameraC
 
 
 def _archive(tmp_path: Path) -> CaptureArchive:
-    """Build and initialise an archive backed by a temporary database."""
-    archive = CaptureArchive(tmp_path / "mgo.db")
-    archive.initialize()
-    return archive
+    """Build a migration-provisioned archive over a temporary database."""
+    database_path = tmp_path / "mgo.db"
+    apply_migrations(database_path)
+    return CaptureArchive(database_path)
 
 
 def _request(
