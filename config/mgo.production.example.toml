@@ -1,0 +1,44 @@
+# Matt's Garden Observatory — EXAMPLE production configuration.
+#
+# This file is an EXAMPLE only. It is tracked in Git purely to document the
+# intended production shape. Do NOT edit it in place for a real deployment and
+# do NOT commit a real production configuration.
+#
+# To deploy, copy this file OUTSIDE the repository — the intended external
+# location is:
+#
+#     /etc/mgo/mgo.toml
+#
+# then point the service at it with the environment selector:
+#
+#     MGO_CONFIG_PATH=/etc/mgo/mgo.toml
+#
+# The values below are safe, illustrative production defaults. Replace hosts,
+# paths and thresholds to match the target machine.
+
+[application]
+name = "Matt's Garden Observatory"
+environment = "production"
+host = "0.0.0.0"
+port = 8080
+
+[storage]
+data_directory = "/home/pi/Projects/garden-observatory/data"
+log_directory = "/home/pi/Projects/garden-observatory/logs"
+database_path = "/home/pi/Projects/garden-observatory/data/mgo.db"
+
+[camera]
+enabled = true
+backend = "rpicam"
+detection_interval_seconds = 60
+capture_directory = "/home/pi/Projects/garden-observatory/data/captures"
+
+[health]
+enabled = true
+collection_interval_seconds = 60
+temperature_warning_celsius = 70.0
+temperature_critical_celsius = 80.0
+disk_warning_percent = 80.0
+disk_critical_percent = 90.0
+memory_warning_percent = 85.0
+memory_critical_percent = 95.0

@@ -68,6 +68,41 @@ capture_directory = "data/captures"
 Defaults are deliberately safe: the camera is **disabled**, no hardware is
 assumed to exist, and no image capture is ever attempted.
 
+### Production configuration
+
+By default the application loads the tracked development configuration at
+`config/mgo.toml` (camera disabled). Production deployments keep their
+machine-specific settings in an **external** file that is never committed to
+Git — the intended location is `/etc/mgo/mgo.toml`.
+
+Selection is controlled by the `MGO_CONFIG_PATH` environment variable:
+
+| Precedence | Source                                         |
+| ---------- | ---------------------------------------------- |
+| 1          | An explicit path passed to `load_config(...)`. |
+| 2          | The `MGO_CONFIG_PATH` environment variable.    |
+| 3          | The repository default, `config/mgo.toml`.     |
+
+`MGO_CONFIG_PATH` accepts absolute paths, `~` (expanded to the user's home),
+and relative paths (resolved against the current working directory). Surrounding
+whitespace is stripped. A set-but-empty or whitespace-only value is rejected
+with a `ValueError`, and a selected file that does not exist fails immediately
+with a `FileNotFoundError` naming the resolved path — there is **no** silent
+fallback to `config/mgo.toml`. Invalid TOML or an invalid configuration (bad
+thresholds, unsupported backend, non-positive interval, and so on) fails at
+startup exactly as it does for the default file.
+
+A complete example lives at `config/mgo.production.example.toml`. Copy it
+outside the repository, edit it for the target machine, and point the service at
+it — for example, in the systemd unit:
+
+```ini
+Environment=MGO_CONFIG_PATH=/etc/mgo/mgo.toml
+```
+
+External production files (including `/etc/mgo/mgo.toml`) must **not** be
+committed to the repository.
+
 ## Camera readiness
 
 This project currently implements **camera capability detection only**. It does
