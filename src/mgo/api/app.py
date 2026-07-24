@@ -3,21 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
 
+from mgo.api.preview_page import render_preview_page
 from mgo.camera import (
+    MJPEG_CONTENT_TYPE,
     CameraUnavailableError,
     CaptureService,
     CaptureTimeoutError,
     CaptureWriteError,
+    MjpegBroker,
+    PreviewProcessFrameSource,
     PreviewService,
     build_capture_backend,
     build_preview_backend,
+    encode_multipart_frame,
 )
 from mgo.camera.exceptions import (
     BackendCaptureError,
@@ -25,6 +32,8 @@ from mgo.camera.exceptions import (
     PreviewStartError,
     PreviewUnavailableError,
 )
+from mgo.camera.preview import PreviewState
+from mgo.camera.streaming import STREAM_IDLE_TIMEOUT_SECONDS
 from mgo.captures import (
     CaptureArchive,
     CaptureArchiveError,
@@ -98,6 +107,22 @@ def _preview_service(app: FastAPI) -> PreviewService:
     return service
 
 
+def _preview_broker(app: FastAPI) -> MjpegBroker:
+    """Return the MJPEG streaming broker, building a default if none attached.
+
+    The broker's frame source reads the *existing* preview process supervised by
+    the preview service (single camera owner); the broker never controls the
+    process, keeping streaming independent of the preview lifecycle.
+    """
+    broker: MjpegBroker | None = getattr(app.state, "preview_broker", None)
+    if broker is not None:
+        return broker
+    service = _preview_service(app)
+    broker = MjpegBroker(lambda: PreviewProcessFrameSource(service))
+    app.state.preview_broker = broker
+    return broker
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Initialise persistent MGO services during application startup."""
@@ -143,9 +168,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Preview shares the camera with capture; it starts STOPPED and is only ever
     # started explicitly via the API. It is attached here so the endpoints and
     # /health reflect a single, canonical preview service.
-    app.state.preview_service = PreviewService(
+    preview_service = PreviewService(
         config.preview,
         build_preview_backend(config.camera.backend),
+    )
+    app.state.preview_service = preview_service
+    # The streaming broker fans the preview process's frames out to browsers.
+    # Its frame source reads the existing preview process (single owner); it
+    # never starts or stops preview.
+    app.state.preview_broker = MjpegBroker(
+        lambda: PreviewProcessFrameSource(preview_service)
     )
     camera_detector = build_detector(config.camera.backend)
     # Evaluate readiness once before serving so /camera/status and /health
@@ -301,6 +333,60 @@ async def camera_preview_stop(request: Request) -> dict[str, Any]:
     service = _preview_service(request.app)
     status = await asyncio.to_thread(service.stop)
     return status.as_dict()
+
+
+async def _mjpeg_stream(broker: MjpegBroker) -> AsyncIterator[bytes]:
+    """Yield multipart MJPEG parts to one viewer until it disconnects.
+
+    Subscribes to the broker for the duration of the connection and always
+    unsubscribes on exit -- normal end, client disconnect (``GeneratorExit``) or
+    error -- so a departed viewer is removed cleanly and the pump stops when the
+    last viewer leaves. The blocking mailbox read runs off the event loop.
+    """
+    subscriber = broker.subscribe()
+    try:
+        while True:
+            try:
+                frame = await asyncio.to_thread(
+                    subscriber.get, STREAM_IDLE_TIMEOUT_SECONDS
+                )
+            except queue.Empty:
+                # No frame within the idle window: end the stream rather than
+                # hold the connection open indefinitely.
+                return
+            if frame is None:
+                # End-of-stream sentinel: the preview stopped producing frames.
+                return
+            yield encode_multipart_frame(frame)
+    finally:
+        broker.unsubscribe(subscriber)
+
+
+@app.get("/camera/preview/stream")
+async def camera_preview_stream(request: Request) -> StreamingResponse:
+    """Stream the live preview to the browser as multipart/x-mixed-replace MJPEG.
+
+    Requires preview to already be running (HTTP 409 otherwise) and never starts
+    it. Supports multiple simultaneous viewers; each disconnect is handled
+    cleanly. The browser only consumes frames and never owns the camera.
+    """
+    preview = _preview_service(request.app)
+    if preview.status().state is not PreviewState.RUNNING:
+        raise HTTPException(
+            status_code=409,
+            detail="Preview is not running; start it before streaming.",
+        )
+    broker = _preview_broker(request.app)
+    return StreamingResponse(
+        _mjpeg_stream(broker),
+        media_type=MJPEG_CONTENT_TYPE,
+    )
+
+
+@app.get("/preview", response_class=HTMLResponse)
+def preview_page() -> HTMLResponse:
+    """Serve the simple browser live-preview page."""
+    return HTMLResponse(content=render_preview_page())
 
 
 @app.get("/captures")

@@ -25,7 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import IO, Any
 
 from mgo.camera.exceptions import (
     PreviewError,
@@ -148,6 +148,20 @@ class PreviewService:
         with self._lock:
             self._reconcile_locked()
             return self._snapshot_locked()
+
+    def frame_stream(self) -> IO[bytes] | None:
+        """Return the running preview process's frame stream, if any.
+
+        The streaming layer reads frames from this existing process so the
+        camera keeps a single owner; the service still solely supervises the
+        process. Returns ``None`` unless preview is running with a captured
+        frame stream.
+        """
+        with self._lock:
+            self._reconcile_locked()
+            if self._state is PreviewState.RUNNING and self._process is not None:
+                return self._process.frame_stream()
+            return None
 
     def start(self) -> PreviewStatus:
         """Start preview, or return the running status if already active.

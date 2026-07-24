@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Protocol
+from typing import IO, Protocol
 
 from mgo.camera.exceptions import PreviewStartError, PreviewUnavailableError
 from mgo.core.config import PreviewConfig
@@ -71,6 +71,15 @@ class PreviewProcess(Protocol):
 
     def read_error(self) -> str:
         """Return a best-effort snapshot of the process's captured stderr."""
+        ...
+
+    def frame_stream(self) -> IO[bytes] | None:
+        """Return the process's MJPEG stdout stream, or ``None`` if not captured.
+
+        The streaming layer reads frames from this *existing* process, so the
+        camera keeps a single owner. It is ``None`` unless the process was
+        launched to emit frames.
+        """
         ...
 
     def close(self) -> None:
@@ -135,6 +144,11 @@ class SubprocessPreviewProcess:
         except OSError:
             return ""
         return _tail(text)
+
+    def frame_stream(self) -> IO[bytes] | None:
+        # ``None`` when stdout was discarded (the default launch); a readable
+        # pipe when the process was launched to emit MJPEG frames.
+        return self._process.stdout
 
     def close(self) -> None:
         if self._stderr_path is not None:
@@ -266,11 +280,13 @@ class MockPreviewProcess:
         launched_dead: bool = False,
         stops_on_terminate: bool = True,
         error_text: str = "",
+        frame_stream: IO[bytes] | None = None,
     ) -> None:
         self._alive = not launched_dead
         self._exit_code: int | None = None if not launched_dead else 1
         self._stops_on_terminate = stops_on_terminate
         self._error_text = error_text
+        self._frame_stream = frame_stream
         self.terminated = False
         self.killed = False
         self.closed = False
@@ -298,6 +314,9 @@ class MockPreviewProcess:
 
     def read_error(self) -> str:
         return self._error_text
+
+    def frame_stream(self) -> IO[bytes] | None:
+        return self._frame_stream
 
     def close(self) -> None:
         self.closed = True

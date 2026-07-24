@@ -48,8 +48,18 @@ from mgo.camera.preview_backend import (
     RPiCamPreviewBackend,
     build_preview_backend,
 )
+from mgo.camera.streaming import (
+    MJPEG_CONTENT_TYPE,
+    FrameSource,
+    MjpegBroker,
+    MockFrameSource,
+    PreviewProcessFrameSource,
+    encode_multipart_frame,
+    parse_mjpeg_frames,
+)
 
 __all__ = [
+    "MJPEG_CONTENT_TYPE",
     "BackendCaptureError",
     "CameraCaptureError",
     "CameraUnavailableError",
@@ -58,9 +68,12 @@ __all__ = [
     "CaptureService",
     "CaptureTimeoutError",
     "CaptureWriteError",
+    "FrameSource",
     "ImageDimensions",
     "InvalidCameraConfigurationError",
+    "MjpegBroker",
     "MockBackend",
+    "MockFrameSource",
     "MockPreviewBackend",
     "MockPreviewProcess",
     "NullBackend",
@@ -68,6 +81,7 @@ __all__ = [
     "PreviewBackend",
     "PreviewError",
     "PreviewProcess",
+    "PreviewProcessFrameSource",
     "PreviewService",
     "PreviewStartError",
     "PreviewState",
@@ -78,4 +92,6 @@ __all__ = [
     "build_capture_backend",
     "build_capture_filename",
     "build_preview_backend",
+    "encode_multipart_frame",
+    "parse_mjpeg_frames",
 ]
