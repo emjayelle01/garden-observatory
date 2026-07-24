@@ -217,12 +217,16 @@ class MockBackend:
         return self._name
 
     def capture(self, destination: Path) -> ImageDimensions:
-        """Write deterministic bytes (or raise the configured error)."""
+        """Write deterministic bytes then optionally raise the configured error.
+
+        Writing before raising lets tests simulate a backend that leaves a
+        partial file behind on failure, exercising the service's cleanup path.
+        """
         self.captures += 1
-        if self._error is not None:
-            raise self._error
         if self._write_file:
             destination.write_bytes(self._payload)
+        if self._error is not None:
+            raise self._error
         return ImageDimensions(width=self._width, height=self._height)
 
 

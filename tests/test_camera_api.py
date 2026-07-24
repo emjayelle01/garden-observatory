@@ -8,6 +8,7 @@ canonical monitored state and never trigger hardware detection themselves.
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -114,7 +115,11 @@ def test_camera_capture_returns_metadata(tmp_path: Path) -> None:
     result = asyncio.run(camera_capture(_capture_request(service)))
 
     assert result["success"] is True
-    assert result["filename"].endswith(".jpg")
+    # The API surfaces the microsecond-precision filename.
+    assert re.match(
+        r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{6}Z\.jpg$",
+        result["filename"],
+    )
     assert result["width"] == 4608
     assert result["height"] == 2592
     assert result["filesize_bytes"] > 0

@@ -27,9 +27,11 @@ from mgo.core.config import CameraConfig
 
 LOGGER = logging.getLogger(__name__)
 
-#: Deterministic, filesystem-safe UTC filename stamp. Colons are avoided so the
-#: name is valid on Windows as well as POSIX; the trailing ``Z`` marks UTC.
-_FILENAME_FORMAT = "%Y-%m-%dT%H-%M-%SZ"
+#: Deterministic, filesystem-safe UTC filename stamp with microsecond precision
+#: (``%f``). Microseconds prevent collisions between two captures in the same
+#: second while keeping names chronologically sortable. Colons are avoided so
+#: the name is valid on Windows as well as POSIX; the trailing ``Z`` marks UTC.
+_FILENAME_FORMAT = "%Y-%m-%dT%H-%M-%S.%fZ"
 _FILE_EXTENSION = ".jpg"
 
 Clock = Callable[[], datetime]
@@ -83,8 +85,17 @@ class CaptureService:
         destination = directory / filename
 
         LOGGER.info("Capturing still image to %s", destination)
-        dimensions = self._backend.capture(destination)
-        filesize = self._filesize(destination)
+        try:
+            dimensions = self._backend.capture(destination)
+            # Independently verify the invariant rather than trusting the
+            # backend: a completed capture must have produced a non-empty file.
+            filesize = self._verify_capture(destination)
+        except CameraCaptureError:
+            # Any expected failure after a destination was selected must not
+            # leave a partial, empty or corrupt file behind. Cleanup never
+            # masks the original error.
+            self._remove_partial_capture(destination)
+            raise
 
         result = CaptureResult(
             success=True,
@@ -122,14 +133,42 @@ class CaptureService:
             ) from exc
         return directory
 
-    def _filesize(self, destination: Path) -> int:
-        """Return the size of the captured file, as a write error if missing."""
+    def _verify_capture(self, destination: Path) -> int:
+        """Verify the captured file exists and is non-empty; return its size.
+
+        This is the service's own guarantee of the "non-empty output" invariant
+        and does not rely on the concrete backend enforcing it. A missing or
+        zero-byte file is surfaced as a :class:`CaptureWriteError`.
+        """
         try:
-            return destination.stat().st_size
-        except OSError as exc:  # pragma: no cover - backend verifies existence
+            size = destination.stat().st_size
+        except OSError as exc:
             raise CaptureWriteError(
-                f"Captured file could not be read at {destination}: {exc}"
+                f"Capture reported success but no file was found at "
+                f"{destination}: {exc}"
             ) from exc
+
+        if size <= 0:
+            raise CaptureWriteError(
+                f"Capture produced an empty file at {destination}."
+            )
+        return size
+
+    def _remove_partial_capture(self, destination: Path) -> None:
+        """Best-effort removal of a partial/invalid capture file.
+
+        Never raises: a cleanup failure is logged and swallowed so it can never
+        replace the original capture exception that triggered cleanup.
+        """
+        try:
+            if destination.exists():
+                destination.unlink()
+                LOGGER.info("Removed partial capture file %s", destination)
+        except OSError:
+            LOGGER.warning(
+                "Failed to remove partial capture file %s", destination,
+                exc_info=True,
+            )
 
 
 __all__ = [

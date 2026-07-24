@@ -8,6 +8,8 @@ runner.
 
 from __future__ import annotations
 
+import logging
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -32,7 +34,7 @@ from mgo.camera.exceptions import BackendCaptureError
 from mgo.core.camera_detection import CommandOutcome, CommandResult
 from mgo.core.config import CameraConfig
 
-_FIXED_TIME = datetime(2026, 7, 24, 8, 15, 23, tzinfo=UTC)
+_FIXED_TIME = datetime(2026, 7, 24, 8, 15, 23, 397636, tzinfo=UTC)
 
 
 def _camera_config(
@@ -72,18 +74,40 @@ def test_filename_is_deterministic_and_filesystem_safe() -> None:
     """Filenames use a UTC stamp with no spaces or path-hostile characters."""
     filename = build_capture_filename(_FIXED_TIME)
 
-    assert filename == "2026-07-24T08-15-23Z.jpg"
+    assert filename == "2026-07-24T08-15-23.397636Z.jpg"
     assert " " not in filename
     assert ":" not in filename  # colons are invalid on Windows
+
+
+def test_filename_includes_microseconds() -> None:
+    """Filenames carry six-digit UTC microseconds and stay sortable."""
+    pattern = re.compile(
+        r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{6}Z\.jpg$"
+    )
+
+    assert pattern.match(build_capture_filename(_FIXED_TIME))
+
+
+def test_same_second_timestamps_produce_distinct_filenames() -> None:
+    """Two captures within the same second must not collide."""
+    first = datetime(2026, 7, 24, 8, 15, 23, 100000, tzinfo=UTC)
+    second = datetime(2026, 7, 24, 8, 15, 23, 900000, tzinfo=UTC)
+
+    name_first = build_capture_filename(first)
+    name_second = build_capture_filename(second)
+
+    assert name_first != name_second
+    # Chronological order is preserved by lexical order.
+    assert name_first < name_second
 
 
 def test_filename_normalises_to_utc() -> None:
     """A non-UTC timestamp is converted to UTC before formatting."""
     plus_two = timezone(timedelta(hours=2))
-    local = datetime(2026, 7, 24, 10, 15, 23, tzinfo=plus_two)
+    local = datetime(2026, 7, 24, 10, 15, 23, 397636, tzinfo=plus_two)
 
-    # 10:15:23 at +02:00 is 08:15:23Z.
-    assert build_capture_filename(local) == "2026-07-24T08-15-23Z.jpg"
+    # 10:15:23.397636 at +02:00 is 08:15:23.397636Z.
+    assert build_capture_filename(local) == "2026-07-24T08-15-23.397636Z.jpg"
 
 
 # --- capture service ------------------------------------------------------
@@ -102,7 +126,7 @@ def test_successful_capture_returns_metadata(tmp_path: Path) -> None:
 
     assert isinstance(result, CaptureResult)
     assert result.success is True
-    assert result.filename == "2026-07-24T08-15-23Z.jpg"
+    assert result.filename == "2026-07-24T08-15-23.397636Z.jpg"
     assert result.absolute_path.name == result.filename
     assert result.absolute_path.exists()
     assert result.timestamp == _FIXED_TIME
@@ -154,8 +178,8 @@ def test_capture_result_serialises(tmp_path: Path) -> None:
     payload = service.capture_image().as_dict()
 
     assert payload["success"] is True
-    assert payload["filename"] == "2026-07-24T08-15-23Z.jpg"
-    assert payload["timestamp"] == "2026-07-24T08:15:23+00:00"
+    assert payload["filename"] == "2026-07-24T08-15-23.397636Z.jpg"
+    assert payload["timestamp"] == "2026-07-24T08:15:23.397636+00:00"
     assert payload["width"] == 4608
     assert payload["height"] == 2592
     assert isinstance(payload["absolute_path"], str)
@@ -225,6 +249,100 @@ def test_backend_success_without_file_is_write_error(tmp_path: Path) -> None:
 
     with pytest.raises(CaptureWriteError):
         service.capture_image()
+
+
+# --- failed-capture cleanup -----------------------------------------------
+
+
+def _jpg_files(directory: Path) -> list[Path]:
+    """Return the capture files currently present in ``directory``."""
+    return list(directory.glob("*.jpg")) if directory.exists() else []
+
+
+def test_partial_file_removed_after_backend_failure(tmp_path: Path) -> None:
+    """A partial file left by a failing backend is removed."""
+    capture_dir = tmp_path / "captures"
+    backend = MockBackend(payload=b"partial-bytes", error=BackendCaptureError("boom"))
+    service = CaptureService(_camera_config(capture_dir), backend, clock=_fixed_clock())
+
+    with pytest.raises(BackendCaptureError, match="boom"):
+        service.capture_image()
+
+    assert _jpg_files(capture_dir) == []
+
+
+def test_empty_file_removed_and_raises_write_error(tmp_path: Path) -> None:
+    """A zero-byte output is removed and reported as a write error.
+
+    The service must catch this itself, independent of the backend.
+    """
+    capture_dir = tmp_path / "captures"
+    backend = MockBackend(payload=b"")  # writes an empty file, no error
+    service = CaptureService(_camera_config(capture_dir), backend, clock=_fixed_clock())
+
+    with pytest.raises(CaptureWriteError):
+        service.capture_image()
+
+    assert _jpg_files(capture_dir) == []
+
+
+def test_timeout_removes_partial_file(tmp_path: Path) -> None:
+    """A capture timeout removes any partial file that was created."""
+    capture_dir = tmp_path / "captures"
+    backend = MockBackend(
+        payload=b"partial-bytes",
+        error=CaptureTimeoutError("timed out"),
+    )
+    service = CaptureService(_camera_config(capture_dir), backend, clock=_fixed_clock())
+
+    with pytest.raises(CaptureTimeoutError):
+        service.capture_image()
+
+    assert _jpg_files(capture_dir) == []
+
+
+def test_successful_capture_file_is_retained(tmp_path: Path) -> None:
+    """A successful capture leaves its file in place."""
+    capture_dir = tmp_path / "captures"
+    service = CaptureService(
+        _camera_config(capture_dir), MockBackend(), clock=_fixed_clock()
+    )
+
+    result = service.capture_image()
+
+    assert result.absolute_path.exists()
+    assert _jpg_files(capture_dir) == [result.absolute_path]
+
+
+def test_cleanup_failure_does_not_hide_original_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If cleanup itself fails, the original capture error still propagates."""
+    capture_dir = tmp_path / "captures"
+    backend = MockBackend(
+        payload=b"partial-bytes",
+        error=BackendCaptureError("original failure"),
+    )
+    service = CaptureService(_camera_config(capture_dir), backend, clock=_fixed_clock())
+
+    def _failing_unlink(self: Path, *args: object, **kwargs: object) -> None:
+        raise OSError("cannot remove file")
+
+    monkeypatch.setattr(Path, "unlink", _failing_unlink)
+
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(BackendCaptureError, match="original failure"),
+    ):
+        service.capture_image()
+
+    # The cleanup failure is logged, never raised in place of the real error.
+    assert any(
+        "Failed to remove partial capture file" in record.message
+        for record in caplog.records
+    )
 
 
 # --- backends -------------------------------------------------------------
