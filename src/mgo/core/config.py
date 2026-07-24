@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "mgo.toml"
+
+#: Environment variable that selects an external configuration file.
+CONFIG_PATH_ENV = "MGO_CONFIG_PATH"
 
 
 @dataclass(frozen=True)
@@ -112,8 +116,55 @@ def _validate_camera_config(camera: CameraConfig) -> None:
         raise ValueError("Camera device index must be zero or positive")
 
 
-def load_config(path: Path = DEFAULT_CONFIG_PATH) -> MGOConfig:
-    """Load and validate MGO configuration from TOML."""
+def resolve_config_path(path: Path | None = None) -> Path:
+    """Resolve the effective configuration path.
+
+    Selection precedence is:
+
+    1. an explicit ``path`` supplied by the caller;
+    2. the :data:`CONFIG_PATH_ENV` (``MGO_CONFIG_PATH``) environment variable;
+    3. the repository default, :data:`DEFAULT_CONFIG_PATH`.
+
+    An explicit path always wins over the environment variable so that callers
+    and tests remain deterministic. When the environment variable is used it is
+    stripped of surrounding whitespace, has ``~`` expanded to the user's home
+    directory, and — if relative — is resolved against the current working
+    directory (normal operating-system path semantics for an operator-supplied
+    value).
+
+    A set-but-empty or whitespace-only environment value is treated as a
+    configuration error and raises :class:`ValueError`; an unset variable is
+    treated as absent.
+    """
+    if path is not None:
+        return path
+
+    raw = os.environ.get(CONFIG_PATH_ENV)
+    if raw is None:
+        return DEFAULT_CONFIG_PATH
+
+    stripped = raw.strip()
+    if not stripped:
+        raise ValueError(
+            f"{CONFIG_PATH_ENV} is set but empty; "
+            "unset it to use the default configuration or provide a valid path"
+        )
+
+    expanded = Path(stripped).expanduser()
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
+    return expanded
+
+
+def load_config(path: Path | None = None) -> MGOConfig:
+    """Load and validate MGO configuration from TOML.
+
+    When ``path`` is ``None`` the effective path is selected via
+    :func:`resolve_config_path`, honouring the ``MGO_CONFIG_PATH`` environment
+    variable. A missing file raises :class:`FileNotFoundError` with the resolved
+    path; there is no silent fallback to the repository default.
+    """
+    path = resolve_config_path(path)
     if not path.exists():
         raise FileNotFoundError(f"Configuration file not found: {path}")
 
