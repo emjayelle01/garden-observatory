@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -17,6 +18,12 @@ from mgo.camera import (
     build_capture_backend,
 )
 from mgo.camera.exceptions import BackendCaptureError, CameraCaptureError
+from mgo.captures import (
+    CaptureArchive,
+    CaptureArchiveError,
+    capture_detail,
+    capture_summary,
+)
 from mgo.core.camera import CameraReadiness, CameraState, default_readiness
 from mgo.core.camera_detection import build_detector
 from mgo.core.camera_monitor import perform_camera_check, run_camera_monitor
@@ -48,10 +55,33 @@ def _capture_service(app: FastAPI) -> CaptureService:
     return CaptureService(config.camera, build_capture_backend(config.camera))
 
 
+def _capture_archive(app: FastAPI) -> CaptureArchive:
+    """Return the capture archive, building a default if none was attached.
+
+    The lifespan attaches an initialised archive to ``app.state``; a lazily
+    built fallback keeps the endpoints usable in contexts (such as direct unit
+    tests) that never ran startup, mirroring :func:`_capture_service`.
+    """
+    archive: CaptureArchive | None = getattr(app.state, "capture_archive", None)
+    if archive is not None:
+        return archive
+    archive = CaptureArchive(config.storage.database_path)
+    archive.initialize()
+    app.state.capture_archive = archive
+    return archive
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Initialise persistent MGO services during application startup."""
     applied_versions = apply_migrations(config.storage.database_path)
+
+    # Provision the capture archive alongside the migration runner. Table
+    # creation is idempotent: new installations gain the ``captures`` table
+    # automatically while existing databases are left untouched.
+    capture_archive = CaptureArchive(config.storage.database_path)
+    capture_archive.initialize()
+    app.state.capture_archive = capture_archive
 
     if applied_versions:
         record_observation(
@@ -177,7 +207,48 @@ async def camera_capture(request: Request) -> dict[str, Any]:
     except CameraCaptureError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return result.as_dict()
+    # The capture is complete and verified on disk. Persist its metadata as the
+    # authoritative catalogue record. A persistence failure must NOT delete the
+    # JPEG: the capture itself remains valid, so we surface an error and leave
+    # the file in place for a later reconciliation.
+    archive = _capture_archive(request.app)
+    try:
+        record = archive.record_capture(result)
+    except CaptureArchiveError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    response = result.as_dict()
+    response["capture_id"] = str(record.id)
+    return response
+
+
+@app.get("/captures")
+def captures(request: Request) -> list[dict[str, Any]]:
+    """Return the capture catalogue, newest first.
+
+    Metadata only: no binary image data is returned.
+    """
+    archive = _capture_archive(request.app)
+    return [capture_summary(capture) for capture in archive.list_captures()]
+
+
+@app.get("/captures/{capture_id}")
+def capture(capture_id: str, request: Request) -> dict[str, Any]:
+    """Return the stored metadata for a single capture.
+
+    Returns HTTP 404 for both malformed and unknown identifiers, since neither
+    can refer to a catalogued capture.
+    """
+    archive = _capture_archive(request.app)
+    try:
+        identifier = uuid.UUID(capture_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Capture not found") from exc
+
+    record = archive.get_capture(identifier)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Capture not found")
+    return capture_detail(record)
 
 
 @app.get("/observations")
