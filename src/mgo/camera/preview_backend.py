@@ -22,6 +22,7 @@ Implementations provided here:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import subprocess
 import tempfile
@@ -104,9 +105,12 @@ def _tail(text: str) -> str:
 class SubprocessPreviewProcess:
     """A :class:`PreviewProcess` backed by a real :class:`subprocess.Popen`.
 
-    ``stdout`` is discarded; ``stderr`` is captured to a temporary file so a
-    chatty process can never deadlock on a full pipe, and its tail can be
-    surfaced as ``last_error`` on failure. :meth:`close` removes the temp file.
+    ``stdout`` is captured as a binary pipe carrying the MJPEG frame stream;
+    :class:`~mgo.camera.streaming.PreviewProcessFrameSource` is its sole
+    consumer. ``stderr`` is captured *separately* to a temporary file so a chatty
+    process can never deadlock on a full stderr pipe and a bounded tail can be
+    surfaced as ``last_error`` on failure. :meth:`close` releases both the stdout
+    pipe and the temporary stderr file.
     """
 
     def __init__(
@@ -152,11 +156,18 @@ class SubprocessPreviewProcess:
         return _tail(text)
 
     def frame_stream(self) -> IO[bytes] | None:
-        # ``None`` when stdout was discarded (the default launch); a readable
-        # pipe when the process was launched to emit MJPEG frames.
+        # The readable stdout pipe carrying MJPEG frames (``None`` only if a
+        # process was constructed without a captured stdout, e.g. a test fake).
         return self._process.stdout
 
     def close(self) -> None:
+        # Release the stdout pipe first (the streaming reader gets EOF), then the
+        # temporary stderr file. Both are idempotent so repeated close is safe;
+        # a missing stdout (fakes) is handled defensively.
+        stdout = self._process.stdout
+        if stdout is not None and not getattr(stdout, "closed", False):
+            with contextlib.suppress(OSError, ValueError):
+                stdout.close()
         if self._stderr_path is not None:
             self._stderr_path.unlink(missing_ok=True)
             self._stderr_path = None
@@ -165,8 +176,12 @@ class SubprocessPreviewProcess:
 def launch_preview_subprocess(args: Sequence[str]) -> PreviewProcess:
     """Launch ``args`` as a supervised preview process.
 
-    Discards stdout and captures stderr to a temporary file. A missing command
-    maps to :class:`PreviewUnavailableError`; any other launch failure maps to
+    Captures stdout as a binary pipe -- the MJPEG frame stream consumed by the
+    streaming layer's single reader -- and captures stderr *separately* to a
+    temporary file so a chatty process can never deadlock on a full stderr pipe
+    while bounded diagnostics remain available. The command is executed as a
+    shell-free argument list. A missing command maps to
+    :class:`PreviewUnavailableError`; any other launch failure maps to
     :class:`PreviewStartError`. Never leaks a raw ``subprocess`` exception.
     """
     stderr_file = tempfile.NamedTemporaryFile(  # noqa: SIM115 - handed to Popen
@@ -176,7 +191,7 @@ def launch_preview_subprocess(args: Sequence[str]) -> PreviewProcess:
     try:
         process: subprocess.Popen[bytes] = subprocess.Popen(
             list(args),
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=stderr_file,
         )
     except FileNotFoundError as exc:

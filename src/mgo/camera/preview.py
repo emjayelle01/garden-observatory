@@ -33,6 +33,7 @@ from mgo.camera.exceptions import (
     PreviewUnavailableError,
 )
 from mgo.camera.preview_backend import PreviewBackend, PreviewProcess
+from mgo.camera.streaming import parse_mjpeg_frames
 from mgo.core.config import PreviewConfig
 
 LOGGER = logging.getLogger(__name__)
@@ -183,13 +184,81 @@ class PreviewService:
             # Already running, or a start is already in progress: return status.
             return result
 
-        # Validate stability OUTSIDE the lock so status()/stop()/capture calls
-        # are never blocked during the (bounded) startup window. This uses the
-        # process's own exit signal -- it does not read stdout, so it never
-        # steals frames from the streaming reader.
+        # Validate startup OUTSIDE the lock so status()/stop()/capture calls are
+        # never blocked during the (bounded) window.
         process = result
-        exit_code = process.wait(self._config.startup_timeout_seconds)
-        return self._finish_start(process, exit_code)
+        failure = self._validate_startup(process)
+        return self._finish_start(process, failure)
+
+    def _validate_startup(self, process: PreviewProcess) -> str | None:
+        """Confirm the process reached a healthy running state, or say why not.
+
+        Returns ``None`` when startup succeeded, otherwise a concise failure
+        reason. When the process exposes its MJPEG stdout pipe, readiness is the
+        arrival of the first complete JPEG frame within
+        ``startup_timeout_seconds`` -- this both proves the camera/encoder work
+        *and* drains the pipe during the window, so the producer cannot block on
+        a full pipe (see :meth:`_await_first_frame`). Test doubles without a
+        pipe fall back to a bounded liveness check (the process must not exit
+        during the window).
+        """
+        stream = process.frame_stream()
+        if stream is None:
+            exit_code = process.wait(self._config.startup_timeout_seconds)
+            if exit_code is not None:
+                detail = process.read_error()
+                return f"exited during startup with code {exit_code}" + (
+                    f": {detail}" if detail else ""
+                )
+            return None
+        return self._await_first_frame(
+            process, stream, self._config.startup_timeout_seconds
+        )
+
+    def _await_first_frame(
+        self, process: PreviewProcess, stream: IO[bytes], timeout: float
+    ) -> str | None:
+        """Drain the MJPEG pipe until the first frame, EOF, or ``timeout``.
+
+        The drain is the *sole* reader of stdout during startup: the streaming
+        broker only reads once the state is ``RUNNING`` (its stream endpoint
+        returns 409 while starting), so this never competes with it. Reading
+        here keeps the pipe from filling during the window. Returns ``None`` on
+        the first frame, or a failure reason on EOF/early-exit, error or timeout.
+        """
+        outcome: dict[str, object] = {}
+        done = threading.Event()
+
+        def _drain() -> None:
+            try:
+                for _frame in parse_mjpeg_frames(stream):
+                    outcome["frame"] = True
+                    break
+                else:
+                    outcome["eof"] = True
+            except Exception as exc:  # reading a torn-down pipe, etc.
+                outcome["error"] = repr(exc)
+            finally:
+                done.set()
+
+        reader = threading.Thread(
+            target=_drain, name="mgo-preview-readiness", daemon=True
+        )
+        reader.start()
+        if not done.wait(timeout):
+            # Alive but silent: the caller reaps the process, which closes the
+            # pipe and lets this daemon reader unblock and exit.
+            return "did not produce a frame within the startup window"
+        if outcome.get("frame"):
+            return None
+        if outcome.get("eof"):
+            exit_code = process.poll()
+            detail = process.read_error()
+            code_text = "unknown" if exit_code is None else str(exit_code)
+            return f"exited during startup with code {code_text}" + (
+                f": {detail}" if detail else ""
+            )
+        return f"stream error during startup: {outcome.get('error')}"
 
     def _begin_start(self) -> PreviewProcess | PreviewStatus:
         """Launch phase (locked). Return the process, or a status to short-circuit."""
@@ -242,7 +311,7 @@ class PreviewService:
             return process
 
     def _finish_start(
-        self, process: PreviewProcess, exit_code: int | None
+        self, process: PreviewProcess, failure: str | None
     ) -> PreviewStatus:
         """Finalise phase (locked). Promote to RUNNING or settle FAILED."""
         with self._lock:
@@ -252,16 +321,18 @@ class PreviewService:
                 self._discard_process(process)
                 return self._snapshot_locked()
 
-            if exit_code is not None:
-                detail = process.read_error()
-                process.close()
-                message = (
-                    f"Preview process exited during startup with code "
-                    f"{exit_code}" + (f": {detail}" if detail else ".")
-                )
+            if failure is not None:
+                # Deterministically reap/terminate the process (it may still be
+                # alive after a no-frame timeout) and release its stdout pipe and
+                # stderr resources before settling into FAILED.
+                self._discard_process(process)
+                message = f"Preview process {failure}."
                 self._fail_locked(message)
                 LOGGER.error("%s", message)
-                LOGGER.info("Preview resources released after failed startup")
+                LOGGER.info(
+                    "Preview process reaped and resources released after "
+                    "failed startup"
+                )
                 raise PreviewStartError(message)
 
             self._started_at = self._clock()

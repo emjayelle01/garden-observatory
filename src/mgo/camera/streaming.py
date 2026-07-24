@@ -172,13 +172,13 @@ class FrameStreamProvider(Protocol):
 
 
 class PreviewProcessFrameSource:
-    """Reads frames from the running preview process's MJPEG output.
+    """Reads frames from the running preview process's MJPEG stdout pipe.
 
-    It consumes the byte stream of the *existing* process supervised by
-    :class:`~mgo.camera.preview.PreviewService` (the single camera owner) and
-    never starts or stops that process. When no frame stream is exposed -- the
-    default launch discards preview output -- it yields nothing and ends, so a
-    connected browser sees the stream close gracefully.
+    It is the *sole* consumer of the byte stream of the existing process
+    supervised by :class:`~mgo.camera.preview.PreviewService` (the single camera
+    owner) and never starts or stops that process. When the process exposes no
+    frame stream (only test doubles) it yields nothing and ends, so a connected
+    browser sees the stream close gracefully.
     """
 
     def __init__(self, provider: FrameStreamProvider) -> None:
