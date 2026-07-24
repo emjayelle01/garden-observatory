@@ -7,11 +7,20 @@ canonical monitored state and never trigger hardware detection themselves.
 
 from __future__ import annotations
 
+import asyncio
+import re
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
-from mgo.api.app import camera_status, health
+import pytest
+from fastapi import HTTPException
+
+from mgo.api.app import camera_capture, camera_status, health
+from mgo.camera import CaptureService, MockBackend
+from mgo.camera.backend import NullBackend
 from mgo.core.camera import CameraReadiness, CameraState, CameraStatus
+from mgo.core.config import CameraConfig
 
 
 def _request(state: CameraState | None) -> SimpleNamespace:
@@ -21,6 +30,23 @@ def _request(state: CameraState | None) -> SimpleNamespace:
     else:
         app_state = SimpleNamespace(camera_state=state)
     return SimpleNamespace(app=SimpleNamespace(state=app_state))
+
+
+def _capture_request(service: CaptureService) -> SimpleNamespace:
+    """Build a fake request exposing ``app.state.capture_service``."""
+    app_state = SimpleNamespace(capture_service=service)
+    return SimpleNamespace(app=SimpleNamespace(state=app_state))
+
+
+def _capture_config(capture_directory: Path, *, enabled: bool = True) -> CameraConfig:
+    """Build a camera config for capture-endpoint tests."""
+    return CameraConfig(
+        enabled=enabled,
+        backend="mock",
+        device_index=None,
+        detection_interval_seconds=30,
+        capture_directory=capture_directory,
+    )
 
 
 def _available_readiness() -> CameraReadiness:
@@ -77,3 +103,50 @@ def test_health_uses_canonical_camera_state() -> None:
     assert result["status"] in {"healthy", "warning", "critical"}
     assert "memory" in result
     assert "disk" in result
+
+
+def test_camera_capture_returns_metadata(tmp_path: Path) -> None:
+    """POST /camera/capture returns HTTP 200 metadata for a mock backend."""
+    service = CaptureService(
+        _capture_config(tmp_path / "captures"),
+        MockBackend(width=4608, height=2592, name="mock"),
+    )
+
+    result = asyncio.run(camera_capture(_capture_request(service)))
+
+    assert result["success"] is True
+    # The API surfaces the microsecond-precision filename.
+    assert re.match(
+        r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{6}Z\.jpg$",
+        result["filename"],
+    )
+    assert result["width"] == 4608
+    assert result["height"] == 2592
+    assert result["filesize_bytes"] > 0
+    assert Path(result["absolute_path"]).exists()
+
+
+def test_camera_capture_unavailable_returns_503(tmp_path: Path) -> None:
+    """An unavailable camera maps to HTTP 503."""
+    service = CaptureService(
+        _capture_config(tmp_path / "captures"),
+        NullBackend(),
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(camera_capture(_capture_request(service)))
+
+    assert excinfo.value.status_code == 503
+
+
+def test_camera_capture_disabled_returns_503(tmp_path: Path) -> None:
+    """Capturing while the camera is disabled maps to HTTP 503."""
+    service = CaptureService(
+        _capture_config(tmp_path / "captures", enabled=False),
+        MockBackend(),
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(camera_capture(_capture_request(service)))
+
+    assert excinfo.value.status_code == 503
