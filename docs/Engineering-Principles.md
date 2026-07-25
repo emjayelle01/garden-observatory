@@ -71,3 +71,18 @@ original capture
     -> cropped subject
     -> identification result
     -> human confirmation
+```
+
+### Build for Today's Requirement, Not Tomorrow's
+
+**Do not build tomorrow's infrastructure before today's requirement exists.**
+
+MGO grows by solving current, demonstrated needs — not speculative ones.
+
+- Solve current, demonstrated requirements.
+- Avoid speculative infrastructure.
+- Preserve room for future extension.
+- Revisit security, scale and operational complexity when the actual requirement emerges.
+- Never compromise current correctness or safety.
+
+For example, SSH key access is configured for convenience on the trusted private LAN, while password authentication stays enabled as a fallback; production-grade SSH hardening is deferred until the Pi's exposure or risk profile actually changes (see `docs/Remote-Access.md`).

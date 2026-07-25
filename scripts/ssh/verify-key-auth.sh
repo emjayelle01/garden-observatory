@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #
-# verify-key-auth.sh — non-destructive SSH key-authentication readiness check.
+# verify-key-auth.sh — check that SSH key-authentication prerequisites are in
+# place on the Raspberry Pi. Read-only: it changes nothing.
 #
-# Run as your normal login user on the Raspberry Pi:
+# Run as your normal login user on the Pi:
 #   bash scripts/ssh/verify-key-auth.sh
 #
-# It only reads state and prints findings; it changes nothing. Use it before and
-# after installing your public key, and before disabling password auth.
+# Success means key-based login is ready to use. Password authentication is a
+# deliberate fallback on this trusted LAN, so its state is shown for information
+# only and is never treated as a problem.
 
 set -euo pipefail
 
@@ -14,63 +16,62 @@ ssh_dir="${HOME}/.ssh"
 auth_keys="${ssh_dir}/authorized_keys"
 problems=0
 
-note() { printf '  - %s\n' "$1"; }
-fail() { printf '  ! %s\n' "$1"; problems=$((problems + 1)); }
+ok()   { printf '  - %s\n' "$1"; }
+bad()  { printf '  ! %s\n' "$1"; problems=$((problems + 1)); }
+info() { printf '  · %s\n' "$1"; }
 
 printf 'MGO SSH key-authentication check for user "%s" on "%s"\n\n' \
   "$(whoami)" "$(hostname)"
 
-# --- authorized_keys presence and permissions ------------------------------
-printf 'authorized_keys:\n'
+# --- ~/.ssh directory ------------------------------------------------------
+printf 'Key prerequisites:\n'
 if [[ -d "${ssh_dir}" ]]; then
   dir_perm="$(stat -c '%a' "${ssh_dir}")"
   if [[ "${dir_perm}" == "700" ]]; then
-    note "~/.ssh permissions are 700"
+    ok "~/.ssh exists with permissions 700"
   else
-    fail "~/.ssh should be 700 but is ${dir_perm} (run: chmod 700 ~/.ssh)"
+    bad "~/.ssh should be 700 but is ${dir_perm} (fix: chmod 700 ~/.ssh)"
   fi
 else
-  fail "~/.ssh does not exist yet (install a public key first)"
+  bad "~/.ssh does not exist yet (install your public key — see docs/Remote-Access.md)"
 fi
 
+# --- authorized_keys presence, permissions and content ---------------------
 if [[ -f "${auth_keys}" ]]; then
   key_perm="$(stat -c '%a' "${auth_keys}")"
   if [[ "${key_perm}" == "600" ]]; then
-    note "authorized_keys permissions are 600"
+    ok "authorized_keys exists with permissions 600"
   else
-    fail "authorized_keys should be 600 but is ${key_perm} (run: chmod 600 ${auth_keys})"
+    bad "authorized_keys should be 600 but is ${key_perm} (fix: chmod 600 ${auth_keys})"
   fi
   key_count="$(grep -cvE '^\s*(#|$)' "${auth_keys}" || true)"
   if [[ "${key_count}" -gt 0 ]]; then
-    note "${key_count} authorized key(s) installed"
+    ok "${key_count} usable public key(s) installed"
   else
-    fail "authorized_keys is empty"
+    bad "authorized_keys is empty (install your public key)"
   fi
 else
-  fail "no authorized_keys file (install your public key — see docs/Remote-Access.md §2)"
+  bad "no authorized_keys file (install your public key — see docs/Remote-Access.md)"
 fi
 
-# --- current effective password-auth setting -------------------------------
-printf '\npassword authentication (effective):\n'
-if command -v sshd >/dev/null 2>&1 && [[ "$(id -u)" -eq 0 ]]; then
+# --- informational: current password-auth setting -------------------------
+# Password authentication is intentionally kept enabled as a fallback on the
+# trusted LAN. This is shown for information only; it is never a failure.
+printf '\nPassword authentication (informational only — a deliberate fallback):\n'
+if [[ "$(id -u)" -eq 0 ]] && command -v sshd >/dev/null 2>&1; then
   pw="$(sshd -T 2>/dev/null | awk '/^passwordauthentication/ {print $2}')"
-  note "PasswordAuthentication ${pw:-unknown} (from sshd -T)"
+  info "PasswordAuthentication ${pw:-unknown} (from sshd -T)"
 else
-  note "re-run with sudo to read the effective sshd setting (sudo sshd -T)"
-  if ls /etc/ssh/sshd_config.d/*.conf >/dev/null 2>&1; then
-    note "drop-ins present in /etc/ssh/sshd_config.d/:"
-    grep -HiEn 'passwordauthentication' /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
-      | sed 's/^/    /' || note "  (no PasswordAuthentication lines found in drop-ins)"
-  fi
+  info "run 'sudo sshd -T | grep -i passwordauthentication' to see the effective value"
 fi
 
 printf '\n'
 if [[ "${problems}" -eq 0 ]]; then
-  printf 'OK: key-authentication prerequisites look correct.\n'
-  printf 'Verify from your workstation before disabling passwords:\n'
-  printf '  ssh -o PreferredAuthentications=publickey -o PasswordAuthentication=no <pi-user>@<pi-host> "echo ok"\n'
+  printf 'OK: key-based login prerequisites are valid.\n'
+  printf 'Prove key-only login from your workstation (no password fallback):\n'
+  printf '  ssh -o PreferredAuthentications=publickey -o PasswordAuthentication=no <pi-user>@<pi-host> "echo key auth OK"\n'
 else
-  printf 'Found %d issue(s) above. Fix them before disabling password auth.\n' \
+  printf 'Found %d issue(s) above with the key setup. Password login still works meanwhile.\n' \
     "${problems}"
   exit 1
 fi
