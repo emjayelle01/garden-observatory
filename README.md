@@ -55,6 +55,15 @@ absolute path, UTC timestamp, dimensions, filesize). Expected failures map to
 meaningful statuses: `503` when the camera is disabled/unavailable, `504` on a
 capture timeout, `502` on a backend failure, and `500` on a write failure.
 
+## Remote access & deployment
+
+Operator guidance for administering the Raspberry Pi over SSH — generating and
+installing keys, verifying key authentication, safely disabling password
+authentication (with rollback), the Git-over-SSH workflow, and the deployment
+steps — lives in [`docs/Remote-Access.md`](docs/Remote-Access.md). Optional,
+non-destructive operator helper scripts are in [`scripts/`](scripts/README.md).
+These are operator procedures only; they do not change application behaviour.
+
 ## Configuration
 
 Configuration is loaded and validated from `config/mgo.toml`. Invalid values
