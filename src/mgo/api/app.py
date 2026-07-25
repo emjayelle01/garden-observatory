@@ -11,6 +11,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel
 
 from mgo.api.preview_page import render_preview_page
 from mgo.camera import (
@@ -48,6 +49,15 @@ from mgo.core.database import apply_migrations
 from mgo.core.health import collect_health
 from mgo.core.health_monitor import run_health_monitor
 from mgo.core.observations import list_observations, record_observation
+from mgo.motion import (
+    BrokerFrameSource,
+    FrameDifferenceDetector,
+    MotionResult,
+    MotionState,
+    MotionStatus,
+    default_motion_result,
+    run_motion_monitor,
+)
 
 config = load_config()
 
@@ -57,6 +67,30 @@ def _current_camera_readiness(app: FastAPI) -> CameraReadiness:
     state: CameraState | None = getattr(app.state, "camera_state", None)
     readiness = state.get() if state is not None else None
     return readiness if readiness is not None else default_readiness(config.camera)
+
+
+def _current_motion_result(app: FastAPI) -> MotionResult:
+    """Return the latest motion result, or a safe startup default.
+
+    Reads application-managed state only; it never runs a frame comparison, so
+    requesting the status triggers no hardware activity.
+    """
+    state: MotionState | None = getattr(app.state, "motion_state", None)
+    result = state.get() if state is not None else None
+    return result if result is not None else default_motion_result(config.motion)
+
+
+class MotionStatusResponse(BaseModel):
+    """Typed, read-only projection of the latest motion-monitor state."""
+
+    enabled: bool
+    status: str
+    detected: bool
+    score: float
+    threshold: float
+    frames_available: bool
+    detail: str
+    evaluated_at: str
 
 
 def _capture_service(app: FastAPI) -> CaptureService:
@@ -197,12 +231,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         name="mgo-camera-monitor",
     )
 
+    # Motion detection shares the preview stream via the broker (single camera
+    # owner); it never starts preview or a second camera process. The state is
+    # always attached so /motion/status is truthful even when disabled; the
+    # background monitor is only started when motion is enabled.
+    motion_state = MotionState()
+    motion_state.set(default_motion_result(config.motion))
+    app.state.motion_state = motion_state
+    motion_stop_event = asyncio.Event()
+    motion_task: asyncio.Task[None] | None = None
+    if config.motion.enabled:
+        motion_task = asyncio.create_task(
+            run_motion_monitor(
+                config,
+                motion_state,
+                BrokerFrameSource(app.state.preview_broker),
+                FrameDifferenceDetector(config.motion),
+                motion_stop_event,
+            ),
+            name="mgo-motion-monitor",
+        )
+
     try:
         yield
     finally:
         stop_event.set()
         camera_stop_event.set()
-        await asyncio.gather(health_task, camera_task)
+        motion_stop_event.set()
+        monitor_tasks = [health_task, camera_task]
+        if motion_task is not None:
+            monitor_tasks.append(motion_task)
+        await asyncio.gather(*monitor_tasks)
         # Ensure no preview process is left running (no orphans) on shutdown.
         await asyncio.to_thread(app.state.preview_service.shutdown)
         record_observation(
@@ -254,6 +313,31 @@ def camera_status(request: Request) -> dict[str, Any]:
     recorded by the background camera monitor.
     """
     return _current_camera_readiness(request.app).as_dict()
+
+
+@app.get("/motion/status")
+def motion_status(request: Request) -> MotionStatusResponse:
+    """Return the latest motion-monitor state.
+
+    Read-only and truthful: it reflects the most recent result recorded by the
+    background motion monitor and never runs a frame comparison itself. Always
+    returns HTTP 200 when the application is healthy -- including the ``disabled``
+    state when motion detection is off and the ``waiting_for_frames`` state when
+    no preview frame is available.
+    """
+    result = _current_motion_result(request.app)
+    return MotionStatusResponse(
+        # Derived from state so the flag is always consistent with the reported
+        # status: only the disabled state means motion detection is off.
+        enabled=result.status is not MotionStatus.DISABLED,
+        status=result.status.value,
+        detected=result.detected,
+        score=result.score,
+        threshold=result.threshold,
+        frames_available=result.frames_available,
+        detail=result.detail,
+        evaluated_at=result.evaluated_at.isoformat(),
+    )
 
 
 @app.post("/camera/capture")

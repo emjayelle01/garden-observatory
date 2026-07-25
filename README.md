@@ -47,6 +47,14 @@ uv run pytest
 | `GET /health`         | System health plus the current camera readiness state. |
 | `GET /camera/status`  | The latest monitored camera readiness result.          |
 | `POST /camera/capture`| Capture one still image; returns its stored metadata.   |
+| `GET /camera/preview/status` | Current live-preview lifecycle status.           |
+| `POST /camera/preview/start` | Start the live preview process.                  |
+| `POST /camera/preview/stop`  | Stop the live preview process.                   |
+| `GET /camera/preview/stream` | Browser MJPEG live-preview stream.               |
+| `GET /preview`        | Simple browser live-preview page.                       |
+| `GET /motion/status`  | The latest monitored motion-detection result.           |
+| `GET /captures`       | Capture catalogue (metadata only), newest first.        |
+| `GET /captures/{id}`  | Stored metadata for a single capture.                   |
 | `GET /observations`   | Recent observation timeline (`?limit=`, `?kind=`).      |
 
 `POST /camera/capture` writes a timestamped JPEG beneath
@@ -123,11 +131,23 @@ committed to the repository.
 
 ## Camera readiness
 
-This project implements camera **readiness detection** (described here) and a
-first **still-image capture** layer (see `POST /camera/capture` above and the
-`mgo.camera` package). It does **not** yet stream video, run inference, or
-perform motion detection. The goal is a truthful, hardware-safe foundation that
-later capture and analysis features build on.
+This project implements camera **readiness detection** (described here), a
+**still-image capture** layer (see `POST /camera/capture` above and the
+`mgo.camera` package), a **capture archive**, a **live preview** with **browser
+MJPEG streaming**, and a first **motion-detection foundation** (see below). It
+detects meaningful *scene change*; it does **not** yet run inference or recognise
+birds or any other object. The goal is a truthful, hardware-safe foundation that
+later analysis features build on.
+
+The distinct camera capabilities are:
+
+- **still capture** — one JPEG per request via `POST /camera/capture`;
+- **capture archive** — catalogued capture metadata via `GET /captures`;
+- **live preview** — a shared preview process streamed to the browser as MJPEG
+  (`GET /preview`, `GET /camera/preview/stream`);
+- **motion detection** — scene-change detection over the preview frames
+  (`GET /motion/status`);
+- **bird recognition** — *future work*; not implemented.
 
 A background monitor evaluates readiness at startup and then every
 `detection_interval_seconds`, keeping the latest result in application state.
@@ -169,3 +189,68 @@ Either way the application starts and serves normally. A `camera_status`
 observation is persisted only when the readiness **materially changes**
 (a change of `status` or `available`); repeated identical checks do not create
 duplicate observations.
+
+## Motion detection
+
+MGO includes a lightweight **motion-detection foundation**. It answers one
+question — *has the camera scene meaningfully changed?* — and nothing more.
+
+What it **does**:
+
+- consumes JPEG frames from the **existing live preview stream** (it never starts
+  a second camera process);
+- reduces each frame to a small greyscale image and compares it with an earlier
+  reference (baseline) frame;
+- reports motion when a large enough proportion of pixels changed;
+- keeps the latest result in application state, exposed at `GET /motion/status`;
+- persists a `motion_status` observation only on a **material transition**.
+
+What it **does not** do (all future or out of scope):
+
+- it does **not** recognise birds, or identify or classify any object;
+- it does **not** track objects or draw bounding boxes;
+- it does **not** trigger a still capture automatically;
+- it uses **no** heavy AI/ML framework (no TensorFlow, PyTorch, YOLO or OpenCV).
+
+Motion detection is **disabled by default**. Detailed architecture, algorithm,
+thresholds, baseline behaviour, API state meanings, troubleshooting and the
+production-validation procedure live in
+[`docs/Motion-Detection.md`](docs/Motion-Detection.md).
+
+### `GET /motion/status`
+
+Read-only and truthful: it reflects the latest result recorded by the background
+monitor and never runs a frame comparison itself. It returns `200` whenever the
+application is healthy — including the `disabled` and `waiting_for_frames`
+states. The `status` field is one of:
+
+| Status                  | Meaning                                                    |
+| ----------------------- | ---------------------------------------------------------- |
+| `disabled`              | Motion detection is off by configuration.                  |
+| `waiting_for_frames`    | Enabled, but no preview frame is available yet.            |
+| `establishing_baseline` | The first frame is being adopted as the reference.         |
+| `no_motion`             | A comparison ran; change stayed within threshold.          |
+| `motion_detected`       | A comparison ran; change exceeded the threshold.           |
+| `error`                 | A frame could not be decoded or the detector failed.       |
+
+### Motion section
+
+```toml
+[motion]
+enabled = false                    # motion detection is off unless enabled
+analysis_interval_seconds = 1.0    # how often a frame is analysed
+analysis_width = 160               # small analysis resolution (bounds CPU/memory)
+analysis_height = 90
+pixel_difference_threshold = 20    # per-pixel luminance change treated as noise
+changed_pixel_ratio_threshold = 0.02  # proportion of changed pixels => motion
+baseline_refresh_seconds = 30.0    # max age of a quiet baseline before refresh
+cooldown_seconds = 5.0             # suppresses recording a repeated motion event
+```
+
+Defaults are hardware-safe: motion detection is **disabled**, no frames are
+consumed, and no analysis runs. The `[motion]` section is optional — configuration
+files without it load unchanged with motion disabled. Invalid values (a
+non-positive interval, out-of-range dimensions or thresholds, a negative
+cooldown) are rejected at startup with a clear error. To actually receive frames
+when enabled, `[preview]` must also be enabled and running; otherwise motion
+detection sits truthfully in `waiting_for_frames`.

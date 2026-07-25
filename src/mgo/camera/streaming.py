@@ -221,25 +221,31 @@ class MjpegBroker:
             return len(self._subscribers)
 
     def subscribe(self) -> Subscriber:
-        """Register a viewer, starting the pump if it is the first."""
+        """Register a consumer, starting the pump if none is currently live.
+
+        The pump is (re)started whenever there is no live pump thread -- not only
+        for the very first subscriber. This keeps the broker correct with
+        multiple, independent consumers (e.g. browser viewers *and* the motion
+        monitor): if the source ended while a long-lived consumer stayed
+        subscribed, a new subscription still revives frame delivery for everyone.
+        """
         subscriber = Subscriber()
         with self._lock:
-            first = not self._subscribers
             self._subscribers.add(subscriber)
             count = len(self._subscribers)
-            if first:
+            if self._pump is None or not self._pump.is_alive():
                 self._start_pump_locked()
-        LOGGER.info("Preview viewer connected (viewers=%d)", count)
+        LOGGER.info("Preview consumer connected (consumers=%d)", count)
         return subscriber
 
     def unsubscribe(self, subscriber: Subscriber) -> None:
-        """Deregister a viewer, stopping the pump if it was the last."""
+        """Deregister a consumer, stopping the pump if it was the last."""
         with self._lock:
             self._subscribers.discard(subscriber)
             count = len(self._subscribers)
             if not self._subscribers:
                 self._stop_pump_locked()
-        LOGGER.info("Preview viewer disconnected (viewers=%d)", count)
+        LOGGER.info("Preview consumer disconnected (consumers=%d)", count)
 
     def _start_pump_locked(self) -> None:
         source = self._source_factory()
@@ -272,6 +278,14 @@ class MjpegBroker:
             LOGGER.exception("Preview stream error")
         finally:
             source.close()
+            # Clear our own references *before* signalling end-of-stream, so any
+            # consumer that observes the sentinel and then re-subscribes sees no
+            # live pump and revives delivery. Guarded so a concurrent
+            # stop/restart that already swapped the source wins.
+            with self._lock:
+                if self._source is source:
+                    self._source = None
+                    self._pump = None
             self._broadcast(_END_OF_STREAM)
             LOGGER.info("Preview stream stopped")
 

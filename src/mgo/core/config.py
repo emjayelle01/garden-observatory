@@ -73,6 +73,35 @@ class PreviewConfig:
 
 
 @dataclass(frozen=True)
+class MotionConfig:
+    """Motion-detection settings.
+
+    ``enabled`` gates all motion behaviour (disabled by default, so no frames
+    are ever consumed unless it is turned on). ``analysis_interval_seconds``
+    controls how often a frame is analysed (deliberately far slower than the
+    preview frame rate). ``analysis_width``/``analysis_height`` are the small
+    resolution frames are reduced to before comparison, bounding both memory and
+    CPU. ``pixel_difference_threshold`` is the per-pixel luminance change (0-255)
+    below which a pixel is treated as unchanged noise.
+    ``changed_pixel_ratio_threshold`` is the proportion of changed pixels (0-1)
+    above which the scene is considered to be in motion.
+    ``baseline_refresh_seconds`` is the maximum age of a quiet baseline before it
+    is refreshed to adapt to gradual lighting change. ``cooldown_seconds``
+    suppresses recording a *repeated* motion event that begins again within the
+    window, without hiding the eventual return to no-motion.
+    """
+
+    enabled: bool
+    analysis_interval_seconds: float
+    analysis_width: int
+    analysis_height: int
+    pixel_difference_threshold: int
+    changed_pixel_ratio_threshold: float
+    baseline_refresh_seconds: float
+    cooldown_seconds: float
+
+
+@dataclass(frozen=True)
 class HealthConfig:
     """Configuration for health monitoring."""
 
@@ -94,6 +123,7 @@ class MGOConfig:
     storage: StorageConfig
     camera: CameraConfig
     preview: PreviewConfig
+    motion: MotionConfig
     health: HealthConfig
 
 
@@ -143,6 +173,60 @@ def _validate_preview_config(preview: PreviewConfig) -> None:
 
     if preview.shutdown_timeout_seconds <= 0:
         raise ValueError("Preview shutdown timeout must be positive")
+
+
+#: Sensible defaults for motion when the ``[motion]`` section is absent, so
+#: pre-existing configuration files keep loading unchanged with motion disabled.
+_MOTION_DEFAULTS = {
+    "enabled": False,
+    "analysis_interval_seconds": 1.0,
+    "analysis_width": 160,
+    "analysis_height": 90,
+    "pixel_difference_threshold": 20,
+    "changed_pixel_ratio_threshold": 0.02,
+    "baseline_refresh_seconds": 30.0,
+    "cooldown_seconds": 5.0,
+}
+
+#: Upper bounds for the analysis resolution. Motion analysis operates on a small
+#: downscaled frame; these keep memory and per-frame CPU bounded even if a
+#: configuration file requests an unreasonable size.
+_MOTION_MAX_ANALYSIS_WIDTH = 1920
+_MOTION_MAX_ANALYSIS_HEIGHT = 1080
+
+
+def _validate_motion_config(motion: MotionConfig) -> None:
+    """Validate motion settings, rejecting unsafe or nonsensical values."""
+    if motion.analysis_interval_seconds <= 0:
+        raise ValueError("Motion analysis interval must be positive")
+
+    if not (0 < motion.analysis_width <= _MOTION_MAX_ANALYSIS_WIDTH):
+        raise ValueError(
+            "Motion analysis width must be between 1 and "
+            f"{_MOTION_MAX_ANALYSIS_WIDTH}"
+        )
+
+    if not (0 < motion.analysis_height <= _MOTION_MAX_ANALYSIS_HEIGHT):
+        raise ValueError(
+            "Motion analysis height must be between 1 and "
+            f"{_MOTION_MAX_ANALYSIS_HEIGHT}"
+        )
+
+    if not (0 <= motion.pixel_difference_threshold <= 255):
+        raise ValueError(
+            "Motion pixel difference threshold must be between 0 and 255"
+        )
+
+    if not (0 < motion.changed_pixel_ratio_threshold <= 1.0):
+        raise ValueError(
+            "Motion changed-pixel ratio threshold must be within (0, 1]"
+        )
+
+    if motion.baseline_refresh_seconds <= 0:
+        raise ValueError("Motion baseline refresh interval must be positive")
+
+    if motion.cooldown_seconds < 0:
+        raise ValueError("Motion cooldown cannot be negative")
 
 
 def _validate_camera_config(camera: CameraConfig) -> None:
@@ -278,6 +362,51 @@ def load_config(path: Path | None = None) -> MGOConfig:
     )
     _validate_preview_config(preview)
 
+    # The ``[motion]`` section is optional so pre-Task-4 configuration files
+    # continue to load; absent keys fall back to safe (disabled) defaults.
+    motion_data = raw.get("motion", {})
+    motion = MotionConfig(
+        enabled=bool(motion_data.get("enabled", _MOTION_DEFAULTS["enabled"])),
+        analysis_interval_seconds=float(
+            motion_data.get(
+                "analysis_interval_seconds",
+                _MOTION_DEFAULTS["analysis_interval_seconds"],
+            )
+        ),
+        analysis_width=int(
+            motion_data.get("analysis_width", _MOTION_DEFAULTS["analysis_width"])
+        ),
+        analysis_height=int(
+            motion_data.get(
+                "analysis_height", _MOTION_DEFAULTS["analysis_height"]
+            )
+        ),
+        pixel_difference_threshold=int(
+            motion_data.get(
+                "pixel_difference_threshold",
+                _MOTION_DEFAULTS["pixel_difference_threshold"],
+            )
+        ),
+        changed_pixel_ratio_threshold=float(
+            motion_data.get(
+                "changed_pixel_ratio_threshold",
+                _MOTION_DEFAULTS["changed_pixel_ratio_threshold"],
+            )
+        ),
+        baseline_refresh_seconds=float(
+            motion_data.get(
+                "baseline_refresh_seconds",
+                _MOTION_DEFAULTS["baseline_refresh_seconds"],
+            )
+        ),
+        cooldown_seconds=float(
+            motion_data.get(
+                "cooldown_seconds", _MOTION_DEFAULTS["cooldown_seconds"]
+            )
+        ),
+    )
+    _validate_motion_config(motion)
+
     return MGOConfig(
         application=ApplicationConfig(
             name=str(application_data["name"]),
@@ -292,5 +421,6 @@ def load_config(path: Path | None = None) -> MGOConfig:
         ),
         camera=camera,
         preview=preview,
+        motion=motion,
         health=health,
     )
