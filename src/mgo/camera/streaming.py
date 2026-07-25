@@ -146,9 +146,17 @@ class MockFrameSource:
 
 
 class Subscriber:
-    """A single viewer's one-slot frame mailbox (latest frame wins)."""
+    """A single viewer's one-slot frame mailbox (latest frame wins).
 
-    def __init__(self) -> None:
+    ``generation`` records which pump/source generation this consumer joined.
+    The broker delivers a generation's frames and its end-of-stream sentinel
+    only to subscribers of that same generation, so a stale pump finishing after
+    a replacement pump has started can never signal (or feed) the replacement's
+    consumers.
+    """
+
+    def __init__(self, generation: int = 0) -> None:
+        self.generation = generation
         self._mailbox: queue.Queue[bytes | None] = queue.Queue(maxsize=1)
 
     def offer(self, frame: bytes | None) -> None:
@@ -201,10 +209,18 @@ class PreviewProcessFrameSource:
 class MjpegBroker:
     """Fans a single :class:`FrameSource` out to multiple browser viewers.
 
-    A background pump thread is created when the first viewer subscribes and
+    A background pump thread is created when the first consumer subscribes and
     stopped when the last unsubscribes; between those it blocks on the source,
     so there is no busy loop. The broker is independent of the preview
     lifecycle: it never starts or stops preview.
+
+    **Generation ownership.** Each pump/source instance is stamped with a
+    monotonically increasing *generation*. A consumer is bound to the generation
+    that is current when it subscribes, and the pump delivers both frames and the
+    end-of-stream sentinel only to consumers of *its own* generation. This makes
+    teardown race-free: an old pump finishing after a replacement pump has
+    already started for a new consumer can neither feed nor signal end-of-stream
+    to that new consumer.
     """
 
     def __init__(self, source_factory: Callable[[], FrameSource]) -> None:
@@ -213,6 +229,8 @@ class MjpegBroker:
         self._subscribers: set[Subscriber] = set()
         self._source: FrameSource | None = None
         self._pump: threading.Thread | None = None
+        #: Generation of the currently-owned pump/source (0 == none yet).
+        self._generation = 0
 
     @property
     def viewer_count(self) -> int:
@@ -221,20 +239,21 @@ class MjpegBroker:
             return len(self._subscribers)
 
     def subscribe(self) -> Subscriber:
-        """Register a consumer, starting the pump if none is currently live.
+        """Register a consumer, starting a fresh pump generation if none is owned.
 
-        The pump is (re)started whenever there is no live pump thread -- not only
-        for the very first subscriber. This keeps the broker correct with
-        multiple, independent consumers (e.g. browser viewers *and* the motion
-        monitor): if the source ended while a long-lived consumer stayed
-        subscribed, a new subscription still revives frame delivery for everyone.
+        A new pump is started whenever the broker owns no pump (``_pump is
+        None``). The owning pump always relinquishes ``_pump`` at the very start
+        of its teardown -- *before* closing its source or signalling end-of-stream
+        -- so a consumer subscribing during another pump's teardown reliably
+        starts a new generation rather than joining the dying one. The consumer
+        is bound to whichever generation is current once that decision is made.
         """
-        subscriber = Subscriber()
         with self._lock:
+            if self._pump is None:
+                self._start_pump_locked()
+            subscriber = Subscriber(self._generation)
             self._subscribers.add(subscriber)
             count = len(self._subscribers)
-            if self._pump is None or not self._pump.is_alive():
-                self._start_pump_locked()
         LOGGER.info("Preview consumer connected (consumers=%d)", count)
         return subscriber
 
@@ -248,16 +267,18 @@ class MjpegBroker:
         LOGGER.info("Preview consumer disconnected (consumers=%d)", count)
 
     def _start_pump_locked(self) -> None:
+        self._generation += 1
+        generation = self._generation
         source = self._source_factory()
         self._source = source
         self._pump = threading.Thread(
             target=self._run_pump,
-            args=(source,),
+            args=(source, generation),
             name="mgo-preview-stream",
             daemon=True,
         )
         self._pump.start()
-        LOGGER.info("Preview stream started")
+        LOGGER.info("Preview stream started (generation=%d)", generation)
 
     def _stop_pump_locked(self) -> None:
         # Closing the source ends its frame iterator, letting the daemon pump
@@ -268,29 +289,34 @@ class MjpegBroker:
         self._source = None
         self._pump = None
 
-    def _run_pump(self, source: FrameSource) -> None:
+    def _run_pump(self, source: FrameSource, generation: int) -> None:
         try:
             for frame in source.frames():
                 if source is not self._source:
                     break
-                self._broadcast(frame)
+                self._broadcast(frame, generation)
         except Exception:
-            LOGGER.exception("Preview stream error")
+            LOGGER.exception("Preview stream error (generation=%d)", generation)
         finally:
-            source.close()
-            # Clear our own references *before* signalling end-of-stream, so any
-            # consumer that observes the sentinel and then re-subscribes sees no
-            # live pump and revives delivery. Guarded so a concurrent
-            # stop/restart that already swapped the source wins.
+            # Relinquish ownership FIRST (guarded), so a consumer subscribing
+            # during teardown starts a new generation instead of waiting on this
+            # dying pump. Only then release the source and signal end-of-stream,
+            # and address that sentinel to *this* generation's consumers only --
+            # never to a replacement generation's consumers.
             with self._lock:
                 if self._source is source:
                     self._source = None
                     self._pump = None
-            self._broadcast(_END_OF_STREAM)
-            LOGGER.info("Preview stream stopped")
+            source.close()
+            self._broadcast(_END_OF_STREAM, generation)
+            LOGGER.info("Preview stream stopped (generation=%d)", generation)
 
-    def _broadcast(self, frame: bytes | None) -> None:
+    def _broadcast(self, frame: bytes | None, generation: int) -> None:
         with self._lock:
-            subscribers = list(self._subscribers)
+            subscribers = [
+                subscriber
+                for subscriber in self._subscribers
+                if subscriber.generation == generation
+            ]
         for subscriber in subscribers:
             subscriber.offer(frame)

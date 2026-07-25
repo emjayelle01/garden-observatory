@@ -191,3 +191,69 @@ def test_broker_revives_pump_for_a_new_consumer_after_source_ends() -> None:
     finally:
         broker.unsubscribe(stale)
         broker.unsubscribe(browser)
+
+
+class _HoldThenEndSource:
+    """Yields its frames, then stays alive until told to end via an event.
+
+    Holding the source alive lets a consumer read the delivered frame before the
+    (latest-wins) end-of-stream sentinel replaces it, making the replacement
+    sequence deterministic.
+    """
+
+    def __init__(self, frames: list[bytes], end_gate: threading.Event) -> None:
+        self._frames = list(frames)
+        self._end_gate = end_gate
+        self.closed = False
+
+    def frames(self):  # type: ignore[no-untyped-def]
+        for frame in self._frames:
+            if self.closed:
+                return
+            yield frame
+        self._end_gate.wait(timeout=5.0)
+
+    def close(self) -> None:
+        self.closed = True
+        self._end_gate.set()
+
+
+def test_motion_and_browser_coexist_across_a_generation_replacement() -> None:
+    """Motion and a browser keep working after the preview source is replaced.
+
+    The first source ends (preview stopped); the motion frame source releases on
+    the genuine end-of-stream, then re-subscribes to a fresh generation. A
+    browser joins that same live generation and both receive frames — proving
+    coexistence survives a generation replacement without cross-generation
+    interference.
+    """
+    end_gate = threading.Event()
+    gen1 = _HoldThenEndSource([_JPEG_A], end_gate)
+    gen2 = MockFrameSource([_JPEG_B], hold_open=threading.Event(), loop=True)
+    created: list[object] = []
+
+    def factory() -> object:
+        source = gen1 if not created else gen2
+        created.append(source)
+        return source
+
+    broker = MjpegBroker(factory)
+    motion = BrokerFrameSource(broker)
+    try:
+        # Generation 1 stays alive until read, then ends deterministically.
+        assert motion.read(timeout=2.0) == _JPEG_A
+        end_gate.set()
+        assert motion.read(timeout=2.0) is None  # genuine end-of-stream
+
+        # Re-subscribing revives delivery on generation 2; a browser coexists.
+        assert motion.read(timeout=2.0) == _JPEG_B
+        browser = broker.subscribe()
+        try:
+            assert browser.get(timeout=2.0) == _JPEG_B
+            assert motion.read(timeout=2.0) == _JPEG_B
+        finally:
+            broker.unsubscribe(browser)
+    finally:
+        motion.close()
+
+    assert _wait_for(lambda: broker.viewer_count == 0)
