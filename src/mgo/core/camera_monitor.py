@@ -29,6 +29,12 @@ LOGGER = logging.getLogger(__name__)
 
 ObservationRecorder = Callable[..., Observation]
 
+#: Called with the new readiness whenever it materially changes. The camera
+#: monitor stays transport-agnostic: the application wires this to the
+#: notification manager, and a listener failure is isolated so it can never
+#: break a readiness check.
+CameraTransitionListener = Callable[[CameraReadiness], None]
+
 _STATUS_SUMMARIES: dict[CameraStatus, str] = {
     CameraStatus.DISABLED: "Camera disabled by configuration",
     CameraStatus.WAITING_FOR_HARDWARE: "Camera enabled; waiting for hardware",
@@ -84,12 +90,15 @@ async def perform_camera_check(
     *,
     detector: CameraDetector,
     recorder: ObservationRecorder = record_observation,
+    on_material_change: CameraTransitionListener | None = None,
 ) -> CameraReadiness:
     """Run one readiness check, update state, and persist material changes.
 
     Detection runs in a worker thread. The latest result is always stored;
-    an observation is written only when the readiness materially changed
-    relative to the previously stored result.
+    an observation is written -- and ``on_material_change`` invoked -- only
+    when the readiness materially changed relative to the previously stored
+    result. A listener failure is logged and swallowed so it can never break
+    the check itself.
     """
     previous = state.get()
     readiness = await asyncio.to_thread(
@@ -101,6 +110,11 @@ async def perform_camera_check(
 
     if is_material_change(previous, readiness):
         _record_camera_observation(config, readiness, recorder=recorder)
+        if on_material_change is not None:
+            try:
+                on_material_change(readiness)
+            except Exception:
+                LOGGER.exception("Camera transition listener failed")
 
     return readiness
 
@@ -111,6 +125,7 @@ async def _safe_check(
     *,
     detector: CameraDetector,
     recorder: ObservationRecorder,
+    on_material_change: CameraTransitionListener | None,
 ) -> None:
     """Run one readiness check, isolating failures from the monitor loop."""
     try:
@@ -119,6 +134,7 @@ async def _safe_check(
             state,
             detector=detector,
             recorder=recorder,
+            on_material_change=on_material_change,
         )
     except asyncio.CancelledError:
         LOGGER.info("Camera monitoring cancelled")
@@ -135,6 +151,7 @@ async def run_camera_monitor(
     detector: CameraDetector,
     recorder: ObservationRecorder = record_observation,
     run_initial: bool = True,
+    on_material_change: CameraTransitionListener | None = None,
 ) -> None:
     """Monitor camera readiness until the supplied stop event is set.
 
@@ -152,14 +169,24 @@ async def run_camera_monitor(
     )
 
     if run_initial:
-        await _safe_check(config, state, detector=detector, recorder=recorder)
+        await _safe_check(
+            config,
+            state,
+            detector=detector,
+            recorder=recorder,
+            on_material_change=on_material_change,
+        )
 
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except TimeoutError:
             await _safe_check(
-                config, state, detector=detector, recorder=recorder
+                config,
+                state,
+                detector=detector,
+                recorder=recorder,
+                on_material_change=on_material_change,
             )
         else:
             break

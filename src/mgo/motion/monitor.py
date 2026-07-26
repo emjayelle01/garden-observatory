@@ -39,6 +39,12 @@ LOGGER = logging.getLogger(__name__)
 Clock = Callable[[], datetime]
 ObservationRecorder = Callable[..., Observation]
 
+#: Called with the new result whenever a material motion transition is
+#: persisted. The monitor stays transport-agnostic: the application wires this
+#: to the notification manager, and a listener failure is isolated so it can
+#: never break an analysis cycle.
+MotionTransitionListener = Callable[[MotionResult], None]
+
 _STATUS_SUMMARIES: dict[MotionStatus, str] = {
     MotionStatus.DISABLED: "Motion detection disabled by configuration",
     MotionStatus.WAITING_FOR_FRAMES: "Motion monitor waiting for preview frames",
@@ -217,9 +223,11 @@ class _MotionObserver:
         config: MGOConfig,
         *,
         recorder: ObservationRecorder,
+        transition_listener: MotionTransitionListener | None = None,
     ) -> None:
         self._config = config
         self._recorder = recorder
+        self._transition_listener = transition_listener
         self._last_persisted: MotionStatus | None = None
         self._last_motion_at: datetime | None = None
 
@@ -250,6 +258,11 @@ class _MotionObserver:
         self._last_persisted = result.status
         if result.status is MotionStatus.MOTION_DETECTED:
             self._last_motion_at = now
+        if self._transition_listener is not None:
+            try:
+                self._transition_listener(result)
+            except Exception:
+                LOGGER.exception("Motion transition listener failed")
         return True
 
 
@@ -311,6 +324,7 @@ async def run_motion_monitor(
     *,
     recorder: ObservationRecorder = record_observation,
     clock: Clock = _utc_now,
+    transition_listener: MotionTransitionListener | None = None,
 ) -> None:
     """Run the motion monitor until ``stop_event`` is set.
 
@@ -335,7 +349,11 @@ async def run_motion_monitor(
         motion.changed_pixel_ratio_threshold,
     )
     evaluator = _MotionEvaluator(motion, detector)
-    observer = _MotionObserver(config, recorder=recorder)
+    observer = _MotionObserver(
+        config,
+        recorder=recorder,
+        transition_listener=transition_listener,
+    )
 
     try:
         while not stop_event.is_set():

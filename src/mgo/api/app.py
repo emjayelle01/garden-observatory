@@ -58,6 +58,14 @@ from mgo.motion import (
     default_motion_result,
     run_motion_monitor,
 )
+from mgo.notifications import (
+    EventSeverity,
+    EventType,
+    NotificationEvent,
+    NotificationManager,
+    build_notification_manager,
+    create_event,
+)
 
 config = load_config()
 
@@ -78,6 +86,85 @@ def _current_motion_result(app: FastAPI) -> MotionResult:
     state: MotionState | None = getattr(app.state, "motion_state", None)
     result = state.get() if state is not None else None
     return result if result is not None else default_motion_result(config.motion)
+
+
+def _notification_manager(app: FastAPI) -> NotificationManager:
+    """Return the notification manager, building one if none was attached.
+
+    The lifespan attaches a manager to ``app.state``; a lazily built fallback
+    keeps the status endpoint usable in contexts (such as direct unit tests)
+    that never ran startup, mirroring :func:`_capture_service`.
+    """
+    manager: NotificationManager | None = getattr(
+        app.state, "notification_manager", None
+    )
+    if manager is not None:
+        return manager
+    manager = build_notification_manager(config.notifications)
+    app.state.notification_manager = manager
+    return manager
+
+
+def _system_event(event_type: EventType, summary: str) -> NotificationEvent:
+    """Build an application lifecycle (start/stop) notification event."""
+    return create_event(
+        event_type,
+        source="mgo-api",
+        title="MGO application lifecycle",
+        summary=summary,
+        payload={"version": "0.1.0"},
+    )
+
+
+def _camera_event(readiness: CameraReadiness) -> NotificationEvent:
+    """Map a material camera readiness change to a notification event.
+
+    Availability decides the event type; anything not available (disabled,
+    waiting for hardware, error) is a ``CAMERA_UNAVAILABLE`` at warning
+    severity so a future real transport can meaningfully alert on it.
+    """
+    if readiness.available:
+        event_type = EventType.CAMERA_AVAILABLE
+        severity = EventSeverity.INFO
+        title = "Camera available"
+    else:
+        event_type = EventType.CAMERA_UNAVAILABLE
+        severity = EventSeverity.WARNING
+        title = "Camera unavailable"
+    return create_event(
+        event_type,
+        source="mgo-camera",
+        title=title,
+        summary=readiness.detail,
+        severity=severity,
+        payload=readiness.as_dict(),
+    )
+
+
+def _motion_event(result: MotionResult) -> NotificationEvent:
+    """Map a material motion transition to a notification event.
+
+    Every material transition is a single ``MOTION_STATE_CHANGED`` event; the
+    new state travels in the structured payload, not in the event type, so the
+    type vocabulary stays small while providers see the full result.
+    """
+    return create_event(
+        EventType.MOTION_STATE_CHANGED,
+        source="mgo-motion",
+        title="Motion state changed",
+        summary=result.detail,
+        payload=result.as_dict(),
+    )
+
+
+class NotificationStatusResponse(BaseModel):
+    """Typed, read-only projection of the notification manager's state."""
+
+    enabled: bool
+    providers: list[str]
+    total_events_published: int
+    total_delivery_failures: int
+    last_event_at: str | None
 
 
 class MotionStatusResponse(BaseModel):
@@ -187,6 +274,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         payload={"version": "0.1.0"},
     )
 
+    # The notification manager is the single publication point for events.
+    # Producers below publish typed events to it and never touch a delivery
+    # transport; with notifications disabled it is a truthful no-op.
+    notification_manager = build_notification_manager(config.notifications)
+    app.state.notification_manager = notification_manager
+    notification_manager.publish(
+        _system_event(EventType.SYSTEM_START, "MGO API started")
+    )
+
     stop_event = asyncio.Event()
     health_task = asyncio.create_task(
         run_health_monitor(config, stop_event),
@@ -214,9 +310,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         lambda: PreviewProcessFrameSource(preview_service)
     )
     camera_detector = build_detector(config.camera.backend)
+
+    # Material camera readiness changes become notification events. The monitor
+    # only knows a callback; the mapping to an event -- and the manager -- stay
+    # here in the application wiring.
+    def _publish_camera_change(readiness: CameraReadiness) -> None:
+        notification_manager.publish(_camera_event(readiness))
+
     # Evaluate readiness once before serving so /camera/status and /health
     # report a truthful state immediately after startup.
-    await perform_camera_check(config, camera_state, detector=camera_detector)
+    await perform_camera_check(
+        config,
+        camera_state,
+        detector=camera_detector,
+        on_material_change=_publish_camera_change,
+    )
     camera_stop_event = asyncio.Event()
     # The initial check already ran above; the monitor waits one interval
     # before its first periodic recheck to avoid a duplicate startup probe.
@@ -227,6 +335,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             camera_stop_event,
             detector=camera_detector,
             run_initial=False,
+            on_material_change=_publish_camera_change,
         ),
         name="mgo-camera-monitor",
     )
@@ -241,6 +350,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     motion_stop_event = asyncio.Event()
     motion_task: asyncio.Task[None] | None = None
     if config.motion.enabled:
+        # Material motion transitions become notification events, mirroring
+        # the camera wiring above.
+        def _publish_motion_transition(result: MotionResult) -> None:
+            notification_manager.publish(_motion_event(result))
+
         motion_task = asyncio.create_task(
             run_motion_monitor(
                 config,
@@ -248,6 +362,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 BrokerFrameSource(app.state.preview_broker),
                 FrameDifferenceDetector(config.motion),
                 motion_stop_event,
+                transition_listener=_publish_motion_transition,
             ),
             name="mgo-motion-monitor",
         )
@@ -264,6 +379,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await asyncio.gather(*monitor_tasks)
         # Ensure no preview process is left running (no orphans) on shutdown.
         await asyncio.to_thread(app.state.preview_service.shutdown)
+        notification_manager.publish(
+            _system_event(EventType.SYSTEM_STOP, "MGO API stopped")
+        )
         record_observation(
             config.storage.database_path,
             kind="application_stop",
@@ -337,6 +455,29 @@ def motion_status(request: Request) -> MotionStatusResponse:
         frames_available=result.frames_available,
         detail=result.detail,
         evaluated_at=result.evaluated_at.isoformat(),
+    )
+
+
+@app.get("/notifications/status")
+def notifications_status(request: Request) -> NotificationStatusResponse:
+    """Return the notification framework's current status.
+
+    Read-only and truthful: it reflects the manager's live counters and never
+    publishes or delivers anything itself. Always returns HTTP 200 when the
+    application is healthy -- including the disabled state, where no provider
+    is configured and every counter stays at zero.
+    """
+    status = _notification_manager(request.app).status()
+    return NotificationStatusResponse(
+        enabled=status.enabled,
+        providers=list(status.providers),
+        total_events_published=status.total_events_published,
+        total_delivery_failures=status.total_delivery_failures,
+        last_event_at=(
+            status.last_event_at.isoformat()
+            if status.last_event_at is not None
+            else None
+        ),
     )
 
 
