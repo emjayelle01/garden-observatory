@@ -38,6 +38,12 @@ shutdown_timeout_seconds = 5.0
 # analysis runs until this is explicitly enabled. Motion detection shares the
 # live preview stream (it never starts a second camera process) and detects
 # scene change only — it does not recognise birds or any other object.
+#
+# Motion is measured frame-to-frame: each analysed frame is compared with the
+# PREVIOUS analysed frame, so "motion" means recent visual activity, not a
+# departure from a fixed quiet scene. A lasting change settles back to no_motion
+# once it stops changing; ordinary garden movement (wind, leaves, birds) may
+# legitimately trigger it.
 enabled = false
 # How often a frame is analysed (seconds). Deliberately far slower than the
 # preview frame rate.
@@ -47,11 +53,11 @@ analysis_width = 160
 analysis_height = 90
 # Per-pixel luminance change (0–255) below which a pixel is treated as noise.
 pixel_difference_threshold = 20
-# Proportion of changed pixels (0–1) above which the scene is "in motion".
-changed_pixel_ratio_threshold = 0.02
-# Maximum age (seconds) of a quiet baseline before it is refreshed to absorb
-# gradual lighting change.
-baseline_refresh_seconds = 30.0
+# Proportion of changed pixels (0–1) above which the frame-to-frame change is
+# "motion". Default 0.08 is based on real IMX708 production measurements (above
+# quiet-scene variation, below clear controlled motion); per-site tuning may
+# still be needed.
+changed_pixel_ratio_threshold = 0.08
 # Suppresses recording a repeated motion event that restarts within this window
 # (seconds); the eventual return to no-motion is never hidden.
 cooldown_seconds = 5.0

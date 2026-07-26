@@ -2,8 +2,10 @@
 
 Matt's Garden Observatory (MGO) includes a small, deliberately simple
 **motion-detection foundation**. Its single job is to decide whether the camera
-scene has *meaningfully changed*. It does **not** identify the cause of the
-change — recognising birds (or anything else) is future work.
+scene has *changed meaningfully since the previous analysed frame* — i.e. whether
+there is recent visual **activity**. It does **not** identify the cause of the
+change — recognising birds (or anything else) is future work, and `motion_detected`
+never means "a bird is present".
 
 This document describes the architecture, algorithm, configuration, runtime
 behaviour, API, limitations and the production-validation procedure.
@@ -70,7 +72,8 @@ or machine learning:
 2. **reduce** it to a small analysis resolution (`analysis_width` ×
    `analysis_height`);
 3. **convert** it to greyscale (luminance);
-4. **compare** each pixel with the reference (baseline) frame;
+4. **compare** each pixel with the **previous analysed frame** (the rolling
+   reference);
 5. **ignore** per-pixel changes at or below `pixel_difference_threshold` (noise);
 6. **compute** the proportion of changed pixels (the *score*, 0–1);
 7. **report motion** when the score exceeds `changed_pixel_ratio_threshold`.
@@ -78,25 +81,40 @@ or machine learning:
 The detector is **pure and deterministic**: the same frames and configuration
 always yield the same score. Frames are normalised to the analysis resolution on
 decode, so the source camera resolution never affects the result, memory stays
-bounded (a single small greyscale buffer), and no frame history is retained.
+bounded (a single small greyscale buffer), and only the single previous frame is
+retained as the reference.
 
-## Baseline behaviour
+## Rolling-reference behaviour
 
-The **baseline** is the reference frame the current frame is compared against.
+Motion is measured **frame to frame**: each analysed frame is compared with the
+*previous analysed frame*, not with a fixed historically quiet image. So
+`motion_detected` means the scene changed meaningfully **since the last frame** —
+recent visual activity — and the live status describes current activity, never
+presence.
 
-- **Established** on the first frame after the monitor starts (or after frames
-  became unavailable). That first cycle reports `establishing_baseline`.
-- **Kept** while motion is detected, so a subject that enters and stays reads as
-  one continuous motion event until it leaves.
-- **Refreshed** during quiet periods once it is older than
-  `baseline_refresh_seconds`, to absorb gradual lighting change without erasing a
-  real event.
-- **Reset** when frames become unavailable, so recovery re-establishes it.
+The **reference** (the frame the next frame is compared against) is:
 
-Because motion is reported while the scene differs from the last *quiet*
-baseline, a subject that enters and remains reads as motion for the duration of
-its visit, and the status returns to `no_motion` once the scene matches the
-baseline again.
+- **established** on the first valid frame after the monitor starts (or after
+  frames became unavailable); that first cycle reports `establishing_baseline`
+  because no comparison was possible yet;
+- **advanced after every successful comparison** — the current frame always
+  becomes the reference for the next cycle, whether the result was `no_motion`
+  *or* `motion_detected`;
+- **preserved** across a bad or failed frame, so a single decode error never
+  corrupts the reference with invalid data;
+- **reset** when frames become unavailable, so recovery re-establishes it.
+
+Because the reference advances every frame, a **lasting** scene change does not
+latch forever: a bird that lands and then stays relatively still, or a feeder
+that settles into a new resting position, reads as motion only while it is
+*changing* and then settles back to `no_motion` even though the subject is still
+in view. Conversely, **continued** activity — a bird pecking or flapping, wind
+moving leaves, several birds at once — legitimately keeps reading as
+`motion_detected` frame after frame.
+
+There is deliberately **no** time-based refresh and **no** maximum-motion
+timeout: the reference advances because another frame was analysed, never because
+a timer elapsed.
 
 ## Monitor lifecycle
 
@@ -132,11 +150,16 @@ health and camera monitors:
 | Status                  | Meaning                                                    |
 | ----------------------- | ---------------------------------------------------------- |
 | `disabled`              | Motion detection is off by configuration.                  |
-| `waiting_for_frames`    | Enabled, but no preview frame is available yet.            |
-| `establishing_baseline` | The first frame is being adopted as the reference.         |
-| `no_motion`             | A comparison ran; change stayed within threshold.          |
-| `motion_detected`       | A comparison ran; change exceeded the threshold.           |
-| `error`                 | A frame could not be decoded or the detector failed.       |
+| `waiting_for_frames`    | No usable preview frame was available; the reference was reset. |
+| `establishing_baseline` | The first valid frame became the rolling reference; no comparison yet. |
+| `no_motion`             | The latest frame-to-frame change did not exceed the threshold. |
+| `motion_detected`       | The latest frame-to-frame change exceeded the threshold.   |
+| `error`                 | The analysis could not be completed truthfully (decode/detector failure). |
+
+`no_motion` describes the pixels, not the garden: it means the scene did not
+change much between the two most recent frames. It does **not** mean no bird is
+present, the feeder is empty, or nothing is moving. Equally, `motion_detected`
+does not mean a bird caused the change — wind, leaves or shadows read the same.
 
 The endpoint always returns `200` when the application is healthy (including the
 `disabled` and `waiting_for_frames` states), and requesting it triggers no
@@ -171,8 +194,7 @@ analysis_interval_seconds = 1.0
 analysis_width = 160
 analysis_height = 90
 pixel_difference_threshold = 20
-changed_pixel_ratio_threshold = 0.02
-baseline_refresh_seconds = 30.0
+changed_pixel_ratio_threshold = 0.08
 cooldown_seconds = 5.0
 ```
 
@@ -182,13 +204,21 @@ cooldown_seconds = 5.0
 | `analysis_interval_seconds`     | float | Must be positive.                                 |
 | `analysis_width` / `_height`    | int   | Positive and bounded (≤ 1920 × 1080).             |
 | `pixel_difference_threshold`    | int   | 0–255.                                            |
-| `changed_pixel_ratio_threshold` | float | Within `(0, 1]`.                                  |
-| `baseline_refresh_seconds`      | float | Must be positive.                                 |
+| `changed_pixel_ratio_threshold` | float | Within `(0, 1]`. Default **0.08**.                |
 | `cooldown_seconds`              | float | Cannot be negative.                               |
 
+The `changed_pixel_ratio_threshold` default of **0.08** is based on real IMX708
+production measurements: quiet-scene frame-to-frame variation sat around
+0.003–0.016, while clear controlled motion measured ~0.12–0.61, so 0.08
+separates the two with margin. Per-site tuning may still be necessary.
+
 The section is optional (files without it load with motion disabled). Invalid
-values are rejected at startup with a clear error. Machine-specific production
-configuration stays **external** to Git (see the main README).
+values are rejected at startup with a clear error. Any unknown key is ignored, so
+a pre-refinement config that still carries `baseline_refresh_seconds` continues
+to load (that field was removed when motion became a rolling-reference detector —
+a time-based refresh has no role once the reference advances every frame).
+Machine-specific production configuration stays **external** to Git (see the main
+README).
 
 ## Tuning
 
@@ -198,8 +228,9 @@ configuration stays **external** to Git (see the main README).
 - **Not sensitive enough**: lower those thresholds.
 - **Missing brief events**: lower `analysis_interval_seconds` (more frequent
   analysis, more CPU).
-- **False motion from slow lighting change**: lower `baseline_refresh_seconds` so
-  the baseline adapts faster during quiet periods.
+- **Slow lighting change**: the rolling reference absorbs it automatically —
+  each frame is compared only with the one before it, so a gradual drift stays
+  below the threshold without any refresh setting.
 
 ## Troubleshooting
 
@@ -208,15 +239,43 @@ configuration stays **external** to Git (see the main README).
 | Status stuck at `waiting_for_frames`      | Preview is not enabled/running. Enable `[preview]` and start it. |
 | Status stuck at `disabled`                | `[motion] enabled = false`. Enable it and restart the service.   |
 | Frequent `error` status                   | Malformed frames from the encoder; check preview health and logs. |
-| Motion never clears                       | A persistent scene change; the baseline refreshes during quiet periods. |
+| Motion never clears                       | The scene is still *changing* every frame (wind, continuous activity). A lasting-but-static change settles to `no_motion` within a cycle or two; if it does not, raise the thresholds. |
 | Too many / too few motion observations    | Tune the thresholds and `cooldown_seconds` (see Tuning).         |
+
+## Deployment context (open garden)
+
+The production camera watches **four bird feeders attached to a tree in an open
+garden**. That scene is rarely still: birds arrive, feed, peck and leave; leaves
+and branches move in wind; feeders sway; shadows shift; daylight and
+auto-exposure change through the day. The detector is designed for exactly this —
+it asks only *"has the scene changed since the previous frame?"*, not *"does the
+scene still match some quiet reference?"*.
+
+Consequences to keep in mind:
+
+- ordinary garden movement (**wind, leaves, shadows, birds**) may legitimately
+  produce `motion_detected` — this is activity detection, not presence detection;
+- **prolonged real movement** (a bird feeding actively, sustained wind) may
+  legitimately keep the status at `motion_detected` for as long as it continues;
+- a bird that **lands and becomes still** may settle to `no_motion` even though
+  it is still on the feeder — the pixels stopped changing;
+- `no_motion` does **not** mean no bird is present, and `motion_detected` does
+  **not** mean a bird caused the movement;
+- the default threshold is based on initial IMX708 production measurements;
+  per-site tuning may still be necessary;
+- the detector does **not** filter wind, and does **not** distinguish birds from
+  branches — object recognition and region-of-interest work are outside Task 4.
 
 ## Limitations
 
-- It detects **scene change only** — it cannot tell *what* changed; a swaying
-  branch, a shadow or a person triggers it just as a bird would.
-- A subject that enters and stays reads as motion for its whole visit.
-- Sudden lighting changes can register as motion until the baseline refreshes.
+- It detects **frame-to-frame scene change only** — it cannot tell *what*
+  changed; a swaying branch, a shadow or a person triggers it just as a bird
+  would.
+- It reports **activity, not presence**: a subject that enters and then holds
+  still settles to `no_motion` while still in view, and continuous movement keeps
+  reading as motion.
+- It does not distinguish causes (wind vs bird vs light) and applies no
+  region-of-interest masking.
 - There is no incident grouping or visit-session modelling.
 
 ## Off-Pi / Windows behaviour

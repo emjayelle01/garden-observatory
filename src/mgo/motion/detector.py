@@ -6,10 +6,13 @@ modelling, optical flow, segmentation or machine learning of any kind:
 1. decode a JPEG frame;
 2. reduce it to a small analysis resolution;
 3. convert it to greyscale (luminance);
-4. compare corresponding pixels against a reference frame;
+4. compare corresponding pixels against the previous analysed (reference) frame;
 5. ignore per-pixel changes below a noise threshold;
 6. compute the proportion of changed pixels;
 7. report motion when that proportion exceeds the configured threshold.
+
+The detector only compares two frames it is handed; which frame is the reference
+(a fixed baseline versus a rolling previous frame) is decided by the caller.
 
 The detector is pure and deterministic: the same input frames and configuration
 always yield the same score. It embeds no FastAPI, subprocess or persistence
@@ -63,7 +66,7 @@ class MotionDetector(Protocol):
         """Decode ``frame`` to a normalised greyscale analysis frame."""
         ...
 
-    def score(self, baseline: AnalysisFrame, current: AnalysisFrame) -> float:
+    def score(self, reference: AnalysisFrame, current: AnalysisFrame) -> float:
         """Return the changed-pixel ratio (0-1) between two analysis frames."""
         ...
 
@@ -112,7 +115,7 @@ class FrameDifferenceDetector:
             raise FrameDecodeError(f"Could not decode frame: {exc}") from exc
         return AnalysisFrame(width=self._width, height=self._height, luma=luma)
 
-    def score(self, baseline: AnalysisFrame, current: AnalysisFrame) -> float:
+    def score(self, reference: AnalysisFrame, current: AnalysisFrame) -> float:
         """Return the proportion of pixels that changed beyond the noise floor.
 
         Both frames must share the analysis dimensions (they always do when
@@ -120,10 +123,10 @@ class FrameDifferenceDetector:
         :class:`ValueError`. Per-pixel changes at or below
         ``pixel_difference_threshold`` are treated as noise and ignored.
         """
-        if (baseline.width, baseline.height) != (current.width, current.height):
+        if (reference.width, reference.height) != (current.width, current.height):
             raise ValueError(
                 "Cannot compare analysis frames of differing dimensions: "
-                f"{baseline.width}x{baseline.height} vs "
+                f"{reference.width}x{reference.height} vs "
                 f"{current.width}x{current.height}"
             )
         total = len(current.luma)
@@ -131,10 +134,10 @@ class FrameDifferenceDetector:
             return 0.0
         threshold = self._pixel_threshold
         changed = 0
-        for base_pixel, current_pixel in zip(
-            baseline.luma, current.luma, strict=True
+        for reference_pixel, current_pixel in zip(
+            reference.luma, current.luma, strict=True
         ):
-            if abs(base_pixel - current_pixel) > threshold:
+            if abs(reference_pixel - current_pixel) > threshold:
                 changed += 1
         return changed / total
 

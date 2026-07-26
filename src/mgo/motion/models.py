@@ -23,14 +23,17 @@ class MotionStatus(StrEnum):
     """The truthful states a motion evaluation can report.
 
     The states are deliberately explicit so the API never has to infer motion
-    from ambiguous evidence:
+    from ambiguous evidence. Motion is measured *frame to frame* -- against the
+    previous analysed frame, not a fixed quiet scene -- so the states describe
+    current visual activity, never bird presence:
 
     * ``DISABLED`` -- motion detection is off by configuration;
-    * ``WAITING_FOR_FRAMES`` -- enabled, but no preview frame is available yet;
-    * ``ESTABLISHING_BASELINE`` -- the first frame is being adopted as the
-      reference; no comparison is possible yet;
-    * ``NO_MOTION`` -- a comparison ran and the change stayed below threshold;
-    * ``MOTION_DETECTED`` -- a comparison ran and the change exceeded threshold;
+    * ``WAITING_FOR_FRAMES`` -- enabled, but no preview frame is available yet
+      (the rolling reference has been reset);
+    * ``ESTABLISHING_BASELINE`` -- the first valid frame has become the rolling
+      reference; no comparison was possible yet;
+    * ``NO_MOTION`` -- the latest frame-to-frame change stayed within threshold;
+    * ``MOTION_DETECTED`` -- the latest frame-to-frame change exceeded threshold;
     * ``ERROR`` -- a frame could not be decoded or the detector failed.
     """
 

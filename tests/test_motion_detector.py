@@ -34,7 +34,6 @@ def _config(
         analysis_height=analysis_height,
         pixel_difference_threshold=pixel_difference_threshold,
         changed_pixel_ratio_threshold=changed_pixel_ratio_threshold,
-        baseline_refresh_seconds=30.0,
         cooldown_seconds=5.0,
     )
 

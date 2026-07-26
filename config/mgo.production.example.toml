@@ -48,6 +48,9 @@ shutdown_timeout_seconds = 5.0
 # Motion detection foundation. It shares the live preview stream (no second
 # camera process) and detects SCENE CHANGE only — it does not recognise birds
 # or any other object, and it never triggers a still capture automatically.
+# Motion is measured frame-to-frame (each frame vs the previous analysed frame),
+# so it reports recent visual activity rather than presence; ordinary garden
+# movement (wind, leaves, birds) may legitimately trigger it.
 #
 # Left DISABLED here: production enablement happens only during an explicit
 # Raspberry Pi validation step. When enabling it, also enable [preview] so the
@@ -58,8 +61,8 @@ analysis_interval_seconds = 1.0
 analysis_width = 160
 analysis_height = 90
 pixel_difference_threshold = 20
-changed_pixel_ratio_threshold = 0.02
-baseline_refresh_seconds = 30.0
+# Default 0.08 is based on real IMX708 production measurements; tune per site.
+changed_pixel_ratio_threshold = 0.08
 cooldown_seconds = 5.0
 
 [health]

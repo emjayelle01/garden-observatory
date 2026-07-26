@@ -193,17 +193,27 @@ duplicate observations.
 ## Motion detection
 
 MGO includes a lightweight **motion-detection foundation**. It answers one
-question — *has the camera scene meaningfully changed?* — and nothing more.
+question — *has the camera scene changed meaningfully since the previous analysed
+frame?* — and nothing more. "Motion" means recent **visual activity**, not bird
+presence.
 
 What it **does**:
 
 - consumes JPEG frames from the **existing live preview stream** (it never starts
   a second camera process);
-- reduces each frame to a small greyscale image and compares it with an earlier
-  reference (baseline) frame;
-- reports motion when a large enough proportion of pixels changed;
+- reduces each frame to a small greyscale image and compares it with the
+  **previous analysed frame** (a rolling reference, not a fixed quiet scene);
+- reports motion when a large enough proportion of pixels changed since that
+  previous frame;
 - keeps the latest result in application state, exposed at `GET /motion/status`;
 - persists a `motion_status` observation only on a **material transition**.
+
+The production camera watches four bird feeders on a tree in an open garden, so
+wind, moving leaves, shadows and birds may all trigger it. A lasting change (a
+bird that lands and stays, a feeder that settles in a new position) reads as
+motion only while it is *changing*, then settles back to `no_motion`; `no_motion`
+does **not** mean nothing (or no bird) is there. Bird recognition remains future
+work.
 
 What it **does not** do (all future or out of scope):
 
@@ -228,9 +238,9 @@ states. The `status` field is one of:
 | ----------------------- | ---------------------------------------------------------- |
 | `disabled`              | Motion detection is off by configuration.                  |
 | `waiting_for_frames`    | Enabled, but no preview frame is available yet.            |
-| `establishing_baseline` | The first frame is being adopted as the reference.         |
-| `no_motion`             | A comparison ran; change stayed within threshold.          |
-| `motion_detected`       | A comparison ran; change exceeded the threshold.           |
+| `establishing_baseline` | The first frame has become the rolling reference.          |
+| `no_motion`             | The frame-to-frame change stayed within threshold.         |
+| `motion_detected`       | The frame-to-frame change exceeded the threshold.          |
 | `error`                 | A frame could not be decoded or the detector failed.       |
 
 ### Motion section
@@ -242,10 +252,13 @@ analysis_interval_seconds = 1.0    # how often a frame is analysed
 analysis_width = 160               # small analysis resolution (bounds CPU/memory)
 analysis_height = 90
 pixel_difference_threshold = 20    # per-pixel luminance change treated as noise
-changed_pixel_ratio_threshold = 0.02  # proportion of changed pixels => motion
-baseline_refresh_seconds = 30.0    # max age of a quiet baseline before refresh
+changed_pixel_ratio_threshold = 0.08  # frame-to-frame changed-pixel ratio => motion
 cooldown_seconds = 5.0             # suppresses recording a repeated motion event
 ```
+
+The `changed_pixel_ratio_threshold` default of **0.08** is based on real IMX708
+production measurements (above quiet-scene frame-to-frame variation, below clear
+controlled motion); per-site tuning may still be needed.
 
 Defaults are hardware-safe: motion detection is **disabled**, no frames are
 consumed, and no analysis runs. The `[motion]` section is optional — configuration

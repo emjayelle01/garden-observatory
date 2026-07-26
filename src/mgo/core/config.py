@@ -84,11 +84,11 @@ class MotionConfig:
     CPU. ``pixel_difference_threshold`` is the per-pixel luminance change (0-255)
     below which a pixel is treated as unchanged noise.
     ``changed_pixel_ratio_threshold`` is the proportion of changed pixels (0-1)
-    above which the scene is considered to be in motion.
-    ``baseline_refresh_seconds`` is the maximum age of a quiet baseline before it
-    is refreshed to adapt to gradual lighting change. ``cooldown_seconds``
-    suppresses recording a *repeated* motion event that begins again within the
-    window, without hiding the eventual return to no-motion.
+    above which the scene is considered to have meaningfully changed between the
+    two most recent frames; its default (0.08) is based on real IMX708
+    production measurements. ``cooldown_seconds`` suppresses recording a
+    *repeated* motion event that begins again within the window, without hiding
+    the eventual return to no-motion.
     """
 
     enabled: bool
@@ -97,7 +97,6 @@ class MotionConfig:
     analysis_height: int
     pixel_difference_threshold: int
     changed_pixel_ratio_threshold: float
-    baseline_refresh_seconds: float
     cooldown_seconds: float
 
 
@@ -177,14 +176,16 @@ def _validate_preview_config(preview: PreviewConfig) -> None:
 
 #: Sensible defaults for motion when the ``[motion]`` section is absent, so
 #: pre-existing configuration files keep loading unchanged with motion disabled.
+#: The ``changed_pixel_ratio_threshold`` default (0.08) is based on real IMX708
+#: production measurements: it sits above the quiet-scene frame-to-frame
+#: variation (~0.003-0.016) and well below clear controlled motion (~0.12-0.61).
 _MOTION_DEFAULTS = {
     "enabled": False,
     "analysis_interval_seconds": 1.0,
     "analysis_width": 160,
     "analysis_height": 90,
     "pixel_difference_threshold": 20,
-    "changed_pixel_ratio_threshold": 0.02,
-    "baseline_refresh_seconds": 30.0,
+    "changed_pixel_ratio_threshold": 0.08,
     "cooldown_seconds": 5.0,
 }
 
@@ -221,9 +222,6 @@ def _validate_motion_config(motion: MotionConfig) -> None:
         raise ValueError(
             "Motion changed-pixel ratio threshold must be within (0, 1]"
         )
-
-    if motion.baseline_refresh_seconds <= 0:
-        raise ValueError("Motion baseline refresh interval must be positive")
 
     if motion.cooldown_seconds < 0:
         raise ValueError("Motion cooldown cannot be negative")
@@ -363,7 +361,9 @@ def load_config(path: Path | None = None) -> MGOConfig:
     _validate_preview_config(preview)
 
     # The ``[motion]`` section is optional so pre-Task-4 configuration files
-    # continue to load; absent keys fall back to safe (disabled) defaults.
+    # continue to load; absent keys fall back to safe (disabled) defaults. Only
+    # the keys below are read, so any legacy/unknown key (e.g. a pre-refinement
+    # ``baseline_refresh_seconds``) is simply ignored rather than rejected.
     motion_data = raw.get("motion", {})
     motion = MotionConfig(
         enabled=bool(motion_data.get("enabled", _MOTION_DEFAULTS["enabled"])),
@@ -391,12 +391,6 @@ def load_config(path: Path | None = None) -> MGOConfig:
             motion_data.get(
                 "changed_pixel_ratio_threshold",
                 _MOTION_DEFAULTS["changed_pixel_ratio_threshold"],
-            )
-        ),
-        baseline_refresh_seconds=float(
-            motion_data.get(
-                "baseline_refresh_seconds",
-                _MOTION_DEFAULTS["baseline_refresh_seconds"],
             )
         ),
         cooldown_seconds=float(

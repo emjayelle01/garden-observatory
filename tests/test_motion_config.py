@@ -48,8 +48,7 @@ analysis_interval_seconds = 1.0
 analysis_width = 160
 analysis_height = 90
 pixel_difference_threshold = 20
-changed_pixel_ratio_threshold = 0.02
-baseline_refresh_seconds = 30.0
+changed_pixel_ratio_threshold = 0.05
 cooldown_seconds = 5.0
 """
 
@@ -69,8 +68,7 @@ def _motion_section(**overrides: object) -> str:
         "analysis_width": 160,
         "analysis_height": 90,
         "pixel_difference_threshold": 20,
-        "changed_pixel_ratio_threshold": 0.02,
-        "baseline_refresh_seconds": 30.0,
+        "changed_pixel_ratio_threshold": 0.08,
         "cooldown_seconds": 5.0,
     }
     fields.update(overrides)
@@ -88,9 +86,11 @@ def test_missing_motion_section_uses_safe_disabled_defaults(tmp_path: Path) -> N
     assert motion.analysis_width == 160
     assert motion.analysis_height == 90
     assert motion.pixel_difference_threshold == 20
-    assert motion.changed_pixel_ratio_threshold == 0.02
-    assert motion.baseline_refresh_seconds == 30.0
+    # Default raised to 0.08 (rolling-reference refinement, IMX708 measurements).
+    assert motion.changed_pixel_ratio_threshold == 0.08
     assert motion.cooldown_seconds == 5.0
+    # The obsolete quiet-baseline refresh field is gone under rolling reference.
+    assert not hasattr(motion, "baseline_refresh_seconds")
 
 
 def test_enabled_motion_configuration_parses(tmp_path: Path) -> None:
@@ -101,7 +101,30 @@ def test_enabled_motion_configuration_parses(tmp_path: Path) -> None:
     assert motion.enabled is True
     assert motion.analysis_interval_seconds == 1.0
     assert motion.pixel_difference_threshold == 20
-    assert motion.changed_pixel_ratio_threshold == 0.02
+    assert motion.changed_pixel_ratio_threshold == 0.05
+
+
+def test_explicit_threshold_overrides_default(tmp_path: Path) -> None:
+    """An explicit changed-pixel ratio threshold overrides the 0.08 default."""
+    section = _motion_section(changed_pixel_ratio_threshold=0.15)
+    config = load_config(_write(tmp_path, motion=section))
+
+    assert config.motion.changed_pixel_ratio_threshold == 0.15
+
+
+def test_legacy_baseline_refresh_key_is_ignored(tmp_path: Path) -> None:
+    """A pre-refinement config carrying baseline_refresh_seconds still loads.
+
+    The parser only reads the keys it knows, so the removed legacy field is
+    silently ignored rather than rejected — the config loads cleanly and no such
+    attribute exists on the resulting MotionConfig.
+    """
+    section = _motion_section() + "baseline_refresh_seconds = 30.0\n"
+    config = load_config(_write(tmp_path, motion=section))
+
+    assert config.motion.enabled is True
+    assert config.motion.changed_pixel_ratio_threshold == 0.08
+    assert not hasattr(config.motion, "baseline_refresh_seconds")
 
 
 def test_repository_default_config_has_motion_disabled() -> None:
@@ -124,7 +147,6 @@ def test_repository_default_config_has_motion_disabled() -> None:
         ({"pixel_difference_threshold": 256}, "pixel difference threshold"),
         ({"changed_pixel_ratio_threshold": 0.0}, "ratio threshold"),
         ({"changed_pixel_ratio_threshold": 1.5}, "ratio threshold"),
-        ({"baseline_refresh_seconds": 0.0}, "baseline refresh"),
         ({"cooldown_seconds": -1.0}, "cooldown cannot be negative"),
     ],
 )

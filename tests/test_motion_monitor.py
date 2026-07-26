@@ -97,8 +97,7 @@ def _motion_config(
     enabled: bool = True,
     interval: float = 0.01,
     cooldown: float = 0.0,
-    refresh: float = 10_000.0,
-    threshold: float = 0.02,
+    threshold: float = 0.08,
 ) -> MotionConfig:
     return MotionConfig(
         enabled=enabled,
@@ -107,7 +106,6 @@ def _motion_config(
         analysis_height=2,
         pixel_difference_threshold=20,
         changed_pixel_ratio_threshold=threshold,
-        baseline_refresh_seconds=refresh,
         cooldown_seconds=cooldown,
     )
 
@@ -117,10 +115,19 @@ def _mgo_config(motion: MotionConfig) -> MGOConfig:
     return dataclasses.replace(load_config(), motion=motion)
 
 
-# --- evaluator ------------------------------------------------------------
+# --- evaluator (rolling reference) ----------------------------------------
+
+
+def _seq(evaluator: _MotionEvaluator, frames: list[bytes]) -> list[MotionStatus]:
+    """Evaluate ``frames`` one second apart and return their statuses."""
+    return [
+        evaluator.evaluate(frame, _T0 + timedelta(seconds=i)).status
+        for i, frame in enumerate(frames)
+    ]
 
 
 def test_evaluator_first_frame_establishes_baseline() -> None:
+    """A. The first valid frame becomes the rolling reference (no comparison)."""
     evaluator = _MotionEvaluator(_motion_config(), _FakeDetector())
 
     result = evaluator.evaluate(b"AAAA", _T0)
@@ -131,15 +138,17 @@ def test_evaluator_first_frame_establishes_baseline() -> None:
     assert result.score == 0.0
 
 
-def test_evaluator_identical_frame_reports_no_motion() -> None:
+def test_evaluator_identical_frames_report_no_motion() -> None:
+    """B. Identical successive frames stay at no_motion (stable scene)."""
     evaluator = _MotionEvaluator(_motion_config(), _FakeDetector())
-    evaluator.evaluate(b"AAAA", _T0)
 
-    result = evaluator.evaluate(b"AAAA", _T0 + timedelta(seconds=1))
+    statuses = _seq(evaluator, [b"AAAA", b"AAAA", b"AAAA"])
 
-    assert result.status is MotionStatus.NO_MOTION
-    assert result.detected is False
-    assert result.score == 0.0
+    assert statuses == [
+        MotionStatus.ESTABLISHING_BASELINE,
+        MotionStatus.NO_MOTION,
+        MotionStatus.NO_MOTION,
+    ]
 
 
 def test_evaluator_changed_frame_reports_motion() -> None:
@@ -153,12 +162,107 @@ def test_evaluator_changed_frame_reports_motion() -> None:
     assert result.score == 1.0
 
 
-def test_evaluator_no_frame_resets_baseline_to_waiting() -> None:
+def test_evaluator_arrival_then_settling() -> None:
+    """C. Empty → object appears → object stays: establishing, motion, no_motion.
+
+    Critical acceptance test: a large change is detected on arrival, and the
+    same scene repeated immediately settles to no_motion because the arrived
+    frame became the reference.
+    """
+    evaluator = _MotionEvaluator(_motion_config(), _FakeDetector())
+
+    statuses = _seq(evaluator, [b"AAAA", b"ZZZZ", b"ZZZZ"])
+
+    assert statuses == [
+        MotionStatus.ESTABLISHING_BASELINE,
+        MotionStatus.MOTION_DETECTED,
+        MotionStatus.NO_MOTION,
+    ]
+
+
+def test_evaluator_continued_activity_stays_motion() -> None:
+    """D. A region that keeps changing each frame keeps reading as motion."""
+    evaluator = _MotionEvaluator(_motion_config(), _FakeDetector())
+
+    statuses = _seq(evaluator, [b"AAAA", b"BBBB", b"CCCC", b"DDDD"])
+
+    assert statuses == [
+        MotionStatus.ESTABLISHING_BASELINE,
+        MotionStatus.MOTION_DETECTED,
+        MotionStatus.MOTION_DETECTED,
+        MotionStatus.MOTION_DETECTED,
+    ]
+
+
+def test_evaluator_departure_then_settling() -> None:
+    """E. Object present → removed → empty repeats: motion on removal, then settles."""
+    evaluator = _MotionEvaluator(_motion_config(), _FakeDetector())
+
+    statuses = _seq(evaluator, [b"ZZZZ", b"AAAA", b"AAAA"])
+
+    assert statuses == [
+        MotionStatus.ESTABLISHING_BASELINE,
+        MotionStatus.MOTION_DETECTED,
+        MotionStatus.NO_MOTION,
+    ]
+
+
+def test_evaluator_lasting_change_does_not_latch() -> None:
+    """F. A lasting change settles to no_motion; it does not latch forever.
+
+    Under a frozen baseline the persistently-changed scene would read as motion
+    indefinitely (it never matches the original empty frame again). Under the
+    rolling reference it settles after the change stops moving.
+    """
+    evaluator = _MotionEvaluator(_motion_config(), _FakeDetector())
+
+    statuses = _seq(evaluator, [b"AAAA", b"ZZZZ", b"ZZZZ", b"ZZZZ", b"ZZZZ"])
+
+    assert statuses[1] is MotionStatus.MOTION_DETECTED
+    # It does not stay latched: every later unchanged frame is no_motion.
+    assert all(s is MotionStatus.NO_MOTION for s in statuses[2:])
+
+
+def test_evaluator_reference_advances_after_no_motion() -> None:
+    """The current frame becomes the reference even after a no_motion result."""
+    evaluator = _MotionEvaluator(
+        _motion_config(), _FakeDetector(motion_threshold=0.5)
+    )
+    evaluator.evaluate(b"AAAA", _T0)
+    # 2-of-4 change (score 0.5) is not motion; AABB becomes the new reference.
+    mid = evaluator.evaluate(b"AABB", _T0 + timedelta(seconds=1))
+    # Compared with AABB this is another 2-of-4 change (no motion); against the
+    # original AAAA it would be a full change and read as motion.
+    result = evaluator.evaluate(b"BBBB", _T0 + timedelta(seconds=2))
+
+    assert mid.status is MotionStatus.NO_MOTION
+    assert result.status is MotionStatus.NO_MOTION
+
+
+def test_evaluator_reference_advances_after_motion() -> None:
+    """G. A motion-detected frame becomes the reference for the next comparison."""
+    evaluator = _MotionEvaluator(_motion_config(), _FakeDetector())
+
+    evaluator.evaluate(b"AAAA", _T0)
+    motion = evaluator.evaluate(b"ZZZZ", _T0 + timedelta(seconds=1))
+    # ZZZZ is now the reference: an identical ZZZZ is no_motion...
+    settled = evaluator.evaluate(b"ZZZZ", _T0 + timedelta(seconds=2))
+    # ...and returning to the original AAAA is a fresh change (motion), proving
+    # the reference had advanced to ZZZZ rather than staying at AAAA.
+    returned = evaluator.evaluate(b"AAAA", _T0 + timedelta(seconds=3))
+
+    assert motion.status is MotionStatus.MOTION_DETECTED
+    assert settled.status is MotionStatus.NO_MOTION
+    assert returned.status is MotionStatus.MOTION_DETECTED
+
+
+def test_evaluator_no_frame_resets_reference_to_waiting() -> None:
+    """H. Frame loss resets the reference; the next valid frame re-establishes it."""
     evaluator = _MotionEvaluator(_motion_config(), _FakeDetector())
     evaluator.evaluate(b"AAAA", _T0)
 
     waiting = evaluator.on_no_frame(_T0 + timedelta(seconds=1))
-    # After a reset the next frame re-establishes the baseline (not no_motion).
+    # After a reset the next frame re-establishes the reference (not no_motion).
     reestablished = evaluator.evaluate(b"AAAA", _T0 + timedelta(seconds=2))
 
     assert waiting.status is MotionStatus.WAITING_FOR_FRAMES
@@ -166,13 +270,14 @@ def test_evaluator_no_frame_resets_baseline_to_waiting() -> None:
     assert reestablished.status is MotionStatus.ESTABLISHING_BASELINE
 
 
-def test_evaluator_decode_error_reports_error_and_keeps_baseline() -> None:
+def test_evaluator_decode_error_reports_error_and_keeps_reference() -> None:
+    """I. A bad frame reports error without corrupting the rolling reference."""
     evaluator = _MotionEvaluator(_motion_config(), _FakeDetector())
     evaluator.evaluate(b"AAAA", _T0)
 
     error = evaluator.evaluate(b"BAD", _T0 + timedelta(seconds=1))
-    # The baseline survives a bad frame, so a following good identical frame is
-    # a normal comparison (no_motion), not a fresh baseline.
+    # The reference survives a bad frame, so a following good identical frame is
+    # a normal comparison (no_motion), not a fresh reference.
     recovered = evaluator.evaluate(b"AAAA", _T0 + timedelta(seconds=2))
 
     assert error.status is MotionStatus.ERROR
@@ -181,43 +286,17 @@ def test_evaluator_decode_error_reports_error_and_keeps_baseline() -> None:
     assert recovered.status is MotionStatus.NO_MOTION
 
 
-def test_evaluator_unexpected_detector_fault_reports_error() -> None:
+def test_evaluator_unexpected_fault_reports_error_and_keeps_reference() -> None:
     evaluator = _MotionEvaluator(_motion_config(), _FakeDetector())
     evaluator.evaluate(b"AAAA", _T0)
 
-    result = evaluator.evaluate(b"BOOM", _T0 + timedelta(seconds=1))
+    error = evaluator.evaluate(b"BOOM", _T0 + timedelta(seconds=1))
+    # The reference is preserved across an unexpected fault, so a following good
+    # identical frame recovers a normal comparison.
+    recovered = evaluator.evaluate(b"AAAA", _T0 + timedelta(seconds=2))
 
-    assert result.status is MotionStatus.ERROR
-
-
-def test_evaluator_refreshes_stale_quiet_baseline() -> None:
-    """A quiet scene that drifts slowly refreshes the baseline over time."""
-    evaluator = _MotionEvaluator(
-        _motion_config(refresh=10.0), _FakeDetector(motion_threshold=0.5)
-    )
-    evaluator.evaluate(b"AAAA", _T0)
-    # A 2-of-4 change (score 0.5) is not motion; after the refresh window it is
-    # adopted as the new baseline.
-    evaluator.evaluate(b"AABB", _T0 + timedelta(seconds=20))
-    # Compared with the refreshed baseline (AABB) this is a 2-of-4 change again
-    # (no motion); against the original baseline (AAAA) it would be a full
-    # change and read as motion.
-    result = evaluator.evaluate(b"BBBB", _T0 + timedelta(seconds=20))
-
-    assert result.status is MotionStatus.NO_MOTION
-
-
-def test_evaluator_does_not_refresh_baseline_before_window() -> None:
-    """Without enough elapsed time the baseline is not refreshed."""
-    evaluator = _MotionEvaluator(
-        _motion_config(refresh=10_000.0), _FakeDetector(motion_threshold=0.5)
-    )
-    evaluator.evaluate(b"AAAA", _T0)
-    evaluator.evaluate(b"AABB", _T0 + timedelta(seconds=1))
-    # Baseline is still AAAA, so a full change reads as motion.
-    result = evaluator.evaluate(b"BBBB", _T0 + timedelta(seconds=2))
-
-    assert result.status is MotionStatus.MOTION_DETECTED
+    assert error.status is MotionStatus.ERROR
+    assert recovered.status is MotionStatus.NO_MOTION
 
 
 # --- observer (persistence + cooldown) ------------------------------------
@@ -375,13 +454,19 @@ def test_disabled_monitor_never_consumes_frames() -> None:
     assert latest.status is MotionStatus.DISABLED
 
 
-def test_monitor_establishes_baseline_then_reports_motion() -> None:
+def test_monitor_reports_arrival_then_settles() -> None:
+    """Arrival is recorded as motion; the now-static scene settles to no_motion.
+
+    The exhausted frame repeats the arrived scene, and under the rolling
+    reference an unchanged repeat is no_motion — so a lasting change does not
+    latch at the monitor level either.
+    """
     recorder = _Recorder()
     config = _mgo_config(_motion_config())
 
     state, source = asyncio.run(
         _drive(
-            [b"AAAA", b"AAAA", b"ZZZZ"],
+            [b"AAAA", b"ZZZZ", b"ZZZZ"],
             exhausted=b"ZZZZ",
             config=config,
             detector=_FakeDetector(),
@@ -391,23 +476,24 @@ def test_monitor_establishes_baseline_then_reports_motion() -> None:
 
     latest = state.get()
     assert latest is not None
-    assert latest.status is MotionStatus.MOTION_DETECTED
+    assert latest.status is MotionStatus.NO_MOTION
     assert recorder.statuses == [
         "establishing_baseline",
-        "no_motion",
         "motion_detected",
+        "no_motion",
     ]
     assert source.closed is True
 
 
-def test_monitor_continuous_motion_does_not_flood_observations() -> None:
+def test_monitor_continuous_activity_does_not_flood_observations() -> None:
+    """A scene that keeps changing every frame records motion once, not per frame."""
     recorder = _Recorder()
     config = _mgo_config(_motion_config())
 
     asyncio.run(
         _drive(
-            [b"AAAA", b"ZZZZ", b"ZZZZ", b"ZZZZ"],
-            exhausted=b"ZZZZ",
+            [b"AAAA", b"BBBB", b"CCCC", b"DDDD"],
+            exhausted=b"DDDD",
             config=config,
             detector=_FakeDetector(),
             recorder=recorder,
@@ -415,6 +501,47 @@ def test_monitor_continuous_motion_does_not_flood_observations() -> None:
     )
 
     assert recorder.statuses.count("motion_detected") == 1
+
+
+def test_monitor_departure_then_settles() -> None:
+    """Removing the subject records motion; the empty scene then settles."""
+    recorder = _Recorder()
+    config = _mgo_config(_motion_config())
+
+    asyncio.run(
+        _drive(
+            [b"ZZZZ", b"AAAA", b"AAAA"],
+            exhausted=b"AAAA",
+            config=config,
+            detector=_FakeDetector(),
+            recorder=recorder,
+        )
+    )
+
+    assert recorder.statuses == [
+        "establishing_baseline",
+        "motion_detected",
+        "no_motion",
+    ]
+
+
+def test_monitor_repeated_stable_frames_do_not_flood_observations() -> None:
+    """A persistently unchanged scene records one no_motion, not one per frame."""
+    recorder = _Recorder()
+    config = _mgo_config(_motion_config())
+
+    asyncio.run(
+        _drive(
+            [b"AAAA", b"AAAA", b"AAAA"],
+            exhausted=b"AAAA",
+            config=config,
+            detector=_FakeDetector(),
+            recorder=recorder,
+        )
+    )
+
+    assert recorder.statuses.count("no_motion") == 1
+    assert "motion_detected" not in recorder.statuses
 
 
 def test_monitor_recovers_after_detector_failure() -> None:

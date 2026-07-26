@@ -25,8 +25,7 @@ def _config(*, enabled: bool) -> MotionConfig:
         analysis_width=160,
         analysis_height=90,
         pixel_difference_threshold=20,
-        changed_pixel_ratio_threshold=0.02,
-        baseline_refresh_seconds=30.0,
+        changed_pixel_ratio_threshold=0.08,
         cooldown_seconds=5.0,
     )
 

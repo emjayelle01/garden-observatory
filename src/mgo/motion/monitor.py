@@ -75,18 +75,28 @@ class MotionState:
 
 
 class _MotionEvaluator:
-    """Baseline management and result production for one running monitor.
+    """Rolling-reference management and result production for one monitor.
 
     Deterministic given ``(frame, now)``: it decodes the frame, compares it with
-    the current baseline and produces a :class:`MotionResult`. The baseline is:
+    the *previous analysed frame* and produces a :class:`MotionResult`. Motion is
+    therefore recent visual *activity* -- a meaningful change since the last
+    frame -- not a departure from a fixed historically quiet image. The rolling
+    reference is:
 
     * **established** on the first frame after start (or after frames became
-      unavailable);
-    * **kept** while motion is detected, so a subject that enters and stays keeps
-      reading as one continuous motion event until it leaves;
-    * **refreshed** during quiet periods once it is older than
-      ``baseline_refresh_seconds``, to absorb gradual lighting change;
+      unavailable); that first cycle reports ``establishing_baseline``;
+    * **advanced** after *every* successful comparison -- the current frame
+      becomes the reference for the next cycle whether the result was
+      ``no_motion`` or ``motion_detected``. A lasting scene change therefore
+      settles to ``no_motion`` once it stops changing, and continued activity
+      legitimately keeps reading as ``motion_detected``;
+    * **preserved** across a bad/failed frame, so a single decode error does not
+      corrupt the reference with invalid data;
     * **reset** when frames become unavailable, so recovery re-establishes it.
+
+    There is deliberately no time-based refresh and no maximum-motion timeout:
+    the reference advances because another frame was analysed, never because a
+    timer elapsed.
     """
 
     def __init__(
@@ -96,13 +106,11 @@ class _MotionEvaluator:
     ) -> None:
         self._config = config
         self._detector = detector
-        self._baseline: AnalysisFrame | None = None
-        self._baseline_at: datetime | None = None
+        self._reference: AnalysisFrame | None = None
 
     def on_no_frame(self, now: datetime) -> MotionResult:
-        """Report ``waiting_for_frames`` and reset the baseline."""
-        self._baseline = None
-        self._baseline_at = None
+        """Report ``waiting_for_frames`` and reset the rolling reference."""
+        self._reference = None
         return MotionResult(
             status=MotionStatus.WAITING_FOR_FRAMES,
             detected=False,
@@ -114,13 +122,18 @@ class _MotionEvaluator:
         )
 
     def evaluate(self, frame: bytes, now: datetime) -> MotionResult:
-        """Evaluate one frame, updating the baseline, never raising."""
+        """Evaluate one frame against the previous one, never raising.
+
+        On success the current frame always becomes the reference for the next
+        evaluation. On a decode/detector error the previous reference is kept
+        intact so a later valid frame recovers a normal comparison.
+        """
         threshold = self._config.changed_pixel_ratio_threshold
         try:
             current = self._detector.decode(frame)
         except FrameDecodeError as exc:
-            # Keep the existing baseline: a single bad frame does not invalidate
-            # the reference. Report a truthful error rather than "no motion".
+            # Keep the existing reference: a single bad frame does not invalidate
+            # it. Report a truthful error rather than "no motion".
             return MotionResult(
                 status=MotionStatus.ERROR,
                 detected=False,
@@ -131,6 +144,8 @@ class _MotionEvaluator:
                 evaluated_at=now,
             )
         except Exception as exc:  # unexpected detector fault
+            # Smallest safe rule: an unexpected fault produced no valid frame, so
+            # preserve the last good reference and recover on the next frame.
             LOGGER.exception("Motion detector raised an unexpected error")
             return MotionResult(
                 status=MotionStatus.ERROR,
@@ -142,9 +157,8 @@ class _MotionEvaluator:
                 evaluated_at=now,
             )
 
-        if self._baseline is None:
-            self._baseline = current
-            self._baseline_at = now
+        if self._reference is None:
+            self._reference = current
             return MotionResult(
                 status=MotionStatus.ESTABLISHING_BASELINE,
                 detected=False,
@@ -155,10 +169,13 @@ class _MotionEvaluator:
                 evaluated_at=now,
             )
 
-        score = self._detector.score(self._baseline, current)
-        if self._detector.is_motion(score):
-            # Do not refresh the baseline while motion is present, so the event
-            # persists until the scene returns to the quiet reference.
+        score = self._detector.score(self._reference, current)
+        detected = self._detector.is_motion(score)
+        # Rolling reference: the current frame is always adopted as the reference
+        # for the next comparison, whether or not motion was detected. This is
+        # what lets a lasting change settle to no_motion once it stops changing.
+        self._reference = current
+        if detected:
             return MotionResult(
                 status=MotionStatus.MOTION_DETECTED,
                 detected=True,
@@ -166,20 +183,11 @@ class _MotionEvaluator:
                 threshold=threshold,
                 frames_available=True,
                 detail=(
-                    f"Changed-pixel ratio {score:.4f} exceeded threshold "
-                    f"{threshold:.4f}."
+                    f"Changed-pixel ratio {score:.4f} since the previous frame "
+                    f"exceeded threshold {threshold:.4f}."
                 ),
                 evaluated_at=now,
             )
-
-        # Quiet: adopt the current frame as the baseline once it is stale enough
-        # to track gradual lighting change without erasing a real event.
-        if self._baseline_at is None or (
-            (now - self._baseline_at).total_seconds()
-            >= self._config.baseline_refresh_seconds
-        ):
-            self._baseline = current
-            self._baseline_at = now
         return MotionResult(
             status=MotionStatus.NO_MOTION,
             detected=False,
@@ -187,8 +195,8 @@ class _MotionEvaluator:
             threshold=threshold,
             frames_available=True,
             detail=(
-                f"Changed-pixel ratio {score:.4f} stayed within threshold "
-                f"{threshold:.4f}."
+                f"Changed-pixel ratio {score:.4f} since the previous frame "
+                f"stayed within threshold {threshold:.4f}."
             ),
             evaluated_at=now,
         )
