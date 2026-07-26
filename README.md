@@ -53,6 +53,7 @@ uv run pytest
 | `GET /camera/preview/stream` | Browser MJPEG live-preview stream.               |
 | `GET /preview`        | Simple browser live-preview page.                       |
 | `GET /motion/status`  | The latest monitored motion-detection result.           |
+| `GET /notifications/status` | Notification framework status and counters.       |
 | `GET /captures`       | Capture catalogue (metadata only), newest first.        |
 | `GET /captures/{id}`  | Stored metadata for a single capture.                   |
 | `GET /observations`   | Recent observation timeline (`?limit=`, `?kind=`).      |
@@ -267,3 +268,27 @@ non-positive interval, out-of-range dimensions or thresholds, a negative
 cooldown) are rejected at startup with a clear error. To actually receive frames
 when enabled, `[preview]` must also be enabled and running; otherwise motion
 detection sits truthfully in `waiting_for_frames`.
+
+## Notifications
+
+MGO includes an event-driven **notification framework foundation**. Producers
+(application startup/shutdown, the camera monitor, the motion monitor) publish
+typed events to a central manager, which fans them out to pluggable providers —
+business logic never calls a delivery transport directly. Only the
+transport-free `log` (application log) and `null` (discard) providers exist so
+far; Telegram/email are future work, as is any notification *policy*.
+
+```toml
+[notifications]
+enabled = false     # notifications are off unless explicitly enabled
+provider = "log"    # "log" or "null"
+```
+
+Defaults are safe: notifications are **disabled** and every published event is
+dropped. The `[notifications]` section is optional — configuration files
+without it load unchanged. `GET /notifications/status` reports the enabled
+state, configured providers, publish/failure counters and the last event
+timestamp; notifications are **not** persisted (observations remain the
+persistent timeline). Architecture, the event model, the provider contract and
+the future-transport path live in
+[`docs/Notifications.md`](docs/Notifications.md).
