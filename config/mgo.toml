@@ -62,6 +62,15 @@ changed_pixel_ratio_threshold = 0.08
 # (seconds); the eventual return to no-motion is never hidden.
 cooldown_seconds = 5.0
 
+[notifications]
+# Notification framework. Disabled by default: no provider is constructed and
+# every published event is dropped until this is explicitly enabled. Only the
+# transport-free providers exist so far — "log" (writes events to the
+# application log, for validation) and "null" (accepts and discards events).
+# Telegram/email/SMS are future work; their settings do NOT belong here yet.
+enabled = false
+provider = "log"
+
 [health]
 enabled = true
 collection_interval_seconds = 60

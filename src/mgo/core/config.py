@@ -100,6 +100,25 @@ class MotionConfig:
     cooldown_seconds: float
 
 
+SUPPORTED_NOTIFICATION_PROVIDERS = frozenset({"log", "null"})
+
+
+@dataclass(frozen=True)
+class NotificationsConfig:
+    """Notification framework settings.
+
+    ``enabled`` gates all notification delivery (disabled by default, so no
+    provider is ever constructed unless it is turned on). ``provider`` selects
+    the delivery provider; only the transport-free ``log`` and ``null``
+    providers exist in this task. Future transports (Telegram, email, ...)
+    extend this section with their own settings -- no tokens or SMTP details
+    belong here yet.
+    """
+
+    enabled: bool
+    provider: str
+
+
 @dataclass(frozen=True)
 class HealthConfig:
     """Configuration for health monitoring."""
@@ -123,6 +142,7 @@ class MGOConfig:
     camera: CameraConfig
     preview: PreviewConfig
     motion: MotionConfig
+    notifications: NotificationsConfig
     health: HealthConfig
 
 
@@ -225,6 +245,28 @@ def _validate_motion_config(motion: MotionConfig) -> None:
 
     if motion.cooldown_seconds < 0:
         raise ValueError("Motion cooldown cannot be negative")
+
+
+#: Sensible defaults for notifications when the ``[notifications]`` section is
+#: absent, so pre-existing configuration files keep loading unchanged with
+#: notifications disabled.
+_NOTIFICATIONS_DEFAULTS = {
+    "enabled": False,
+    "provider": "log",
+}
+
+
+def _validate_notifications_config(notifications: NotificationsConfig) -> None:
+    """Validate notification settings, rejecting unsupported providers."""
+    if (
+        notifications.provider.strip().lower()
+        not in SUPPORTED_NOTIFICATION_PROVIDERS
+    ):
+        supported = ", ".join(sorted(SUPPORTED_NOTIFICATION_PROVIDERS))
+        raise ValueError(
+            f"Unsupported notification provider {notifications.provider!r}; "
+            f"supported providers: {supported}"
+        )
 
 
 def _validate_camera_config(camera: CameraConfig) -> None:
@@ -401,6 +443,23 @@ def load_config(path: Path | None = None) -> MGOConfig:
     )
     _validate_motion_config(motion)
 
+    # The ``[notifications]`` section is optional so pre-Task-5 configuration
+    # files continue to load; absent keys fall back to safe (disabled) defaults.
+    notifications_data = raw.get("notifications", {})
+    notifications = NotificationsConfig(
+        enabled=bool(
+            notifications_data.get(
+                "enabled", _NOTIFICATIONS_DEFAULTS["enabled"]
+            )
+        ),
+        provider=str(
+            notifications_data.get(
+                "provider", _NOTIFICATIONS_DEFAULTS["provider"]
+            )
+        ),
+    )
+    _validate_notifications_config(notifications)
+
     return MGOConfig(
         application=ApplicationConfig(
             name=str(application_data["name"]),
@@ -416,5 +475,6 @@ def load_config(path: Path | None = None) -> MGOConfig:
         camera=camera,
         preview=preview,
         motion=motion,
+        notifications=notifications,
         health=health,
     )

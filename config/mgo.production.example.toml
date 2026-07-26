@@ -65,6 +65,15 @@ pixel_difference_threshold = 20
 changed_pixel_ratio_threshold = 0.08
 cooldown_seconds = 5.0
 
+[notifications]
+# Notification framework foundation. Only the transport-free providers exist so
+# far: "log" (application log, for validation) and "null" (discard). Real
+# transports (Telegram/email) are future work — no tokens or SMTP settings
+# belong here yet. Left DISABLED here; production enablement happens only
+# during an explicit validation step.
+enabled = false
+provider = "log"
+
 [health]
 enabled = true
 collection_interval_seconds = 60

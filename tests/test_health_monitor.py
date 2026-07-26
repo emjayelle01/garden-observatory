@@ -22,6 +22,7 @@ def _config_with_database(database_path: Path) -> MGOConfig:
         camera=config.camera,
         preview=config.preview,
         motion=config.motion,
+        notifications=config.notifications,
         health=config.health,
     )
 
