@@ -54,6 +54,7 @@ uv run pytest
 | `POST /camera/preview/stop`  | Stop the live preview process.                   |
 | `GET /camera/preview/stream` | Browser MJPEG live-preview stream.               |
 | `GET /preview`        | Simple browser live-preview page.                       |
+| `GET /dashboard`      | Local operational dashboard (browser page).             |
 | `GET /motion/status`  | The latest monitored motion-detection result.           |
 | `GET /notifications/status` | Notification framework status and counters.       |
 | `GET /captures`       | Capture catalogue (metadata only), newest first.        |
@@ -111,6 +112,45 @@ deliberately carries **no** version field.
 Full response contracts, fallback behaviour, the privacy exclusions, the
 compatibility promise and the production validation procedure live in
 [`docs/API.md`](docs/API.md).
+
+## Dashboard
+
+`GET /dashboard` is the **local operational dashboard** — the browser page an
+operator opens to see whether the appliance is well. With the application
+running, open:
+
+```text
+http://127.0.0.1:8000/dashboard
+```
+
+(or `http://<pi-hostname>:8080/dashboard` on the Pi). It shows application
+identity and version, overall health, hostname, uptime, CPU utilisation and
+temperature, memory, disk, database, camera readiness, preview state, motion
+status and notification status.
+
+It is deliberately inert and read-only. The route returns a **static HTML
+shell**: requesting it collects no health, touches no hardware, opens no
+database connection and starts nothing — in particular, **opening the
+dashboard never starts a preview or camera process**. Every live value is
+fetched by the browser from the existing contracts (`/health`, `/version`,
+`/motion/status`, `/notifications/status`), so the page cannot disagree with
+the API, and the browser only ever issues GET requests.
+
+Values refresh every 10 seconds on a non-overlapping loop. A source that fails
+is marked **stale** and keeps its last good reading rather than being blanked
+or zeroed, and the other cards keep updating. Nothing claims a healthy state
+before an API response has supplied one. There is no external stylesheet,
+script, font or CDN, so it works with no internet access.
+
+This is **local** functionality on a trusted LAN: no authentication, accounts
+or public exposure are added. `GET /` is unchanged and remains the minimal
+JSON identity endpoint; `/preview` remains where preview is controlled.
+**Bird recognition is future work** and the page says so.
+
+Purpose, architecture, data sources, refresh and stale-data design, card
+behaviour, accessibility and privacy boundaries, the testing approach, and the
+local and Raspberry Pi validation procedures live in
+[`docs/Dashboard.md`](docs/Dashboard.md).
 
 ## Database
 

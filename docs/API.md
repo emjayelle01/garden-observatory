@@ -245,6 +245,34 @@ would enlarge a production-validated contract for no need. This is an
 intentional decision and is asserted by a test, so changing it later is a
 deliberate contract change rather than an accident.
 
+## `GET /dashboard` — browser interface, not a JSON contract
+
+`GET /dashboard` returns **HTML**, not JSON. It is a browser interface, and it
+has **no response-body contract**: nothing should parse it, and its markup may
+change freely without that being an API change. It is documented here only so
+the endpoint list is complete.
+
+```text
+GET /dashboard   ->   200, text/html
+```
+
+It is a **static shell**. The route returns a constant document and performs
+no work: no health collection, no hardware detection, no database I/O, no
+subprocess, no monitor, no camera or preview action and no state mutation.
+
+All of its live values are fetched **by the browser** from the contracts
+documented here and alongside their own subsystems — `/health`, `/version`,
+`/motion/status` and `/notifications/status`. It therefore *consumes* existing
+contracts and defines none of its own, and it can never report something the
+API did not say. The browser issues GET requests only.
+
+`GET /` is unchanged: it remains the minimal three-key JSON identity endpoint
+and is **not** redirected to the dashboard. `/preview` is likewise unchanged.
+Adding `/dashboard` changed no existing route, field, type, unit or status
+value.
+
+See [`docs/Dashboard.md`](Dashboard.md) for the page itself.
+
 ## Compatibility promise
 
 - `/` keeps its exact three keys and their values. Only the *source* of

@@ -2,8 +2,31 @@
 
 ## Status
 
-Defined. Implementation follows in a separate commit on
-`task-009-dashboard-shell`.
+**Implemented on `task-009-dashboard-shell`; not merged, and not validated on
+the Raspberry Pi.**
+
+Delivered exactly as decided below, with no deviation:
+
+- `src/mgo/api/dashboard_page.py` — the self-contained page and
+  `render_dashboard_page()`;
+- `src/mgo/api/app.py` — `GET /dashboard` registered on the production
+  application object (two additions: the import and the route);
+- `tests/test_dashboard.py` — 108 tests covering the route, its isolation, the
+  browser source contract, formatting safety, privacy and the compatibility of
+  the endpoints it consumes;
+- `docs/Dashboard.md`, plus `README.md` and `docs/API.md` updates.
+
+No dependency was added; `pyproject.toml` and `uv.lock` are unchanged. No
+existing API contract, status vocabulary, configuration file, migration or
+systemd unit was touched.
+
+Validation on this workstation: `ruff` passed, `mypy src` passed (39 source
+files), `pytest` 618 passed (baseline 510 + 108 added). The page was also
+loaded in a real browser against a local `uvicorn` run and exercised — live
+values, the refresh cadence, non-overlapping cycles, partial-failure staleness
+and the responsive layout were all confirmed. **Raspberry Pi validation has
+not been performed**; the procedure for Matthew to run is in
+[`docs/Dashboard.md`](../Dashboard.md).
 
 ## Authoritative definition
 
