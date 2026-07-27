@@ -2,8 +2,17 @@
 
 ## Status
 
-**Implemented on `task-009-dashboard-shell`; not merged, and not validated on
-the Raspberry Pi.**
+**Complete and validated. Approved for pull request, fast-forward merge and
+deployment from `main`.**
+
+| Gate | Outcome |
+| ---- | ------- |
+| Implementation | Complete |
+| Repository review | Complete |
+| Corrective review | Complete |
+| Local static and automated validation | Passed |
+| Manual browser validation | Passed |
+| Raspberry Pi validation | **Passed** — performed and confirmed by Matthew |
 
 Delivered exactly as decided below, with no deviation:
 
@@ -29,14 +38,37 @@ No dependency was added; `pyproject.toml` and `uv.lock` are unchanged. No
 existing API contract, status vocabulary, configuration file, migration or
 systemd unit was touched.
 
-Validation on this workstation: `ruff` passed, `mypy src` passed (39 source
-files), `pytest` 633 passed (baseline 510 + 123 added). The page was also
-loaded in a real browser against a local `uvicorn` run and exercised — live
-values, the refresh cadence, non-overlapping cycles, the responsive layout,
-and every failure state: first-load partial failure, first-load total failure,
-recovery, failure after success, and malformed payloads both before and after
-a successful reading. **Raspberry Pi validation has not been performed**; the
-procedure for Matthew to run is in [`docs/Dashboard.md`](../Dashboard.md).
+Validation on the development workstation: `ruff` passed, `mypy src` passed (39
+source files), `pytest` 633 passed (baseline 510 + 123 added). The page was
+also loaded in a real browser against a local `uvicorn` run and exercised —
+live values, the refresh cadence, non-overlapping cycles, the responsive
+layout, and every failure state: first-load partial failure, first-load total
+failure, recovery, failure after success, and malformed payloads both before
+and after a successful reading.
+
+### Raspberry Pi validation
+
+**Passed.** The Raspberry Pi validation was **performed and confirmed by
+Matthew**, not by an automated agent. Matthew confirmed that all prescribed
+Task 9 Raspberry Pi validation steps — the procedure in
+[`docs/Dashboard.md`](../Dashboard.md) — passed.
+
+The validated runtime-code SHA was:
+
+```text
+e0d0511e2bbc571d3b5a8558051b8faeadea6662
+```
+
+Only this task record changed after that SHA. Runtime code, tests,
+dependencies, configuration, migrations and deployment scripts are unchanged
+from the commit that was validated on the Pi, so the merged result runs the
+code that passed.
+
+No detailed Pi readings are reproduced here: this record states the confirmed
+outcome only, and does not restate measurements, timings, process identifiers
+or journal contents that would be second-hand.
+
+No Task 10, Task 11 or Task 12 work has been started.
 
 ## Authoritative definition
 
