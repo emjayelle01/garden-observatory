@@ -71,6 +71,19 @@ cooldown_seconds = 5.0
 enabled = false
 provider = "log"
 
+[database]
+# SQLite runtime settings. The database LOCATION is not here — it is
+# [storage].database_path, the single source of truth for that path.
+#
+# The schema is versioned by ordered SQL migrations under migrations/, applied
+# automatically at startup. See docs/Database.md.
+#
+# How often the background monitor runs the read-only health check (seconds).
+health_check_interval_seconds = 60
+# Finite time SQLite waits for a competing writer's lock before failing with
+# "database is locked". A bound, never a retry loop.
+busy_timeout_seconds = 5.0
+
 [health]
 enabled = true
 collection_interval_seconds = 60

@@ -15,10 +15,13 @@ logs/*
 data/*
 !data/.gitkeep
 
-# SQLite
+# SQLite (including the WAL/shm sidecars a running database leaves alongside it)
 *.db
 *.sqlite
 *.sqlite3
+*-wal
+*-shm
+*.db-journal
 
 # macOS
 .DS_Store

@@ -44,7 +44,8 @@ uv run pytest
 | Endpoint              | Description                                             |
 | --------------------- | ------------------------------------------------------- |
 | `GET /`               | Application identity.                                   |
-| `GET /health`         | System health plus the current camera readiness state. |
+| `GET /health`         | System health plus database, camera readiness and preview. |
+| `GET /database/status`| The latest monitored database-health check result.      |
 | `GET /camera/status`  | The latest monitored camera readiness result.          |
 | `POST /camera/capture`| Capture one still image; returns its stored metadata.   |
 | `GET /camera/preview/status` | Current live-preview lifecycle status.           |
@@ -63,6 +64,59 @@ uv run pytest
 absolute path, UTC timestamp, dimensions, filesize). Expected failures map to
 meaningful statuses: `503` when the camera is disabled/unavailable, `504` on a
 capture timeout, `502` on a backend failure, and `500` on a write failure.
+
+## Database
+
+MGO keeps everything it records — the observation timeline and the capture
+catalogue — in a single SQLite database at `[storage].database_path`
+(`data/mgo.db` in development, `/var/lib/garden-observatory/db/mgo.db` in
+production).
+
+The schema is versioned by ordered numbered SQL files under `migrations/`,
+tracked in a `schema_migrations` table and applied automatically at startup:
+
+- each migration runs in **its own transaction**, so a failure rolls back
+  completely and the schema is never left part-way through;
+- re-running is a no-op once the database is current;
+- an existing **unversioned** database is verified against the supported table
+  shape and adopted without touching its data — it is never assumed to be empty;
+- a database recording a version **newer** than the running build is refused,
+  and startup fails rather than opening it.
+
+Connections enforce foreign keys, use WAL journalling (verified, not assumed)
+and a finite `busy_timeout`. A migration failure prevents the application from
+starting, so it never serves against a schema it cannot trust.
+
+```toml
+[database]
+health_check_interval_seconds = 60   # read-only health check cadence
+busy_timeout_seconds = 5.0           # finite wait for a competing writer
+```
+
+The `[database]` section is optional — configuration files without it load
+unchanged with the same values the application already used.
+
+### `GET /health` and `GET /database/status`
+
+A background monitor runs a **read-only** check (`PRAGMA quick_check(1)`) and
+both endpoints serve that cached result: neither performs database I/O per
+request, and neither can run a migration, create a table or repair anything.
+`/health` gains a `database` section — every pre-existing field keeps its name
+and meaning — and the database now contributes to the top-level status:
+
+| Database state | Meaning | `/health` status |
+| -------------- | ------- | ---------------- |
+| `healthy`  | Sound, at the expected schema version, foreign keys on, WAL in use. | `healthy` |
+| `degraded` | Usable, but the schema is behind, foreign keys are off, or WAL is not in use. | `warning` |
+| `unhealthy`| Unreachable, corrupt, unversioned, or newer than this build supports. | `critical` |
+
+Camera readiness is reported independently, so a database fault is never
+mislabelled as a camera failure.
+
+Backup and restore are **not** implemented in this task. The file layout, the
+migration and adoption rules, the health-check policy, operator troubleshooting
+and the production validation procedure live in
+[`docs/Database.md`](docs/Database.md).
 
 ## Remote access & deployment
 

@@ -46,7 +46,13 @@ from mgo.core.camera_detection import build_detector
 from mgo.core.camera_monitor import perform_camera_check, run_camera_monitor
 from mgo.core.config import load_config
 from mgo.core.database import apply_migrations
-from mgo.core.health import collect_health
+from mgo.core.database_health import (
+    DatabaseHealth,
+    DatabaseHealthState,
+    unavailable_health,
+)
+from mgo.core.database_monitor import perform_database_check, run_database_monitor
+from mgo.core.health import collect_health, worst_status
 from mgo.core.health_monitor import run_health_monitor
 from mgo.core.observations import list_observations, record_observation
 from mgo.motion import (
@@ -86,6 +92,18 @@ def _current_motion_result(app: FastAPI) -> MotionResult:
     state: MotionState | None = getattr(app.state, "motion_state", None)
     result = state.get() if state is not None else None
     return result if result is not None else default_motion_result(config.motion)
+
+
+def _current_database_health(app: FastAPI) -> DatabaseHealth:
+    """Return the latest checked database health, or a safe startup default.
+
+    Reads application-managed state only. Requesting the status never opens a
+    database connection, so the endpoint cannot add load to -- or block on -- a
+    struggling database.
+    """
+    state: DatabaseHealthState | None = getattr(app.state, "database_state", None)
+    health = state.get() if state is not None else None
+    return health if health is not None else unavailable_health(config)
 
 
 def _notification_manager(app: FastAPI) -> NotificationManager:
@@ -167,6 +185,27 @@ class NotificationStatusResponse(BaseModel):
     last_event_at: str | None
 
 
+class DatabaseStatusResponse(BaseModel):
+    """Typed, read-only projection of the latest database-health check.
+
+    ``database`` is the database file's *name*, not its absolute path: the
+    status endpoints expose no filesystem layout, and the configured path is
+    already available to an operator from the configuration file.
+    """
+
+    status: str
+    accessible: bool
+    database: str
+    schema_version: int | None
+    expected_schema_version: int
+    migration_status: str
+    journal_mode: str | None
+    foreign_keys: bool
+    integrity: str
+    detail: str
+    checked_at: str
+
+
 class MotionStatusResponse(BaseModel):
     """Typed, read-only projection of the latest motion-monitor state."""
 
@@ -204,7 +243,10 @@ def _capture_archive(app: FastAPI) -> CaptureArchive:
     archive: CaptureArchive | None = getattr(app.state, "capture_archive", None)
     if archive is not None:
         return archive
-    apply_migrations(config.storage.database_path)
+    apply_migrations(
+        config.storage.database_path,
+        busy_timeout_seconds=config.database.busy_timeout_seconds,
+    )
     archive = CaptureArchive(config.storage.database_path)
     app.state.capture_archive = archive
     return archive
@@ -246,14 +288,33 @@ def _preview_broker(app: FastAPI) -> MjpegBroker:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Initialise persistent MGO services during application startup."""
-    applied_versions = apply_migrations(config.storage.database_path)
+    """Initialise persistent MGO services during application startup.
+
+    Ordering is deliberate and load-bearing: configuration is already resolved
+    at import time, the database is migrated *first*, and its health is
+    established before any other service exists. Migration failure propagates
+    out of the lifespan so the application refuses to start rather than serving
+    against a schema it cannot trust -- there is no partially migrated running
+    state. Camera, preview, motion and notification startup all follow, and
+    none of them can affect database health.
+    """
+    applied_versions = apply_migrations(
+        config.storage.database_path,
+        busy_timeout_seconds=config.database.busy_timeout_seconds,
+    )
 
     # The numbered migration runner creates the ``captures`` table (migration
     # 002) alongside the observation schema in the shared database. The archive
     # only needs the shared path; it opens bounded connections per operation and
     # never manages its own engine or schema.
     app.state.capture_archive = CaptureArchive(config.storage.database_path)
+
+    # Establish the initial database-health state before serving, so /health
+    # and /database/status are truthful from the first request rather than
+    # reporting an "unevaluated" placeholder until the first monitor tick.
+    database_state = DatabaseHealthState()
+    app.state.database_state = database_state
+    await asyncio.to_thread(perform_database_check, config, database_state)
 
     if applied_versions:
         record_observation(
@@ -287,6 +348,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     health_task = asyncio.create_task(
         run_health_monitor(config, stop_event),
         name="mgo-health-monitor",
+    )
+
+    # The initial check already ran above; the monitor waits one interval
+    # before its first periodic re-check to avoid a duplicate startup check.
+    database_stop_event = asyncio.Event()
+    database_task = asyncio.create_task(
+        run_database_monitor(
+            config,
+            database_state,
+            database_stop_event,
+            run_initial=False,
+        ),
+        name="mgo-database-monitor",
     )
 
     camera_state = CameraState()
@@ -371,9 +445,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         stop_event.set()
+        database_stop_event.set()
         camera_stop_event.set()
         motion_stop_event.set()
-        monitor_tasks = [health_task, camera_task]
+        monitor_tasks = [health_task, database_task, camera_task]
         if motion_task is not None:
             monitor_tasks.append(motion_task)
         await asyncio.gather(*monitor_tasks)
@@ -412,15 +487,55 @@ def root() -> dict[str, str]:
 
 @app.get("/health")
 def health(request: Request) -> dict[str, Any]:
-    """Return live system health, camera readiness and preview status.
+    """Return live system health, database, camera readiness and preview status.
 
     A stopped preview is not an error: preview is reported for visibility only
-    and never changes the overall health status.
+    and never changes the overall health status. The database *does* affect the
+    top-level status, because nothing the application records can be trusted
+    while its database is unusable -- a degraded database contributes
+    ``warning`` and an unhealthy one ``critical``. Camera readiness is reported
+    independently, so a database problem is never mislabelled as a camera
+    failure (and vice versa).
+
+    The database section reads the state recorded by the background monitor; no
+    database I/O happens per request.
     """
     result = collect_health(config)
+    database_health = _current_database_health(request.app)
+    result["database"] = database_health.health_dict()
+    result["status"] = worst_status(
+        str(result["status"]),
+        database_health.severity,
+    )
     result["camera"] = _current_camera_readiness(request.app).as_dict()
     result["preview"] = _preview_service(request.app).status().health_dict()
     return result
+
+
+@app.get("/database/status")
+def database_status(request: Request) -> DatabaseStatusResponse:
+    """Return the latest database-health check result.
+
+    Read-only and truthful: it reflects the most recent result recorded by the
+    background database monitor and never opens a database connection, runs a
+    migration or repairs anything itself. Always returns HTTP 200 when the
+    application is serving -- including when the database itself is unhealthy,
+    which is reported in ``status`` rather than as an HTTP error.
+    """
+    health_result = _current_database_health(request.app)
+    return DatabaseStatusResponse(
+        status=health_result.status.value,
+        accessible=health_result.accessible,
+        database=health_result.database_name,
+        schema_version=health_result.schema_version,
+        expected_schema_version=health_result.expected_schema_version,
+        migration_status=health_result.migration_status.value,
+        journal_mode=health_result.journal_mode,
+        foreign_keys=health_result.foreign_keys_enabled,
+        integrity=health_result.integrity,
+        detail=health_result.detail,
+        checked_at=health_result.checked_at.isoformat(),
+    )
 
 
 @app.get("/camera/status")

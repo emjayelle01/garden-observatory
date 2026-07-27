@@ -82,6 +82,20 @@ cooldown_seconds = 5.0
 enabled = false
 provider = "log"
 
+[database]
+# SQLite runtime settings. The database FILE is [storage].database_path above —
+# /var/lib/garden-observatory/db/mgo.db, inside the state directory owned by the
+# "mgo" runtime account (see docs/Service-Identity.md). Its WAL and shm sidecars
+# are written alongside it, so that directory must stay writable by the service.
+#
+# The schema is versioned and migrated automatically at startup; a database
+# newer than the running build is refused rather than opened. See
+# docs/Database.md.
+health_check_interval_seconds = 60
+# Bounded wait for a competing writer's lock. Five seconds comfortably covers
+# the short transactions this application makes on SD-card storage.
+busy_timeout_seconds = 5.0
+
 [health]
 enabled = true
 collection_interval_seconds = 60

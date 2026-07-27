@@ -194,6 +194,25 @@ class NotificationsConfig:
 
 
 @dataclass(frozen=True)
+class DatabaseConfig:
+    """SQLite runtime settings.
+
+    The database *location* deliberately does not live here: it is already
+    ``storage.database_path``, and a second setting naming the same file would
+    create two sources of truth for the most safety-critical path in the
+    deployment. This section carries only the runtime knobs.
+
+    ``health_check_interval_seconds`` is how often the background monitor runs
+    the read-only health check. ``busy_timeout_seconds`` is the finite time
+    SQLite waits for a competing writer's lock before failing -- a bound, never
+    a retry loop.
+    """
+
+    health_check_interval_seconds: int
+    busy_timeout_seconds: float
+
+
+@dataclass(frozen=True)
 class HealthConfig:
     """Configuration for health monitoring."""
 
@@ -217,6 +236,7 @@ class MGOConfig:
     preview: PreviewConfig
     motion: MotionConfig
     notifications: NotificationsConfig
+    database: DatabaseConfig
     health: HealthConfig
 
 
@@ -340,6 +360,37 @@ def _validate_notifications_config(notifications: NotificationsConfig) -> None:
         raise ValueError(
             f"Unsupported notification provider {notifications.provider!r}; "
             f"supported providers: {supported}"
+        )
+
+
+#: Sensible defaults for the database when the ``[database]`` section is
+#: absent, so pre-Task-7 configuration files keep loading unchanged. They match
+#: the values the application used before the section existed: a five-second
+#: busy timeout and the same one-minute cadence the health monitor uses.
+_DATABASE_DEFAULTS = {
+    "health_check_interval_seconds": 60,
+    "busy_timeout_seconds": 5.0,
+}
+
+#: Upper bound for the SQLite busy timeout. A longer wait would stall a request
+#: rather than surfacing a stuck writer.
+_MAX_BUSY_TIMEOUT_SECONDS = 60.0
+
+
+def _validate_database_config(database: DatabaseConfig) -> None:
+    """Validate SQLite runtime settings, rejecting unusable values."""
+    if database.health_check_interval_seconds < 10:
+        raise ValueError(
+            "Database health check interval must be at least 10 seconds"
+        )
+
+    if database.busy_timeout_seconds <= 0:
+        raise ValueError("Database busy timeout must be positive")
+
+    if database.busy_timeout_seconds > _MAX_BUSY_TIMEOUT_SECONDS:
+        raise ValueError(
+            "Database busy timeout must not exceed "
+            f"{_MAX_BUSY_TIMEOUT_SECONDS} seconds"
         )
 
 
@@ -534,6 +585,26 @@ def load_config(path: Path | None = None) -> MGOConfig:
     )
     _validate_notifications_config(notifications)
 
+    # The ``[database]`` section is optional so pre-Task-7 configuration files
+    # continue to load; absent keys fall back to the values the application
+    # already used, so an existing deployment behaves identically.
+    database_data = raw.get("database", {})
+    database = DatabaseConfig(
+        health_check_interval_seconds=int(
+            database_data.get(
+                "health_check_interval_seconds",
+                _DATABASE_DEFAULTS["health_check_interval_seconds"],
+            )
+        ),
+        busy_timeout_seconds=float(
+            database_data.get(
+                "busy_timeout_seconds",
+                _DATABASE_DEFAULTS["busy_timeout_seconds"],
+            )
+        ),
+    )
+    _validate_database_config(database)
+
     return MGOConfig(
         application=ApplicationConfig(
             name=str(application_data["name"]),
@@ -550,5 +621,6 @@ def load_config(path: Path | None = None) -> MGOConfig:
         preview=preview,
         motion=motion,
         notifications=notifications,
+        database=database,
         health=health,
     )

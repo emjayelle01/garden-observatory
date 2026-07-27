@@ -50,8 +50,13 @@ def _usage_status(value: float, warning: float, critical: float) -> str:
     return "healthy"
 
 
-def _worst_status(*statuses: str) -> str:
-    """Return the most severe known status."""
+def worst_status(*statuses: str) -> str:
+    """Return the most severe known status.
+
+    The single place the application's severity ordering is defined, so every
+    component that folds into the overall health status -- system resources
+    here, the database at the API layer -- agrees on what "worse" means.
+    """
     severity = {"unknown": 0, "healthy": 1, "warning": 2, "critical": 3}
     return max(statuses, key=lambda status: severity.get(status, 0))
 
@@ -74,7 +79,7 @@ def collect_health(config: MGOConfig) -> dict[str, Any]:
         config.health.memory_warning_percent,
         config.health.memory_critical_percent,
     )
-    overall_status = _worst_status(
+    overall_status = worst_status(
         temperature_status,
         disk_status,
         memory_status,
