@@ -5,13 +5,87 @@ from __future__ import annotations
 import os
 import tomllib
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "mgo.toml"
 
 #: Environment variable that selects an external configuration file.
 CONFIG_PATH_ENV = "MGO_CONFIG_PATH"
+
+# --- Production service identity and filesystem layout ---------------------
+#
+# The constants below describe the *deployment host* (Raspberry Pi OS) layout
+# under which MGO runs in production: a dedicated, non-login service account
+# and a persistent filesystem layout separate from any operator's home
+# directory. They are the single source of truth shared by the production
+# example configuration, the systemd unit template, the provisioning scripts
+# and the documentation.
+#
+# They are deliberately :class:`~pathlib.PurePosixPath` values rather than
+# :class:`~pathlib.Path`: they name locations on the Linux deployment host and
+# are never opened on the Windows development machine. Nothing in the
+# application resolves configuration from them implicitly -- the effective
+# configuration path is still chosen only by :func:`resolve_config_path`, so
+# existing deployments keep loading exactly the file they load today.
+
+#: Dedicated non-login runtime account the service runs as.
+SERVICE_ACCOUNT = "mgo"
+
+#: Primary group owning the persistent application data.
+SERVICE_GROUP = "mgo"
+
+#: Supplementary group granting access to the Raspberry Pi camera devices
+#: (``/dev/video*``, ``/dev/media*``, ``/dev/vchiq``). It is the only
+#: supplementary group the runtime account needs.
+CAMERA_GROUP = "video"
+
+#: systemd unit that runs the application under the dedicated identity.
+SERVICE_UNIT_NAME = "mgo.service"
+
+#: Read-only configuration directory (owned by ``root``, readable by the
+#: runtime group, so the service cannot rewrite its own configuration).
+SYSTEM_CONFIG_DIRECTORY = PurePosixPath("/etc/garden-observatory")
+
+#: Canonical production configuration file.
+SYSTEM_CONFIG_PATH = SYSTEM_CONFIG_DIRECTORY / "mgo.toml"
+
+#: Persistent application data root, owned by the runtime account.
+SYSTEM_STATE_DIRECTORY = PurePosixPath("/var/lib/garden-observatory")
+
+#: Database directory (SQLite file plus its WAL/shm sidecars).
+SYSTEM_DATABASE_DIRECTORY = SYSTEM_STATE_DIRECTORY / "db"
+
+#: Media root for captured imagery.
+SYSTEM_MEDIA_DIRECTORY = SYSTEM_STATE_DIRECTORY / "media"
+
+#: Queue spool directory. Reserved for future asynchronous work (for example
+#: pending notification deliveries); nothing writes to it yet.
+SYSTEM_QUEUE_DIRECTORY = SYSTEM_STATE_DIRECTORY / "queues"
+
+#: Volatile-but-persisted runtime state (markers, cursors) that must survive a
+#: restart. Reserved; nothing writes to it yet.
+SYSTEM_RUNTIME_STATE_DIRECTORY = SYSTEM_STATE_DIRECTORY / "state"
+
+#: Log directory. Application logging goes to the journal via stdout/stderr;
+#: this exists for any file-based log destination and for ``log_directory``.
+SYSTEM_LOG_DIRECTORY = PurePosixPath("/var/log/garden-observatory")
+
+#: Production database file.
+SYSTEM_DATABASE_PATH = SYSTEM_DATABASE_DIRECTORY / "mgo.db"
+
+#: Production capture directory.
+SYSTEM_CAPTURE_DIRECTORY = SYSTEM_MEDIA_DIRECTORY / "captures"
+
+#: Every directory the deployment provisions beneath the state root, in
+#: creation order (parents first).
+SYSTEM_STATE_SUBDIRECTORIES: tuple[PurePosixPath, ...] = (
+    SYSTEM_DATABASE_DIRECTORY,
+    SYSTEM_MEDIA_DIRECTORY,
+    SYSTEM_CAPTURE_DIRECTORY,
+    SYSTEM_QUEUE_DIRECTORY,
+    SYSTEM_RUNTIME_STATE_DIRECTORY,
+)
 
 
 @dataclass(frozen=True)

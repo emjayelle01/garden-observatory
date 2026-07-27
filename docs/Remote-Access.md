@@ -23,9 +23,14 @@ configuration and never commits machine-specific secrets.
 ## 1. Assumptions and placeholders
 
 - The Pi runs **Raspberry Pi OS** (Bookworm or later) on a trusted LAN.
-- The MGO repository lives at `~/Projects/garden-observatory` on the Pi and the
-  service is `mgo.service` (see the project README and
-  `config/mgo.production.example.toml`).
+- The MGO repository lives at `/opt/garden-observatory` on the Pi (owned by the
+  administrative account, readable by the runtime group) and the service is
+  `mgo.service`. See the project README,
+  `config/mgo.production.example.toml` and
+  [`Service-Identity.md`](Service-Identity.md).
+- The service itself runs as the dedicated non-login `mgo` account, **not** as
+  `<pi-user>`. Everything in this document concerns the *administrative*
+  identity only; the two never overlap.
 - The admin workstation is Matthew's **Windows** development machine with the
   built-in OpenSSH client (`ssh`, `ssh-keygen`) available in PowerShell or Git
   Bash. Verify with `ssh -V`.
@@ -85,7 +90,7 @@ safe (idempotent).
 On the Pi you can confirm the setup non-destructively at any time:
 
 ```bash
-bash ~/Projects/garden-observatory/scripts/ssh/verify-key-auth.sh
+bash /opt/garden-observatory/scripts/ssh/verify-key-auth.sh
 ```
 
 ---
@@ -157,7 +162,7 @@ Verify and switch the repository remote to SSH:
 
 ```bash
 ssh -T git@github.com                 # expect a GitHub greeting (no shell)
-cd ~/Projects/garden-observatory
+cd /opt/garden-observatory
 git remote set-url origin git@github.com:emjayelle01/garden-observatory.git
 git remote -v
 ```
@@ -169,29 +174,39 @@ Normal Git operations then work over SSH: `git fetch`, `git pull --ff-only`,
 
 ## 8. Deployment — align the Pi to `main`
 
-Deployment is unchanged from prior tasks: align to `main` and restart the
-service. Use the helper:
+Deployment is unchanged in shape: align to `main` and restart the service. Use
+the helper:
 
 ```bash
-bash ~/Projects/garden-observatory/scripts/deploy/update-main.sh
+bash /opt/garden-observatory/scripts/deploy/update-main.sh
 ```
 
 or the equivalent manual steps:
 
 ```bash
-cd ~/Projects/garden-observatory
+cd /opt/garden-observatory
 git fetch origin
 git checkout main
 git pull --ff-only origin main
 git rev-parse HEAD
 uv sync
+sudo chgrp -R mgo /opt/garden-observatory
+sudo chmod -R g+rX /opt/garden-observatory
 sudo systemctl restart mgo.service
 systemctl --no-pager --full status mgo.service
 ```
 
+The `chgrp`/`chmod` step keeps newly pulled or synced files readable by the
+runtime account; the helper does it for you.
+
 The deploy helper is **non-destructive**: it refuses to run with a dirty working
-tree, only fast-forwards `main`, and prints the service status and a health
-probe afterwards. It never changes SSH configuration.
+tree, only fast-forwards `main`, and prints the service status plus probes of
+the four status endpoints afterwards. It never changes SSH configuration.
+
+The **first** deployment onto the dedicated service identity has extra one-time
+steps (moving the checkout to `/opt`, provisioning the account and directories,
+carrying existing data across). Those are in
+[`Service-Identity.md` §7](Service-Identity.md#7-deployment).
 
 ---
 
@@ -233,3 +248,8 @@ fix these):
   the hardening that the new requirement actually justifies.
 - This task does **not** add authentication to the MGO web UI or API — remote
   administration is via SSH only, and the API stays on the LAN as before.
+- **The runtime identity is separate.** The service runs as the non-login `mgo`
+  account, which has no password, no shell, no capabilities and no
+  administrative group membership — it cannot be used to log in over SSH or
+  otherwise. Compromising the service does not yield the administrative account.
+  See [`Service-Identity.md`](Service-Identity.md).

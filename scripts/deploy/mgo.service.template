@@ -1,0 +1,93 @@
+# Matt's Garden Observatory — systemd unit TEMPLATE.
+#
+# This file is a template, not an installed unit. The placeholders below are
+# substituted by scripts/deploy/install-service-identity.sh, which renders it
+# to /etc/systemd/system/mgo.service:
+#
+#   @APP_ROOT@       absolute path of the application checkout on the Pi
+#   @SERVICE_USER@   dedicated non-login runtime account (default: mgo)
+#   @SERVICE_GROUP@  primary runtime group (default: mgo)
+#   @CAMERA_GROUP@   supplementary group for camera devices (default: video)
+#   @CONFIG_PATH@    production configuration file
+#   @HOST@ / @PORT@  bind address and port
+#
+# The service runs as an unprivileged, non-login account with no Linux
+# capabilities. Only systemd's own start-up runs as root.
+
+[Unit]
+Description=Matt's Garden Observatory (MGO) API
+Documentation=https://github.com/emjayelle01/garden-observatory
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+
+# --- runtime identity ------------------------------------------------------
+# The dedicated service account. It owns the persistent data directories and
+# nothing else; it has no login shell and no administrative access. The
+# supplementary group is the minimum needed to reach the camera devices.
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+SupplementaryGroups=@CAMERA_GROUP@
+
+# --- application -----------------------------------------------------------
+# The virtualenv interpreter is invoked directly: no package manager runs at
+# service start, so the runtime account never needs write access to the
+# application checkout.
+WorkingDirectory=@APP_ROOT@
+Environment=MGO_CONFIG_PATH=@CONFIG_PATH@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@APP_ROOT@/.venv/bin/uvicorn mgo.api.app:app --host @HOST@ --port @PORT@
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# --- persistent state ------------------------------------------------------
+# systemd creates and chowns these to User=/Group= on every start, so a fresh
+# machine needs no manual directory setup. They are also the only paths under
+# ProtectSystem=strict that stay writable.
+#   db/      SQLite database and its WAL/shm sidecars
+#   media/   captured imagery
+#   queues/  reserved for future asynchronous delivery work
+#   state/   reserved for persisted runtime markers
+StateDirectory=garden-observatory garden-observatory/db garden-observatory/media garden-observatory/media/captures garden-observatory/queues garden-observatory/state
+StateDirectoryMode=0750
+LogsDirectory=garden-observatory
+LogsDirectoryMode=0750
+
+# --- least privilege -------------------------------------------------------
+# No capabilities are granted or retained: the port is above 1024 and camera
+# access comes from group membership, so the service needs none.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+UMask=0027
+
+# The whole filesystem is read-only apart from the state/log directories above
+# and the service's private /tmp. Operator home directories are unreachable,
+# which keeps administrative SSH access separate from the runtime identity.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+
+# NOTE: PrivateDevices= is deliberately NOT enabled. The camera pipeline needs
+# the real /dev/video*, /dev/media* and /dev/vchiq nodes; access to them is
+# already restricted to members of @CAMERA_GROUP@.
+
+[Install]
+WantedBy=multi-user.target

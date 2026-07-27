@@ -291,10 +291,10 @@ and the automated tests never require hardware or run `rpicam-*` commands.
 Perform this only after the feature branch has been reviewed and approved. Do
 **not** merge before validation.
 
-1. **Back up** the existing production configuration
-   (`sudo cp /etc/mgo/mgo.toml /etc/mgo/mgo.toml.bak`).
+1. **Back up** the existing production configuration (`sudo cp
+   /etc/garden-observatory/mgo.toml /etc/garden-observatory/mgo.toml.bak`).
 2. Align the Pi to the feature branch (`task-004-motion-detection-foundation`).
-3. Add a temporary `[motion]` section to `/etc/mgo/mgo.toml` with
+3. Add a temporary `[motion]` section to `/etc/garden-observatory/mgo.toml` with
    `enabled = true`, and ensure `[preview]` is enabled.
 4. Start the service.
 5. Confirm `GET /health` is healthy.
@@ -312,8 +312,9 @@ Perform this only after the feature branch has been reviewed and approved. Do
 13. Confirm browser preview and the motion monitor **coexist**.
 14. Stop the service; confirm **no orphaned `rpicam-vid` process** remains
     (`pgrep -a rpicam-vid` returns nothing).
-15. If validation fails, **restore** the backed-up configuration
-    (`sudo mv /etc/mgo/mgo.toml.bak /etc/mgo/mgo.toml`) and restart.
+15. If validation fails, **restore** the backed-up configuration (`sudo mv
+    /etc/garden-observatory/mgo.toml.bak /etc/garden-observatory/mgo.toml`) and
+    restart.
 
 Production enablement of motion detection happens only during this explicit
 validation step; the merged default keeps motion **disabled**.

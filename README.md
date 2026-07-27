@@ -75,6 +75,39 @@ a fallback (SSH hardening is out of current scope). Optional, non-destructive
 operator helper scripts are in [`scripts/`](scripts/README.md). These are
 operator procedures only; they do not change application behaviour.
 
+## Service identity
+
+In production MGO runs as a dedicated, non-login system account — `mgo` — with
+its persistent data outside any operator's home directory. Administrative SSH
+access and the runtime identity are completely separate: the service account
+cannot log in, holds no Linux capabilities, and belongs to no administrative
+group.
+
+| Location | Owner | Mode | Contents |
+| -------- | ----- | ---- | -------- |
+| `/etc/garden-observatory/` | `root:mgo` | `0750` | `mgo.toml` (`0640`) — readable, never writable, by the service |
+| `/var/lib/garden-observatory/` | `mgo:mgo` | `0750` | `db/`, `media/captures/`, `queues/`, `state/` |
+| `/var/log/garden-observatory/` | `mgo:mgo` | `0750` | file-based logs (the journal remains primary) |
+
+Its only supplementary group is `video`, which grants camera device access.
+Nothing is world-readable or world-writable.
+
+Provision it once on the Pi, then verify:
+
+```bash
+sudo bash scripts/deploy/install-service-identity.sh
+```
+
+```bash
+sudo bash scripts/deploy/verify-service-identity.sh
+```
+
+The account, groups, directory layout, ownership and permission model, the
+systemd unit, the migration steps for an existing deployment, and
+troubleshooting live in [`docs/Service-Identity.md`](docs/Service-Identity.md).
+This is a deployment foundation only — the API, camera pipeline, motion
+detection and notifications are unchanged.
+
 ## Configuration
 
 Configuration is loaded and validated from `config/mgo.toml`. Invalid values
@@ -100,7 +133,8 @@ assumed to exist, and no image capture is ever attempted.
 By default the application loads the tracked development configuration at
 `config/mgo.toml` (camera disabled). Production deployments keep their
 machine-specific settings in an **external** file that is never committed to
-Git — the intended location is `/etc/mgo/mgo.toml`.
+Git — the canonical location is `/etc/garden-observatory/mgo.toml`, owned
+`root:mgo` with mode `0640` (see [Service identity](#service-identity)).
 
 Selection is controlled by the `MGO_CONFIG_PATH` environment variable:
 
@@ -119,16 +153,21 @@ fallback to `config/mgo.toml`. Invalid TOML or an invalid configuration (bad
 thresholds, unsupported backend, non-positive interval, and so on) fails at
 startup exactly as it does for the default file.
 
-A complete example lives at `config/mgo.production.example.toml`. Copy it
-outside the repository, edit it for the target machine, and point the service at
-it — for example, in the systemd unit:
+A complete example lives at `config/mgo.production.example.toml`. The service
+identity installer seeds `/etc/garden-observatory/mgo.toml` from it on a first
+install (and never overwrites an existing one); the systemd unit then points the
+service at it:
 
 ```ini
-Environment=MGO_CONFIG_PATH=/etc/mgo/mgo.toml
+Environment=MGO_CONFIG_PATH=/etc/garden-observatory/mgo.toml
 ```
 
-External production files (including `/etc/mgo/mgo.toml`) must **not** be
-committed to the repository.
+There is no implicit discovery of that path — `MGO_CONFIG_PATH` is what selects
+it, so the precedence table above is unchanged and an existing deployment
+pointing at an older location keeps working.
+
+External production files (including `/etc/garden-observatory/mgo.toml`) must
+**not** be committed to the repository.
 
 ## Camera readiness
 

@@ -48,20 +48,43 @@ else
   printf 'WARNING: uv not found on PATH; skipping "uv sync".\n' >&2
 fi
 
+# --- re-assert runtime read access -----------------------------------------
+# The service runs as the dedicated "mgo" account, which needs read/execute
+# access to the checkout. A pull or "uv sync" can introduce files the account
+# cannot read, so the minimum group access is re-applied here. Nothing is made
+# writable to the service and nothing is granted to "other".
+service_group="mgo"
+if getent group "${service_group}" >/dev/null 2>&1; then
+  printf '\nRe-asserting %s read access to %s ...\n' "${service_group}" "${repo_root}"
+  sudo chgrp -R "${service_group}" "${repo_root}"
+  sudo chmod -R g+rX "${repo_root}"
+  sudo find "${repo_root}" -type d -exec chmod g+s {} +
+else
+  printf '\nNOTE: group "%s" not found; skipping runtime access re-assertion.\n' \
+    "${service_group}"
+  printf '      Run scripts/deploy/install-service-identity.sh to provision it.\n'
+fi
+
 # --- restart the service ---------------------------------------------------
 printf '\nRestarting %s ...\n' "${service}"
 sudo systemctl restart "${service}"
 sleep 1
 systemctl --no-pager --full status "${service}" || true
 
-# --- health probe (best effort) -------------------------------------------
-printf '\nHealth probe:\n'
+# --- endpoint probes (best effort) -----------------------------------------
+printf '\nEndpoint probes:\n'
 if command -v curl >/dev/null 2>&1; then
-  curl -fsS "http://127.0.0.1:8080/health" \
-    && printf '\n' \
-    || printf '(health endpoint not reachable on :8080 — check the service and config)\n'
+  for endpoint in /health /camera/status /motion/status /notifications/status; do
+    printf '  %-24s ' "${endpoint}"
+    if curl -fsS -o /dev/null -w '%{http_code}\n' \
+      "http://127.0.0.1:8080${endpoint}"; then
+      :
+    else
+      printf 'unreachable\n'
+    fi
+  done
 else
-  printf '(curl not installed; skip health probe)\n'
+  printf '(curl not installed; skip endpoint probes)\n'
 fi
 
 printf '\nDeployment step complete. Current HEAD: %s\n' "${after}"

@@ -1,3 +1,9 @@
 # Shell scripts must keep LF line endings so they run on the Raspberry Pi.
 # (CRLF would cause "$'\r': command not found" errors under bash.)
 *.sh text eol=lf
+
+# systemd units and the templates they are rendered from must also keep LF.
+# A trailing CR would become part of a directive's value (e.g. "User=mgo\r")
+# and the unit would fail to start.
+*.service text eol=lf
+*.service.template text eol=lf
