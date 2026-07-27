@@ -384,8 +384,15 @@ _DASHBOARD_PAGE = """<!DOCTYPE html>
     "notifications": NOTIFICATIONS_URL
   };
 
-  // "never" until an endpoint has answered once; "stale" once a later
-  // refresh fails. A failure never clears the last good reading.
+  // Four states, kept distinct so a badge can never overclaim:
+  //   never        no refresh attempt has completed for this source yet
+  //   unavailable  the latest request failed and this source has never
+  //                supplied a successful reading
+  //   loaded       the latest request succeeded; the reading is current
+  //   stale        the latest request failed, but an earlier successful
+  //                reading is still displayed
+  // A failure never clears the last good reading, and a source that has
+  // never succeeded must never claim to be showing one.
   var sourceState = {
     "health": "never",
     "version": "never",
@@ -742,6 +749,88 @@ _DASHBOARD_PAGE = """<!DOCTYPE html>
     "notifications": renderNotifications
   };
 
+  // --- payload validation ---------------------------------------------
+  // HTTP 200 with valid JSON is not proof of a usable payload. Each source
+  // is checked against its endpoint's minimum contract shape BEFORE any card
+  // is mutated, so a structurally wrong body -- an empty object, a scalar, an
+  // array, or another endpoint's response -- is treated as a source failure
+  // instead of quietly rendering a card full of "Unavailable" badged Live.
+  //
+  // Presence is checked, never truthiness or type, so a nullable field the
+  // API explicitly allows (a null temperature, commit, owner or last event)
+  // remains valid. An individually malformed *value* still renders as
+  // "Unavailable" through the formatters; only a response that is not this
+  // endpoint's object is rejected outright.
+
+  var HEALTH_FIELDS = [
+    "status", "application", "hostname", "uptime_seconds", "cpu_percent",
+    "memory", "disk", "temperature", "database", "camera", "preview"
+  ];
+  var HEALTH_SECTIONS = [
+    "memory", "disk", "temperature", "database", "camera", "preview"
+  ];
+  var VERSION_FIELDS = [
+    "application", "version", "commit", "python_version", "architecture"
+  ];
+  var MOTION_FIELDS = [
+    "enabled", "status", "detected", "score", "threshold",
+    "frames_available", "detail", "evaluated_at"
+  ];
+  var NOTIFICATION_FIELDS = [
+    "enabled", "providers", "total_events_published",
+    "total_delivery_failures", "last_event_at"
+  ];
+
+  function isObject(value) {
+    return value !== null && typeof value === "object" &&
+      Object.prototype.toString.call(value) !== "[object Array]";
+  }
+
+  function hasFields(payload, names) {
+    if (!isObject(payload)) {
+      return false;
+    }
+    var index = 0;
+    for (index = 0; index < names.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(payload, names[index])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function validateHealth(payload) {
+    if (!hasFields(payload, HEALTH_FIELDS)) {
+      return false;
+    }
+    var index = 0;
+    for (index = 0; index < HEALTH_SECTIONS.length; index += 1) {
+      if (!isObject(payload[HEALTH_SECTIONS[index]])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function validateVersion(payload) {
+    return hasFields(payload, VERSION_FIELDS);
+  }
+
+  function validateMotion(payload) {
+    return hasFields(payload, MOTION_FIELDS);
+  }
+
+  function validateNotifications(payload) {
+    return hasFields(payload, NOTIFICATION_FIELDS);
+  }
+
+  var VALIDATORS = {
+    "health": validateHealth,
+    "version": validateVersion,
+    "motion": validateMotion,
+    "notifications": validateNotifications
+  };
+
   // --- refresh state --------------------------------------------------
 
   function renderBadges() {
@@ -750,13 +839,17 @@ _DASHBOARD_PAGE = """<!DOCTYPE html>
       var key = SOURCE_KEYS[index];
       var state = sourceState[key];
       var text = "";
-      var stale = false;
+      var degraded = false;
       if (state === "never") {
         text = "Awaiting live data";
+      } else if (state === "unavailable") {
+        text = "Unavailable \\u2014 latest refresh failed; no successful " +
+          "reading yet";
+        degraded = true;
       } else if (state === "stale") {
         text = "Stale \\u2014 latest refresh failed; showing the last " +
           "successful reading";
-        stale = true;
+        degraded = true;
       } else {
         text = "Live";
       }
@@ -764,7 +857,7 @@ _DASHBOARD_PAGE = """<!DOCTYPE html>
       var node = 0;
       for (node = 0; node < nodes.length; node += 1) {
         nodes[node].textContent = text;
-        if (stale) {
+        if (degraded) {
           nodes[node].className = "badge stale";
         } else {
           nodes[node].className = "badge";
@@ -787,10 +880,27 @@ _DASHBOARD_PAGE = """<!DOCTYPE html>
     setText("refresh-outcome", lastOutcome);
   }
 
-  function markAllStale() {
+  // The single failure transition. A failed source degrades from its
+  // PREVIOUS state, so a source that has never succeeded becomes
+  // "unavailable" and never claims a last successful reading it does not
+  // have:
+  //   never       -> unavailable
+  //   unavailable -> unavailable
+  //   loaded      -> stale
+  //   stale       -> stale
+  function markSourceFailure(key) {
+    var previous = sourceState[key];
+    var degraded = "unavailable";
+    if (previous === "loaded" || previous === "stale") {
+      degraded = "stale";
+    }
+    sourceState[key] = degraded;
+  }
+
+  function markAllFailed() {
     var index = 0;
     for (index = 0; index < SOURCE_KEYS.length; index += 1) {
-      sourceState[SOURCE_KEYS[index]] = "stale";
+      markSourceFailure(SOURCE_KEYS[index]);
     }
   }
 
@@ -808,6 +918,12 @@ _DASHBOARD_PAGE = """<!DOCTYPE html>
   }
 
   function apply(key, payload) {
+    // Validate BEFORE touching the DOM: a payload that is not this
+    // endpoint's response must never overwrite a card, whether wholly or
+    // partially.
+    if (VALIDATORS[key](payload) !== true) {
+      return false;
+    }
     try {
       RENDERERS[key](payload);
       return true;
@@ -831,7 +947,7 @@ _DASHBOARD_PAGE = """<!DOCTYPE html>
       if (ok) {
         sourceState[key] = "loaded";
       } else {
-        sourceState[key] = "stale";
+        markSourceFailure(key);
         failures += 1;
       }
     }
@@ -840,7 +956,7 @@ _DASHBOARD_PAGE = """<!DOCTYPE html>
       lastComplete = lastAttempt;
       lastOutcome = "Complete \\u2014 all four sources answered";
     } else if (failures === SOURCE_KEYS.length) {
-      lastOutcome = "Failed \\u2014 no source answered; readings are stale";
+      lastOutcome = "Failed \\u2014 no source answered";
     } else {
       lastOutcome = "Partial \\u2014 " + String(failures) + " of " +
         String(SOURCE_KEYS.length) + " sources failed";
@@ -879,7 +995,7 @@ _DASHBOARD_PAGE = """<!DOCTYPE html>
     }).catch(function () {
       lastAttempt = new Date();
       lastOutcome = "Failed \\u2014 the refresh could not complete";
-      markAllStale();
+      markAllFailed();
       renderBadges();
       renderSummary();
     }).then(function () {

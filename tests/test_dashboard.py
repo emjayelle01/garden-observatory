@@ -417,18 +417,264 @@ def test_partial_failure_is_handled_explicitly(page: str) -> None:
     assert "Partial " in script
 
 
-def test_a_failed_source_is_marked_stale_and_keeps_its_last_reading(
+def test_a_failed_source_is_degraded_and_keeps_its_last_reading(
     page: str,
 ) -> None:
-    """A failure marks the card stale; it never clears the values."""
+    """A failure degrades the card's badge; it never clears the values."""
     script = _script(page)
 
-    assert 'sourceState[key] = "stale";' in script
+    # Failure goes through the single transition helper, never a direct
+    # assignment at the call site.
+    assert "markSourceFailure(key);\n        failures += 1;" in script
     assert "Stale " in script
     assert "showing the last " in script
     # Nothing in the failure path writes a placeholder over a rendered card:
     # only the badge elements are touched.
-    assert "markAllStale" in script
+    assert "markAllFailed" in script
+
+
+# --- browser contract: the four-state refresh model --------------------------
+#
+# The state a failed source lands in depends on whether it has EVER succeeded.
+# A source that has never returned a reading must say so, and must never claim
+# to be showing a last successful reading it does not have.
+
+
+def test_state_vocabulary_includes_unavailable(page: str) -> None:
+    """The model distinguishes never, unavailable, loaded and stale."""
+    script = _script(page)
+
+    for state in ('"never"', '"unavailable"', '"loaded"', '"stale"'):
+        assert state in script
+
+    # All four are rendered as distinct badges.
+    assert 'if (state === "never") {' in script
+    assert '} else if (state === "unavailable") {' in script
+    assert '} else if (state === "stale") {' in script
+
+
+def test_unavailable_wording_denies_any_successful_reading(page: str) -> None:
+    """A never-loaded source states plainly that no reading exists yet."""
+    script = _script(page)
+
+    assert "Unavailable " in script
+    assert "no successful " in script
+    assert "reading yet" in script
+
+
+def test_never_loaded_failure_does_not_become_stale(page: str) -> None:
+    """`never` degrades to `unavailable`, never straight to `stale`.
+
+    This is the corrective regression guard: the earlier implementation
+    assigned "stale" unconditionally, so a first-load failure claimed to be
+    showing a last successful reading that had never been fetched.
+    """
+    script = _script(page)
+
+    # There is no unconditional generic failure assignment anywhere.
+    assert 'sourceState[key] = "stale";' not in script
+    assert 'sourceState[SOURCE_KEYS[index]] = "stale";' not in script
+
+    # The one assignment is a variable whose default is "unavailable" and
+    # which only becomes "stale" when a previous success is proven.
+    assert 'var degraded = "unavailable";' in script
+    assert (
+        'if (previous === "loaded" || previous === "stale") {\n'
+        '      degraded = "stale";\n'
+        "    }\n"
+        "    sourceState[key] = degraded;" in script
+    )
+
+
+def test_failure_transitions_depend_on_the_previous_state(page: str) -> None:
+    """never/unavailable stay unavailable; loaded/stale become stale."""
+    script = _script(page)
+
+    match = re.search(
+        r"function markSourceFailure\(key\) \{(.*?)\n  \}", script, re.DOTALL
+    )
+    assert match is not None
+    body = match.group(1)
+
+    # The previous state is what decides the outcome.
+    assert "var previous = sourceState[key];" in body
+    # Only a proven prior success (loaded or stale) yields stale.
+    assert '"loaded"' in body
+    assert '"stale"' in body
+    assert '"unavailable"' in body
+    # "never" is not in the promoting branch, so it falls through to
+    # unavailable rather than being special-cased into stale.
+    assert '"never"' not in body
+
+
+def test_all_source_failure_uses_the_same_transition_helper(page: str) -> None:
+    """The catch-all path cannot bypass the per-state transition rule."""
+    script = _script(page)
+
+    match = re.search(
+        r"function markAllFailed\(\) \{(.*?)\n  \}", script, re.DOTALL
+    )
+    assert match is not None
+    assert "markSourceFailure(SOURCE_KEYS[index]);" in match.group(1)
+
+    # The catch path for a wholly failed refresh uses it too.
+    assert "markAllFailed();" in script
+
+
+def test_total_failure_summary_does_not_claim_stale_readings(page: str) -> None:
+    """With nothing ever loaded, the summary must not imply prior data."""
+    script = _script(page)
+
+    assert 'lastOutcome = "Failed \\u2014 no source answered";' in script
+    assert "readings are stale" not in script
+
+
+# --- browser contract: payload validation ------------------------------------
+
+
+def test_source_specific_payload_validators_exist(page: str) -> None:
+    """Each endpoint has its own minimum-shape validator."""
+    script = _script(page)
+
+    for validator in (
+        "function validateHealth(",
+        "function validateVersion(",
+        "function validateMotion(",
+        "function validateNotifications(",
+    ):
+        assert validator in script
+
+    assert "var VALIDATORS = {" in script
+    for key in ('"health":', '"version":', '"motion":', '"notifications":'):
+        assert key in script
+
+
+def test_validation_happens_before_the_renderer_is_called(page: str) -> None:
+    """No card may be mutated by a payload that failed validation."""
+    script = _script(page)
+
+    match = re.search(
+        r"function apply\(key, payload\) \{(.*?)\n  \}", script, re.DOTALL
+    )
+    assert match is not None
+    body = match.group(1)
+
+    validate_at = body.index("VALIDATORS[key](payload)")
+    render_at = body.index("RENDERERS[key](payload)")
+    assert validate_at < render_at
+
+    # A failed validation returns immediately, without rendering.
+    assert (
+        "if (VALIDATORS[key](payload) !== true) {\n      return false;\n    }" in body
+    )
+
+
+@pytest.mark.parametrize(
+    ("constant", "fields"),
+    [
+        (
+            "HEALTH_FIELDS",
+            (
+                "status",
+                "application",
+                "hostname",
+                "uptime_seconds",
+                "cpu_percent",
+                "memory",
+                "disk",
+                "temperature",
+                "database",
+                "camera",
+                "preview",
+            ),
+        ),
+        (
+            "VERSION_FIELDS",
+            ("application", "version", "commit", "python_version", "architecture"),
+        ),
+        (
+            "MOTION_FIELDS",
+            (
+                "enabled",
+                "status",
+                "detected",
+                "score",
+                "threshold",
+                "frames_available",
+                "detail",
+                "evaluated_at",
+            ),
+        ),
+        (
+            "NOTIFICATION_FIELDS",
+            (
+                "enabled",
+                "providers",
+                "total_events_published",
+                "total_delivery_failures",
+                "last_event_at",
+            ),
+        ),
+    ],
+)
+def test_validators_require_every_contract_field(
+    page: str, constant: str, fields: tuple[str, ...]
+) -> None:
+    """The validators pin each endpoint's required contract fields."""
+    script = _script(page)
+
+    match = re.search(rf"var {constant} = \[(.*?)\];", script, re.DOTALL)
+    assert match is not None
+    declared = set(re.findall(r'"([a-z_]+)"', match.group(1)))
+
+    assert declared == set(fields)
+
+
+def test_health_validator_requires_object_sections(page: str) -> None:
+    """A health payload whose sections are not objects is not usable."""
+    script = _script(page)
+
+    match = re.search(r"var HEALTH_SECTIONS = \[(.*?)\];", script, re.DOTALL)
+    assert match is not None
+    assert set(re.findall(r'"([a-z_]+)"', match.group(1))) == {
+        "memory",
+        "disk",
+        "temperature",
+        "database",
+        "camera",
+        "preview",
+    }
+    assert "if (!isObject(payload[HEALTH_SECTIONS[index]])) {" in script
+
+
+def test_validators_reject_non_objects_and_arrays(page: str) -> None:
+    """A scalar, null or array body is not this endpoint's response."""
+    script = _script(page)
+
+    assert 'value !== null && typeof value === "object"' in script
+    assert 'Object.prototype.toString.call(value) !== "[object Array]"' in script
+    assert "if (!isObject(payload)) {\n      return false;\n    }" in script
+
+
+def test_validators_allow_nullable_api_fields(page: str) -> None:
+    """Presence is checked, not truthiness, so documented nulls stay valid.
+
+    `temperature.celsius`, `commit`, `preview.owner`, `preview.uptime_seconds`
+    and `last_event_at` are all legitimately null, and a zero counter is a
+    real reading. Validation must not reject any of them.
+    """
+    script = _script(page)
+
+    match = re.search(
+        r"function hasFields\(payload, names\) \{(.*?)\n  \}", script, re.DOTALL
+    )
+    assert match is not None
+    body = match.group(1)
+
+    assert "hasOwnProperty.call(payload, names[index])" in body
+    # No value inspection at all -- only key presence.
+    assert "typeof payload[" not in body
+    assert "=== null" not in body
 
 
 def test_refresh_summary_reports_attempt_completeness_and_success(

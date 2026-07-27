@@ -132,15 +132,20 @@ It is deliberately inert and read-only. The route returns a **static HTML
 shell**: requesting it collects no health, touches no hardware, opens no
 database connection and starts nothing — in particular, **opening the
 dashboard never starts a preview or camera process**. Every live value is
-fetched by the browser from the existing contracts (`/health`, `/version`,
-`/motion/status`, `/notifications/status`), so the page cannot disagree with
-the API, and the browser only ever issues GET requests.
+fetched by the browser from the four existing contracts (`/health`,
+`/version`, `/motion/status`, `/notifications/status`), so the page cannot
+disagree with the API, and the browser only ever issues GET requests.
 
-Values refresh every 10 seconds on a non-overlapping loop. A source that fails
-is marked **stale** and keeps its last good reading rather than being blanked
-or zeroed, and the other cards keep updating. Nothing claims a healthy state
-before an API response has supplied one. There is no external stylesheet,
-script, font or CDN, so it works with no internet access.
+Values refresh every 10 seconds on a non-overlapping loop, and the four
+sources succeed or fail independently — one failure never discards the others.
+A source that fails **after** succeeding at least once is marked **stale** and
+keeps its last good reading rather than being blanked or zeroed; a source that
+has **never** answered is marked **unavailable** and says plainly that no
+successful reading exists yet, rather than claiming to show one. A response
+that is not the expected endpoint payload — an empty object, a scalar — is
+rejected before it can touch a card, so it is never badged live. Nothing
+claims a healthy state before an API response has supplied one. There is no
+external stylesheet, script, font or CDN, so it works with no internet access.
 
 This is **local** functionality on a trusted LAN: no authentication, accounts
 or public exposure are added. `GET /` is unchanged and remains the minimal

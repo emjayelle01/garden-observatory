@@ -5,8 +5,8 @@
 `GET /dashboard` is the browser page an operator opens to answer one question:
 *is this appliance well, and what is it doing right now?*
 
-It gathers what is otherwise spread across five JSON endpoints — identity,
-system health, database, camera, preview, motion and notifications — into a
+It gathers what is otherwise spread across **four** JSON endpoints —
+`/health`, `/version`, `/motion/status` and `/notifications/status` — into a
 single readable overview on the local network. It is a **reporting** surface
 only: it controls nothing.
 
@@ -96,7 +96,8 @@ refresh
   -> issue all four requests
   -> wait for every one to settle (Promise.allSettled)
   -> render each source that succeeded
-  -> mark each source that failed as stale
+  -> degrade each source that failed (unavailable, or stale if it has
+     previously succeeded)
   -> update the refresh summary
   -> schedule the next refresh
 ```
@@ -123,13 +124,38 @@ requests only.
 One failed endpoint never discards the other three's responses: `/health` can
 render normally while `/motion/status` is unreachable.
 
-Each source is in one of three states:
+Each source is in one of **four** states:
 
 | State | Shown as | Meaning |
 | ----- | -------- | ------- |
-| never loaded | `Awaiting live data` | the endpoint has not answered yet |
-| loaded | `Live` | the latest refresh succeeded |
-| stale | `Stale — latest refresh failed; showing the last successful reading` | the latest refresh failed |
+| `never` | `Awaiting live data` | no refresh attempt has completed for this source yet |
+| `unavailable` | `Unavailable — latest refresh failed; no successful reading yet` | the latest request failed and this source has **never** supplied a successful reading |
+| `loaded` | `Live` | the latest request succeeded and the reading is current |
+| `stale` | `Stale — latest refresh failed; showing the last successful reading` | the latest request failed, but an earlier successful reading is still displayed |
+
+### First-load failure versus later failure
+
+The distinction matters, and the two must never be confused:
+
+- a **first-load failure** — the endpoint has never answered — is
+  `unavailable`. The card still holds its `Loading…` placeholders, so the page
+  must not claim to be showing anything;
+- a **later failure**, after at least one success, is `stale`. Real values are
+  on screen, and saying so is the useful thing to tell an operator.
+
+A failed source therefore degrades from its **previous** state, through one
+helper (`markSourceFailure`) that every failure path uses, including the
+catch-all for a wholly failed refresh:
+
+```text
+never       -> unavailable
+unavailable -> unavailable
+loaded      -> stale
+stale       -> stale
+```
+
+A source that has never succeeded can never reach `stale`, so the phrase
+"showing the last successful reading" can only ever appear when one exists.
 
 A failed refresh **never** erases the last valid reading and never replaces it
 with a fabricated zero or a blank. This is deliberate:
@@ -141,8 +167,39 @@ Stale — latest refresh failed; showing the last successful reading
 
 is far more useful to an operator than an empty card.
 
-A malformed payload from an endpoint that *did* answer is treated the same
-way: that one card is marked stale, and the other three still render.
+### Malformed payloads
+
+HTTP 200 with valid JSON is **not** proof of a usable payload. Because the
+formatters safely turn every missing value into `Unavailable`, an empty object
+would otherwise render as a card full of `Unavailable` badged `Live` — a
+response the dashboard never actually understood, presented as current.
+
+Each source therefore has a small validator that checks the payload against
+its endpoint's minimum contract shape **before any card is mutated**:
+
+| Source | Required |
+| ------ | -------- |
+| `/health` | a non-null, non-array object containing `status`, `application`, `hostname`, `uptime_seconds`, `cpu_percent`, `memory`, `disk`, `temperature`, `database`, `camera`, `preview`; the six nested sections must themselves be objects |
+| `/version` | `application`, `version`, `commit`, `python_version`, `architecture` |
+| `/motion/status` | `enabled`, `status`, `detected`, `score`, `threshold`, `frames_available`, `detail`, `evaluated_at` |
+| `/notifications/status` | `enabled`, `providers`, `total_events_published`, `total_delivery_failures`, `last_event_at` |
+
+Validation checks **key presence only** — never truthiness, never type — so
+every value the API is documented to return as `null` (`temperature.celsius`,
+`commit`, `preview.owner`, `preview.uptime_seconds`, `last_event_at`) remains
+valid, as does a zero counter. An individually malformed *value* still renders
+as `Unavailable` through the formatters; only a body that is not this
+endpoint's response at all — an empty object, a scalar, an array, another
+endpoint's payload — is rejected.
+
+A rejected payload is a **source failure** and follows the same transition as
+a network failure: `unavailable` with no prior success, `stale` with one. It
+is never partially rendered over a good reading, because validation runs
+before the renderer is called. The other three sources are unaffected. This is
+also true of a renderer that throws.
+
+No schema framework and no dependency were added; the validators are a
+presence check over a list of field names.
 
 The refresh summary at the top of the page reports:
 
@@ -400,7 +457,10 @@ Coverage:
   application, the route is still complete and available;
 - **browser contract** — safe DOM writes only, a bounded 10-second interval, an
   immediate first refresh, a non-overlapping completion-scheduled loop,
-  `Promise.allSettled`, visible stale marking, GET-only requests, no external
+  `Promise.allSettled`, the four-state failure transition (a never-loaded
+  source degrades to `unavailable`, never to `stale`) and its single shared
+  helper, the source-specific payload validators and their ordering before any
+  DOM mutation, GET-only requests, no external
   URL, no hardware or database work in the browser, a neutral fallback for
   unknown statuses, and no truthiness fallback that could swallow a valid zero;
 - **formatting** — the presence and shape of every formatter, the binary byte
@@ -412,8 +472,18 @@ Coverage:
   return exactly what they returned before, and the dashboard and preview
   pages remain separate.
 
-Formatting behaviour that exists only in browser JavaScript is validated by
-these source-contract assertions plus the live browser check below; it is
+**The browser assertions above are deterministic checks over the served
+JavaScript source, not runtime execution of it.** They pin the structure —
+that the transition helper exists and is what every failure path calls, that
+validation precedes rendering, that the required contract fields are declared
+— but they cannot prove the code behaves correctly when run. Runtime
+behaviour of the browser code is established by the manual browser validation
+below, and by that alone. Treat the two as complementary: neither substitutes
+for the other, and a change to the page's JavaScript needs the browser check
+repeating.
+
+Formatting behaviour that exists only in browser JavaScript is validated the
+same way; it is
 deliberately not duplicated in Python solely to make it unit-testable, and no
 JavaScript runtime or test framework was added.
 
@@ -458,9 +528,28 @@ preview process starts.
 To exercise failure handling without touching production code, block one
 source from the browser's developer tools — a request-blocking rule, an
 offline override, or a console override of `window.fetch` for that one URL.
-The affected card must keep its last reading and gain a **Stale** badge while
-the other cards keep updating, and the summary must report a **partial**
-refresh.
+
+Check both failure shapes, because they are different states:
+
+- **after** at least one successful refresh, the affected card must keep its
+  last reading and gain a **Stale** badge, while the other cards keep
+  updating and the summary reports a **partial** refresh;
+- **before** any successful refresh — block the source, then reload the page —
+  the card must read **Unavailable — … no successful reading yet**, keep its
+  `Loading…` placeholders, and must **not** claim to be showing a last
+  successful reading. With all four blocked from the start, every card must
+  say unavailable and the summary must read `Failed — no source answered`.
+
+A first-load failure needs the block in place before the page's first refresh.
+Serving the same page from a throwaway local harness whose endpoints can be
+failed on demand is a convenient way to do that; the page bytes must be the
+unmodified production output.
+
+Also confirm a structurally invalid but successful response is rejected:
+override one endpoint to return HTTP 200 with `{}` or a JSON scalar. That
+source must **not** be badged `Live` — it becomes `unavailable` with no prior
+success, or `stale` with one — and no part of the malformed body may be
+rendered over a good reading.
 
 ## Raspberry Pi validation procedure
 
@@ -512,7 +601,8 @@ confirm:
 - real memory and disk usage are shown;
 - database, camera, preview, motion and notification statuses are correct;
 - the page refreshes automatically and refreshes never overlap;
-- partial refresh failure is visible and stale data is identified;
+- partial refresh failure is visible, stale data is identified, and a source
+  that has never answered reads unavailable rather than stale;
 - the `/preview` link works;
 - **no preview process starts merely by opening the dashboard**, and no
   capture occurs;

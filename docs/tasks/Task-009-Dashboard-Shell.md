@@ -11,22 +11,32 @@ Delivered exactly as decided below, with no deviation:
   `render_dashboard_page()`;
 - `src/mgo/api/app.py` — `GET /dashboard` registered on the production
   application object (two additions: the import and the route);
-- `tests/test_dashboard.py` — 108 tests covering the route, its isolation, the
-  browser source contract, formatting safety, privacy and the compatibility of
-  the endpoints it consumes;
+- `tests/test_dashboard.py` — 123 tests covering the route, its isolation, the
+  browser source contract, the refresh-state model, payload validation,
+  formatting safety, privacy and the compatibility of the endpoints it
+  consumes;
 - `docs/Dashboard.md`, plus `README.md` and `docs/API.md` updates.
+
+A fourth, corrective commit followed a repository review that found a real
+truthfulness defect: the failure path assigned `stale` unconditionally, so a
+source failing on the **first** refresh claimed to be "showing the last
+successful reading" it had never fetched, and `apply()` treated any
+non-throwing render as success, so a structurally invalid 200 response (an
+empty object, a scalar) was badged `Live`. Both are fixed — see
+"Stale-data design" below.
 
 No dependency was added; `pyproject.toml` and `uv.lock` are unchanged. No
 existing API contract, status vocabulary, configuration file, migration or
 systemd unit was touched.
 
 Validation on this workstation: `ruff` passed, `mypy src` passed (39 source
-files), `pytest` 618 passed (baseline 510 + 108 added). The page was also
+files), `pytest` 633 passed (baseline 510 + 123 added). The page was also
 loaded in a real browser against a local `uvicorn` run and exercised — live
-values, the refresh cadence, non-overlapping cycles, partial-failure staleness
-and the responsive layout were all confirmed. **Raspberry Pi validation has
-not been performed**; the procedure for Matthew to run is in
-[`docs/Dashboard.md`](../Dashboard.md).
+values, the refresh cadence, non-overlapping cycles, the responsive layout,
+and every failure state: first-load partial failure, first-load total failure,
+recovery, failure after success, and malformed payloads both before and after
+a successful reading. **Raspberry Pi validation has not been performed**; the
+procedure for Matthew to run is in [`docs/Dashboard.md`](../Dashboard.md).
 
 ## Authoritative definition
 
@@ -262,13 +272,35 @@ truth.
 
 ## Stale-data design
 
-Each of the four sources tracks its own state:
+Each of the four sources tracks its own state. **Four** states are needed, not
+three: a source that has never answered must not claim to be showing a last
+successful reading it does not have.
 
 ```text
-never loaded  ->  "Loading…" / "Awaiting live data"
-loaded        ->  live values, no badge
-stale         ->  last good values retained, visibly badged "Stale"
+never        ->  "Loading…" placeholders, badged "Awaiting live data"
+unavailable  ->  placeholders retained, badged "Unavailable — … no
+                 successful reading yet"
+loaded       ->  live values, badged "Live"
+stale        ->  last good values retained, badged "Stale — … showing the
+                 last successful reading"
 ```
+
+A failed source degrades from its **previous** state through one shared
+helper, which every failure path uses:
+
+```text
+never       -> unavailable
+unavailable -> unavailable
+loaded      -> stale
+stale       -> stale
+```
+
+A successful HTTP response is not enough to be `loaded`. Each source validates
+the payload against its endpoint's minimum contract shape **before** any card
+is mutated; a body that is not that endpoint's response (an empty object, a
+scalar, an array) is a source failure following the same transition. Presence
+of keys is checked, never truthiness, so documented `null` values and zero
+counters remain valid.
 
 A failed refresh **never** erases the last valid reading and never substitutes
 a fabricated zero or blank. The initial HTML asserts nothing: no card shows
