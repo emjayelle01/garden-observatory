@@ -60,10 +60,51 @@ application's expected version is the constant
 constant stays in step with the migration files, so a new migration cannot land
 without moving the application's notion of "current".
 
-`PRAGMA user_version` is deliberately **not** used. The `schema_migrations`
-table already existed, records *which* migrations ran rather than only how far
-the schema got, and survives being read by an operator with `sqlite3` far more
-legibly than an integer pragma.
+### Why `schema_migrations` and not `PRAGMA user_version`
+
+> **`PRAGMA user_version` is intentionally unused and always reads `0`.**
+>
+> **A `user_version` of `0` is expected on a fully migrated, healthy database.
+> It does *not* mean the database is unversioned, unmigrated or damaged.**
+
+`schema_migrations` is the **sole authoritative source** of the schema version.
+Every runtime decision resolves to it and to nothing else:
+
+- the migration runner's "which migrations are still pending" calculation;
+- the fail-closed compatibility gate that refuses a database newer than
+  `CURRENT_SCHEMA_VERSION`;
+- the legacy-adoption path;
+- the health check's `schema_version` and `migration_status`;
+- the `schema_version` reported by `GET /health` and `GET /database/status`.
+
+Nothing in the application reads or writes `PRAGMA user_version`, so it keeps
+whatever value SQLite gives a new database — `0`.
+
+The rationale for a single authority:
+
+- **The existing migration framework already used `schema_migrations`.** The
+  table and the runner keyed on it predate this task. Moving the authority to
+  `user_version` would mean stamping a *new* authority into every existing
+  production database and reading both during the transition to decide which to
+  trust when they disagree — a schema-authority migration, and a far larger risk
+  than anything else this foundation carries.
+- **The table records *which* migrations ran, not just how far the schema
+  got.** `user_version` is a single integer. `version` + `name` + `applied_at`
+  gives an auditable history, so an incident yields
+  `002_capture_archive.sql applied 2026-07-27T14:03Z` rather than `2`. Adoption
+  of a legacy unversioned database is visible after the fact for the same
+  reason.
+- **Two independent version authorities can diverge.** A hand-edited pragma, a
+  partially restored database, or a future migration that updates one and not
+  the other would produce two different answers to the same question with no
+  rule for which wins. One authority cannot disagree with itself. This is the
+  same reasoning that keeps the database path solely in
+  `[storage].database_path` (§7).
+
+For completeness: `PRAGMA user_version` is *not* rejected for being unsafe. It
+is transactional and would roll back correctly inside a migration's
+transaction. It is simply not the authority here, and is therefore left alone
+rather than maintained as a second number that adds no information.
 
 ### What the initial migration contains
 
@@ -396,17 +437,33 @@ leaked, and camera, preview, motion and notification shutdown are unchanged.
 
 ### Inspect the schema version safely
 
-Read-only, on the Pi, without touching the running service:
+There are exactly **two** supported ways to check the schema version. Use
+either; they always agree.
 
-```bash
-sudo -u mgo sqlite3 -readonly /var/lib/garden-observatory/db/mgo.db "SELECT version, name, applied_at FROM schema_migrations ORDER BY version;"
-```
-
-Or simply ask the application, which never opens a connection to answer:
+Ask the application, which reads cached state and never opens a connection:
 
 ```bash
 curl -s http://localhost:8080/database/status
 ```
+
+Or query the authoritative table directly — read-only, on the Pi, without
+touching the running service:
+
+```bash
+sudo -u mgo sqlite3 -readonly /var/lib/garden-observatory/db/mgo.db "SELECT version, name FROM schema_migrations ORDER BY version;"
+```
+
+Add `applied_at` to that `SELECT` when you also want to know *when* each
+migration ran.
+
+> **Do not use `PRAGMA user_version` to check the schema version.**
+>
+> It is intentionally unused by MGO and **always returns `0`**, including on a
+> fully migrated, healthy database. A `0` there is expected and means nothing
+> about the schema — see
+> [§2, Why `schema_migrations` and not `PRAGMA user_version`](#why-schema_migrations-and-not-pragma-user_version).
+> The authoritative version is `MAX(version)` from `schema_migrations`, which is
+> what every runtime compatibility check uses.
 
 ### `status: unhealthy`, `accessible: false`
 
@@ -519,6 +576,18 @@ It is non-destructive and read-only apart from the normal service restart.
 
    Expect `status: healthy`, `schema_version: 2`, `migration_status: current`,
    `journal_mode: wal`, `foreign_keys: true`, `integrity: ok`.
+
+   **This is the schema-version check.** Do not cross-check it with
+   `PRAGMA user_version` — that pragma is intentionally unused and returns `0`
+   on a correctly migrated database (see §2 and §11). To confirm against the
+   database directly, query `schema_migrations`:
+
+   ```bash
+   sudo -u mgo sqlite3 -readonly /var/lib/garden-observatory/db/mgo.db "SELECT version, name FROM schema_migrations ORDER BY version;"
+   ```
+
+   Expect rows `1 | 001_initial_observation_engine.sql` and
+   `2 | 002_capture_archive.sql`.
 
 6. Confirm `/health` reports the database and an unchanged overall contract:
 
