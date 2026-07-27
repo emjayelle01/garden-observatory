@@ -15,6 +15,11 @@
 # configuration file. It only ever ADDS the minimum group access required; it
 # never widens permissions to "other" and never makes anything world-writable.
 #
+# It refuses to install the systemd unit when the checkout's virtual environment
+# belongs to a different directory (the usual result of relocating a checkout),
+# because such a unit could never start. It never recreates the environment
+# itself — "uv sync" must run as the administrative user.
+#
 # It does NOT start or restart the service — the operator does that explicitly
 # once the configuration has been reviewed.
 
@@ -254,12 +259,89 @@ run chmod -R g+rX "${app_root}"
 run find "${app_root}" -type d -exec chmod g+s {} +
 note "${app_root} is group-readable by '${service_group}' (read/execute only, never writable)"
 
-venv_uvicorn="${app_root}/.venv/bin/uvicorn"
-if [[ ! -x "${venv_uvicorn}" ]]; then
-  warn "no virtualenv entry point at ${venv_uvicorn}; run 'uv sync' in ${app_root} as the administrative user before starting the service."
+# --- 6. virtual environment -------------------------------------------------
+
+step "Virtual environment"
+
+# A Python virtual environment is LOCATION-DEPENDENT: every launcher in
+# .venv/bin hard-codes the absolute path of the interpreter that created it.
+# Moving or copying a checkout (for example from a home directory to /opt)
+# leaves those launchers pointing at the old path, and systemd then fails the
+# service with status=203/EXEC. Detect that here rather than installing a unit
+# that cannot possibly start.
+#
+# The block between the markers below is self-contained: it reads only
+# ``venv_dir`` and ``venv_launcher`` and sets ``venv_problem`` to a description
+# of the first problem found (empty when the environment is usable). Keeping it
+# free of side effects is what lets the test suite execute the real logic.
+
+venv_dir="${app_root}/.venv"
+venv_launcher="${venv_dir}/bin/uvicorn"
+interpreter=""
+
+# >>> venv-detection >>>
+venv_problem=""
+
+if [[ ! -d "${venv_dir}" ]]; then
+  venv_problem="no virtual environment at ${venv_dir}"
+elif [[ ! -f "${venv_launcher}" ]]; then
+  venv_problem="no launcher at ${venv_launcher}"
+elif [[ ! -x "${venv_launcher}" ]]; then
+  venv_problem="${venv_launcher} is not executable"
+else
+  venv_shebang="$(head -n 1 "${venv_launcher}")"
+  # Strip the "#!" and take the first field: a shebang may carry an argument,
+  # as in "#!/usr/bin/env python".
+  interpreter="${venv_shebang#\#!}"
+  interpreter="${interpreter%% *}"
+
+  if [[ -z "${interpreter}" || "${interpreter}" != /* ]]; then
+    venv_problem="${venv_launcher} has no absolute interpreter in its shebang: ${venv_shebang}"
+  elif [[ "${interpreter}" != "${venv_dir}/"* ]]; then
+    # The relocation failure: the launcher still refers to another checkout.
+    venv_problem="${venv_launcher} belongs to another checkout — its interpreter is ${interpreter}, outside ${venv_dir}"
+  elif [[ ! -x "${interpreter}" ]]; then
+    venv_problem="${venv_launcher} refers to a missing or non-executable interpreter: ${interpreter}"
+  fi
+fi
+# <<< venv-detection <<<
+
+if [[ -n "${venv_problem}" ]]; then
+  printf '\n'
+  warn "${venv_problem}"
+  cat >&2 <<EOF
+
+         A Python virtual environment is LOCATION-DEPENDENT. Every launcher in
+         .venv/bin hard-codes the absolute path of the interpreter that created
+         it, and moving or copying a checkout does NOT update them. systemd then
+         fails to start the service with status=203/EXEC.
+
+         Recreate the environment as the administrative user (NOT as root, so
+         the checkout keeps its ownership):
+
+           cd ${app_root}
+           rm -rf .venv
+           uv sync
+
+         Then re-run this script.
+
+EOF
+
+  # Refuse to install a unit that cannot start. The environment is never
+  # recreated automatically: "uv sync" must run as the administrative user, and
+  # silently deleting a virtual environment from a root-run installer would be
+  # a surprising, unrequested action.
+  if (( install_unit )); then
+    fail "refusing to install ${service_unit} against an unusable virtual environment."
+  fi
+
+  warn "continuing only because --no-unit was given: no systemd unit will be pointed at this virtual environment."
+else
+  note "${venv_dir} belongs to this checkout"
+  note "launcher interpreter: ${interpreter}"
 fi
 
-# --- 6. access verification -------------------------------------------------
+# --- 7. access verification -------------------------------------------------
 
 step "Access verification"
 
@@ -293,8 +375,8 @@ else
 
   if (( access_ok )); then
     note "'${service_user}' can traverse every parent of ${app_root}"
-    if [[ -x "${venv_uvicorn}" ]] && ! as_service_user test -x "${venv_uvicorn}" 2>/dev/null; then
-      warn "'${service_user}' cannot execute ${venv_uvicorn}"
+    if [[ -x "${venv_launcher}" ]] && ! as_service_user test -x "${venv_launcher}" 2>/dev/null; then
+      warn "'${service_user}' cannot execute ${venv_launcher}"
       access_ok=0
     fi
   fi
@@ -314,7 +396,7 @@ else
   (( access_ok )) && note "runtime account has exactly the access it needs"
 fi
 
-# --- 7. legacy data notice --------------------------------------------------
+# --- 8. legacy data notice --------------------------------------------------
 
 legacy_database="${app_root}/data/mgo.db"
 if [[ -f "${legacy_database}" && ! -f "${state_dir}/db/mgo.db" ]]; then
@@ -327,7 +409,7 @@ if [[ -f "${legacy_database}" && ! -f "${state_dir}/db/mgo.db" ]]; then
   printf '           sudo chown -R %s:%s %s\n' "${service_user}" "${service_group}" "${state_dir}" >&2
 fi
 
-# --- 8. systemd unit --------------------------------------------------------
+# --- 9. systemd unit --------------------------------------------------------
 
 if (( install_unit )); then
   step "systemd unit"

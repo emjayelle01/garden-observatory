@@ -229,11 +229,26 @@ sudo mkdir -p /opt
 sudo mv ~/Projects/garden-observatory /opt/garden-observatory
 sudo chown -R "$(id -un)":"$(id -gn)" /opt/garden-observatory
 cd /opt/garden-observatory
+rm -rf .venv
 uv sync
 ```
 
 The checkout stays owned by the operator, so `git pull` and `uv sync` still work
 without `sudo`.
+
+> **The `rm -rf .venv` is required, not optional.** A Python virtual environment
+> is **location-dependent**: every launcher in `.venv/bin` hard-codes the
+> absolute path of the interpreter that created it. Moving or copying a checkout
+> does not update them, so a relocated `.venv` still starts with a shebang like
+>
+> ```
+> #!/home/pi/Projects/garden-observatory/.venv/bin/python3
+> ```
+>
+> and systemd fails the service with `status=203/EXEC`. Recreating the
+> environment is the only fix — the paths cannot be safely rewritten in place.
+> The same applies to restoring a checkout from a backup or copying one between
+> machines.
 
 ### 7.2 Provision the identity
 
@@ -247,7 +262,17 @@ permissions every run, and **never** overwrites an existing
 `/etc/garden-observatory/mgo.toml`. It backs up any existing systemd unit to
 `/etc/systemd/system/mgo.service.bak-<timestamp>` before writing the new one.
 
+It also **refuses to install the unit** if the checkout's `.venv` belongs to a
+different directory, is missing, or has an unusable interpreter — installing a
+unit that could never start would only surface later as a confusing
+`status=203/EXEC`. It prints the remediation above and stops; it never rewrites
+launcher shebangs and never deletes the environment for you, because `uv sync`
+has to run as the administrative user rather than as root. Re-run the installer
+after recreating the environment.
+
 Useful options: `--app-root PATH`, `--host`, `--port`, `--no-unit`, `--dry-run`.
+Under `--no-unit` an unusable `.venv` is only a warning, since no unit is being
+written that could point at it.
 
 ### 7.3 Carry existing data across
 
@@ -321,7 +346,7 @@ bash /opt/garden-observatory/scripts/deploy/update-main.sh
 | Symptom | Cause | Fix |
 | ------- | ----- | --- |
 | `Failed to locate executable .../uvicorn: Permission denied` | The `mgo` account cannot traverse a parent of the checkout. | Move the checkout to `/opt/garden-observatory` and re-run the install script. |
-| `status=203/EXEC` | No virtualenv at `<app-root>/.venv`. | Run `uv sync` in the checkout as the operator. |
+| `status=203/EXEC`, `Failed to execute .../.venv/bin/uvicorn` | The `.venv` is missing, or belongs to a different checkout after a move/copy — its launchers still point at the old interpreter path. | `cd <app-root> && rm -rf .venv && uv sync`, then restart. Confirm with `head -1 .venv/bin/uvicorn`: the shebang must sit under the current app root. The installer refuses to write a unit in this state. |
 | `sqlite3.OperationalError: unable to open database file` | The state directory is missing or wrongly owned. | `sudo bash scripts/deploy/install-service-identity.sh` then restart. |
 | `FileNotFoundError: Configuration file not found` | `MGO_CONFIG_PATH` points at a file that does not exist. | Check `Environment=` in the unit and that `/etc/garden-observatory/mgo.toml` exists. |
 | `camera` readiness is `waiting_for_hardware` on the Pi | The account is not in `video`, or the group was created after the account. | `sudo usermod -aG video mgo && sudo systemctl restart mgo.service` |
