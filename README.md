@@ -43,7 +43,8 @@ uv run pytest
 
 | Endpoint              | Description                                             |
 | --------------------- | ------------------------------------------------------- |
-| `GET /`               | Application identity.                                   |
+| `GET /`               | Minimal application identity.                           |
+| `GET /version`        | Release and build identity.                             |
 | `GET /health`         | System health plus database, camera readiness and preview. |
 | `GET /database/status`| The latest monitored database-health check result.      |
 | `GET /camera/status`  | The latest monitored camera readiness result.          |
@@ -64,6 +65,52 @@ uv run pytest
 absolute path, UTC timestamp, dimensions, filesize). Expected failures map to
 meaningful statuses: `503` when the camera is disabled/unavailable, `504` on a
 capture timeout, `502` on a backend failure, and `500` on a write failure.
+
+### Identity, version and health
+
+Three endpoints answer *"what is running, and is it well?"*:
+
+| Endpoint | Answers | Cost per request |
+| -------- | ------- | ---------------- |
+| `GET /` | is the service up, and what is it? | none — three constants |
+| `GET /version` | which build is deployed? | none — values resolved once at startup |
+| `GET /health` | is this machine and its subsystems well? | live system metrics plus cached monitor state |
+
+```json
+{
+  "application": "Matt's Garden Observatory",
+  "version": "0.1.0",
+  "commit": null,
+  "python_version": "3.13.14",
+  "architecture": "aarch64"
+}
+```
+
+`pyproject.toml` `[project].version` is the **single** authoritative release
+version, read at runtime from the installed distribution's package metadata and
+resolved once per process. Everything that reports a version — the OpenAPI
+document, `GET /`, `GET /version`, the lifecycle notification events and the
+persisted start/stop observations — reads that one value, so they cannot
+disagree. Cutting a release is one edit plus `uv sync`. If package metadata is
+ever unreadable, `version` becomes `"unknown"` — truthful, and never a startup
+failure.
+
+`commit` is populated only from the **optional** `MGO_BUILD_COMMIT` environment
+variable, validated as a 7–40 character hex SHA and read once. Unset — the
+normal case — reports `null`. **Git is never invoked and `.git` is never read**,
+so `/version` behaves identically whether or not Git is installed. Nothing was
+added to `mgo.toml`: a release version is build identity, not machine
+configuration.
+
+`/version` performs no database I/O, no hardware detection, no subprocess and
+no network call, and does not depend on the background monitors — so it is
+truthful with no camera, no usable database and no Git. `/health` keeps every
+field it had, still does no per-request database or hardware work, and
+deliberately carries **no** version field.
+
+Full response contracts, fallback behaviour, the privacy exclusions, the
+compatibility promise and the production validation procedure live in
+[`docs/API.md`](docs/API.md).
 
 ## Database
 

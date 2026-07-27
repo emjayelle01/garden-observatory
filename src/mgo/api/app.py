@@ -54,6 +54,7 @@ from mgo.core.database_health import (
 from mgo.core.database_monitor import perform_database_check, run_database_monitor
 from mgo.core.health import collect_health, worst_status
 from mgo.core.health_monitor import run_health_monitor
+from mgo.core.identity import build_identity, get_application_version
 from mgo.core.observations import list_observations, record_observation
 from mgo.motion import (
     BrokerFrameSource,
@@ -74,6 +75,12 @@ from mgo.notifications import (
 )
 
 config = load_config()
+
+#: The one release version this module reports, resolved once from package
+#: metadata. Every place that used to carry a hard-coded literal -- the OpenAPI
+#: document, ``GET /``, the lifecycle notification events and the persisted
+#: start/stop observations -- now reads this, so they cannot disagree.
+APPLICATION_VERSION = get_application_version()
 
 
 def _current_camera_readiness(app: FastAPI) -> CameraReadiness:
@@ -130,7 +137,7 @@ def _system_event(event_type: EventType, summary: str) -> NotificationEvent:
         source="mgo-api",
         title="MGO application lifecycle",
         summary=summary,
-        payload={"version": "0.1.0"},
+        payload={"version": APPLICATION_VERSION},
     )
 
 
@@ -173,6 +180,26 @@ def _motion_event(result: MotionResult) -> NotificationEvent:
         summary=result.detail,
         payload=result.as_dict(),
     )
+
+
+class VersionResponse(BaseModel):
+    """Typed, read-only projection of the application's build identity.
+
+    Every field is configured metadata or a pure platform lookup. There is
+    deliberately no filesystem path, configuration location, hostname, remote
+    URL, command output or raw environment value here: the endpoint reports
+    *what build is running*, and nothing about where it lives.
+
+    ``commit`` is ``None`` whenever the deployment supplied no valid
+    ``MGO_BUILD_COMMIT``; ``version`` is ``unknown`` whenever package metadata
+    cannot be read. Both are truthful absences rather than errors.
+    """
+
+    application: str
+    version: str
+    commit: str | None
+    python_version: str
+    architecture: str
 
 
 class NotificationStatusResponse(BaseModel):
@@ -332,7 +359,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         source="mgo-api",
         status="success",
         summary="MGO API started",
-        payload={"version": "0.1.0"},
+        payload={"version": APPLICATION_VERSION},
     )
 
     # The notification manager is the single publication point for events.
@@ -463,13 +490,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             source="mgo-api",
             status="success",
             summary="MGO API stopped",
-            payload={"version": "0.1.0"},
+            payload={"version": APPLICATION_VERSION},
         )
 
 
 app = FastAPI(
     title=config.application.name,
-    version="0.1.0",
+    version=APPLICATION_VERSION,
     description="API for Matt's Garden Observatory.",
     lifespan=lifespan,
 )
@@ -477,12 +504,44 @@ app = FastAPI(
 
 @app.get("/")
 def root() -> dict[str, str]:
-    """Return the application identity."""
+    """Return the application identity.
+
+    Deliberately minimal and unchanged: the same three keys it has always
+    returned. Only the *source* of ``version`` changed -- from a hard-coded
+    literal to the central package-metadata authority -- so any existing client
+    or probe keeps working. Full build identity lives at ``GET /version``.
+    """
     return {
         "name": config.application.name,
-        "version": "0.1.0",
+        "version": APPLICATION_VERSION,
         "status": "operational",
     }
+
+
+@app.get("/version")
+def version() -> VersionResponse:
+    """Return the application's release and build identity.
+
+    Read-only, side-effect free and deterministic for a running process: it
+    reads values resolved once at import (package metadata, the optional build
+    commit) plus two pure ``platform`` lookups. It performs no database I/O, no
+    hardware detection, no subprocess and no network call, so it answers
+    truthfully with no camera attached, no usable database and no Git
+    installed. It always returns HTTP 200 while the application is serving.
+
+    ``version`` is the installed distribution's version, or ``unknown`` when
+    package metadata cannot be read. ``commit`` is the validated
+    ``MGO_BUILD_COMMIT`` value, or ``null`` when the deployment did not supply
+    one -- an absent optional build identifier is not an error.
+    """
+    identity = build_identity(config.application.name)
+    return VersionResponse(
+        application=identity.application,
+        version=identity.version,
+        commit=identity.commit,
+        python_version=identity.python_version,
+        architecture=identity.architecture,
+    )
 
 
 @app.get("/health")

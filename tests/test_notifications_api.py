@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from mgo.api.app import (
+    APPLICATION_VERSION,
     NotificationStatusResponse,
     _camera_event,
     _motion_event,
@@ -140,7 +141,10 @@ def test_system_event_mapping() -> None:
     assert event.severity is EventSeverity.INFO
     assert event.source == "mgo-api"
     assert event.summary == "MGO API started"
-    assert event.payload == {"version": "0.1.0"}
+    # Compared against the central authority rather than a literal: the point
+    # is that lifecycle events carry the *resolved* release version, not that
+    # the release happens to be a particular number today.
+    assert event.payload == {"version": APPLICATION_VERSION}
 
 
 def test_camera_event_maps_available_readiness() -> None:
