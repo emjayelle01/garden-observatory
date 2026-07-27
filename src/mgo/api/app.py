@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
+from mgo.api.dashboard_page import render_dashboard_page
 from mgo.api.preview_page import render_preview_page
 from mgo.camera import (
     MJPEG_CONTENT_TYPE,
@@ -786,6 +787,24 @@ async def camera_preview_stream(request: Request) -> StreamingResponse:
 def preview_page() -> HTMLResponse:
     """Serve the simple browser live-preview page."""
     return HTMLResponse(content=render_preview_page())
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard_page() -> HTMLResponse:
+    """Serve the local operational dashboard page.
+
+    Purely additive and deliberately inert: it returns a constant HTML shell
+    and nothing else. It collects no health, inspects no hardware, opens no
+    database connection, starts no monitor, never touches the camera or
+    preview, publishes no notification and mutates no application state --
+    opening the dashboard is as cheap and as safe as opening a static file.
+
+    Every live value is fetched by the *browser* from the existing contracts
+    (``/health``, ``/version``, ``/motion/status``, ``/notifications/status``),
+    so this route composes no subsystem status of its own and cannot disagree
+    with the API. ``GET /`` remains the minimal JSON identity endpoint.
+    """
+    return HTMLResponse(content=render_dashboard_page())
 
 
 @app.get("/captures")
