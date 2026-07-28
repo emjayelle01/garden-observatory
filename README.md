@@ -234,7 +234,7 @@ group.
 | `/etc/garden-observatory/` | `root:mgo` | `0750` | `mgo.toml` (`0640`) — readable, never writable, by the service |
 | `/var/lib/garden-observatory/` | `mgo:mgo` | `0750` | `db/`, `media/captures/`, `queues/`, `state/` |
 | `/var/log/garden-observatory/` | `mgo:mgo` | `0750` | file-based logs (the journal remains primary) |
-| `/var/backups/garden-observatory/` | `mgo:mgo` | `0750` | database backups and their manifests (`0640`) |
+| `/var/backups/garden-observatory/` | `mgo:mgo` | `0750` | recovery sets — database, configuration snapshot and manifest (all `0640`) |
 
 Its only supplementary group is `video`, which grants camera device access.
 
@@ -243,11 +243,19 @@ Its only supplementary group is `video`, which grants camera device access.
 Backups, log rotation and diagnostics are documented in
 [`docs/Operations.md`](docs/Operations.md).
 
-A **daily backup** of the SQLite database runs at 02:30 local time via
-`mgo-backup.timer`. It uses SQLite's online backup API, so it is taken **while
-the API keeps serving** — no step in the normal backup procedure stops
-`mgo.service`. Each backup is validated, checksummed and published atomically
-alongside a JSON manifest, and the newest 14 complete sets are retained.
+A **daily backup** runs at 02:30 local time via `mgo-backup.timer`. It uses
+SQLite's online backup API, so it is taken **while the API keeps serving** — no
+step in the normal backup procedure stops `mgo.service`.
+
+Each run produces a **complete recovery set of three files**: the database
+snapshot, a byte-exact snapshot of the production configuration, and a manifest
+that binds them. The manifest is written last and is the completion marker.
+Verification compares every recorded value against the artefact it describes,
+and the newest 14 complete sets are retained.
+
+> The configuration snapshot may contain credentials. It lives only in
+> `/var/backups/garden-observatory` (`mgo:mgo 0750`, files `0640`) and is
+> **never** included in a support bundle.
 
 ```bash
 scripts/operations/backup-database.sh backup
@@ -261,9 +269,11 @@ scripts/operations/backup-database.sh list
 scripts/operations/backup-database.sh restore-test /var/backups/garden-observatory/<backup>.db
 ```
 
-There is deliberately **no `restore` command**: `restore-test` proves a backup
-can be recovered, while restoring over the live database stays an explicit
-operator disaster-recovery procedure documented in `docs/Operations.md`.
+`restore-test` verifies the complete set before copying anything, restores both
+artefacts into an isolated directory, and checks the restored configuration's
+checksum without ever activating it. There is deliberately **no `restore`
+command**: restoring over the live database stays an explicit operator
+disaster-recovery procedure documented in `docs/Operations.md`.
 
 A **diagnostic support bundle** collects health, status, a bounded journal slice
 and a redacted configuration summary into one archive, so a fault can be
@@ -275,7 +285,9 @@ scripts/operations/create-support-bundle.sh --output-directory /tmp
 
 Every member is generated in memory, so the bundle structurally cannot contain
 the database, its WAL sidecars, media, media filenames, the raw configuration,
-SSH material or Git credentials. Inspect it before sending it anywhere.
+SSH material or Git credentials. Collection is literal-loopback only with
+proxies disabled and redirects refused, and every traversal and response is
+bounded. Inspect it before sending it anywhere.
 
 MGO's runtime logs live in the **journal** (`journalctl -u mgo.service`), which
 is bounded by host-level journald retention. The Task 10 logrotate policy covers

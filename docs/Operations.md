@@ -13,7 +13,8 @@ fault is diagnosed without attaching a monitor and keyboard to the Raspberry Pi.
 
 Task 10 delivers the operations foundation:
 
-- a consistent SQLite backup that runs while the API keeps serving;
+- a consistent SQLite backup that runs while the API keeps serving, **paired
+  with a snapshot of the production configuration**;
 - backup verification, isolated restore testing and bounded retention;
 - a scheduled backup service and timer;
 - a log-rotation policy for MGO-owned file logs;
@@ -82,6 +83,78 @@ by this task.
 
 ## 3. Backup architecture
 
+### 3.0 Complete backup sets
+
+A **recovery set is three files**, all sharing one UTC timestamp:
+
+```text
+mgo-20260728T023000Z.db              the database snapshot
+mgo-20260728T023000Z.config.toml     the production configuration snapshot
+mgo-20260728T023000Z.manifest.json   the manifest that binds them
+```
+
+The configuration is part of the set because the plan requires the database
+*and* the configuration to be backed up, and because a database restored onto a
+machine whose configuration is gone is only half a recovery: an operator would
+have to reconstruct `/etc/garden-observatory/mgo.toml` from memory during an
+incident.
+
+**A set is complete only when all three files are present and mutually
+consistent.** The manifest is written **last** and is the completion marker — if
+publication fails part-way, the recovery files already written are removed, so
+no manifest can survive claiming a set that is not there.
+
+#### Which configuration is captured
+
+The application's existing resolution rules, and no others:
+
+1. an explicit `--config`;
+2. `MGO_CONFIG_PATH`;
+3. the tracked development default.
+
+The scheduled backup unit sets both `MGO_CONFIG_PATH` and `--config`, so in
+production this is always `/etc/garden-observatory/mgo.toml`. One answer serves
+both purposes — locating the database and choosing the configuration — so a set
+can never pair a database with a configuration that does not belong to it.
+
+#### Safety and secrecy
+
+> **The configuration snapshot is a protected disaster-recovery artefact, not a
+> diagnostic one.** It may contain credentials that future transports add, so it
+> is the most sensitive file in the backup directory. It is **never** included in
+> a support bundle.
+
+The capture refuses to proceed when the configuration:
+
+- does not exist, or is not a regular file;
+- is a **symlink** — the target could be changed between unattended runs;
+- cannot be read;
+- exceeds **1 MiB** (`MAX_CONFIGURATION_BYTES`) — MGO's configuration is a few
+  kilobytes, and an unattended job must not read an unbounded file;
+- **changes while it is being copied** — the snapshot would be neither the old
+  file nor the new one.
+
+The file is validated through its own file descriptor after opening rather than
+through the path, so the thing that was checked is the thing that was read.
+
+Bytes are preserved **exactly**: the file is never parsed, normalised or
+rewritten. A configuration round-tripped through a TOML parser would lose its
+comments and its ordering, and a restore would hand the operator something
+merely equivalent rather than identical.
+
+Contents never appear in a structured event, the manifest, the command summary
+or a support bundle. The manifest records only four safe descriptors:
+
+```text
+configuration_source_name     a basename, never a path
+configuration_filename
+configuration_size_bytes
+configuration_sha256
+```
+
+The snapshot is written `0640`, from a temporary file that is `0600` before any
+bytes are written — so the contents are never briefly group-readable.
+
 ### 3.1 Consistency without stopping the service
 
 The production database runs in **WAL mode** with the API writing to it
@@ -145,7 +218,7 @@ sorts lexically in chronological order, which is what makes retention a simple
 
 ### 3.5 The manifest
 
-Every successful backup has a JSON manifest recording:
+Every successful recovery set has a JSON manifest recording:
 
 | Field | Meaning |
 | ----- | ------- |
@@ -159,20 +232,26 @@ Every successful backup has a JSON manifest recording:
 | `schema_version` / `expected_schema_version` | Recorded and supported schema. |
 | `integrity` | `quick_check` verdict at the time of writing. |
 | `journal_mode_of_backup` | The copy's journal mode (`delete`). |
-| `table_row_counts` | Row counts for the expected tables. |
+| `table_row_counts` | Row counts for **exactly** the expected tables. |
+| `configuration_source_name` | The configuration's **name**, never its path. |
+| `configuration_filename` | The snapshot in this set. |
+| `configuration_size_bytes` | Size, checked on verification. |
+| `configuration_sha256` | Checksum, checked on verification. |
 
-A manifest travels with its backup, and a backup may be copied somewhere less
-private than the Pi. It therefore contains **no** absolute path, configuration
-value, environment value, username, hostname or database row content. Row
+A manifest travels with its set, and a set may be copied somewhere less private
+than the Pi. It therefore contains **no** absolute path, configuration
+*content*, environment value, username, hostname or database row content. Row
 *counts* are included; row *contents* never are.
 
-A manifest recording a `format_version` newer than this build understands is
-refused rather than interpreted optimistically — the same rule the database
-schema follows.
+Only the exact supported `format_version` is accepted. There is deliberately no
+forward- or backward-compatibility policy: one would have to define which fields
+may be absent and what they default to, and accepting a manifest of another
+version means accepting one whose meaning this build cannot actually know.
 
 ### 3.6 Validation before publication
 
-Before a backup is published it is opened independently and must pass:
+Before a set is published the database copy is opened independently and must
+pass:
 
 - it is a valid SQLite database;
 - `PRAGMA quick_check(1)` reports `ok`;
@@ -181,15 +260,52 @@ Before a backup is published it is opened independently and must pass:
 - the expected tables (`schema_migrations`, `observations`, `captures`) exist;
 - the manifest checksum matches the final file.
 
-A backup that fails any of these is not published.
+The configuration passes its own checks (§3.0) before anything is published. A
+set that fails any of these is not published.
+
+### 3.6.1 What verification actually checks
+
+`verify` is **binding**, not merely structural. Being parseable is not enough:
+a manifest that is internally tidy but describes a *different* set must fail.
+
+Structural validation refuses a manifest with missing fields, wrong types,
+booleans used as integers, negative sizes or versions, malformed SHA-256 values,
+filenames that are not names this tooling produces, source names that are
+absolute or contain a directory separator, invalid timestamps, an unsupported
+format version, or a `table_row_counts` map that does not cover exactly the
+required tables.
+
+Semantic binding then compares every recorded value against the artefact it
+claims to describe:
+
+```text
+backup_filename            == the actual database filename
+configuration_filename     == the actual configuration filename
+backup_size_bytes          == the actual database size
+configuration_size_bytes   == the actual configuration size
+sha256                     == the actual database SHA-256
+configuration_sha256       == the actual configuration SHA-256
+schema_version             == the actual database schema version
+expected_schema_version    == CURRENT_SCHEMA_VERSION
+integrity                  == the actual integrity result
+journal_mode_of_backup     == the actual backup journal mode
+table_row_counts           == the exact actual expected-table counts
+```
+
+The row-count comparison is exact and in **both** directions. Comparing only the
+keys a manifest happens to carry would let an empty `table_row_counts` object
+verify against any database at all.
 
 ### 3.7 Retention
 
-- Default **14** complete backup sets (`--keep`, validated as a bounded positive
-  integer, minimum 1 so retention can never delete everything).
-- Runs **only after** a validated backup has been published.
-- A set's `.db` and manifest are removed **together**; deleting one and leaving
-  the other would manufacture an orphan.
+- Default **14** complete recovery sets (`--keep`, validated as `1..3650` — the
+  same bound the installer applies, so a unit can never be written with a value
+  the runtime would reject).
+- Runs **only after** a validated set has been published.
+- A set's three files are removed together, **manifest first**. That order
+  matters: the manifest is the completion marker, so an interrupted deletion
+  leaves recognisable orphans rather than a manifest still advertising a set
+  whose database has already gone. Every partial deletion is reported.
 - Only files matching the strict backup name pattern are ever candidates.
   Support bundles, operator notes and unrelated files sharing the directory are
   never touched. Orphans and in-progress temporary files are not counted as
@@ -314,33 +430,49 @@ No step in the normal backup procedure requires stopping `mgo.service`.
 scripts/operations/backup-database.sh list
 ```
 
-Reports complete sets newest first with their verification state, plus any
-orphaned `.db` files, orphaned manifests and in-progress temporary files —
-which are reported but never treated as backups.
+Reports complete sets newest first with their verification state, plus orphaned
+database files, orphaned **configuration snapshots**, orphaned manifests and
+in-progress temporary files — each reported separately, because a database with
+no configuration is a different problem from a manifest with no database, and
+never treated as backups.
 
-### 5.3 Verify a backup
+### 5.3 Verify a recovery set
 
 ```bash
 scripts/operations/backup-database.sh verify /var/backups/garden-observatory/mgo-20260728T023000Z.db
 ```
 
-Read-only. Checks the manifest structure and version, the recorded size, the
-SHA-256, SQLite integrity, schema compatibility, the expected tables and the
-recorded row counts.
+Read-only. Names the database file; the configuration and manifest are located
+beside it. Performs the full structural and binding validation described in
+§3.6.1.
 
-### 5.4 Restore-test a backup
+### 5.4 Restore-test a recovery set
 
 ```bash
 scripts/operations/backup-database.sh restore-test /var/backups/garden-observatory/mgo-20260728T023000Z.db
 ```
 
-Restores into an isolated temporary directory, opens it as an independent
-database, runs the same integrity/schema/table/row-count checks, confirms the
-source backup is unchanged, and cleans up. It never writes into the production
-database directory, never replaces a configured database, never stops the
-service and never modifies the backup or the configuration.
+**Verifies the complete set first**, and stops if verification fails — a missing
+manifest, a missing configuration snapshot, a checksum mismatch or a
+semantically inconsistent manifest all fail *before a single byte is copied*.
 
-Add `--preserve` to keep the restored copy for inspection after a failure.
+It then copies both artefacts into an isolated directory under fixed names:
+
+```text
+restored.db
+restored-mgo.toml
+```
+
+and checks database integrity, schema compatibility, expected tables, exact row
+counts, the restored configuration's checksum, and that neither source changed
+during the test.
+
+The restored configuration is **checked, never activated**: nothing is pointed
+at it, no API is started and no production path is written.
+
+If either target file already exists in a caller-supplied `--work-directory`,
+the test refuses before writing rather than overwriting it. Add `--preserve` to
+keep the restored copies for inspection after a failure.
 
 ### 5.5 Generate a support bundle
 
@@ -424,7 +556,18 @@ Read this fully before starting. Nothing below is automated.
    sudo -u mgo cp /var/backups/garden-observatory/<chosen>.db /var/lib/garden-observatory/db/mgo.db
    ```
 
-5. **Start and confirm.**
+5. **Restore the configuration too, if it was lost.** The set contains it. Diff
+   before replacing — the live file may be newer than the snapshot.
+
+   ```bash
+   diff /etc/garden-observatory/mgo.toml /var/backups/garden-observatory/<chosen>.config.toml
+   ```
+
+   ```bash
+   sudo install -o root -g mgo -m 0640 /var/backups/garden-observatory/<chosen>.config.toml /etc/garden-observatory/mgo.toml
+   ```
+
+6. **Start and confirm.**
 
    ```bash
    sudo systemctl start mgo.service
@@ -437,7 +580,7 @@ Read this fully before starting. Nothing below is automated.
    Expect `status: healthy` and the schema version the manifest recorded. The
    application applies any pending migrations at startup.
 
-6. **Only once the restore is confirmed good**, decide what to do with
+7. **Only once the restore is confirmed good**, decide what to do with
    `mgo.db.damaged`. Observations recorded between the backup and the failure
    are lost; that gap is the backup interval.
 
@@ -598,6 +741,12 @@ Git credentials, Git configuration, repository remotes, tokens, passwords,
 private keys, cookies or browser data. Tests inspect generated archive members
 and their bytes to prove it.
 
+> **The configuration snapshot taken by a backup is never included.** Adding the
+> configuration to recovery sets (§3.0) deliberately did **not** add it to
+> bundles: a recovery set is protected storage on the Pi, while a bundle is a
+> file intended to be handed to someone else. The bundle still carries only the
+> redacted *summary* described in §9.5.
+
 ### 9.5 Redaction
 
 The configuration summary is built from the **typed** configuration, so only
@@ -626,20 +775,70 @@ fields this build knows about can appear, each chosen by hand. Beyond that:
 | Journal window | previous 24 hours |
 | Journal lines | 2,000 |
 | Journal bytes | 2 MiB |
+| Storage entries inspected | 20,000 per directory |
+| Storage traversal depth | 8 levels |
 | Archive members | 64 |
-| Archive bytes | 8 MiB |
+| Archive bytes | 8 MiB (checked before **and** after compression) |
 
 A misbehaving source cannot fill the SD card. The journal slice is scoped to the
 MGO unit only — the whole system journal would carry other services' logs and
 other users' activity off the Pi.
 
+#### Bounded storage aggregation
+
+Directory totals are gathered by an explicitly bounded iterative walk, not by
+`rglob`. The captures directory is flat today, and the implementation must not
+depend on that remaining true — nor spend minutes stat-ing a media archive on a
+device that is already unwell.
+
+- **Symlinked directories are never descended.** A link into `/` would otherwise
+  turn a capture-directory scan into a whole-filesystem walk, and a link loop
+  would run forever.
+- **Symlinked files are counted but never stat-ed through**, so the size of a
+  target outside the approved directory is never read.
+- Files that vanish mid-walk and directories that cannot be read are skipped.
+- Hitting a bound returns the counts gathered so far with `truncated: true` and
+  the limit that stopped it, adds a diagnostic error so the bundle outcome
+  becomes **partial**, and never fails the bundle.
+- No filename is ever emitted, truncated or not.
+
 ### 9.7 Network boundary
 
-Collection is **loopback only**. The base URL is validated to address
-`127.0.0.1` rather than assumed, so bundle generation cannot be pointed at a
-remote address. Only read-only status endpoints are contacted: no capture, no
-preview start or stop, no stream, no notification publication. Nothing is
-uploaded anywhere.
+Collection is **loopback only**, and enforced rather than assumed:
+
+- the base URL must use `http`;
+- the host must be a **literal** loopback address — `127.0.0.1` or `::1`.
+  `localhost` is deliberately **refused**: resolving it is a DNS lookup governed
+  by `/etc/hosts`, `nsswitch.conf` and the resolver, none of which this tooling
+  controls. A literal address needs no resolution, so there is nothing to
+  redirect;
+- user information, query strings and fragments are refused, so credentials
+  cannot be smuggled into a URL that ends up in a log and endpoint paths stay
+  fixed by the reviewed table.
+
+Validating the URL alone is not sufficient, so the HTTP client is built
+explicitly:
+
+- **proxies are disabled.** `urllib`'s default opener reads
+  `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`; on a machine with a proxy configured, a
+  "loopback only" request would have been sent to it — off the machine entirely;
+- **redirects are never followed.** A 3xx is recorded as a failed source. Without
+  this, a local service could redirect a diagnostic request to an external host
+  *after* the initial URL had validated cleanly.
+
+Only read-only status endpoints are contacted: no capture, no preview start or
+stop, no stream, no notification publication. Nothing is uploaded anywhere.
+
+### 9.7.1 Command results are believed only when they succeed
+
+A non-zero `systemctl` or `journalctl` is treated as **unavailable**, not as an
+empty success. Reporting `available: true` with no properties after `systemctl`
+failed would read as "the service exists and told us nothing", which is a
+different and far more alarming diagnosis than "systemctl could not answer".
+
+Each failure retains a bounded, whitespace-collapsed detail from `stderr` (the
+explanation is genuinely useful), adds a diagnostic error, and makes the bundle
+outcome partial.
 
 ### 9.8 Partial success and exit codes
 
@@ -685,8 +884,11 @@ is the contract; the message is the explanation.
 | `BACKUP_RETENTION_FAILED` | Expired sets could not be removed. |
 | `BACKUP_CHECKSUM_MISMATCH` | Size or SHA-256 disagrees with the manifest. |
 | `BACKUP_NOT_FOUND` | The named backup or directory does not exist. |
+| `BACKUP_CONFIGURATION_UNAVAILABLE` | The configuration is missing, not a regular file, a symlink, unreadable, over 1 MiB, or changed mid-copy. |
+| `BACKUP_SET_INCOMPLETE` | The three files are not all present, or do not describe each other. |
 | `RESTORE_TEST_FAILED` | The restored copy did not pass its checks. |
 | `RESTORE_TARGET_REJECTED` | A production data location was named as a target. |
+| `RESTORE_TARGET_EXISTS` | A restore-test target file already exists; it is never overwritten. |
 | `DIAGNOSTIC_OUTPUT_UNWRITABLE` | The bundle directory cannot be written. |
 | `DIAGNOSTIC_SOURCE_UNAVAILABLE` | An endpoint or command could not be reached. |
 | `DIAGNOSTIC_TIMEOUT` | A command did not finish in time. |
@@ -730,9 +932,57 @@ It remains **idempotent**: it skips rewriting a file that is already identical,
 backs up any file it does replace, never overwrites the production
 configuration, never deletes a backup, and never restarts `mgo.service`.
 
+### 11.1 Installer flag semantics
+
+The two units run **different executables**, so the virtual environment is
+validated per selected target:
+
+| Unit | Executable validated |
+| ---- | -------------------- |
+| `mgo.service` | `.venv/bin/uvicorn` |
+| `mgo-backup.service` | `.venv/bin/python` |
+
+| Flags | Behaviour with a broken virtual environment |
+| ----- | ------------------------------------------- |
+| *(default)* | **Fails** — both units are selected. |
+| `--no-unit` | **Fails** — the backup service is still selected. |
+| `--no-operations` | **Fails** — the API service is still selected. |
+| `--no-unit --no-operations` | Continues — no systemd executable is installed. |
+
+`--no-unit` skips `mgo.service` only. It does **not** skip Task 10
+provisioning, so a broken environment still stops the run — the installer must
+never point a unit at an interpreter that cannot start it.
+
 `--dry-run` prints every change without making any. `--no-operations` skips all
-Task 10 provisioning. `--keep N` sets the scheduled retention; `--backup-dir`
-sets the backup root.
+Task 10 provisioning. `--keep N` sets the scheduled retention and is validated
+against the same `1..3650` bound the runtime enforces, so the installer can
+never write a unit that would fail every scheduled run. `--backup-dir` sets the
+backup root.
+
+### 11.2 Timer activation is strict
+
+Installing the timer is checked at every step, in order:
+
+1. install the unit files;
+2. `systemctl daemon-reload`;
+3. seed the persistence stamp (if absent);
+4. `systemctl enable mgo-backup.timer`;
+5. `systemctl start mgo-backup.timer`;
+6. verify `is-enabled`;
+7. verify `is-active`.
+
+Success is reported **only after all seven pass**. Any failure exits non-zero
+and names the step that failed. `enable` and `start` can each report success
+while the resulting state is not what was asked for, which is why steps 6 and 7
+confirm the state rather than inferring it from exit codes.
+
+A missing `systemctl` is a **failure**, not a warning: unit files installed with
+no scheduler is not a successful installation.
+
+> A failed activation may leave the installed unit files behind. That is stated
+> plainly in the failure message, because the files existing does **not** mean a
+> backup is scheduled. Re-run the installer once the cause is fixed. No failure
+> path runs the backup service or touches `mgo.service`.
 
 ## 12. Verification
 
@@ -853,6 +1103,19 @@ capture count, service PID, restart count, preview state.
 3. The dashboard loads in a browser at `http://mgo-core:8080/dashboard` and
    shows live values.
 
+### 13.3a Record the configuration state
+
+The configuration is now part of every recovery set, so its "before" state is
+recorded too.
+
+```bash
+sudo sha256sum /etc/garden-observatory/mgo.toml
+```
+
+```bash
+stat -c '%U:%G %a %n' /etc/garden-observatory/mgo.toml
+```
+
 ### 13.4 Install
 
 ```bash
@@ -862,12 +1125,23 @@ sudo bash scripts/deploy/install-service-identity.sh --dry-run
 Confirm it describes the backup directory, the backup unit, the timer and the
 logrotate policy, and changes nothing.
 
+Also exercise the flag combination that was previously unsafe:
+
+```bash
+sudo bash scripts/deploy/install-service-identity.sh --no-unit --dry-run
+```
+
+Confirm it still validates the environment for `mgo-backup.service` (it must
+report the **backup interpreter**, `.venv/bin/python`) and does **not** claim
+that no unit will reference the virtual environment.
+
 ```bash
 sudo bash scripts/deploy/install-service-identity.sh
 ```
 
-Confirm `mgo.service` was **not** restarted (`NRestarts` and `MainPID`
-unchanged).
+Confirm the run reports each timer step in turn and ends with
+`mgo-backup.timer is enabled and active`. Confirm `mgo.service` was **not**
+restarted (`NRestarts` and `MainPID` unchanged).
 
 ### 13.5 Check what was provisioned
 
@@ -880,6 +1154,9 @@ Expect `mgo:mgo 750`.
 ```bash
 systemctl cat mgo-backup.service
 ```
+
+Confirm `ExecStart` uses `.venv/bin/python` — the interpreter the installer
+validated.
 
 ```bash
 systemctl cat mgo-backup.timer
@@ -912,24 +1189,46 @@ validation backup. **Do not delete any pre-existing backup.**
 sudo -u mgo /opt/garden-observatory/scripts/operations/backup-database.sh list
 ```
 
+**Confirm the set has all three files:**
+
+```bash
+sudo ls -l /var/backups/garden-observatory/
+```
+
+Expect `<backup>.db`, `<backup>.config.toml` and `<backup>.manifest.json`
+sharing one timestamp, with no orphans and no temporary files.
+
 ```bash
 sudo -u mgo cat /var/backups/garden-observatory/<backup>.manifest.json
 ```
 
-Confirm the manifest's `schema_version`, `integrity: "ok"`, row counts and
-`journal_mode_of_backup`.
+Confirm `schema_version`, `integrity: "ok"`, row counts for **all three**
+expected tables, `journal_mode_of_backup`, and the four `configuration_*`
+fields. Confirm the manifest contains **no** configuration content.
 
 ```bash
-stat -c '%U:%G %a %n' /var/backups/garden-observatory/<backup>.db
+stat -c '%U:%G %a %n' /var/backups/garden-observatory/<backup>.db /var/backups/garden-observatory/<backup>.config.toml /var/backups/garden-observatory/<backup>.manifest.json
 ```
 
-Expect `mgo:mgo 640`.
+Expect `mgo:mgo 640` for all three, and nothing world-readable.
 
 ```bash
-sudo -u mgo sha256sum /var/backups/garden-observatory/<backup>.db
+sudo -u mgo sha256sum /var/backups/garden-observatory/<backup>.db /var/backups/garden-observatory/<backup>.config.toml
 ```
 
-Confirm it matches the manifest's `sha256`.
+Confirm these match the manifest's `sha256` and `configuration_sha256`.
+
+**Prove the configuration snapshot is the live configuration:**
+
+```bash
+sudo sha256sum /etc/garden-observatory/mgo.toml
+```
+
+```bash
+sudo diff /etc/garden-observatory/mgo.toml /var/backups/garden-observatory/<backup>.config.toml && echo "identical"
+```
+
+Both must match the value recorded in §13.3a.
 
 ```bash
 sudo -u mgo /opt/garden-observatory/scripts/operations/backup-database.sh verify /var/backups/garden-observatory/<backup>.db
@@ -939,7 +1238,9 @@ sudo -u mgo /opt/garden-observatory/scripts/operations/backup-database.sh verify
 sudo -u mgo /opt/garden-observatory/scripts/operations/backup-database.sh restore-test /var/backups/garden-observatory/<backup>.db
 ```
 
-Both must exit `0`.
+Both must exit `0`. In the restore-test output confirm `set_verified`,
+`restored_configuration` and `row_counts` are all `ok`, and that **nothing
+reports `skipped`**.
 
 ### 13.7 Confirm production data is untouched
 
@@ -951,18 +1252,29 @@ sudo -u mgo sha256sum /var/lib/garden-observatory/db/mgo.db
 curl -s http://127.0.0.1:8080/database/status
 ```
 
-Compare against §13.2. Observation and capture counts must be unchanged apart
-from any the running application legitimately recorded meanwhile.
+```bash
+sudo sha256sum /etc/garden-observatory/mgo.toml
+```
+
+Compare all three against §13.2 and §13.3a. Observation and capture counts must
+be unchanged apart from any the running application legitimately recorded
+meanwhile, and the production configuration must be **byte-identical** — a
+backup reads it and never writes it.
 
 ### 13.8 Scheduled run
+
+```bash
+systemctl is-enabled mgo-backup.timer && systemctl is-active mgo-backup.timer
+```
 
 ```bash
 systemctl list-timers mgo-backup.timer
 ```
 
-Confirm the timer is enabled, active and has a next elapse — and that **no
-backup ran at install time** (the only backup present should be the one taken by
-hand in §13.6, plus any pre-existing).
+Confirm the timer reports itself both enabled and active with a next elapse —
+the same two states the installer verified rather than assumed — and that **no
+backup ran at install time** (the only recovery set present should be the one
+taken by hand in §13.6, plus any pre-existing).
 
 ```bash
 sudo systemctl start mgo-backup.service
@@ -1029,8 +1341,36 @@ listing; no raw configuration; no token or password; the journal member is
 bounded; paths are canonical or reported by role only.
 
 ```bash
-tar -tzf /tmp/mgo-support-*.tar.gz | grep -E '(\.db|-wal|-shm|\.jpg|\.jpeg|\.png|\.mp4)$' && echo "PROBLEM" || echo "clean"
+tar -tzf /tmp/mgo-support-*.tar.gz | grep -E '(\.db|-wal|-shm|\.jpg|\.jpeg|\.png|\.mp4|\.toml)$' && echo "PROBLEM" || echo "clean"
 ```
+
+**Prove the raw configuration is absent** — the recovery-set snapshot must never
+appear in a bundle:
+
+```bash
+sudo grep -c . /etc/garden-observatory/mgo.toml >/dev/null && tar -xzOf /tmp/mgo-support-*.tar.gz | grep -F "$(sudo sed -n '2p' /etc/garden-observatory/mgo.toml)" && echo "PROBLEM: configuration content present" || echo "clean"
+```
+
+**Confirm the storage summary is bounded**:
+
+```bash
+tar -xzOf /tmp/mgo-support-*.tar.gz storage-summary.json
+```
+
+Every directory entry must carry a `truncated` field. If any is `true`, the
+bundle outcome must be `partial` and `errors.json` must say which limit was
+reached.
+
+**Confirm collection stayed on loopback.** With the API running, generation
+should be `complete`; there must be no outbound connection. A proxy in the
+environment must make no difference:
+
+```bash
+cd /tmp && sudo -u mgo HTTP_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 /opt/garden-observatory/scripts/operations/create-support-bundle.sh --output-directory /tmp
+```
+
+This must still exit `0` (or `1` only for genuinely unavailable sources), proving
+the proxy variables were ignored rather than honoured.
 
 ### 13.11 Journal and rotation
 
@@ -1196,24 +1536,37 @@ deletes backups is precisely the thing that must not exist.
 | `BACKUP_SCHEMA_INCOMPATIBLE` | The database records a newer schema than this build supports — the checkout is older than the data. Update the application. |
 | `BACKUP_CHECKSUM_MISMATCH` on verify | The backup changed since it was written; suspect SD-card bit rot. Verify the other backups and replace the card if more than one is affected. |
 | `BACKUP_RETENTION_FAILED` | The new backup succeeded; old sets could not be removed. Check ownership in the backup directory — the directory will otherwise keep growing. |
+| `BACKUP_CONFIGURATION_UNAVAILABLE` | The selected configuration is missing, a symlink, over 1 MiB, or was edited while the backup ran. Check `MGO_CONFIG_PATH` and the unit's `--config`; re-run once any edit has settled. |
+| `BACKUP_SET_INCOMPLETE` | A recovery set is missing one of its three files, or the manifest describes a different set. Run `list` to see which orphans exist; the set is not restorable. |
+| `RESTORE_TARGET_EXISTS` | The `--work-directory` already holds `restored.db` or `restored-mgo.toml`. Choose an empty directory; the test never overwrites. |
+| Installer fails on `--keep` | The value is outside `1..3650`. The bound matches the runtime, so a rejected value would have failed every scheduled run. |
+| Installer fails naming a step | The timer was not activated. The step name says which of daemon-reload / enable / start / verify-enabled / verify-active failed. Unit files may be installed, but **no backup is scheduled** — fix the cause and re-run. |
 | Timer enabled but never runs | Check `systemctl list-timers mgo-backup.timer` and the Pi's clock/timezone (`timedatectl`). |
 | A backup ran the moment the installer finished | The timer stamp was not seeded. Confirm `/var/lib/systemd/timers/stamp-mgo-backup.timer` exists. |
+| `storage-summary.json` says `truncated: true` | A directory hit the entry or depth bound. The counts are partial and the bundle is `partial`; this is reported, not a fault. |
 | Support bundle exits `1` | Partial: one or more sources were unreachable. Read `errors.json` inside the bundle — often the API being down, which is the fault itself. |
 | Support bundle exits `2` | No bundle was created; the output directory is unwritable. |
 | `logrotate` reports nothing to do | Expected. journald is primary and there may be no `*.log` files at all. |
 
 ## 16. Security
 
-- Backups `0640`; backup directory `mgo:mgo 0750`; support bundles `0600`.
-  Nothing is world-readable or world-writable.
+- Backups and configuration snapshots `0640`; backup directory `mgo:mgo 0750`;
+  support bundles `0600`. Nothing is world-readable or world-writable.
+- **The configuration snapshot may contain credentials.** It lives only in the
+  protected backup directory, never in a support bundle. Treat a copied recovery
+  set as sensitive.
 - No secret, token, password, credential, private key, environment dump, raw
-  configuration, database file, media file or media filename enters any
-  artefact.
-- No external network access; the bundle talks only to `127.0.0.1`.
+  configuration, database file, media file or media filename enters a **support
+  bundle**.
+- No external network access: literal loopback only, proxies disabled, redirects
+  refused.
 - No `shell=True` anywhere; every subprocess uses an argument array with an
   explicit timeout and bounded captured output.
 - No archive member may be absolute, contain `..` or be a symlink.
-- A symlinked source database is refused outright, with no override.
+- A symlinked source database **or configuration** is refused outright, with no
+  override.
+- Storage aggregation never descends a symlinked directory and never stat-s a
+  symlink's target.
 - `restore-test` refuses to write into the production database directory or the
   configured database's directory.
 - Nothing in Task 10 runs the application as root.
@@ -1225,15 +1578,13 @@ deletes backups is precisely the thing that must not exist.
 
 - **The Raspberry Pi validation has not been performed.** Backups are configured
   and tested off-Pi; they are not yet proven on the Pi.
-- **Media is not backed up.** Only the database is. The capture archive is
-  larger than the SD card can hold twice, and image retention policy is future
-  work.
-- **The configuration file is not backed up automatically.** It is
-  root-owned, changes rarely and is not writable by the runtime account; copy
-  `/etc/garden-observatory/mgo.toml` by hand when you change it.
+- **Media is not backed up.** Only the database and the configuration are. The
+  capture archive is larger than the SD card can hold twice, and image retention
+  policy is future work.
 - **Backups stay on the same device.** There is no remote or cloud copy, so an
-  SD-card failure loses both the database and its backups. Copy a backup off the
-  Pi periodically.
+  SD-card failure loses both the database and its backups. Copy a recovery set
+  off the Pi periodically — and remember that the configuration snapshot inside
+  it may contain credentials.
 - **No production restore automation**, by design ([§6](#6-restore-the-deliberate-boundary)).
 - **Application-wide structured logging is deferred**; only the Task 10 tools
   emit JSON events.

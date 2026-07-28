@@ -2,15 +2,25 @@
 
 ## Status
 
-**Implemented on `task-010-operations`. Awaiting review and Raspberry Pi
-validation.**
+**Implementation complete; repository corrections in progress.**
+
+A repository review of the five implementation commits found nine genuine
+defects — one requirement omitted outright, several checks that were weaker
+than they appeared, and three places where a failure was reported as a
+success. They are recorded in [§ Repository review](#repository-review) below
+and corrected in commits after `a5c9776`.
 
 | Gate | Outcome |
 | ---- | ------- |
 | Architecture review | Complete |
 | Implementation | Complete |
+| Repository review | Complete — nine findings |
+| Corrections | Complete, **awaiting re-review** |
 | Local static and automated validation | Passed |
 | Raspberry Pi validation | **Not performed** — procedure prepared for Matthew |
+
+Readiness for Pi validation is **not** claimed until the corrections have
+passed review.
 
 Delivered as decided below:
 
@@ -26,19 +36,20 @@ Delivered as decided below:
 - installer integration in `scripts/deploy/install-service-identity.sh`;
 - `docs/Operations.md`, plus `README.md`, `scripts/README.md`,
   `docs/Service-Identity.md` and `docs/Database.md` updates;
-- 262 added tests across `tests/test_operations_events.py`,
+- 460 added tests across `tests/test_operations_events.py`,
   `tests/test_operations_backup.py`, `tests/test_operations_support_bundle.py`
-  and `tests/test_operations_deployment.py`.
+  and `tests/test_operations_deployment.py` (262 with the implementation, 198
+  more with the corrections below).
 
 `scripts/deploy/mgo.service.template` is **byte-for-byte unchanged**, asserted
 by a test that diffs it against `main`. No dependency was added; `pyproject.toml`
 and `uv.lock` are unchanged. No migration, no configuration field, no API
 endpoint and no dashboard change.
 
-Validation on the development workstation: `ruff` passed, `mypy src` passed (47
-source files), `pytest` 891 passed / 4 skipped (baseline 633 + 262 added). The
-four skips are POSIX mode-bit and symlink-creation assertions that cannot be
-made on Windows.
+Validation on the development workstation after the corrections: `ruff` passed,
+`mypy src` passed (47 source files), `pytest` **1084 passed / 9 skipped**
+(baseline 633 + 460 added). Every skip is a POSIX mode-bit or symlink-creation
+assertion that cannot be made on Windows.
 
 Two real defects were found and fixed during implementation, both caused by
 Windows resolving a rooted POSIX path against the current drive:
@@ -54,6 +65,109 @@ Windows resolving a rooted POSIX path against the current drive:
 
 No pull request is opened, nothing is merged, and no Raspberry Pi was accessed.
 No Task 11 or Task 12 work has been started.
+
+## Repository review
+
+Nine findings, all genuine. Each is stated as the defect, why it mattered, and
+what was changed.
+
+### 1. Configuration backup was omitted
+
+The plan requires "the database and configuration must be backed up". Only the
+database was. A restore would have recovered the observation history onto a
+machine whose configuration was gone — the operator would have had to
+reconstruct `/etc/garden-observatory/mgo.toml` from memory during an incident.
+
+**Corrected.** A recovery set is now three files. See
+[§Complete backup sets](#complete-backup-sets).
+
+### 2. Manifests were not bound to the artefacts they describe
+
+`BackupManifest.from_dict()` coerced fields with `str()`/`int()` and caught only
+`KeyError`/`TypeError`/`ValueError`, so a manifest could be *parseable* while
+meaningless: a boolean where a size belonged, a negative version, a "checksum"
+that was arbitrary text, a "filename" that was a path.
+
+Worse, `verify_backup()` compared row counts by iterating **only the keys the
+manifest happened to carry**. A manifest with `"table_row_counts": {}` therefore
+verified successfully against *any* database — the single most important
+verification silently did nothing.
+
+**Corrected.** Structural validation of every field, and binding comparison of
+every recorded value against the artefact. Row counts are compared exactly, in
+both directions, over the authoritative table set.
+
+### 3. Restore testing permitted a missing manifest
+
+`restore_test()` recorded `row_counts: "skipped (no manifest)"` and still
+returned `ok`. A rehearsal that quietly skips its most important assertion is
+worse than no rehearsal, because it produces a passing result an operator will
+trust.
+
+**Corrected.** Full set verification runs before anything is copied; the
+"skipped" path no longer exists.
+
+### 4. `--no-unit` could install an unusable backup service
+
+The installer failed a broken virtual environment only when the API unit was
+selected. Once Task 10 could install `mgo-backup.service`, `--no-unit` skipped
+`mgo.service` while still installing a backup service against the same
+environment — and printed "no systemd unit will be pointed at this virtual
+environment", which had become untrue.
+
+**Corrected.** Per-target validation: `uvicorn` for the API unit, `python` for
+the backup unit. See [§Installer flag semantics](#installer-flag-semantics).
+
+### 5. Timer activation failures were hidden
+
+`systemctl enable` and `systemctl start` both ended in `|| true`, and the script
+then printed "enabled and started" unconditionally. A timer that failed to
+enable was reported as enabled: the operator would believe backups were
+scheduled when nothing was scheduled at all. For a task whose entire purpose is
+"backups happen", this was the most serious finding.
+
+**Corrected.** Every step is checked, names itself on failure, and the resulting
+state is verified rather than inferred.
+
+### 6. Installer retention validation was weaker than the runtime
+
+The installer accepted any positive integer; the Python CLI enforces
+`1..3650`. `--keep 100000` would have written a unit guaranteed to fail every
+scheduled run — a backup service that never once succeeded.
+
+**Corrected.** The installer applies the same bound.
+
+### 7. Diagnostic HTTP could use a proxy or follow a redirect
+
+Only the *initial* URL was validated. `urllib`'s default opener honours
+`HTTP_PROXY`/`ALL_PROXY` and follows 3xx responses, so a "loopback only" request
+could have been sent to a proxy or redirected to an external host — with the
+validation having passed either way. The privacy boundary was one environment
+variable from being bypassed.
+
+**Corrected.** Explicit opener with proxies disabled and redirects refused;
+literal loopback addresses only.
+
+### 8. Some non-zero commands were treated as successes
+
+`collect_service_status()` returned `available: true` with an empty property set
+after `systemctl` failed. "The service exists and told us nothing" is a
+different — and far more alarming — diagnosis than "systemctl could not answer".
+`collect_journal_disk_usage()` had the same problem.
+
+**Corrected.** Return codes are inspected; failures carry a bounded, sanitised
+detail and make the bundle partial.
+
+### 9. Storage aggregation was unbounded
+
+`Path.rglob("*")` walks an entire tree with no limit. The captures directory is
+flat *today*; a diagnostic tool must not depend on that remaining true, and must
+not spend minutes stat-ing a media archive on a device that is already unwell. A
+symlinked directory could also have turned a capture scan into a filesystem
+walk, or looped forever.
+
+**Corrected.** Bounded iterative traversal that never descends a symlink and
+reports truncation.
 
 ## Authoritative definition
 

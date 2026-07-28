@@ -365,7 +365,7 @@ What the installer now also provisions:
 
 | Item | Detail |
 | ---- | ------ |
-| `/var/backups/garden-observatory` | `mgo:mgo 0750`. Outside the state tree, so a backup is not lost to the same accident as the original. |
+| `/var/backups/garden-observatory` | `mgo:mgo 0750`. Outside the state tree, so a backup is not lost to the same accident as the original. Holds three-file recovery sets: the database snapshot, a snapshot of `/etc/garden-observatory/mgo.toml`, and the manifest (all `0640`). **The configuration snapshot may contain credentials** — treat a copied set as sensitive; it is never included in a support bundle. |
 | `mgo-backup.service` | One-shot, `mgo:mgo`, no capabilities, `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateDevices=yes` (it needs no camera), `RestrictAddressFamilies=AF_UNIX`. Never starts, stops or requires `mgo.service`. |
 | `mgo-backup.timer` | Daily 02:30 local, `Persistent=true`, 30-minute randomised delay. |
 | `/etc/logrotate.d/garden-observatory` | Rotates only MGO-owned `*.log` files. Does not rotate the journal. |
@@ -374,6 +374,13 @@ The backup unit's `ReadWritePaths` includes the **database directory** as well
 as the backup root. That is required, not incidental: SQLite needs shared-memory
 access to read a WAL database, so the directory must be writable even for a
 read-only reader. It grants filesystem write access, not database write access.
+
+The installer validates the virtual environment **per selected target** — the
+API unit runs `.venv/bin/uvicorn`, the backup unit runs `.venv/bin/python` — and
+`--no-unit` skips only `mgo.service`, so a broken environment still stops the
+run while the backup service is being installed. Timer activation is checked
+step by step and its enabled/active states verified, so a failed activation can
+never be reported as success.
 
 Verify the operations provisioning with its own read-only script:
 
