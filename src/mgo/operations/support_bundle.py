@@ -99,7 +99,14 @@ MEMBER_MODE = 0o640
 #: The API is read over the loopback interface only. A bundle must never reach
 #: the network, so the host is validated rather than assumed.
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8080"
-_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+#: Literal loopback addresses, and *only* literal addresses. ``localhost`` is
+#: deliberately excluded: resolving it is a DNS lookup, and what it resolves to
+#: is decided by ``/etc/hosts``, ``nsswitch.conf`` and the resolver -- none of
+#: which this tooling controls. A name that "is obviously loopback" is exactly
+#: the kind of assumption a privacy boundary must not rest on. A literal IP
+#: needs no resolution at all, so there is nothing to redirect.
+ALLOWED_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
 
 #: Per-request timeout. Short and explicit: a struggling API must not stall a
 #: diagnostic run, and there are no retries -- a retry loop is exactly how a
@@ -309,39 +316,92 @@ Runner = Callable[[Sequence[str]], CommandResult]
 
 
 def _validated_base_url(base_url: str) -> str:
-    """Return the API base URL, refusing anything that is not loopback.
+    """Return the API base URL, refusing anything that is not literal loopback.
 
-    A support bundle must never reach the network. Validating the host here --
-    rather than trusting the default -- means an operator (or a future caller)
-    cannot accidentally point bundle generation at a remote address and post
-    the Pi's status to it.
+    A support bundle must never reach the network. Validating the base URL here
+    means an operator (or a future caller) cannot point bundle generation at a
+    remote address and post the Pi's status to it.
+
+    Validation is deliberately strict, because every rejected form is a way the
+    request could have left the machine or carried something it should not:
+
+    * only ``http`` -- ``https`` to loopback would be a misconfiguration, and
+      accepting other schemes invites ``file://`` and ``ftp://``;
+    * only a **literal** loopback address, never a name (see
+      :data:`ALLOWED_LOOPBACK_HOSTS`);
+    * no user information, so credentials cannot be smuggled into a URL that
+      ends up in a log;
+    * no query string or fragment, because the endpoint paths are fixed by the
+      reviewed table and a base URL is not a place to add parameters.
     """
     parsed = urlparse(base_url)
+
     if parsed.scheme != "http":
         raise OperationError(
             ErrorCode.INVALID_ARGUMENT,
             "The API base URL must use http:// on the loopback interface.",
         )
-    if (parsed.hostname or "") not in _ALLOWED_HOSTS:
+    if parsed.username is not None or parsed.password is not None:
         raise OperationError(
             ErrorCode.INVALID_ARGUMENT,
-            "The API base URL must address the loopback interface "
-            "(127.0.0.1); a support bundle never reaches the network.",
+            "The API base URL must not contain user information.",
+        )
+    if parsed.query or parsed.fragment:
+        raise OperationError(
+            ErrorCode.INVALID_ARGUMENT,
+            "The API base URL must not contain a query string or fragment; "
+            "endpoint paths are fixed by the reviewed endpoint table.",
+        )
+    if (parsed.hostname or "") not in ALLOWED_LOOPBACK_HOSTS:
+        allowed = ", ".join(sorted(ALLOWED_LOOPBACK_HOSTS))
+        raise OperationError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"The API base URL must address a literal loopback address "
+            f"({allowed}); a support bundle never reaches the network, and a "
+            "hostname would require a DNS lookup this tooling does not control.",
         )
     return base_url.rstrip("/")
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect handler that refuses to follow anything.
+
+    ``urllib``'s default follows 3xx responses automatically, which would let a
+    compromised or merely misconfigured local service redirect a diagnostic
+    request to an external host -- and the validation of the *initial* URL would
+    have passed. Returning ``None`` from every redirect hook makes ``urllib``
+    surface the 3xx as an :class:`~urllib.error.HTTPError` instead, which the
+    caller records as a failed source.
+    """
+
+    def redirect_request(self, *args: object, **kwargs: object) -> None:
+        """Never produce a follow-up request."""
+        return None
+
+
+#: The opener used for every diagnostic request.
+#:
+#: Built explicitly rather than using ``urllib.request.urlopen``'s global
+#: opener, because the default installs a ``ProxyHandler`` that reads
+#: ``HTTP_PROXY``/``ALL_PROXY`` from the environment. On a machine with a proxy
+#: configured, a "loopback only" request would have been sent to that proxy --
+#: off the machine entirely. ``ProxyHandler({})`` disables proxying outright.
+_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoRedirects,
+)
 
 
 def _http_get(url: str) -> bytes:
     """Fetch a loopback URL with an explicit timeout and a bounded read.
 
-    One attempt, no retries, and at most :data:`MAX_ENDPOINT_RESPONSE_BYTES`
-    plus one byte read -- the extra byte is how an over-long response is
-    detected rather than silently truncated into invalid JSON.
+    One attempt, no retries, no proxy, no redirect, and at most
+    :data:`MAX_ENDPOINT_RESPONSE_BYTES` plus one byte read -- the extra byte is
+    how an over-long response is detected rather than silently truncated into
+    invalid JSON.
     """
     request = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(
-        request, timeout=ENDPOINT_TIMEOUT_SECONDS
-    ) as response:
+    with _OPENER.open(request, timeout=ENDPOINT_TIMEOUT_SECONDS) as response:
         return bytes(response.read(MAX_ENDPOINT_RESPONSE_BYTES + 1))
 
 
@@ -393,6 +453,26 @@ def _run_command(command: Sequence[str]) -> CommandResult:
         stderr=(completed.stderr or "")[:4096],
         truncated=truncated,
     )
+
+
+def _fsync_path(path: Path) -> None:
+    """Flush a file or directory to storage, best effort.
+
+    Durability matters here for the same reason it does for a backup: a bundle
+    generated moments before a Pi is power-cycled should survive the reboot.
+    Windows cannot open a directory as a file descriptor and raises, which is
+    expected and ignored.
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
 
 
 def _json_bytes(payload: object) -> bytes:
@@ -447,6 +527,29 @@ def collect_endpoint(
         )
 
 
+#: Longest error detail retained from a failed command. stderr is attacker- and
+#: accident-adjacent text that ends up in a file leaving the machine, so it is
+#: bounded and whitespace-collapsed rather than copied through wholesale.
+MAX_COMMAND_ERROR_DETAIL = 300
+
+
+def _command_failure_detail(name: str, result: CommandResult) -> str:
+    """Return a bounded, sanitised description of a failed command.
+
+    A command that exits non-zero usually explains itself on stderr, and that
+    explanation is genuinely useful ("Unit mgo.service could not be found").
+    What must not happen is unbounded stderr flowing into the bundle, so the
+    text is collapsed to one line and truncated.
+    """
+    detail = f"{name} exited {result.returncode}"
+    message = " ".join((result.stderr or "").split())
+    if message:
+        if len(message) > MAX_COMMAND_ERROR_DETAIL:
+            message = message[: MAX_COMMAND_ERROR_DETAIL - 1].rstrip() + "…"
+        detail = f"{detail}: {message}"
+    return detail + "."
+
+
 def collect_service_status(
     unit: str, run: Runner
 ) -> tuple[dict[str, Any], SourceError | None]:
@@ -473,6 +576,19 @@ def collect_service_status(
             ),
         )
 
+    # A non-zero exit means systemctl did not answer the question -- an unknown
+    # unit, a refused request, no running systemd. Reporting ``available: true``
+    # with an empty property set would read as "the service exists and told us
+    # nothing", which is a different and much more alarming fact.
+    if result.returncode not in (0, None):
+        detail = _command_failure_detail("systemctl", result)
+        return (
+            {"unit": unit, "available": False, "error": detail},
+            SourceError(
+                "systemctl", ErrorCode.DIAGNOSTIC_SOURCE_UNAVAILABLE, detail
+            ),
+        )
+
     allowed = set(SERVICE_PROPERTIES)
     properties: dict[str, str] = {}
     for line in result.stdout.splitlines():
@@ -483,10 +599,26 @@ def collect_service_status(
         if separator and key in allowed:
             properties[key] = value
 
-    return (
-        {"unit": unit, "available": True, "properties": properties},
-        None,
-    )
+    if not properties:
+        detail = (
+            f"systemctl returned no recognised property for {unit}; the unit "
+            "may not exist on this host."
+        )
+        return (
+            {"unit": unit, "available": False, "error": detail},
+            SourceError(
+                "systemctl", ErrorCode.DIAGNOSTIC_SOURCE_UNAVAILABLE, detail
+            ),
+        )
+
+    summary: dict[str, Any] = {
+        "unit": unit,
+        "available": True,
+        "properties": properties,
+    }
+    if result.truncated:
+        summary["truncated"] = True
+    return summary, None
 
 
 def collect_journal(unit: str, run: Runner) -> tuple[str, SourceError | None]:
@@ -524,8 +656,8 @@ def collect_journal(unit: str, run: Runner) -> tuple[str, SourceError | None]:
         )
     if result.returncode not in (0, None):
         detail = (
-            f"journalctl exited {result.returncode}; access may be denied to "
-            "this account."
+            f"{_command_failure_detail('journalctl', result)} Access may be "
+            "denied to this account."
         )
         return (
             f"[journal unavailable] {detail}\n",
@@ -554,6 +686,21 @@ def collect_journal_disk_usage(run: Runner) -> tuple[str, SourceError | None]:
     result = run(["journalctl", "--disk-usage"])
     if not result.available or result.error:
         detail = result.error or "journalctl is unavailable on this host."
+        code = (
+            ErrorCode.DIAGNOSTIC_TIMEOUT
+            if result.available
+            else ErrorCode.DIAGNOSTIC_SOURCE_UNAVAILABLE
+        )
+        return (
+            f"[unavailable] {detail}\n",
+            SourceError("journalctl --disk-usage", code, detail),
+        )
+
+    # A non-zero exit means the figure was not obtained. Returning whatever
+    # happened to be on stdout would put an empty (or partial) line in the
+    # bundle and call it a disk-usage reading.
+    if result.returncode not in (0, None):
+        detail = _command_failure_detail("journalctl --disk-usage", result)
         return (
             f"[unavailable] {detail}\n",
             SourceError(
@@ -562,6 +709,7 @@ def collect_journal_disk_usage(run: Runner) -> tuple[str, SourceError | None]:
                 detail,
             ),
         )
+
     return result.stdout.strip() + "\n", None
 
 
@@ -696,35 +844,129 @@ def _unrecognised_settings(
     return unknown
 
 
-def _directory_totals(directory: Path) -> dict[str, Any]:
-    """Return the entry count and total byte size of a directory.
+#: Bounds for storage aggregation. ``Path.rglob("*")`` walks an entire tree with
+#: no limit, which is fine for today's flat captures directory and is exactly
+#: the kind of assumption that stops being true later. A diagnostic tool must
+#: not be able to spend minutes stat-ing a media archive on a device that is
+#: already unwell, so traversal stops and says so instead.
+MAX_STORAGE_ENTRIES = 20_000
+MAX_STORAGE_DEPTH = 8
 
-    Counts and bytes only -- never a filename. This is what makes the storage
-    summary safe to include when the directory in question is the media
-    archive.
+
+def _directory_totals(
+    directory: Path,
+    *,
+    max_entries: int | None = None,
+    max_depth: int | None = None,
+) -> dict[str, Any]:
+    """Return a bounded entry count and total byte size for a directory.
+
+    Counts and bytes only -- **never a filename**. That is what makes this safe
+    to run over the media archive: the diagnostic question is "is the SD card
+    filling up?", which needs no image name to answer.
+
+    Traversal is explicitly bounded and iterative:
+
+    * at most ``max_entries`` filesystem entries are inspected;
+    * at most ``max_depth`` levels below the root are descended;
+    * **symlinked directories are never descended**, so a link into ``/`` cannot
+      turn a capture-directory scan into a whole-filesystem walk, and a link
+      loop cannot make it run forever;
+    * symlinked *files* are counted as entries but not stat-ed through, so the
+      size of a target outside the approved directory is never read;
+    * entries that vanish or cannot be read mid-walk are skipped rather than
+      failing the whole bundle.
+
+    When a limit is reached the counts gathered so far are returned with
+    ``truncated: true`` and the limit that stopped it, so a partial figure is
+    never mistaken for a complete one.
+
+    The limits default to :data:`MAX_STORAGE_ENTRIES` and
+    :data:`MAX_STORAGE_DEPTH`, resolved **at call time** rather than bound as
+    default argument values, so the module constants remain the single
+    authority and a caller (or a test) can lower them.
     """
+    max_entries = MAX_STORAGE_ENTRIES if max_entries is None else max_entries
+    max_depth = MAX_STORAGE_DEPTH if max_depth is None else max_depth
+
     if not directory.is_dir():
-        return {"exists": False, "entries": 0, "total_bytes": 0}
+        return {"exists": False, "entries": 0, "total_bytes": 0, "truncated": False}
 
     entries = 0
     total = 0
-    with suppress(OSError):
-        for item in directory.rglob("*"):
-            if item.is_file():
-                entries += 1
-                with suppress(OSError):
-                    total += item.stat().st_size
-    return {"exists": True, "entries": entries, "total_bytes": total}
+    truncated_by: str | None = None
+    # Iterative breadth-first walk with an explicit queue: no recursion to blow
+    # the stack, and the depth is a value rather than a call count.
+    queue: list[tuple[Path, int]] = [(directory, 0)]
+
+    while queue and truncated_by is None:
+        current, depth = queue.pop(0)
+        try:
+            children = list(current.iterdir())
+        except OSError:
+            # Unreadable directory: skip it, keep the totals gathered so far.
+            continue
+
+        for item in children:
+            if entries >= max_entries:
+                truncated_by = "max_entries"
+                break
+
+            try:
+                is_symlink = item.is_symlink()
+                is_directory = item.is_dir()
+            except OSError:
+                continue
+
+            if is_directory:
+                if is_symlink:
+                    # Never descend a link: it may point outside the approved
+                    # root, or back into this tree.
+                    continue
+                if depth + 1 > max_depth:
+                    truncated_by = "max_depth"
+                    break
+                queue.append((item, depth + 1))
+                continue
+
+            entries += 1
+            if is_symlink:
+                # Counted, but its target is not measured.
+                continue
+            try:
+                total += item.stat().st_size
+            except OSError:
+                # Disappeared between listing and stat: normal on a live system.
+                continue
+
+    summary: dict[str, Any] = {
+        "exists": True,
+        "entries": entries,
+        "total_bytes": total,
+        "truncated": truncated_by is not None,
+    }
+    if truncated_by is not None:
+        summary["truncated_by"] = truncated_by
+        summary["limit"] = (
+            max_entries if truncated_by == "max_entries" else max_depth
+        )
+    return summary
 
 
 def collect_storage_summary(
     config: MGOConfig, backup_directory: Path
-) -> dict[str, Any]:
-    """Summarise storage as aggregates only.
+) -> tuple[dict[str, Any], SourceError | None]:
+    """Summarise storage as aggregates only, with bounded traversal.
 
     Sizes and counts, never contents and never names. The media directory is
     reported as "how many files and how many bytes", which is the diagnostic
     question ("is the SD card filling up?") without any of the imagery.
+
+    Returns the summary and, when any directory hit a traversal bound, a
+    :class:`SourceError` so the bundle outcome becomes ``partial``. Truncation
+    is a *reported* condition, never a silent one and never a fatal one: a
+    figure that stopped early is still worth having, provided the reader knows
+    it stopped.
     """
     summary: dict[str, Any] = {}
 
@@ -753,17 +995,30 @@ def collect_storage_summary(
                 database_summary[f"sidecar{suffix}_bytes"] = sidecar.stat().st_size
     summary["database"] = database_summary
 
-    summary["captures"] = _directory_totals(config.camera.capture_directory)
-    summary["logs"] = _directory_totals(config.storage.log_directory)
-    summary["backups"] = _directory_totals(backup_directory)
-    summary["queues"] = _directory_totals(
-        config.storage.data_directory / "queues"
-    )
-    summary["runtime_state"] = _directory_totals(
-        config.storage.data_directory / "state"
-    )
+    aggregated = {
+        "captures": config.camera.capture_directory,
+        "logs": config.storage.log_directory,
+        "backups": backup_directory,
+        "queues": config.storage.data_directory / "queues",
+        "runtime_state": config.storage.data_directory / "state",
+    }
+    truncated: list[str] = []
+    for role, directory in aggregated.items():
+        totals = _directory_totals(directory)
+        summary[role] = totals
+        if totals.get("truncated"):
+            truncated.append(f"{role} ({totals.get('truncated_by')})")
 
-    return summary
+    failure = None
+    if truncated:
+        failure = SourceError(
+            "storage-summary",
+            ErrorCode.DIAGNOSTIC_LIMIT_EXCEEDED,
+            "Storage aggregation stopped at a traversal bound for: "
+            f"{', '.join(sorted(truncated))}. The counts reported are partial.",
+        )
+
+    return summary, failure
 
 
 # --- archive assembly -------------------------------------------------------
@@ -893,12 +1148,10 @@ def create_support_bundle(
             )
         )
 
-    members.append(
-        (
-            "storage-summary.json",
-            _json_bytes(collect_storage_summary(config, backups)),
-        )
-    )
+    storage_summary, storage_failure = collect_storage_summary(config, backups)
+    members.append(("storage-summary.json", _json_bytes(storage_summary)))
+    if storage_failure is not None:
+        errors.append(storage_failure)
 
     members.append(("errors.json", _json_bytes([e.as_dict() for e in errors])))
     members.append(
@@ -950,6 +1203,18 @@ def create_support_bundle(
         ) from exc
 
     target = destination / bundle_filename(started)
+
+    # Never overwrite an existing bundle. Two runs in the same second would
+    # otherwise silently destroy the first one -- which, given a bundle is
+    # generated precisely when something is going wrong, is the moment an
+    # operator can least afford to lose evidence.
+    if target.exists() or target.is_symlink():
+        raise OperationError(
+            ErrorCode.DIAGNOSTIC_OUTPUT_UNWRITABLE,
+            f"A bundle named {target.name} already exists; it is never "
+            "overwritten. Retry in a moment or choose another directory.",
+        )
+
     descriptor, temporary_name = tempfile.mkstemp(
         dir=destination, prefix=".mgo-support-", suffix=".tmp"
     )
@@ -958,9 +1223,27 @@ def create_support_bundle(
 
     try:
         _write_archive(members, temporary)
+
+        # The compressed archive is the artefact that actually lands on the SD
+        # card, so its real size is checked -- not just the pre-compression
+        # total already bounded above.
+        written = temporary.stat().st_size
+        if written > MAX_ARCHIVE_BYTES:
+            raise OperationError(
+                ErrorCode.DIAGNOSTIC_LIMIT_EXCEEDED,
+                f"The completed bundle is {written} bytes, above the limit of "
+                f"{MAX_ARCHIVE_BYTES}. It was discarded rather than published.",
+            )
+
         with suppress(OSError):
             os.chmod(temporary, BUNDLE_FILE_MODE)
+        _fsync_path(temporary)
         os.replace(temporary, target)
+        _fsync_path(destination)
+    except OperationError:
+        with suppress(OSError):
+            temporary.unlink()
+        raise
     except (OSError, tarfile.TarError) as exc:
         with suppress(OSError):
             temporary.unlink()
@@ -991,6 +1274,7 @@ def create_support_bundle(
 
 
 __all__ = [
+    "ALLOWED_LOOPBACK_HOSTS",
     "BUNDLE_FILE_MODE",
     "BUNDLE_FORMAT_VERSION",
     "BUNDLE_NAME_PREFIX",
@@ -1002,10 +1286,13 @@ __all__ = [
     "JOURNAL_SINCE",
     "MAX_ARCHIVE_BYTES",
     "MAX_ARCHIVE_MEMBERS",
+    "MAX_COMMAND_ERROR_DETAIL",
     "MAX_COMMAND_OUTPUT_BYTES",
     "MAX_ENDPOINT_RESPONSE_BYTES",
     "MAX_JOURNAL_BYTES",
     "MAX_JOURNAL_LINES",
+    "MAX_STORAGE_DEPTH",
+    "MAX_STORAGE_ENTRIES",
     "NON_CANONICAL_PATH",
     "SERVICE_PROPERTIES",
     "SUBPROCESS_TIMEOUT_SECONDS",

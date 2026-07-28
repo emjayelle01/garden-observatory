@@ -19,6 +19,7 @@ import os
 import stat
 import tarfile
 import urllib.error
+import urllib.request
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,14 +35,17 @@ from mgo.core.config import (
     MGOConfig,
     load_config,
 )
+from mgo.operations import support_bundle
 from mgo.operations.errors import ErrorCode, OperationError
 from mgo.operations.events import REDACTED, EventEmitter
 from mgo.operations.support_bundle import (
+    ALLOWED_LOOPBACK_HOSTS,
     BUNDLE_FILE_MODE,
     BUNDLE_NAME_PREFIX,
     BUNDLE_SUFFIX,
     COLLECTED_ENDPOINTS,
     MAX_ARCHIVE_BYTES,
+    MAX_COMMAND_ERROR_DETAIL,
     MAX_ENDPOINT_RESPONSE_BYTES,
     MAX_JOURNAL_LINES,
     MEMBER_MODE,
@@ -49,8 +53,10 @@ from mgo.operations.support_bundle import (
     SERVICE_PROPERTIES,
     BundleOutcome,
     CommandResult,
+    _directory_totals,
     collect_configuration_summary,
     collect_journal,
+    collect_journal_disk_usage,
     collect_service_status,
     create_support_bundle,
 )
@@ -754,7 +760,7 @@ def test_a_denied_journal_is_recorded_and_collection_continues() -> None:
     text, failure = collect_journal("mgo.service", denied)
 
     assert failure is not None
-    assert "access may be denied" in failure.detail
+    assert "Access may be denied" in failure.detail
     assert "journal unavailable" in text
 
 
@@ -955,6 +961,532 @@ def test_a_bundle_cannot_be_mistaken_for_a_backup_by_retention(
 
     assert result.bundle_path is not None
     assert not BACKUP_NAME_PATTERN.match(result.bundle_path.name)
+
+
+# --- regression: no external network access ---------------------------------
+#
+# Validating only the initial URL was insufficient. urllib's default opener
+# honours HTTP_PROXY/ALL_PROXY and follows redirects, so a "loopback only"
+# request could have been sent to a proxy or redirected to an external host --
+# and the initial validation would have passed either way.
+
+
+def test_the_opener_installs_no_proxy_handler() -> None:
+    """No proxy handler at all is the strongest form of "no proxy".
+
+    ``build_opener(ProxyHandler({}))`` works by *exclusion*: passing an instance
+    makes ``build_opener`` drop the default ``ProxyHandler`` class, and an empty
+    proxy map registers no ``*_open`` methods so nothing is installed in its
+    place. The observable result — and the thing worth asserting — is that the
+    opener carries no proxy handler, so there is nothing left to read
+    ``HTTP_PROXY``.
+    """
+    for handler in support_bundle._OPENER.handlers:
+        assert not isinstance(handler, urllib.request.ProxyHandler), handler
+
+
+@pytest.mark.parametrize(
+    "variable",
+    ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"],
+)
+def test_a_configured_proxy_is_never_consulted(
+    monkeypatch: pytest.MonkeyPatch, variable: str
+) -> None:
+    """The environment must not be able to redirect a diagnostic request.
+
+    A default opener built while these are set would carry a proxy handler
+    populated from them; ours never does, whatever the environment says.
+    """
+    monkeypatch.setenv(variable, "http://proxy.example.com:3128")
+
+    # The shipped opener is unaffected...
+    for handler in support_bundle._OPENER.handlers:
+        assert not isinstance(handler, urllib.request.ProxyHandler)
+
+    # ...and rebuilding it the same way under this environment stays clean,
+    # proving the exclusion is structural rather than an artefact of import
+    # order.
+    rebuilt = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), support_bundle._NoRedirects
+    )
+    for handler in rebuilt.handlers:
+        assert not isinstance(handler, urllib.request.ProxyHandler)
+
+    # For contrast: the default opener *would* have picked the proxy up.
+    default = urllib.request.build_opener()
+    proxied = [
+        handler
+        for handler in default.handlers
+        if isinstance(handler, urllib.request.ProxyHandler)
+    ]
+    assert proxied and proxied[0].proxies, (
+        "the default opener should read the environment — that is the risk "
+        "this correction removes"
+    )
+
+
+def test_redirects_are_never_followed() -> None:
+    """A local service must not be able to redirect a bundle off the host."""
+    from mgo.operations.support_bundle import _NoRedirects
+
+    handler = _NoRedirects()
+    assert handler.redirect_request(None, None, 302, "Found", {}, "http://x/") is None
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_a_redirect_response_is_recorded_as_a_source_failure(
+    config: MGOConfig, tmp_path: Path, status: int
+) -> None:
+    """A 3xx is a failed source, not a hop to follow."""
+
+    def redirecting(url: str) -> bytes:
+        raise urllib.error.HTTPError(
+            url,
+            status,
+            "Redirect",
+            {"Location": "http://evil.example.com/"},  # type: ignore[arg-type]
+            None,
+        )
+
+    result = _generate(config, tmp_path / "out", fetch=redirecting)
+
+    assert result.outcome is BundleOutcome.PARTIAL
+    assert result.bundle_path is not None
+    text = _archive_text(result.bundle_path)
+    assert "evil.example.com" not in text
+    assert str(status) in text
+
+
+def test_the_opener_is_used_rather_than_the_global_urlopen() -> None:
+    """``urlopen`` would reintroduce the default proxy and redirect handlers."""
+    source = Path(
+        "src/mgo/operations/support_bundle.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_OPENER.open(" in source
+    assert "urllib.request.urlopen(" not in source
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.com:8080",
+        "http://192.168.1.50:8080",
+        "http://10.0.0.1:8080",
+        "https://127.0.0.1:8080",
+        "ftp://127.0.0.1:8080",
+        "file:///etc/passwd",
+        "http://user:password@127.0.0.1:8080",
+        "http://user@127.0.0.1:8080",
+        "http://127.0.0.1:8080?debug=1",
+        "http://127.0.0.1:8080#fragment",
+        "http://mgo-core:8080",
+        "http://localhost:8080",
+        "http://127.0.0.1.evil.com:8080",
+    ],
+)
+def test_every_unsafe_base_url_is_refused(
+    config: MGOConfig, tmp_path: Path, url: str
+) -> None:
+    """Only a literal loopback address with no credentials, query or fragment."""
+    with pytest.raises(OperationError) as caught:
+        _generate(config, tmp_path / "out", api_base_url=url)
+
+    assert caught.value.code is ErrorCode.INVALID_ARGUMENT
+
+
+def test_localhost_is_refused_because_it_needs_resolution() -> None:
+    """A name resolves through /etc/hosts and the resolver; a literal does not."""
+    assert "localhost" not in ALLOWED_LOOPBACK_HOSTS
+    assert {"127.0.0.1", "::1"} == ALLOWED_LOOPBACK_HOSTS
+
+
+def test_literal_loopback_addresses_are_accepted(
+    config: MGOConfig, tmp_path: Path
+) -> None:
+    """The permitted forms must actually work."""
+    result = _generate(config, tmp_path / "out", api_base_url="http://127.0.0.1:8080")
+
+    assert result.outcome is BundleOutcome.COMPLETE
+
+
+# --- regression: command return codes ----------------------------------------
+#
+# A non-zero systemctl was previously reported as ``available: true`` with an
+# empty property set, which reads as "the service exists and told us nothing".
+
+
+def test_a_non_zero_systemctl_is_not_reported_as_available() -> None:
+    """The defect: an empty property set presented as a successful reading."""
+
+    def failing(command: list[str]) -> CommandResult:
+        return CommandResult(
+            available=True,
+            returncode=1,
+            stdout="",
+            stderr="Unit mgo.service could not be found.",
+        )
+
+    status, failure = collect_service_status("mgo.service", failing)
+
+    assert status["available"] is False
+    assert failure is not None
+    assert failure.error_code is ErrorCode.DIAGNOSTIC_SOURCE_UNAVAILABLE
+    assert "could not be found" in status["error"]
+
+
+def test_a_non_zero_systemctl_without_stderr_still_fails() -> None:
+    """The exit code alone is enough to know the answer was not obtained."""
+
+    def failing(command: list[str]) -> CommandResult:
+        return CommandResult(available=True, returncode=1, stdout="", stderr="")
+
+    status, failure = collect_service_status("mgo.service", failing)
+
+    assert status["available"] is False
+    assert failure is not None
+    assert "exited 1" in status["error"]
+
+
+def test_systemctl_returning_no_recognised_property_fails() -> None:
+    """Exit 0 with nothing usable is still not a service status."""
+
+    def empty(command: list[str]) -> CommandResult:
+        return CommandResult(available=True, returncode=0, stdout="")
+
+    status, failure = collect_service_status("mgo.service", empty)
+
+    assert status["available"] is False
+    assert failure is not None
+
+
+def test_stderr_in_a_command_failure_is_bounded() -> None:
+    """Unbounded stderr must not flow into a file that leaves the machine."""
+
+    def noisy(command: list[str]) -> CommandResult:
+        return CommandResult(
+            available=True, returncode=1, stdout="", stderr="x" * 10_000
+        )
+
+    status, _ = collect_service_status("mgo.service", noisy)
+
+    assert len(status["error"]) < MAX_COMMAND_ERROR_DETAIL + 100
+
+
+def test_a_non_zero_journal_disk_usage_is_a_failure() -> None:
+    """An empty line must not be published as a disk-usage reading."""
+
+    def failing(command: list[str]) -> CommandResult:
+        return CommandResult(
+            available=True, returncode=1, stdout="", stderr="No journal files."
+        )
+
+    text, failure = collect_journal_disk_usage(failing)
+
+    assert failure is not None
+    assert failure.error_code is ErrorCode.DIAGNOSTIC_SOURCE_UNAVAILABLE
+    assert "unavailable" in text
+
+
+def test_a_successful_journal_disk_usage_is_reported() -> None:
+    """The success path still works."""
+    text, failure = collect_journal_disk_usage(healthy_run)
+
+    assert failure is None
+    assert "96.0M" in text
+
+
+def test_a_command_timeout_is_distinguished_from_a_failure() -> None:
+    """A hung command and a refused one are different diagnoses."""
+
+    def timed_out(command: list[str]) -> CommandResult:
+        return CommandResult(available=True, error="systemctl did not finish.")
+
+    _, failure = collect_service_status("mgo.service", timed_out)
+
+    assert failure is not None
+    assert failure.error_code is ErrorCode.DIAGNOSTIC_TIMEOUT
+
+
+def test_a_failing_command_makes_the_bundle_partial(
+    config: MGOConfig, tmp_path: Path
+) -> None:
+    """A non-zero command must degrade the overall outcome."""
+
+    def failing(command: list[str]) -> CommandResult:
+        return CommandResult(available=True, returncode=1, stdout="", stderr="no")
+
+    result = _generate(config, tmp_path / "out", run=failing)
+
+    assert result.outcome is BundleOutcome.PARTIAL
+
+
+# --- regression: bounded storage aggregation ---------------------------------
+#
+# Path.rglob("*") walked an entire tree with no limit. The captures directory is
+# flat today; the implementation must not depend on that staying true.
+
+
+def test_directory_totals_stop_at_the_entry_limit(tmp_path: Path) -> None:
+    """A media archive must not be walked without bound."""
+    directory = tmp_path / "many"
+    directory.mkdir()
+    for index in range(25):
+        (directory / f"file-{index}.bin").write_bytes(b"x")
+
+    totals = _directory_totals(directory, max_entries=10)
+
+    assert totals["entries"] == 10
+    assert totals["truncated"] is True
+    assert totals["truncated_by"] == "max_entries"
+    assert totals["limit"] == 10
+
+
+def test_directory_totals_stop_at_the_depth_limit(tmp_path: Path) -> None:
+    """A deep tree must not be descended without bound."""
+    directory = tmp_path / "deep"
+    current = directory
+    for level in range(6):
+        current = current / f"level-{level}"
+    current.mkdir(parents=True)
+    (current / "buried.bin").write_bytes(b"x")
+
+    totals = _directory_totals(directory, max_depth=2)
+
+    assert totals["truncated"] is True
+    assert totals["truncated_by"] == "max_depth"
+    assert totals["entries"] == 0
+
+
+def test_directory_totals_count_nested_files_within_the_bounds(
+    tmp_path: Path
+) -> None:
+    """Bounded does not mean shallow: nesting inside the limits is counted."""
+    directory = tmp_path / "nested"
+    (directory / "a" / "b").mkdir(parents=True)
+    (directory / "top.bin").write_bytes(b"xx")
+    (directory / "a" / "mid.bin").write_bytes(b"xxx")
+    (directory / "a" / "b" / "deep.bin").write_bytes(b"x")
+
+    totals = _directory_totals(directory)
+
+    assert totals["entries"] == 3
+    assert totals["total_bytes"] == 6
+    assert totals["truncated"] is False
+
+
+def test_directory_totals_never_descend_a_symlinked_directory(
+    tmp_path: Path
+) -> None:
+    """A link into / would turn a capture scan into a filesystem walk."""
+    directory = tmp_path / "root"
+    directory.mkdir()
+    (directory / "real.bin").write_bytes(b"x")
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    for index in range(5):
+        (elsewhere / f"other-{index}.bin").write_bytes(b"yyyy")
+
+    try:
+        (directory / "link").symlink_to(elsewhere, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not creatable in this environment")
+
+    totals = _directory_totals(directory)
+
+    assert totals["entries"] == 1
+    assert totals["total_bytes"] == 1
+
+
+def test_directory_totals_survive_a_symlink_loop(tmp_path: Path) -> None:
+    """A self-referential link must not make aggregation run forever."""
+    directory = tmp_path / "loop"
+    directory.mkdir()
+    (directory / "real.bin").write_bytes(b"x")
+    try:
+        (directory / "self").symlink_to(directory, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not creatable in this environment")
+
+    totals = _directory_totals(directory)
+
+    assert totals["entries"] == 1
+    assert totals["truncated"] is False
+
+
+def test_directory_totals_do_not_measure_a_symlinked_files_target(
+    tmp_path: Path
+) -> None:
+    """The size of a file outside the approved directory is never read."""
+    directory = tmp_path / "root"
+    directory.mkdir()
+    outside = tmp_path / "secret.bin"
+    outside.write_bytes(b"y" * 5000)
+
+    try:
+        (directory / "link.bin").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not creatable in this environment")
+
+    totals = _directory_totals(directory)
+
+    assert totals["entries"] == 1
+    assert totals["total_bytes"] == 0
+
+
+def test_directory_totals_handle_an_empty_directory(tmp_path: Path) -> None:
+    """Zero is a valid answer, not a missing one."""
+    directory = tmp_path / "empty"
+    directory.mkdir()
+
+    totals = _directory_totals(directory)
+
+    assert totals == {
+        "exists": True,
+        "entries": 0,
+        "total_bytes": 0,
+        "truncated": False,
+    }
+
+
+def test_directory_totals_handle_a_missing_directory(tmp_path: Path) -> None:
+    """An absent directory is reported, not an error."""
+    totals = _directory_totals(tmp_path / "absent")
+
+    assert totals["exists"] is False
+    assert totals["truncated"] is False
+
+
+def test_directory_totals_skip_a_file_that_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live system deletes files mid-walk; that is not a bundle failure."""
+    directory = tmp_path / "racing"
+    directory.mkdir()
+    (directory / "vanishing.bin").write_bytes(b"xxx")
+    (directory / "stable.bin").write_bytes(b"xx")
+
+    real_stat = Path.stat
+
+    def vanishing(self: Path, *args: object, **kwargs: object) -> object:
+        if self.name == "vanishing.bin":
+            raise OSError(2, "No such file or directory")
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", vanishing)
+    totals = _directory_totals(directory)
+
+    assert totals["entries"] == 2
+    assert totals["total_bytes"] == 2
+
+
+def test_an_unreadable_subdirectory_does_not_fail_aggregation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permission problems are skipped, keeping the totals gathered so far."""
+    directory = tmp_path / "root"
+    (directory / "blocked").mkdir(parents=True)
+    (directory / "top.bin").write_bytes(b"x")
+
+    real_iterdir = Path.iterdir
+
+    def refusing(self: Path) -> object:
+        if self.name == "blocked":
+            raise OSError(13, "Permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", refusing)
+    totals = _directory_totals(directory)
+
+    assert totals["entries"] == 1
+
+
+def test_storage_truncation_makes_the_bundle_partial(
+    config: MGOConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Truncation is reported, never silent -- and never fatal."""
+    captures = config.camera.capture_directory
+    captures.mkdir(parents=True, exist_ok=True)
+    for index in range(5):
+        (captures / f"capture-{index}.jpg").write_bytes(b"x")
+
+    monkeypatch.setattr(
+        "mgo.operations.support_bundle.MAX_STORAGE_ENTRIES", 2
+    )
+
+    result = _generate(config, tmp_path / "out")
+
+    assert result.outcome is BundleOutcome.PARTIAL
+    assert any(
+        error.error_code is ErrorCode.DIAGNOSTIC_LIMIT_EXCEEDED
+        for error in result.errors
+    )
+    assert result.bundle_path is not None
+    storage = json.loads(_members(result.bundle_path)["storage-summary.json"])
+    assert storage["captures"]["truncated"] is True
+    # Still no filename, even when truncated.
+    assert "capture-0.jpg" not in _archive_text(result.bundle_path)
+
+
+# --- regression: bundle publication hardening --------------------------------
+
+
+def test_an_existing_bundle_is_never_overwritten(
+    config: MGOConfig, tmp_path: Path
+) -> None:
+    """A bundle is generated when something is wrong; evidence must survive."""
+    destination = tmp_path / "out"
+    moment = datetime(2026, 7, 28, 2, 30, 0, tzinfo=UTC)
+
+    first = _generate(config, destination, now=moment)
+    assert first.bundle_path is not None
+    original = first.bundle_path.read_bytes()
+
+    with pytest.raises(OperationError) as caught:
+        _generate(config, destination, now=moment)
+
+    assert caught.value.code is ErrorCode.DIAGNOSTIC_OUTPUT_UNWRITABLE
+    assert first.bundle_path.read_bytes() == original
+
+
+def test_a_bundle_over_the_size_limit_is_discarded(
+    config: MGOConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compressed artefact is what lands on the SD card, so it is checked."""
+    destination = tmp_path / "out"
+    real_write = support_bundle._write_archive
+
+    def oversized(members: object, target: Path) -> None:
+        real_write(members, target)  # type: ignore[arg-type]
+        # Simulate an archive that compressed far worse than expected. The
+        # limit is set high enough that the pre-compression check passes, so
+        # this test exercises the *post-write* size check specifically.
+        target.write_bytes(b"x" * 30_000)
+
+    monkeypatch.setattr(support_bundle, "_write_archive", oversized)
+    monkeypatch.setattr(support_bundle, "MAX_ARCHIVE_BYTES", 20_000)
+
+    with pytest.raises(OperationError) as caught:
+        _generate(config, destination)
+
+    assert caught.value.code is ErrorCode.DIAGNOSTIC_LIMIT_EXCEEDED
+    assert "completed bundle" in caught.value.message
+    # Neither the temporary file nor a published bundle survives.
+    assert list(destination.iterdir()) == []
+
+
+def test_the_temporary_archive_is_removed_after_a_size_failure(
+    config: MGOConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No half-published bundle may be left in the output directory."""
+    destination = tmp_path / "out"
+    monkeypatch.setattr(support_bundle, "MAX_ARCHIVE_BYTES", 64)
+
+    with pytest.raises(OperationError):
+        _generate(config, destination)
+
+    assert not destination.exists() or list(destination.iterdir()) == []
 
 
 def test_generation_emits_a_structured_completion_event(
