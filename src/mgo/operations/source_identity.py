@@ -29,11 +29,23 @@ fallback to following the link** after that refusal: retrying without
 than weaken the Linux guarantee to make the tests convenient, the fallback uses
 the strongest identity checks the platform does offer -- ``lstat`` before the
 open, ``fstat`` on the descriptor, ``lstat`` again afterwards, and a comparison
-of the ``(st_dev, st_ino)`` identity across all three. Windows populates both
+of the ``(st_dev, st_ino)`` identity **across all three**. Windows populates both
 fields from ``GetFileInformationByHandle``, and they agree between ``fstat`` and
 ``lstat`` for the same object, which is what makes the comparison meaningful.
 A substitution is therefore *detected* on Windows rather than *prevented*, and
 the difference is recorded here rather than papered over.
+
+The pre-open comparison is not decoration. An earlier version took that
+``lstat``, rejected a symlink, and then **discarded the observation**. That left
+a regular file replaceable by another regular file between the ``lstat`` and the
+``os.open``: from the open onwards every observation would describe the
+replacement, and they would all agree with one another, so nothing later could
+notice. Only the discarded observation disagreed.
+
+Descriptor lifetime is part of the guarantee too. Every path comparison happens
+**while the descriptor is still open**, because holding it is what stops an
+unlinked inode being recycled underneath the comparison -- the same reasoning
+that makes :class:`SourceAnchor` work.
 
 Nothing in this module reads, logs or returns file *contents* on a failure
 path: the whole point is that these files may hold credentials.
@@ -113,12 +125,36 @@ class SourceIdentity:
         return (self.size, self.mtime_ns) == (other.size, other.mtime_ns)
 
 
+@dataclass(frozen=True)
+class OpenedSource:
+    """A descriptor, plus what was observed about the path before opening it.
+
+    ``pre_open_identity`` is ``None`` on a platform where ``O_NOFOLLOW`` did the
+    work: there the kernel is authoritative and no earlier observation is needed
+    or meaningful. On the fallback platform it carries the ``lstat`` taken
+    immediately before the open, so the caller can prove that the object it
+    opened is the object it inspected.
+
+    Retaining that observation is the whole point. An earlier version rejected a
+    pre-open symlink and then *discarded* the ``lstat``, which left a regular
+    file replaceable by another regular file between the check and the open: the
+    descriptor and every later observation would agree with each other, because
+    both would describe the replacement.
+    """
+
+    descriptor: int
+    pre_open_identity: SourceIdentity | None
+
+
 def _open_flags() -> int:
     """Return the most protective read-only open flags this platform offers."""
     flags = os.O_RDONLY
     # Linux: refuse a symlink in the kernel, and never leak the descriptor
-    # across an exec.
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    # across an exec. Gated on the module constant rather than on ``os``
+    # directly, so a test can force the fallback path deterministically on a
+    # platform that does support the flag.
+    if SUPPORTS_NO_FOLLOW:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_CLOEXEC", 0)
     # Windows: no newline translation, and do not let child processes inherit
     # a handle to a file that may hold credentials.
@@ -132,16 +168,20 @@ def _fail(code: ErrorCode, message: str) -> OperationError:
     return OperationError(code, message)
 
 
-def open_no_follow(path: Path, *, subject: str, code: ErrorCode) -> int:
+def open_no_follow(path: Path, *, subject: str, code: ErrorCode) -> OpenedSource:
     """Open ``path`` read-only, refusing to traverse a symbolic link.
 
-    Returns a file descriptor the caller must close.
+    Returns the descriptor together with the pre-open observation (where one was
+    taken). The caller must close the descriptor and must compare the
+    observation against the descriptor's own ``fstat`` — see
+    :func:`require_opened_identity`.
 
     On a platform without ``O_NOFOLLOW`` the link is rejected by an ``lstat``
-    immediately before the open. That check *can* be raced; the identity
-    comparisons performed by the callers below are what detect such a race
-    afterwards.
+    immediately before the open. That check alone *can* be raced, which is
+    precisely why the observation is returned rather than thrown away.
     """
+    pre_open: SourceIdentity | None = None
+
     if not SUPPORTS_NO_FOLLOW:
         try:
             pre = os.lstat(path)
@@ -157,9 +197,10 @@ def open_no_follow(path: Path, *, subject: str, code: ErrorCode) -> int:
                 f"{subject} is a symbolic link. Reading through a link is "
                 "refused: the target could be changed between runs.",
             )
+        pre_open = SourceIdentity.from_stat(pre)
 
     try:
-        return os.open(path, _open_flags())
+        descriptor = os.open(path, _open_flags())
     except FileNotFoundError as exc:
         raise _fail(code, f"{subject} does not exist.") from exc
     except IsADirectoryError as exc:
@@ -180,6 +221,34 @@ def open_no_follow(path: Path, *, subject: str, code: ErrorCode) -> int:
         raise _fail(
             code, f"{subject} could not be opened: {exc.strerror or exc}."
         ) from exc
+
+    return OpenedSource(descriptor=descriptor, pre_open_identity=pre_open)
+
+
+def require_opened_identity(
+    opened: OpenedSource,
+    observed: SourceIdentity,
+    *,
+    subject: str,
+    code: ErrorCode,
+) -> None:
+    """Confirm the descriptor refers to the object observed before opening.
+
+    A no-op where ``O_NOFOLLOW`` was used, because the kernel already guaranteed
+    it. On the fallback platform this is the check that catches a **regular file
+    replaced by another regular file** between the ``lstat`` and the ``os.open``
+    — a substitution that no later comparison can see, because from the open
+    onwards every observation describes the replacement consistently.
+    """
+    if opened.pre_open_identity is None:
+        return
+
+    if not observed.names_the_same_file_as(opened.pre_open_identity):
+        raise _fail(
+            code,
+            f"{subject} was replaced between being inspected and being opened; "
+            "the file that was opened is not the file that was validated.",
+        )
 
 
 def _identity_of_path(path: Path, *, subject: str, code: ErrorCode) -> SourceIdentity:
@@ -215,22 +284,34 @@ def read_regular_file(
 
     Returns the bytes and the identity of the object they came from.
 
-    The sequence is what makes the result trustworthy:
+    The sequence is what makes the result trustworthy, and the **ordering** is
+    part of it:
 
-    1. open without following a symlink;
+    1. open without following a symlink, keeping any pre-open observation;
     2. ``fstat`` the **descriptor** -- so every later check describes the object
        actually opened, not whatever the path names by then;
     3. require a regular file and enforce the size bound *before* reading;
-    4. read at most ``max_bytes + 1``, the extra byte being how a file that grew
+    4. confirm the descriptor is the object observed before the open (fallback
+       platforms only);
+    5. read at most ``max_bytes + 1``, the extra byte being how a file that grew
        is detected rather than silently truncated;
-    5. ``fstat`` again, and ``lstat`` the path again;
-    6. require that the path still names this same object, that it is not now a
-       symlink, and that size and modification time are unchanged.
+    6. ``fstat`` again, and ``lstat`` the path again -- **while the descriptor is
+       still open**;
+    7. require that the path still names this same object, that it is not now a
+       symlink, and that size and modification time are unchanged;
+    8. only then close the descriptor.
 
-    Any disagreement is a failure. The caller receives no partial read: a
-    snapshot that is half the old file and half the new one is worse than none.
+    Step 6 happening before step 8 is load-bearing. An earlier version closed
+    the descriptor first, which meant an unlinked inode could in principle be
+    recycled before the comparison ran -- and this module explains elsewhere
+    that holding the descriptor open is exactly what prevents that.
+
+    Any disagreement is a failure, and the descriptor is closed on every path.
+    The caller receives no partial read: a snapshot that is half the old file
+    and half the new one is worse than none.
     """
-    descriptor = open_no_follow(path, subject=subject, code=code)
+    opened = open_no_follow(path, subject=subject, code=code)
+    descriptor = opened.descriptor
     try:
         try:
             before = os.fstat(descriptor)
@@ -249,6 +330,9 @@ def read_regular_file(
                 "byte limit.",
             )
 
+        identity = SourceIdentity.from_stat(before)
+        require_opened_identity(opened, identity, subject=subject, code=code)
+
         try:
             data = os.read(descriptor, max_bytes + 1)
             # os.read may return short; keep going until the bound or EOF.
@@ -262,34 +346,33 @@ def read_regular_file(
             raise _fail(
                 code, f"{subject} could not be read: {exc.strerror or exc}."
             ) from exc
+
+        if len(data) > max_bytes:
+            raise _fail(code, f"{subject} exceeds the {max_bytes} byte limit.")
+
+        # Still holding the descriptor: the inode cannot be recycled underneath
+        # this comparison.
+        current = _identity_of_path(path, subject=subject, code=code)
+
+        if not current.names_the_same_file_as(identity):
+            raise _fail(
+                code,
+                f"{subject} was replaced while it was being read; the path no "
+                "longer names the file that was opened.",
+            )
+
+        finished = SourceIdentity.from_stat(after)
+        if not finished.is_unmodified_since(identity) or len(data) != identity.size:
+            raise _fail(
+                code,
+                f"{subject} changed while it was being read; the snapshot "
+                "would be neither the old file nor the new one.",
+            )
     finally:
         with suppress(OSError):
             os.close(descriptor)
 
-    if len(data) > max_bytes:
-        raise _fail(
-            code, f"{subject} exceeds the {max_bytes} byte limit."
-        )
-
-    opened = SourceIdentity.from_stat(before)
-    finished = SourceIdentity.from_stat(after)
-    current = _identity_of_path(path, subject=subject, code=code)
-
-    if not current.names_the_same_file_as(opened):
-        raise _fail(
-            code,
-            f"{subject} was replaced while it was being read; the path no "
-            "longer names the file that was opened.",
-        )
-
-    if not finished.is_unmodified_since(opened) or len(data) != opened.size:
-        raise _fail(
-            code,
-            f"{subject} changed while it was being read; the snapshot would be "
-            "neither the old file nor the new one.",
-        )
-
-    return data, opened
+    return data, identity
 
 
 class SourceAnchor:
@@ -341,15 +424,27 @@ class SourceAnchor:
 
 @contextmanager
 def anchored_source(
-    path: Path, *, subject: str, code: ErrorCode
+    path: Path,
+    *,
+    subject: str,
+    code: ErrorCode,
+    identity_code: ErrorCode | None = None,
 ) -> Iterator[SourceAnchor]:
     """Hold an identity anchor on a regular file for the duration of the block.
 
-    The file is opened without following a symlink and required to be regular
-    before the block runs, so the anchor can only ever pin something safe to
-    read.
+    The file is opened without following a symlink, required to be regular, and
+    -- on a fallback platform -- proven to be the object observed immediately
+    before the open, all *before* the block runs. The anchor can therefore only
+    ever pin something that was safe to read at the moment it was pinned.
+
+    ``identity_code`` is the error raised when an identity comparison fails,
+    letting a caller distinguish "the source is unusable" from "the source was
+    substituted". It defaults to ``code``.
     """
-    descriptor = open_no_follow(path, subject=subject, code=code)
+    failure_code = identity_code if identity_code is not None else code
+
+    opened = open_no_follow(path, subject=subject, code=code)
+    descriptor = opened.descriptor
     try:
         try:
             observed = os.fstat(descriptor)
@@ -361,7 +456,12 @@ def anchored_source(
         if not stat.S_ISREG(observed.st_mode):
             raise _fail(code, f"{subject} is not a regular file.")
 
-        anchor = SourceAnchor(path, SourceIdentity.from_stat(observed), descriptor)
+        identity = SourceIdentity.from_stat(observed)
+        require_opened_identity(
+            opened, identity, subject=subject, code=failure_code
+        )
+
+        anchor = SourceAnchor(path, identity, descriptor)
     except BaseException:
         with suppress(OSError):
             os.close(descriptor)
@@ -375,9 +475,11 @@ def anchored_source(
 
 __all__ = [
     "SUPPORTS_NO_FOLLOW",
+    "OpenedSource",
     "SourceAnchor",
     "SourceIdentity",
     "anchored_source",
     "open_no_follow",
     "read_regular_file",
+    "require_opened_identity",
 ]

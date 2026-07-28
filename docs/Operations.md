@@ -154,10 +154,20 @@ Opening is race-resistant, not merely checked:
 - the file is validated through its own **descriptor**, and the path is then
   re-examined to prove it still names that same object (`st_dev`, `st_ino`);
 - on **Windows** — the development machine only — `O_NOFOLLOW` does not exist,
-  so the fallback uses `lstat` before the open, `fstat` on the descriptor and
-  `lstat` afterwards. A substitution is therefore **detected** on Windows rather
-  than **prevented**. The Linux guarantee was not weakened to make the tests
-  convenient; the difference is stated here and asserted by a test.
+  so the fallback takes an `lstat` before the open and compares it against the
+  descriptor's `fstat`, then against a final `lstat` afterwards — **all three**
+  observations, not two. A substitution is therefore **detected** on Windows
+  rather than **prevented**. The Linux guarantee was not weakened to make the
+  tests convenient; the difference is stated here and asserted by a test.
+
+The pre-open comparison is load-bearing on that fallback. Without it, a regular
+file could be replaced by *another regular file* between the check and the open:
+from the open onwards every observation describes the replacement, and they all
+agree with one another, so nothing later can notice.
+
+Every path comparison happens **while the descriptor is still open**. Closing it
+first would allow an unlinked inode to be recycled before the comparison ran —
+holding the descriptor is precisely what prevents that.
 
 A plain `path.is_symlink()` followed by `path.open()` is *not* equivalent. It is
 correct only for a path that does not change, and `fstat` does not rescue it:
@@ -233,15 +243,24 @@ directory could change in between.
 
 The backup therefore holds an **identity anchor**:
 
-1. the database is opened with `O_NOFOLLOW` and its `(device, inode)` recorded;
+1. the database is opened with `O_NOFOLLOW` and its `(device, inode)` recorded
+   — on the fallback platform, after confirming the descriptor is the object
+   observed immediately before the open;
 2. that descriptor is **held open** while SQLite connects — holding it is the
    load-bearing part, because it stops the kernel recycling that inode and so
    keeps the comparison meaningful;
 3. once SQLite has opened the path, the path is re-examined and must still name
    the anchored file;
-4. only then is a single page copied.
+4. the online copy is taken;
+5. the path is re-examined **again** before the copy is accepted.
 
-A mismatch fails with `BACKUP_SOURCE_IDENTITY_CHANGED` and publishes nothing.
+Two checks, not one. The first proves SQLite opened the right file; the second
+proves the path was still that file for the whole of the read. A substitution
+during the copy would otherwise have had no fail-closed result.
+
+A mismatch at either point fails with `BACKUP_SOURCE_IDENTITY_CHANGED` and
+publishes nothing — no database snapshot, no configuration snapshot, no
+manifest, and no temporary file. The API keeps running throughout.
 That code is deliberately distinct from `BACKUP_SOURCE_UNAVAILABLE`: "the file I
 checked is not the file I opened" is a very different incident from "the file is
 missing", and an operator seeing it should be looking for something replacing
@@ -986,7 +1005,7 @@ is the contract; the message is the explanation.
 | `BACKUP_NOT_FOUND` | The named backup or directory does not exist. |
 | `BACKUP_CONFIGURATION_UNAVAILABLE` | The configuration is missing, not a regular file, a symlink, unreadable, over 1 MiB, unparseable, changed mid-read, or replaced while being read. |
 | `BACKUP_SET_INCOMPLETE` | The three files are not all present, or do not describe each other. |
-| `BACKUP_SOURCE_IDENTITY_CHANGED` | The database was replaced, or became a symlink, between validation and SQLite's open of it. Nothing was published. |
+| `BACKUP_SOURCE_IDENTITY_CHANGED` | The database was replaced, or became a symlink, at any point between validation and the end of the copy. Nothing was published. |
 | `RESTORE_TEST_FAILED` | The restored copy did not pass its checks. |
 | `RESTORE_TARGET_REJECTED` | A production data location was named as a target. |
 | `RESTORE_TARGET_EXISTS` | A restore-test target file already exists; it is never overwritten. |
@@ -1742,8 +1761,11 @@ deletes backups is precisely the thing that must not exist.
 - A symlinked source database **or configuration** is refused outright, with no
   override — refused by the kernel at the open on Linux (`O_NOFOLLOW`), not by a
   check that a later open could race.
-- Both sources are proven, after opening, to still be the object the path names.
-  The database's identity is held across SQLite's own open of it.
+- Both sources are proven, after opening, to still be the object the path names,
+  and — on the fallback platform — to be the object observed *before* the open.
+  Every comparison runs while the descriptor is still held.
+- The database's identity is held across SQLite's own open **and** re-verified
+  after the copy, so a substitution at either point fails before publication.
 - The configuration is read once; the bytes stored in a recovery set are the
   bytes that chose the database it sits beside.
 - Storage aggregation never descends a symlinked directory and never stat-s a

@@ -527,11 +527,12 @@ checkpoint or vacuum this database.
 
 The database it reads is also proven to be the database it validated. SQLite
 opens by name, so the backup holds an identity anchor (`O_NOFOLLOW` on Linux)
-across SQLite's own open and re-checks the path afterwards; a substitution in
-that window fails the run before anything is published. `immutable=1` is
-deliberately **not** used — this database is live and carries WAL state, and
-asserting that it cannot change would produce an inconsistent read rather than a
-safe one.
+across SQLite's own open and re-checks the path **twice** — once after the
+connection is established, and again after the online copy has been read, before
+that copy is accepted. A substitution at either point fails the run before
+anything is published. `immutable=1` is deliberately **not** used — this database
+is live and carries WAL state, and asserting that it cannot change would produce
+an inconsistent read rather than a safe one.
 
 Not implemented, and not claimed to be:
 

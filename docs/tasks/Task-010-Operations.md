@@ -2,7 +2,7 @@
 
 ## Status
 
-**Implementation complete; final source-identity hardening in progress.**
+**Implementation complete; final identity-ordering correction in progress.**
 
 A repository review of the five implementation commits found nine genuine
 defects — one requirement omitted outright, several checks that were weaker
@@ -14,12 +14,17 @@ A final re-review then found one further class of problem — source *identity*
 — recorded in [§ Final re-review](#final-re-review) and corrected in commits
 after `a020f83`.
 
+A review of that correction found three narrowly scoped **ordering** defects
+within it, recorded in [§ Identity-ordering review](#identity-ordering-review)
+and corrected in commits after `52c6d31`.
+
 | Gate | Outcome |
 | ---- | ------- |
 | Architecture review | Complete |
 | Implementation | Complete |
 | Repository review | Complete — nine findings, corrected |
 | Final re-review | Complete — source-identity findings, corrected |
+| Identity-ordering review | Complete — three findings, corrected |
 | Local static and automated validation | Passed |
 | Raspberry Pi validation | **Not performed** — procedure prepared for Matthew |
 
@@ -41,11 +46,12 @@ Delivered as decided below:
 - installer integration in `scripts/deploy/install-service-identity.sh`;
 - `docs/Operations.md`, plus `README.md`, `scripts/README.md`,
   `docs/Service-Identity.md` and `docs/Database.md` updates;
-- 497 added tests across `tests/test_operations_events.py`,
+- 513 added tests across `tests/test_operations_events.py`,
   `tests/test_operations_backup.py`, `tests/test_operations_support_bundle.py`,
   `tests/test_operations_deployment.py` and
   `tests/test_operations_source_identity.py` (262 with the implementation, 198
-  with the repository corrections, 37 with the source-identity hardening).
+  with the repository corrections, 37 with the source-identity hardening, 16
+  with the identity-ordering correction).
 
 `scripts/deploy/mgo.service.template` is **byte-for-byte unchanged**, asserted
 by a test that diffs it against `main`. No dependency was added; `pyproject.toml`
@@ -53,8 +59,8 @@ and `uv.lock` are unchanged. No migration, no configuration field, no API
 endpoint and no dashboard change.
 
 Validation on the development workstation after the corrections: `ruff` passed,
-`mypy src` passed (48 source files), `pytest` **1119 passed / 11 skipped**
-(baseline 633 + 497 added). Every skip is a POSIX mode-bit, POSIX-behaviour or
+`mypy src` passed (48 source files), `pytest` **1134 passed / 12 skipped**
+(baseline 633 + 513 added). Every skip is a POSIX mode-bit, POSIX-behaviour or
 symlink-creation assertion that cannot be made on Windows.
 
 Two real defects were found and fixed during implementation, both caused by
@@ -237,6 +243,64 @@ re-verified immediately afterwards, before a page is copied.
   Windows has no `O_NOFOLLOW`, so its fallback *detects* a substitution rather
   than *preventing* it. That difference is documented in the module and asserted
   by a test, rather than glossed over.
+
+## Identity-ordering review
+
+The source-identity work above was structurally right but got three orderings
+wrong. Each is small; two of them meant a guarantee that had been *claimed* was
+not actually being enforced.
+
+### 13. The fallback discarded its pre-open observation
+
+On a platform without `O_NOFOLLOW`, `open_no_follow()` took an `lstat`, rejected
+a symlink, and then **threw the observation away**.
+
+That left a regular file replaceable by *another regular file* between the
+`lstat` and the `os.open`. From the open onwards, the descriptor and every later
+observation describe the replacement — and they all agree with each other, so no
+later check can see anything wrong. Only the discarded observation disagreed.
+
+This also made the previous documentation and completion report **inaccurate**:
+both stated that pre-open, descriptor and post-open identities were compared.
+Two of the three were; the pre-open one was collected and dropped. That wording
+is corrected wherever it appeared.
+
+**Corrected.** `open_no_follow()` returns an `OpenedSource` carrying the
+observation, and `require_opened_identity()` compares it against the
+descriptor's own `fstat`. Applied to both configuration reading and database
+anchoring.
+
+### 14. The descriptor closed before the final comparison
+
+`read_regular_file()` closed the descriptor in a `finally` block and *then* ran
+the post-read `lstat` and identity comparison. Once closed, an unlinked inode
+can in principle be recycled before the comparison runs.
+
+The same module explains, in `SourceAnchor`, that holding the descriptor open is
+precisely what prevents inode recycling — so the ordering contradicted the
+module's own stated design.
+
+**Corrected.** All comparisons now happen while the descriptor is open; it is
+closed in a `finally` afterwards, on every path.
+
+### 15. The database was verified once, not throughout
+
+The anchor was verified immediately after SQLite connected, which proves the
+right file was *opened*. Nothing re-checked it after the online copy completed,
+so a path replaced during the read had no fail-closed result.
+
+**Corrected.** A second `anchor.verify()` runs after
+`source_connection.backup()` and before the temporary copy is accepted.
+
+### How these were confirmed
+
+Each fix was **mutation-tested**: the correction was reverted in place and the
+new tests were confirmed to fail, then restored and confirmed to pass. That
+exercise found a real weakness in one of the new tests — the descriptor-ordering
+test originally compared the *first* `lstat` with the *first* `close`, which the
+fallback's pre-open `lstat` satisfied on Windows regardless of the bug. It now
+compares the **last** `lstat` with the **first** `close`, and fails against the
+reverted code as it should.
 
 ## Authoritative definition
 

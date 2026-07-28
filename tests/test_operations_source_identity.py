@@ -28,6 +28,7 @@ import pytest
 from mgo.core.config import parse_config_bytes
 from mgo.core.database import apply_migrations
 from mgo.operations import backup as backup_module
+from mgo.operations import source_identity
 from mgo.operations.backup import (
     MAX_CONFIGURATION_BYTES,
     ConfigurationSnapshot,
@@ -187,6 +188,59 @@ def _substitute_after_open(
         return _fake_lstat(result, **overrides)
 
     monkeypatch.setattr(os, "lstat", substituting)
+
+
+def _force_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the no-``O_NOFOLLOW`` code path regardless of platform.
+
+    ``_open_flags()`` and ``open_no_follow()`` both consult the module constant
+    rather than ``os`` directly, so clearing it switches the whole function to
+    the fallback consistently — the flag is dropped *and* the pre-open ``lstat``
+    is taken. Without that, this test would only ever run on Windows.
+    """
+    monkeypatch.setattr(source_identity, "SUPPORTS_NO_FOLLOW", False)
+
+
+def _swap_on_open(
+    monkeypatch: pytest.MonkeyPatch, target: Path, replacement: Path
+) -> dict[str, int]:
+    """Replace ``target`` with ``replacement`` at the moment it is opened.
+
+    ``os.replace`` gives the path a **different inode** while leaving it a
+    perfectly ordinary regular file that stays there for the rest of the
+    operation. That is exactly the substitution no post-open comparison can
+    see: from the open onwards, every observation describes the replacement
+    and they all agree with each other. Only the pre-open observation
+    disagrees.
+    """
+    real_open = os.open
+    resolved = str(target)
+    calls = {"count": 0}
+
+    def swapping(path: Any, *args: Any, **kwargs: Any) -> int:
+        if str(path) == resolved and calls["count"] == 0:
+            calls["count"] += 1
+            os.replace(replacement, target)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapping)
+    return calls
+
+
+def _twin_files(tmp_path: Path, name: str, payload: bytes) -> tuple[Path, Path]:
+    """Return two distinct regular files with identical size and mtime.
+
+    Same length, same modification timestamp, different inode — so only the
+    ``(device, inode)`` identity can tell them apart.
+    """
+    original = tmp_path / name
+    replacement = tmp_path / f"replacement-{name}"
+    original.write_bytes(payload)
+    replacement.write_bytes(payload)
+    stamp = (1_000_000, 1_000_000)
+    os.utime(original, stamp)
+    os.utime(replacement, stamp)
+    return original, replacement
 
 
 # --- the primitive ----------------------------------------------------------
@@ -924,3 +978,468 @@ def test_the_snapshot_type_is_what_create_backup_requires(
 
     assert isinstance(snapshot, ConfigurationSnapshot)
     assert isinstance(snapshot.identity, SourceIdentity)
+
+
+# --- regression: the fallback must *use* its pre-open observation ------------
+#
+# The fallback originally took a pre-open lstat, rejected a symlink, and then
+# discarded the observation. A regular file could therefore be replaced by
+# another regular file between the lstat and the open, and nothing would
+# notice: the descriptor and every later observation would describe the
+# replacement, consistently.
+#
+# These tests use two ordinary regular files. Nothing here involves a symlink,
+# so they cannot pass for the wrong reason.
+
+
+def test_the_fallback_keeps_its_pre_open_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The observation must be retained, not thrown away."""
+    _force_fallback(monkeypatch)
+    target = tmp_path / "config.toml"
+    target.write_text("a = 1\n", encoding="utf-8")
+
+    opened = open_no_follow(
+        target,
+        subject="The configuration",
+        code=ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
+    )
+    try:
+        assert opened.pre_open_identity is not None
+        assert opened.pre_open_identity.inode == os.lstat(target).st_ino
+    finally:
+        os.close(opened.descriptor)
+
+
+@POSIX_ONLY
+def test_no_pre_open_observation_is_needed_where_the_kernel_enforces_it() -> None:
+    """On Linux the kernel is authoritative, so there is nothing to compare."""
+    assert SUPPORTS_NO_FOLLOW
+
+
+def test_a_regular_file_swapped_before_the_open_is_refused_when_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact defect: regular file A validated, regular file B opened."""
+    _force_fallback(monkeypatch)
+    target, replacement = _twin_files(tmp_path, "config.toml", b"a = 1\n")
+    original_inode = os.lstat(target).st_ino
+
+    _swap_on_open(monkeypatch, target, replacement)
+
+    with pytest.raises(OperationError) as caught:
+        read_regular_file(
+            target,
+            max_bytes=1024,
+            subject="The configuration",
+            code=ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
+        )
+
+    assert caught.value.code is ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE
+    assert "between being inspected and being opened" in caught.value.message
+
+    # The replacement is still a perfectly ordinary regular file, still at the
+    # path, and is *not* the file that was validated. Only the pre-open
+    # comparison could have caught this.
+    assert target.is_file()
+    assert not target.is_symlink()
+    assert os.lstat(target).st_ino != original_inode
+
+
+def test_a_regular_file_swapped_before_the_open_is_refused_when_anchoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same protection for the database anchor."""
+    _force_fallback(monkeypatch)
+    target, replacement = _twin_files(tmp_path, "mgo.db", b"SQLite placeholder")
+
+    _swap_on_open(monkeypatch, target, replacement)
+
+    with pytest.raises(OperationError) as caught, anchored_source(
+        target,
+        subject="The source database",
+        code=ErrorCode.BACKUP_SOURCE_UNAVAILABLE,
+        identity_code=ErrorCode.BACKUP_SOURCE_IDENTITY_CHANGED,
+    ):
+        pass
+
+    assert caught.value.code is ErrorCode.BACKUP_SOURCE_IDENTITY_CHANGED
+    assert target.is_file()
+    assert not target.is_symlink()
+
+
+def test_identical_size_and_timestamp_do_not_hide_a_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only ``(device, inode)`` can tell these two apart.
+
+    Both files are the same length and carry the same modification time, so a
+    size-and-mtime comparison would see nothing wrong.
+    """
+    _force_fallback(monkeypatch)
+    payload = b"# identical\nvalue = 1\n"
+    target, replacement = _twin_files(tmp_path, "same.toml", payload)
+
+    before = os.lstat(target)
+    after_stat = os.lstat(replacement)
+    assert before.st_size == after_stat.st_size
+    assert before.st_mtime == after_stat.st_mtime
+    assert before.st_ino != after_stat.st_ino
+
+    _swap_on_open(monkeypatch, target, replacement)
+
+    with pytest.raises(OperationError) as caught:
+        read_regular_file(
+            target,
+            max_bytes=1024,
+            subject="The configuration",
+            code=ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
+        )
+
+    assert "between being inspected and being opened" in caught.value.message
+
+
+def test_capture_configuration_refuses_a_pre_open_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the real capture entry point."""
+    _force_fallback(monkeypatch)
+    target = tmp_path / "mgo.toml"
+    replacement = tmp_path / "other.toml"
+    text = CONFIGURATION_TEXT.format(database=(tmp_path / "a.db").as_posix())
+    target.write_text(text, encoding="utf-8")
+    replacement.write_text(text, encoding="utf-8")
+
+    _swap_on_open(monkeypatch, target, replacement)
+
+    with pytest.raises(OperationError) as caught:
+        capture_configuration(target)
+
+    assert caught.value.code is ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE
+
+
+def test_a_matching_pre_open_identity_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback must not reject the ordinary, unmolested case."""
+    _force_fallback(monkeypatch)
+    target = tmp_path / "config.toml"
+    # Written as bytes: the reader returns exactly what is on disk, so a
+    # text-mode write would make this assertion platform-dependent rather than
+    # testing the reader.
+    target.write_bytes(b"a = 1\n")
+
+    data, identity = read_regular_file(
+        target,
+        max_bytes=1024,
+        subject="The configuration",
+        code=ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
+    )
+
+    assert data == b"a = 1\n"
+    assert identity.inode == os.lstat(target).st_ino
+
+
+def test_an_unproven_pre_open_identity_fails_closed() -> None:
+    """A zero inode cannot prove anything, so it must not be treated as proof."""
+    from mgo.operations.source_identity import OpenedSource, require_opened_identity
+
+    opened = OpenedSource(
+        descriptor=-1,
+        pre_open_identity=SourceIdentity(device=1, inode=0, size=4, mtime_ns=0),
+    )
+
+    with pytest.raises(OperationError):
+        require_opened_identity(
+            opened,
+            SourceIdentity(device=1, inode=0, size=4, mtime_ns=0),
+            subject="The configuration",
+            code=ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
+        )
+
+
+# --- regression: descriptor lifetime ----------------------------------------
+#
+# The final path comparison used to run *after* the descriptor was closed,
+# which left a window in which an unlinked inode could be recycled. The module
+# explains elsewhere that holding the descriptor open is what prevents exactly
+# that, so the ordering was a contradiction of its own design.
+
+
+def _record_order(
+    monkeypatch: pytest.MonkeyPatch, target: Path
+) -> list[str]:
+    """Record the order of the final ``lstat`` and the ``close``."""
+    order: list[str] = []
+    real_lstat = os.lstat
+    real_close = os.close
+    resolved = str(target)
+
+    def recording_lstat(path: Any, **kwargs: Any) -> os.stat_result:
+        if str(path) == resolved:
+            order.append("lstat")
+        return real_lstat(path, **kwargs)
+
+    def recording_close(descriptor: int) -> None:
+        order.append("close")
+        real_close(descriptor)
+
+    monkeypatch.setattr(os, "lstat", recording_lstat)
+    monkeypatch.setattr(os, "close", recording_close)
+    return order
+
+
+def test_the_final_path_check_happens_before_the_descriptor_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordering that stops an inode being recycled under the comparison.
+
+    The assertion compares the **last** ``lstat`` with the **first** ``close``,
+    not the first of each. On the fallback platform an ``lstat`` is also taken
+    *before* the open, so comparing first-to-first would be satisfied by that
+    earlier observation and would never examine the ordering that matters —
+    which is exactly what this test exists to pin down.
+    """
+    target = tmp_path / "config.toml"
+    target.write_bytes(b"a = 1\n")
+
+    order = _record_order(monkeypatch, target)
+
+    read_regular_file(
+        target,
+        max_bytes=1024,
+        subject="The configuration",
+        code=ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
+    )
+
+    assert "lstat" in order
+    assert "close" in order
+
+    last_lstat = len(order) - 1 - order[::-1].index("lstat")
+    first_close = order.index("close")
+    assert last_lstat < first_close, (
+        f"every path observation must complete before the descriptor is "
+        f"released; observed order was {order}"
+    )
+
+
+def test_the_descriptor_is_closed_after_a_successful_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Success must not leak a descriptor."""
+    target = tmp_path / "config.toml"
+    target.write_text("a = 1\n", encoding="utf-8")
+
+    order = _record_order(monkeypatch, target)
+    read_regular_file(
+        target,
+        max_bytes=1024,
+        subject="The configuration",
+        code=ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
+    )
+
+    assert order.count("close") == 1
+
+
+def test_the_descriptor_is_closed_after_a_mutation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failure paths must not leak either."""
+    target = tmp_path / "config.toml"
+    target.write_text("a = 1\n", encoding="utf-8")
+
+    closes = {"count": 0}
+    real_close = os.close
+    real_fstat = os.fstat
+    seen = {"count": 0}
+
+    def counting_close(descriptor: int) -> None:
+        closes["count"] += 1
+        real_close(descriptor)
+
+    def shifting_fstat(descriptor: int) -> os.stat_result:
+        result = real_fstat(descriptor)
+        seen["count"] += 1
+        if seen["count"] > 1:
+            return _fake_lstat(result, st_size=result.st_size + 10)
+        return result
+
+    monkeypatch.setattr(os, "close", counting_close)
+    monkeypatch.setattr(os, "fstat", shifting_fstat)
+
+    with pytest.raises(OperationError):
+        read_regular_file(
+            target,
+            max_bytes=1024,
+            subject="The configuration",
+            code=ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
+        )
+
+    assert closes["count"] == 1
+
+
+def test_the_descriptor_is_closed_after_an_identity_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The post-read comparison failing must still release the descriptor."""
+    target = tmp_path / "config.toml"
+    target.write_text("a = 1\n", encoding="utf-8")
+
+    closes = {"count": 0}
+    real_close = os.close
+
+    def counting_close(descriptor: int) -> None:
+        closes["count"] += 1
+        real_close(descriptor)
+
+    monkeypatch.setattr(os, "close", counting_close)
+    _substitute_after_open(monkeypatch, target, st_ino=888_888)
+
+    with pytest.raises(OperationError):
+        read_regular_file(
+            target,
+            max_bytes=1024,
+            subject="The configuration",
+            code=ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
+        )
+
+    assert closes["count"] == 1
+
+
+def test_the_descriptor_is_closed_after_a_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An I/O error mid-read must not leak the descriptor."""
+    target = tmp_path / "config.toml"
+    target.write_text("a = 1\n", encoding="utf-8")
+
+    closes = {"count": 0}
+    real_close = os.close
+
+    def counting_close(descriptor: int) -> None:
+        closes["count"] += 1
+        real_close(descriptor)
+
+    def failing_read(descriptor: int, size: int) -> bytes:
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(os, "close", counting_close)
+    monkeypatch.setattr(os, "read", failing_read)
+
+    with pytest.raises(OperationError) as caught:
+        read_regular_file(
+            target,
+            max_bytes=1024,
+            subject="The configuration",
+            code=ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
+        )
+
+    assert closes["count"] == 1
+    assert "could not be read" in caught.value.message
+
+
+# --- regression: identity is re-checked after the copy ----------------------
+
+
+def test_the_database_identity_is_verified_after_the_online_copy(
+    database: Path,
+    configuration: Path,
+    destination: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A path replaced *during* the read must be caught before publication.
+
+    The first verification (immediately after SQLite connects) is allowed to
+    pass; the substitution is introduced afterwards, so only the post-copy
+    check can catch it.
+    """
+    snapshot = capture_configuration(configuration)
+
+    real_lstat = os.lstat
+    resolved = str(database)
+    observations = {"count": 0}
+    # On Windows an extra pre-open lstat is taken when the anchor is created.
+    allow_before_swap = 1 if SUPPORTS_NO_FOLLOW else 2
+
+    def substituting(path: Any, **kwargs: Any) -> os.stat_result:
+        result = real_lstat(path, **kwargs)
+        if str(path) != resolved:
+            return result
+        observations["count"] += 1
+        if observations["count"] <= allow_before_swap:
+            return result
+        return _fake_lstat(result, st_ino=result.st_ino + 5_000)
+
+    monkeypatch.setattr(os, "lstat", substituting)
+
+    with pytest.raises(OperationError) as caught:
+        create_backup(
+            database_path=database,
+            configuration=snapshot,
+            destination=destination,
+        )
+
+    assert caught.value.code is ErrorCode.BACKUP_SOURCE_IDENTITY_CHANGED
+    # The first verification really did pass, so this is the second one firing.
+    assert observations["count"] > allow_before_swap
+
+
+def test_a_post_copy_identity_failure_publishes_nothing(
+    database: Path,
+    configuration: Path,
+    destination: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No snapshot, no configuration, no manifest, no temporary file."""
+    snapshot = capture_configuration(configuration)
+
+    real_lstat = os.lstat
+    resolved = str(database)
+    observations = {"count": 0}
+    allow_before_swap = 1 if SUPPORTS_NO_FOLLOW else 2
+
+    def substituting(path: Any, **kwargs: Any) -> os.stat_result:
+        result = real_lstat(path, **kwargs)
+        if str(path) != resolved:
+            return result
+        observations["count"] += 1
+        if observations["count"] <= allow_before_swap:
+            return result
+        return _fake_lstat(result, st_ino=result.st_ino + 5_000)
+
+    monkeypatch.setattr(os, "lstat", substituting)
+
+    with pytest.raises(OperationError):
+        create_backup(
+            database_path=database,
+            configuration=snapshot,
+            destination=destination,
+        )
+
+    assert list(destination.iterdir()) == []
+
+
+def test_the_source_database_is_verified_twice(
+    database: Path, configuration: Path, destination: Path
+) -> None:
+    """A successful run performs both checks, not just the first."""
+    snapshot = capture_configuration(configuration)
+    verifications: list[str] = []
+
+    real_verify = backup_module.SourceAnchor.verify
+
+    def counting(self: Any, **kwargs: Any) -> None:
+        verifications.append("verify")
+        real_verify(self, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(backup_module.SourceAnchor, "verify", counting)
+        result = create_backup(
+            database_path=database,
+            configuration=snapshot,
+            destination=destination,
+        )
+
+    assert result.backup_path.is_file()
+    assert len(verifications) == 2, "expected a post-connect and a post-copy check"

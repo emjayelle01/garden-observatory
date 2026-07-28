@@ -995,8 +995,11 @@ def _copy_database(source: Path, target: Path, anchor: SourceAnchor) -> str:
     ``anchor`` pins the identity of the file that was validated for this run.
     SQLite opens the database **by name**, so between validation and that open
     the path could be repointed at another file; the anchor is therefore held
-    open across the connect and the path re-checked immediately afterwards. A
-    substitution in that window fails the run before anything is published.
+    open across the connect and the path checked **twice**: immediately after
+    SQLite connects, and again once the whole copy has been read. The first
+    proves the right file was opened; the second proves the path was still that
+    file throughout the read. A substitution at either point fails the run
+    before anything is published.
 
     ``immutable=1`` is deliberately not used to sidestep this: the production
     database is live and carries WAL state, and telling SQLite it cannot change
@@ -1034,6 +1037,17 @@ def _copy_database(source: Path, target: Path, anchor: SourceAnchor) -> str:
         target_connection = sqlite3.connect(target)
         try:
             source_connection.backup(target_connection)
+
+            # Verified a second time, now that the whole copy has been read.
+            # The first check proved SQLite opened the right file; this one
+            # proves the path was still that file for the duration of the read.
+            # A failure here happens before the temporary copy is accepted, so
+            # nothing is published.
+            anchor.verify(
+                subject="The source database",
+                code=ErrorCode.BACKUP_SOURCE_IDENTITY_CHANGED,
+            )
+
             target_connection.execute("PRAGMA journal_mode = DELETE")
             mode = journal_mode(target_connection)
         finally:
@@ -1153,6 +1167,7 @@ def create_backup(
                 source,
                 subject="The source database",
                 code=ErrorCode.BACKUP_SOURCE_UNAVAILABLE,
+                identity_code=ErrorCode.BACKUP_SOURCE_IDENTITY_CHANGED,
             ) as anchor:
                 mode = _copy_database(source, temporary, anchor)
 
