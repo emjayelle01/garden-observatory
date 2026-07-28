@@ -2,7 +2,8 @@
 
 ## Status
 
-**Implementation complete; final identity-ordering correction in progress.**
+**Implementation complete; operator configuration-default correction in
+progress.**
 
 A repository review of the five implementation commits found nine genuine
 defects — one requirement omitted outright, several checks that were weaker
@@ -17,6 +18,13 @@ after `a020f83`.
 A review of that correction found three narrowly scoped **ordering** defects
 within it, recorded in [§ Identity-ordering review](#identity-ordering-review)
 and corrected in commits after `52c6d31`.
+
+The source-identity work then passed review, and a final operational review
+found one defect at the **operator boundary** rather than inside the
+implementation: the manual wrappers did not select the production
+configuration. It is recorded in
+[§ Operator configuration-default review](#operator-configuration-default-review)
+and corrected in a commit after `d991d3b`.
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -301,6 +309,92 @@ test originally compared the *first* `lstat` with the *first* `close`, which the
 fallback's pre-open `lstat` satisfied on Windows regardless of the bug. It now
 compares the **last** `lstat` with the **first** `close`, and fails against the
 reverted code as it should.
+
+## Operator configuration-default review
+
+The source-identity implementation passed review. One operational defect
+remained, and it was not in the implementation at all — it was at the boundary
+where an operator meets it.
+
+### 16. The manual wrappers did not select the production configuration
+
+`mgo-backup.service` was correct, and had always been:
+
+```ini
+Environment=MGO_CONFIG_PATH=/etc/garden-observatory/mgo.toml
+ExecStart=... backup --config /etc/garden-observatory/mgo.toml ...
+```
+
+The manual wrappers — `scripts/operations/backup-database.sh` and
+`scripts/operations/create-support-bundle.sh` — supplied **neither**. They
+forwarded arguments to Python and nothing else, and `resolve_config_path()`
+deliberately falls back to the tracked development configuration when no
+explicit path and no environment value are present.
+
+`sudo` clears the environment, so this was not a corner case: it was what every
+documented manual command did. An operator following the documented procedure
+
+```bash
+sudo -u mgo /opt/garden-observatory/scripts/operations/backup-database.sh backup
+```
+
+would have reached `config/mgo.toml` inside the checkout, and could therefore:
+
+* select a **development database path** rather than the production database;
+* fail against development-relative storage paths that do not exist on the Pi;
+* create a **support bundle describing the wrong configuration** — the wrong
+  storage paths, the wrong camera, preview, motion and notification settings,
+  and unknown-key redaction applied to a file nobody asked about;
+* believe all of it, because every one of those outputs is internally
+  consistent and reports success.
+
+**Scheduled operation was production-safe. Manual operation was not.** That
+distinction is the whole finding: the timer would have kept producing correct
+recovery sets while an operator investigating an incident by hand was handed a
+picture of a machine that was not the one in front of them.
+
+**Corrected.** Each wrapper now exports the canonical production path before
+invoking Python, and only when the variable is genuinely unset:
+
+```bash
+if [[ ! -v MGO_CONFIG_PATH ]]; then
+    export MGO_CONFIG_PATH="/etc/garden-observatory/mgo.toml"
+fi
+```
+
+`-v` tests whether the *name* is set. The shorter
+`: "${MGO_CONFIG_PATH:=...}"` would also have replaced a deliberately empty or
+whitespace-only value, which the application treats as a configuration error and
+must keep treating as one — silently repairing a broken unit or a typo in a
+profile, by pointing the tooling at the live system, would hide exactly the
+fault it should surface.
+
+### Where the default belongs
+
+In the wrappers, not in `resolve_config_path()`. Moving it into the library
+would make every developer test run and every `uv run` on the development
+machine reach for a path that does not exist there, and a platform-conditional
+default would be untestable on one of the two platforms. Direct Python execution
+with no explicit path and no environment value still loads `config/mgo.toml`.
+
+The wrappers can no longer be described as containing *no* logic. They make one
+**execution-environment** decision — which configuration an operator means —
+and the comments, `--help` output and `scripts/README.md` now say so. Backup,
+verification, retention, redaction and collection decisions remain in Python.
+
+`scripts/deploy/mgo-backup.service.template` was **not** modified: it was
+already explicit, it invokes the interpreter directly rather than the wrapper,
+and a test now asserts both, so the scheduled path cannot come to depend on
+wrapper behaviour.
+
+### How this was confirmed
+
+The tests run the **real wrappers** under `bash` against a fake
+`.venv/bin/python` that reports the argument vector and the `MGO_CONFIG_PATH` it
+was handed, covering unset, custom, empty and whitespace-only values, argument
+forwarding, `--config` precedence, exit-status preservation, the missing
+interpreter error and that the wrapper writes nothing. Nothing touches `/etc`,
+`/var`, `/opt` or the production virtual environment.
 
 ## Authoritative definition
 

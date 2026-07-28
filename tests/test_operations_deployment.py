@@ -14,14 +14,19 @@ Everything is static analysis of tracked text plus Git metadata. Nothing runs
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
 import pytest
 
 from mgo.core.config import (
+    CONFIG_PATH_ENV,
+    DEFAULT_CONFIG_PATH,
     PROJECT_ROOT,
     SERVICE_ACCOUNT,
     SERVICE_GROUP,
@@ -31,12 +36,14 @@ from mgo.core.config import (
     SYSTEM_DATABASE_DIRECTORY,
     SYSTEM_LOG_DIRECTORY,
     SYSTEM_STATE_DIRECTORY,
+    resolve_config_path,
 )
 from mgo.operations.backup import DEFAULT_RETENTION_COUNT, MAX_RETENTION_COUNT
 from mgo.operations.errors import OperationError
 
 DEPLOY = PROJECT_ROOT / "scripts" / "deploy"
 OPERATIONS = PROJECT_ROOT / "scripts" / "operations"
+DOCUMENTATION = PROJECT_ROOT / "docs" / "Operations.md"
 
 API_UNIT = DEPLOY / "mgo.service.template"
 BACKUP_UNIT = DEPLOY / "mgo-backup.service.template"
@@ -1198,6 +1205,521 @@ def test_a_failed_activation_does_not_run_the_backup_or_touch_the_api() -> None:
     assert 'systemctl start "${backup_unit}"' not in commands
     assert "systemctl restart" not in commands
     assert "backup_cli" not in commands
+
+
+# --- regression: the operator wrappers select the production configuration ---
+#
+# mgo-backup.service always set MGO_CONFIG_PATH *and* passed --config, so the
+# scheduled backup was correct. The manual wrappers supplied neither, and
+# resolve_config_path() deliberately falls back to the tracked development
+# configuration, so a documented bare command --
+#
+#   sudo -u mgo /opt/garden-observatory/scripts/operations/backup-database.sh backup
+#
+# -- backed up a development database path and snapshotted the repository's
+# configuration. sudo clears the environment, so this was not a corner case: it
+# was what every documented manual command did.
+#
+# These tests run the REAL wrappers under bash against a fake interpreter that
+# reports the argument vector and environment it was handed. Nothing touches
+# /etc, /var, /opt or the production virtual environment.
+
+#: A stand-in for ``.venv/bin/python`` that prints what it was invoked with.
+#: It writes to stdout rather than to a file so no Windows path has to be
+#: translated into an MSYS path to be read back.
+FAKE_INTERPRETER = """#!/bin/sh
+for arg in "$@"; do
+  printf 'ARG %s\\n' "$arg"
+done
+if [ -n "${{{env}+set}}" ]; then
+  printf 'ENV [%s]\\n' "${env}"
+else
+  printf 'ENV-UNSET\\n'
+fi
+exit {exit_code}
+"""
+
+#: Exit status each wrapper uses for "the virtual environment is unusable".
+MISSING_VENV_STATUS = {"backup-database.sh": 1, "create-support-bundle.sh": 2}
+
+#: Python module each wrapper hands off to.
+WRAPPER_MODULE = {
+    "backup-database.sh": "mgo.operations.backup_cli",
+    "create-support-bundle.sh": "mgo.operations.support_bundle_cli",
+}
+
+#: Smallest argument vector each wrapper accepts without printing its usage.
+#: ``backup-database.sh`` exits 2 on no arguments, so "no arguments" is not a
+#: neutral way to exercise the rest of the script.
+WRAPPER_ARGUMENTS: dict[str, list[str]] = {
+    "backup-database.sh": ["backup"],
+    "create-support-bundle.sh": [],
+}
+
+WRAPPERS = (BACKUP_WRAPPER, BUNDLE_WRAPPER)
+WRAPPER_IDS = ("backup", "bundle")
+
+#: The canonical production configuration, as the wrappers spell it.
+PRODUCTION_CONFIG = SYSTEM_CONFIG_PATH.as_posix()
+
+
+def _sandbox(
+    tmp_path: Path, wrapper: Path, *, exit_code: int = 0, interpreter: bool = True
+) -> Path:
+    """Copy one wrapper into a throwaway application root and return its path.
+
+    The layout has to be real: the wrapper derives ``app_root`` from its own
+    location, so the fake interpreter must sit at ``<root>/.venv/bin/python``
+    exactly as the deployed one does.
+    """
+    root = tmp_path / "app"
+    operations = root / "scripts" / "operations"
+    operations.mkdir(parents=True)
+    copied = operations / wrapper.name
+    copied.write_bytes(wrapper.read_bytes())
+
+    if interpreter:
+        bin_directory = root / ".venv" / "bin"
+        bin_directory.mkdir(parents=True)
+        fake = bin_directory / "python"
+        fake.write_text(
+            FAKE_INTERPRETER.format(env=CONFIG_PATH_ENV, exit_code=exit_code),
+            encoding="utf-8",
+            newline="\n",
+        )
+        fake.chmod(0o755)
+
+    return copied
+
+
+def _run_wrapper(
+    script: Path,
+    args: Sequence[str] = (),
+    *,
+    config_env: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a sandboxed wrapper with ``MGO_CONFIG_PATH`` in a known state.
+
+    ``config_env=None`` means genuinely unset -- the case the defect was in.
+    """
+    bash = _find_bash()
+    if bash is None:  # pragma: no cover - bash is present on Windows and the Pi
+        pytest.skip("bash is unavailable")
+
+    environment = dict(os.environ)
+    environment.pop(CONFIG_PATH_ENV, None)
+    if config_env is not None:
+        environment[CONFIG_PATH_ENV] = config_env
+
+    return subprocess.run(
+        [bash, str(script).replace("\\", "/"), *args],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        env=environment,
+    )
+
+
+def _observed(
+    completed: subprocess.CompletedProcess[str],
+) -> tuple[list[str], str | None]:
+    """Return the argument vector and configuration value Python was handed."""
+    assert completed.returncode == 0, completed.stderr
+
+    lines = completed.stdout.splitlines()
+    arguments = [line[len("ARG ") :] for line in lines if line.startswith("ARG ")]
+
+    reports = [line for line in lines if line.startswith(("ENV [", "ENV-UNSET"))]
+    assert len(reports) == 1, completed.stdout
+    if reports[0] == "ENV-UNSET":
+        return arguments, None
+    return arguments, reports[0][len("ENV [") : -1]
+
+
+def _tree_digest(root: Path) -> dict[str, str]:
+    """Hash every file under ``root`` so a wrapper's writes cannot go unseen."""
+    return {
+        str(path.relative_to(root)).replace("\\", "/"): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+def test_an_unset_configuration_becomes_the_production_configuration(
+    tmp_path: Path, wrapper: Path
+) -> None:
+    """The defect itself: a bare operator command must mean production."""
+    script = _sandbox(tmp_path, wrapper)
+
+    _, selected = _observed(_run_wrapper(script, WRAPPER_ARGUMENTS[wrapper.name]))
+
+    assert selected == PRODUCTION_CONFIG
+    assert selected == "/etc/garden-observatory/mgo.toml"
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+def test_the_production_default_is_not_the_development_configuration(
+    tmp_path: Path, wrapper: Path
+) -> None:
+    """Stated the other way round, because that is the failure being fixed."""
+    script = _sandbox(tmp_path, wrapper)
+
+    _, selected = _observed(_run_wrapper(script, WRAPPER_ARGUMENTS[wrapper.name]))
+
+    # Leaving it unset is the defect, not an acceptable alternative: Python
+    # would then fall through to the tracked development configuration.
+    assert selected is not None
+    assert Path(selected) != DEFAULT_CONFIG_PATH
+    assert "config/mgo.toml" not in selected
+    assert not Path(selected).is_relative_to(PROJECT_ROOT)
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+def test_a_caller_supplied_configuration_is_preserved(
+    tmp_path: Path, wrapper: Path
+) -> None:
+    """An operator who sets the variable meant it."""
+    script = _sandbox(tmp_path, wrapper)
+
+    _, selected = _observed(
+        _run_wrapper(
+            script,
+            WRAPPER_ARGUMENTS[wrapper.name],
+            config_env="/srv/other/mgo.toml",
+        )
+    )
+
+    assert selected == "/srv/other/mgo.toml"
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+@pytest.mark.parametrize(
+    "value",
+    ["", " ", "\t", "   \t "],
+    ids=["empty", "space", "tab", "blank"],
+)
+def test_a_set_but_blank_configuration_is_not_repaired(
+    tmp_path: Path,
+    wrapper: Path,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``: "${VAR:=default}"`` would silently replace these; ``-v`` must not.
+
+    An empty or whitespace-only ``MGO_CONFIG_PATH`` is an error the application
+    reports, and it must keep reporting it. Substituting production for a value
+    the operator deliberately set would hide a broken unit or a typo in a
+    profile, and would do so by pointing the tooling at the live system.
+    """
+    script = _sandbox(tmp_path, wrapper)
+
+    _, selected = _observed(
+        _run_wrapper(script, WRAPPER_ARGUMENTS[wrapper.name], config_env=value)
+    )
+
+    assert selected == value
+    # The value the wrapper preserved is one the application still rejects.
+    monkeypatch.setenv(CONFIG_PATH_ENV, value)
+    with pytest.raises(ValueError):
+        resolve_config_path()
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+def test_an_explicit_config_argument_is_forwarded_untouched(
+    tmp_path: Path, wrapper: Path
+) -> None:
+    """``--config`` beats the environment, and shell must not parse it."""
+    script = _sandbox(tmp_path, wrapper)
+
+    arguments, selected = _observed(
+        _run_wrapper(script, ["--config", "/srv/explicit.toml"])
+    )
+
+    assert arguments[-2:] == ["--config", "/srv/explicit.toml"]
+    # The environment default is still supplied; Python's precedence decides.
+    assert selected == PRODUCTION_CONFIG
+    assert resolve_config_path(Path("/srv/explicit.toml")) == Path("/srv/explicit.toml")
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+def test_every_argument_reaches_python_unchanged(
+    tmp_path: Path, wrapper: Path
+) -> None:
+    """Including empty strings, spaces and dashes -- nothing is re-split."""
+    script = _sandbox(tmp_path, wrapper)
+    forwarded = [
+        "backup",
+        "--output-directory",
+        "/tmp/a directory",
+        "--keep",
+        "3",
+        "",
+        "--database",
+        "/var/lib/garden-observatory/db/mgo.db",
+    ]
+
+    arguments, _ = _observed(_run_wrapper(script, forwarded))
+
+    assert arguments == ["-m", WRAPPER_MODULE[wrapper.name], *forwarded]
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+@pytest.mark.parametrize("status", [0, 1, 2, 7])
+def test_the_python_exit_status_is_still_preserved(
+    tmp_path: Path, wrapper: Path, status: int
+) -> None:
+    """The bundle wrapper's 0/1/2 contract depends on this exactly."""
+    script = _sandbox(tmp_path, wrapper, exit_code=status)
+
+    completed = _run_wrapper(script, WRAPPER_ARGUMENTS[wrapper.name])
+
+    assert completed.returncode == status
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+def test_the_missing_interpreter_error_is_unchanged(
+    tmp_path: Path, wrapper: Path
+) -> None:
+    """The default must not run before, or instead of, the existing check."""
+    script = _sandbox(tmp_path, wrapper, interpreter=False)
+
+    completed = _run_wrapper(script, WRAPPER_ARGUMENTS[wrapper.name])
+
+    assert completed.returncode == MISSING_VENV_STATUS[wrapper.name]
+    assert "no Python interpreter at" in completed.stderr
+    assert "/.venv/bin/python" in completed.stderr
+    assert "uv sync" in completed.stderr
+    assert completed.stdout == ""
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+def test_the_wrapper_writes_nothing(tmp_path: Path, wrapper: Path) -> None:
+    """An operator wrapper that edits its own checkout would be a defect."""
+    script = _sandbox(tmp_path, wrapper)
+    root = script.parents[2]
+    before = _tree_digest(root)
+
+    _observed(_run_wrapper(script, WRAPPER_ARGUMENTS[wrapper.name]))
+
+    assert _tree_digest(root) == before
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+def test_the_help_text_names_the_file_that_will_be_used(wrapper: Path) -> None:
+    """An operator must be able to discover which file they are about to use."""
+    _, _, remainder = _read(wrapper).partition("<<'USAGE'")
+    help_text, terminator, _ = remainder.partition("\nUSAGE")
+
+    assert terminator, f"{wrapper.name} should print a usage heredoc"
+    assert PRODUCTION_CONFIG in help_text
+    assert CONFIG_PATH_ENV in help_text
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+def test_the_default_distinguishes_unset_from_empty(wrapper: Path) -> None:
+    """Asserted on the source too, so the intent cannot be lost in a rewrite."""
+    body = _code(_read(wrapper))
+
+    assert f"[[ ! -v {CONFIG_PATH_ENV} ]]" in body
+    assert f'export {CONFIG_PATH_ENV}="{PRODUCTION_CONFIG}"' in body
+    # The idiom that would have replaced a deliberately empty value.
+    assert f'"${{{CONFIG_PATH_ENV}:=' not in body
+    assert f"${{{CONFIG_PATH_ENV}:-" not in body
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+def test_the_default_is_a_plain_assignment(wrapper: Path) -> None:
+    """No escalation, no substitution, no command runs to produce the value."""
+    body = _code(_read(wrapper))
+    assignment = [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip().startswith(f"export {CONFIG_PATH_ENV}=")
+    ]
+
+    assert len(assignment) == 1
+    assert assignment[0] == f'export {CONFIG_PATH_ENV}="{PRODUCTION_CONFIG}"'
+    # The only variable a wrapper exports is the configuration path.
+    assert re.findall(r"^\s*export\s+(\w+)=", body, re.MULTILINE) == [CONFIG_PATH_ENV]
+
+
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=WRAPPER_IDS)
+def test_the_wrappers_no_longer_claim_to_be_environment_neutral(
+    wrapper: Path,
+) -> None:
+    """Truthfulness: they now make one execution-environment decision."""
+    text = _read(wrapper)
+
+    assert "contains NO business logic" not in text
+    assert "Contains NO business logic" not in text
+    assert "execution-environment decision" in text
+
+
+# --- regression: the Python default is untouched -----------------------------
+
+
+def test_direct_python_execution_still_uses_the_development_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fix belongs at the operator boundary, not in the library.
+
+    Moving the production default into ``resolve_config_path`` would make every
+    developer test run, and every ``uv run`` on this machine, reach for a path
+    that does not exist here.
+    """
+    monkeypatch.delenv(CONFIG_PATH_ENV, raising=False)
+
+    assert resolve_config_path() == DEFAULT_CONFIG_PATH
+    assert resolve_config_path() != Path(PRODUCTION_CONFIG)
+    assert DEFAULT_CONFIG_PATH.is_relative_to(PROJECT_ROOT)
+
+
+def test_the_python_default_does_not_depend_on_the_operating_system() -> None:
+    """A platform-conditional default would be untestable on one of them."""
+    source = (PROJECT_ROOT / "src" / "mgo" / "core" / "config.py").read_text(
+        encoding="utf-8"
+    )
+    resolver = source.partition("def resolve_config_path")[2].partition("\ndef ")[0]
+
+    assert resolver, "resolve_config_path should exist"
+    for forbidden in ("sys.platform", "os.name", "platform.system", "SYSTEM_CONFIG"):
+        assert forbidden not in resolver, forbidden
+
+
+# --- regression: the scheduled service stays independently explicit ----------
+
+
+def test_the_scheduled_service_does_not_rely_on_the_wrapper_default() -> None:
+    """The unit runs python directly; it must carry its own configuration."""
+    unit = _read(BACKUP_UNIT)
+    exec_start = _values(unit, "ExecStart")[0]
+
+    assert "Environment=MGO_CONFIG_PATH=@CONFIG_PATH@" in unit
+    assert "--config @CONFIG_PATH@" in exec_start
+    assert "backup-database.sh" not in unit
+    assert "scripts/operations" not in unit
+
+
+def test_the_scheduled_service_template_is_unchanged_by_this_correction() -> None:
+    """The unit was already correct, so the fix must not have edited it."""
+    git = _git()
+    completed = subprocess.run(
+        [
+            git,
+            "diff",
+            "--quiet",
+            "52c6d31419b04a8ea8cdc486180acec857db2ee3",
+            "--",
+            "scripts/deploy/mgo-backup.service.template",
+        ],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode not in (0, 1):  # pragma: no cover - shallow clone
+        pytest.skip("the recorded Task 10 commit is unavailable for comparison")
+
+    assert completed.returncode == 0, (
+        "scripts/deploy/mgo-backup.service.template changed; the scheduled unit "
+        "was already explicit and this correction is confined to the wrappers"
+    )
+
+
+# --- regression: the documented bare commands are now safe -------------------
+
+
+def _bash_commands(text: str) -> list[str]:
+    """Return every command inside a ```bash fence, continuations joined.
+
+    Joining matters: several documented commands are wrapped with a trailing
+    backslash, and treating each physical line as its own command would let a
+    ``--config`` on the second line go unseen.
+    """
+    commands: list[str] = []
+    pending = ""
+    inside = False
+
+    for line in text.splitlines():
+        if line.startswith("```"):
+            inside = line.strip() == "```bash"
+            pending = ""
+            continue
+        stripped = line.strip()
+        if not inside or not stripped:
+            continue
+        if stripped.endswith("\\"):
+            pending += stripped[:-1].strip() + " "
+            continue
+        commands.append((pending + stripped).strip())
+        pending = ""
+
+    return commands
+
+
+def _documented_wrapper_commands() -> list[str]:
+    """Documented commands that invoke an operator wrapper."""
+    commands = _bash_commands(_read(DOCUMENTATION))
+    return [
+        command
+        for command in commands
+        if any(wrapper.name in command for wrapper in WRAPPERS)
+    ]
+
+
+def test_the_documentation_still_shows_bare_wrapper_commands() -> None:
+    """The point of the fix is that these did not have to grow a --config.
+
+    Requiring every documented command to repeat ``--config
+    /etc/garden-observatory/mgo.toml`` would have papered over the operator
+    boundary instead of fixing it, and the first command an operator typed from
+    memory would still have been wrong.
+    """
+    bare = [
+        command
+        for command in _documented_wrapper_commands()
+        if "--config" not in command
+    ]
+
+    assert bare, "the documented operator commands should not all need --config"
+    assert any("backup-database.sh backup" in command for command in bare)
+    assert any("create-support-bundle.sh" in command for command in bare)
+
+
+def test_every_bare_documented_command_reaches_a_wrapper_that_defaults() -> None:
+    """A bare example is only safe because the wrapper supplies the default."""
+    for command in _documented_wrapper_commands():
+        if "--config" in command:
+            continue
+        named = [wrapper for wrapper in WRAPPERS if wrapper.name in command]
+        assert len(named) == 1, command
+        body = _code(_read(named[0]))
+        assert f"[[ ! -v {CONFIG_PATH_ENV} ]]" in body, command
+
+
+def test_no_documented_operator_command_bypasses_the_wrapper() -> None:
+    """``python -m mgo.operations.backup_cli`` would get no default at all."""
+    for command in _bash_commands(_read(DOCUMENTATION)):
+        for module in WRAPPER_MODULE.values():
+            if module not in command:
+                continue
+            assert "--config" in command, command
+
+
+def test_the_documentation_states_the_override_order() -> None:
+    """An operator has to be able to predict which file will be used."""
+    text = _read(DOCUMENTATION)
+
+    assert "wrapper-supplied production" in text
+    assert f"defaults `{CONFIG_PATH_ENV}`" in text or (
+        f"default `{CONFIG_PATH_ENV}`" in text
+    )
+    assert "set-but-empty" in text or "set but empty" in text
 
 
 # --- generated artefacts stay untracked -------------------------------------

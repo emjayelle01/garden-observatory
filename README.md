@@ -378,6 +378,16 @@ There is no implicit discovery of that path — `MGO_CONFIG_PATH` is what select
 it, so the precedence table above is unchanged and an existing deployment
 pointing at an older location keeps working.
 
+The two operator wrappers in `scripts/operations/` set `MGO_CONFIG_PATH` to
+`/etc/garden-observatory/mgo.toml` themselves when it is **unset**, so a manual
+command typed on the Pi means production rather than falling through to row 3.
+A value the caller supplied is preserved exactly, including a set-but-empty one,
+which the application still rejects. That default is applied by the wrappers
+before Python starts; it does not change the table above, and direct Python
+execution on a development machine still loads `config/mgo.toml`. See
+[`scripts/README.md`](scripts/README.md) and
+[`docs/Operations.md`](docs/Operations.md).
+
 External production files (including `/etc/garden-observatory/mgo.toml`) must
 **not** be committed to the repository.
 

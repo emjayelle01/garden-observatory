@@ -11,6 +11,8 @@ for the production runtime account and filesystem layout.
 
 All scripts are POSIX/Bash, use strict mode, are idempotent, quote their inputs,
 and never edit files tracked in this repository or the Pi's SSH configuration.
+The `operations/` wrappers are not otherwise environment-neutral: they select
+the production configuration when the caller has not (see below).
 
 | Script | Run as | What it does |
 | ------ | ------ | ------------ |
@@ -19,8 +21,30 @@ and never edit files tracked in this repository or the Pi's SSH configuration.
 | `deploy/install-service-identity.sh` | **root** (`sudo`) | Provisions the production runtime identity: the non-login `mgo` system account and group, `/etc/garden-observatory`, `/var/lib/garden-observatory` (with `db`, `media/captures`, `queues`, `state`), `/var/log/garden-observatory`, `/var/backups/garden-observatory`, their ownership and permissions, and the rendered systemd units. Validates the virtual environment **per selected target** — `uvicorn` for `mgo.service`, `python` for `mgo-backup.service` — and refuses to install a unit against an unusable one (a relocated checkout would fail with `status=203/EXEC`); it reports the fix rather than repairing it. `--no-unit` skips only the API unit, so a broken environment still stops the run while the backup service is selected. Timer activation is checked at every step and the enabled/active states are verified, so a failed activation is never reported as success. Idempotent; never overwrites an existing production configuration; backs up any existing unit. Supports `--dry-run`, `--no-operations`, `--keep N` (validated `1..3650`, matching the runtime) and `--backup-dir`. |
 | `deploy/verify-service-identity.sh` | normal user (more checks with `sudo`) | **Read-only** verification of the service identity: account type, non-login shell, locked password, group membership, directory ownership/modes, configuration readable-but-not-writable, unit identity directives, and the owner of the running process. Exits non-zero on any problem. Changes nothing. |
 | `deploy/verify-operations.sh` | normal user (more checks with `sudo`) | **Read-only** verification of the Task 10 operations provisioning: backup directory ownership/mode, the backup unit's type, identity, sandbox and writable paths, the timer's schedule/persistence/enablement/next run, and the logrotate policy's location, mode, target confinement and bounded retention. Reports journal disk usage for information. Takes no backup, forces no rotation, enables nothing, repairs nothing. |
-| `operations/backup-database.sh` | `mgo` (via `sudo -u mgo`) | Operator wrapper for the backup CLI: `backup`, `verify`, `restore-test`, `list`. Produces a **three-file recovery set** — database snapshot, production configuration snapshot and manifest — taken **while the API keeps serving**; it never stops `mgo.service`. Contains no business logic; forwards every argument to Python and preserves its exit status. There is deliberately no `restore` subcommand. |
-| `operations/create-support-bundle.sh` | `mgo` (via `sudo -u mgo`) | Operator wrapper for the diagnostic bundle CLI. Produces a bounded `mgo-support-<timestamp>.tar.gz` (mode `0600`) containing status, a bounded journal slice and a redacted configuration summary — never the database, media, raw configuration or credentials, and never the recovery set's configuration snapshot. Collection is literal-loopback only, proxies disabled, redirects refused. Exit `0` complete, `1` partial, `2` no bundle. Uploads nothing; **inspect the archive before sending it**. |
+| `operations/backup-database.sh` | `mgo` (via `sudo -u mgo`) | Operator wrapper for the backup CLI: `backup`, `verify`, `restore-test`, `list`. Produces a **three-file recovery set** — database snapshot, production configuration snapshot and manifest — taken **while the API keeps serving**; it never stops `mgo.service`. Makes no backup decisions; forwards every argument to Python and preserves its exit status. Defaults `MGO_CONFIG_PATH` to `/etc/garden-observatory/mgo.toml` when unset (see below). There is deliberately no `restore` subcommand. |
+| `operations/create-support-bundle.sh` | `mgo` (via `sudo -u mgo`) | Operator wrapper for the diagnostic bundle CLI. Produces a bounded `mgo-support-<timestamp>.tar.gz` (mode `0600`) containing status, a bounded journal slice and a redacted configuration summary — never the database, media, raw configuration or credentials, and never the recovery set's configuration snapshot. Collection is literal-loopback only, proxies disabled, redirects refused. Exit `0` complete, `1` partial, `2` no bundle. Defaults `MGO_CONFIG_PATH` the same way. Uploads nothing; **inspect the archive before sending it**. |
+
+## The operator wrappers and `MGO_CONFIG_PATH`
+
+The two `operations/` wrappers make **one** execution-environment decision:
+which configuration an operator means. When `MGO_CONFIG_PATH` is unset they
+export `/etc/garden-observatory/mgo.toml` before invoking Python.
+
+```text
+explicit --config PATH              wins over everything
+caller-provided MGO_CONFIG_PATH     preserved exactly
+wrapper-supplied production default applied only when the variable is unset
+```
+
+A set-but-empty or whitespace-only value is **preserved**, not replaced, so the
+CLI still reports it as the configuration error it is. `sudo` clears the
+environment, so without this default every documented manual command fell
+through to the tracked *development* configuration; `mgo-backup.service` was
+always explicit and was never affected. Direct Python execution on a development
+machine still uses `config/mgo.toml`.
+
+Backup, verification, retention, redaction and collection decisions remain in
+Python, where they are typed and unit-tested.
 
 Tracked deployment assets that are installed rather than run:
 

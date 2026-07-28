@@ -115,6 +115,9 @@ The application's existing resolution rules, and no others:
 The scheduled backup unit sets both `MGO_CONFIG_PATH` and `--config`, so in
 production this is always `/etc/garden-observatory/mgo.toml`.
 
+The operator wrappers reach the same file without the operator having to say so.
+See [§5.0 Which configuration an operator command uses](#50-which-configuration-an-operator-command-uses).
+
 #### It is read exactly once
 
 The configuration is read **once per run**, and those exact bytes are
@@ -511,6 +514,57 @@ Run these on the Pi from the application root.
 
 ```bash
 cd /opt/garden-observatory
+```
+
+### 5.0 Which configuration an operator command uses
+
+The wrappers default `MGO_CONFIG_PATH` to `/etc/garden-observatory/mgo.toml`
+**only when the variable is unset**. That default is applied before Python
+starts, so a bare operator command means production.
+
+Effective precedence, highest first:
+
+```text
+explicit --config PATH
+caller-provided MGO_CONFIG_PATH
+wrapper-supplied production MGO_CONFIG_PATH
+```
+
+| Environment state | What the wrapper does |
+| ----------------- | --------------------- |
+| unset | sets `/etc/garden-observatory/mgo.toml` |
+| set to a path | preserved exactly |
+| set-but-empty | preserved, so the CLI reports the error |
+| whitespace only | preserved, so the CLI reports the error |
+
+**Why this exists.** `mgo-backup.service` has always set `MGO_CONFIG_PATH` *and*
+passed `--config`, so the scheduled backup was correct. The manual wrappers
+supplied neither, and configuration resolution falls back to the tracked
+*development* configuration. `sudo` clears the environment, so every documented
+manual command — `sudo -u mgo .../backup-database.sh backup` — resolved to the
+repository's development file. That could select a development database path,
+fail against development-relative storage, or produce a support bundle
+describing a configuration the Pi does not use. Scheduled operation was
+production-safe; manual operation was not.
+
+**Why set-but-empty is preserved.** The application treats an empty or
+whitespace-only `MGO_CONFIG_PATH` as a configuration error. The wrapper uses
+`[[ ! -v MGO_CONFIG_PATH ]]`, which tests whether the *name* is set, rather than
+`: "${MGO_CONFIG_PATH:=...}"`, which would also replace a deliberately empty
+value. Silently repairing a broken unit or a typo in a profile — by pointing the
+tooling at the live system — would hide the fault it should surface.
+
+**Development is unaffected.** The default lives in the operator wrappers, not
+in `resolve_config_path()`. Running Python directly with no `--config` and no
+`MGO_CONFIG_PATH` still loads `config/mgo.toml`, on every platform.
+
+**The timer does not depend on this.** `mgo-backup.service` invokes the
+interpreter directly, never the wrapper, and remains independently explicit.
+
+To override for one command:
+
+```bash
+sudo -u mgo MGO_CONFIG_PATH=/tmp/other.toml /opt/garden-observatory/scripts/operations/backup-database.sh backup
 ```
 
 ### 5.1 Take a backup
@@ -1293,6 +1347,61 @@ bash scripts/deploy/verify-operations.sh
 ```bash
 bash scripts/deploy/verify-service-identity.sh
 ```
+
+### 13.5a Prove the manual wrapper selects the production configuration
+
+Run this **before** §13.6, because every later manual step depends on it. `env
+-u` removes the variable entirely, reproducing what `sudo` does to an operator's
+environment.
+
+```bash
+sudo -u mgo env -u MGO_CONFIG_PATH /opt/garden-observatory/scripts/operations/backup-database.sh backup --output-directory /tmp/mgo-wrapper-default-validation
+```
+
+Expect exit `0`. The configuration snapshot in that recovery set must be
+**byte-identical** to the production configuration:
+
+```bash
+sudo cmp /etc/garden-observatory/mgo.toml /tmp/mgo-wrapper-default-validation/*.config.toml
+```
+
+`cmp` must print nothing and exit `0`. If it reports a difference, the wrapper
+default is not in effect and the manual commands below would be describing the
+wrong machine — stop and investigate.
+
+Confirm the summary reports `"database_source": "configuration"` and that the
+database path it used is under `/var/lib/garden-observatory`, not under
+`/opt/garden-observatory`.
+
+Now prove a caller-supplied value is **preserved** rather than overridden, using
+a temporary configuration well outside production:
+
+```bash
+sudo -u mgo install -m 0640 /etc/garden-observatory/mgo.toml /tmp/mgo-wrapper-custom.toml
+```
+
+```bash
+sudo -u mgo MGO_CONFIG_PATH=/tmp/mgo-wrapper-custom.toml /opt/garden-observatory/scripts/operations/create-support-bundle.sh --output-directory /tmp/mgo-wrapper-default-validation
+```
+
+The bundle must be produced from that file. Then prove a deliberately empty
+value is still an error rather than being silently replaced:
+
+```bash
+sudo -u mgo MGO_CONFIG_PATH= /opt/garden-observatory/scripts/operations/backup-database.sh backup --output-directory /tmp/mgo-wrapper-default-validation
+```
+
+This must exit non-zero and report that `MGO_CONFIG_PATH` is set but empty. It
+must **not** fall back to production.
+
+Remove only the temporary validation artefacts:
+
+```bash
+sudo rm -rf /tmp/mgo-wrapper-default-validation /tmp/mgo-wrapper-custom.toml
+```
+
+Nothing in this step writes to `/var/backups/garden-observatory`, so no
+pre-existing backup and no retention state is affected.
 
 ### 13.6 Take a backup while the API is serving
 
