@@ -32,6 +32,7 @@ from typing import IO, Any
 from mgo.core.config import (
     SYSTEM_BACKUP_DIRECTORY,
     load_config,
+    resolve_config_path,
 )
 from mgo.operations.backup import (
     BACKUP_SERVICE,
@@ -51,8 +52,30 @@ EXIT_FAILURE = 1
 EXIT_USAGE = 2
 
 
+def _resolve_configuration_path(explicit: Path | None) -> Path:
+    """Resolve which configuration file this run uses.
+
+    Uses the application's existing resolution rules and no others: an explicit
+    ``--config``, then ``MGO_CONFIG_PATH``, then the tracked development
+    default. The scheduled backup unit sets ``MGO_CONFIG_PATH`` and passes
+    ``--config``, so in production this is the canonical
+    ``/etc/garden-observatory/mgo.toml``.
+
+    This single answer is used for two purposes -- finding the database and
+    choosing the configuration to snapshot -- so a recovery set can never pair a
+    database with a configuration that does not belong to it.
+    """
+    try:
+        return resolve_config_path(explicit)
+    except ValueError as exc:
+        raise OperationError(
+            ErrorCode.CONFIGURATION_UNAVAILABLE,
+            f"The configuration path could not be resolved: {exc}.",
+        ) from exc
+
+
 def _resolve_database_path(
-    explicit: Path | None, config_path: Path | None
+    explicit: Path | None, configuration_path: Path
 ) -> Path:
     """Resolve the database to back up.
 
@@ -65,7 +88,7 @@ def _resolve_database_path(
         return explicit
 
     try:
-        config = load_config(config_path)
+        config = load_config(configuration_path)
     except FileNotFoundError as exc:
         raise OperationError(
             ErrorCode.CONFIGURATION_UNAVAILABLE,
@@ -196,11 +219,13 @@ def _run_backup(
     arguments: argparse.Namespace, events: EventEmitter, stream: IO[str]
 ) -> int:
     """Execute the ``backup`` subcommand."""
-    database = _resolve_database_path(arguments.database, arguments.config)
+    configuration = _resolve_configuration_path(arguments.config)
+    database = _resolve_database_path(arguments.database, configuration)
     destination = _default_output_directory(arguments.output_directory)
 
     result = create_backup(
         database_path=database,
+        configuration_path=configuration,
         destination=destination,
         keep=arguments.keep,
         emitter=events,
@@ -247,7 +272,9 @@ def _run_restore_test(
     """Execute the ``restore-test`` subcommand."""
     database: Path | None
     try:
-        database = _resolve_database_path(None, arguments.config)
+        database = _resolve_database_path(
+            None, _resolve_configuration_path(arguments.config)
+        )
     except OperationError:
         # A restore test does not need the configuration; it is read only so the
         # configured database directory can be added to the protected list.

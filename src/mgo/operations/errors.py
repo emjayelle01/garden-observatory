@@ -43,9 +43,24 @@ class ErrorCode(StrEnum):
     BACKUP_CHECKSUM_MISMATCH = "BACKUP_CHECKSUM_MISMATCH"
     BACKUP_NOT_FOUND = "BACKUP_NOT_FOUND"
 
+    #: The production configuration could not be captured: missing, not a
+    #: regular file, a symlink, unreadable, larger than the permitted bound, or
+    #: modified while it was being copied. A recovery set without the
+    #: configuration is incomplete, so this fails the whole backup.
+    BACKUP_CONFIGURATION_UNAVAILABLE = "BACKUP_CONFIGURATION_UNAVAILABLE"
+
+    #: The three files of a recovery set are not all present, or do not
+    #: describe each other. Distinct from a corrupt individual artefact: the
+    #: files may each be intact while the set as a whole cannot be restored.
+    BACKUP_SET_INCOMPLETE = "BACKUP_SET_INCOMPLETE"
+
     # --- restore verification ----------------------------------------------
     RESTORE_TEST_FAILED = "RESTORE_TEST_FAILED"
     RESTORE_TARGET_REJECTED = "RESTORE_TARGET_REJECTED"
+
+    #: A restore-test target file already exists. Overwriting it could destroy
+    #: whatever the operator put there, so the test refuses before writing.
+    RESTORE_TARGET_EXISTS = "RESTORE_TARGET_EXISTS"
 
     # --- diagnostics --------------------------------------------------------
     DIAGNOSTIC_OUTPUT_UNWRITABLE = "DIAGNOSTIC_OUTPUT_UNWRITABLE"

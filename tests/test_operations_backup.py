@@ -16,12 +16,14 @@ production path and no root.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import sqlite3
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -37,9 +39,11 @@ from mgo.operations.backup import (
     DEFAULT_RETENTION_COUNT,
     EXPECTED_TABLES,
     LOCK_FILENAME,
+    MAX_CONFIGURATION_BYTES,
     TEMPORARY_PREFIX,
     BackupManifest,
     apply_retention,
+    configuration_path_for,
     create_backup,
     file_sha256,
     list_backups,
@@ -48,6 +52,7 @@ from mgo.operations.backup import (
     verify_backup,
 )
 from mgo.operations.errors import ErrorCode, OperationError
+from mgo.operations.events import EventEmitter
 from mgo.operations.locking import OperationLock
 
 POSIX_ONLY = pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits")
@@ -83,6 +88,30 @@ def source_database(tmp_path: Path) -> Path:
     return database
 
 
+#: Deliberately contains a comment, a blank line and a secret-looking value.
+#: The comment and blank line prove the snapshot preserves exact bytes rather
+#: than round-tripping through a TOML parser; the value proves configuration
+#: content never reaches an event, a manifest or a summary.
+CONFIGURATION_TEXT = """\
+# Matt's Garden Observatory — production configuration.
+
+[application]
+name = "MGO"
+
+[future_transport]
+bot_token = "SECRET-TOKEN-MUST-NOT-LEAK"
+"""
+
+
+@pytest.fixture
+def source_configuration(tmp_path: Path) -> Path:
+    """A production-shaped configuration file to snapshot."""
+    path = tmp_path / "source" / "mgo.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(CONFIGURATION_TEXT, encoding="utf-8")
+    return path
+
+
 @pytest.fixture
 def destination(tmp_path: Path) -> Path:
     """An empty backup directory."""
@@ -100,14 +129,80 @@ def _row_count(database: Path, table: str) -> int:
         connection.close()
 
 
-def _make_backup(source: Path, target: Path, **kwargs: object) -> Path:
-    """Take a backup and return the published file."""
-    result = create_backup(
+def _configuration_beside(source: Path) -> Path:
+    """Return a configuration file created next to a database source.
+
+    Tests that build their own database outside the fixtures still need a
+    configuration for the recovery set, and it must not be shared with another
+    test's temporary tree.
+    """
+    path = source.parent / "mgo.toml"
+    if not path.exists():
+        path.write_text(CONFIGURATION_TEXT, encoding="utf-8")
+    return path
+
+
+def _backup(
+    source: Path,
+    target: Path,
+    configuration: Path | None = None,
+    **kwargs: object,
+) -> Any:
+    """Take a complete recovery set, defaulting the configuration."""
+    return create_backup(
         database_path=source,
+        configuration_path=(
+            configuration
+            if configuration is not None
+            else _configuration_beside(source)
+        ),
         destination=target,
         **kwargs,  # type: ignore[arg-type]
     )
-    return result.backup_path
+
+
+def _make_backup(source: Path, target: Path, **kwargs: object) -> Path:
+    """Take a recovery set and return the published database file."""
+    return _backup(source, target, **kwargs).backup_path
+
+
+def _manifest_body(
+    backup: Path, configuration: Path, **overrides: Any
+) -> dict[str, Any]:
+    """Build a structurally valid manifest body for a hand-made set.
+
+    Defaults describe the files actually on disk, so a test only has to state
+    the one field it wants to be wrong.
+    """
+    body: dict[str, Any] = {
+        "format_version": BACKUP_FORMAT_VERSION,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "application": "garden-observatory",
+        "application_version": "0.1.0",
+        "source_database_name": "mgo.db",
+        "backup_filename": backup.name,
+        "backup_size_bytes": backup.stat().st_size,
+        "sha256": file_sha256(backup),
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "expected_schema_version": CURRENT_SCHEMA_VERSION,
+        "integrity": "ok",
+        "journal_mode_of_backup": "delete",
+        "table_row_counts": dict.fromkeys(EXPECTED_TABLES, 0),
+        "configuration_source_name": "mgo.toml",
+        "configuration_filename": configuration.name,
+        "configuration_size_bytes": configuration.stat().st_size,
+        "configuration_sha256": file_sha256(configuration),
+    }
+    body.update(overrides)
+    return body
+
+
+def _rewrite_manifest(backup: Path, **overrides: Any) -> None:
+    """Rewrite a real backup's manifest with the given field overrides."""
+    manifest = manifest_path_for(backup)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload.update(overrides)
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
 
 
 # --- taking a backup --------------------------------------------------------
@@ -117,7 +212,7 @@ def test_a_wal_database_is_backed_up_successfully(
     source_database: Path, destination: Path
 ) -> None:
     """The ordinary case: a live WAL database yields a published backup."""
-    result = create_backup(database_path=source_database, destination=destination)
+    result = _backup(source_database, destination)
 
     assert result.backup_path.is_file()
     assert result.manifest_path.is_file()
@@ -144,9 +239,7 @@ def test_a_backup_succeeds_while_the_source_is_open_for_writing(
         )
         writer.commit()
 
-        result = create_backup(
-            database_path=source_database, destination=destination
-        )
+        result = _backup(source_database, destination)
     finally:
         writer.close()
 
@@ -160,7 +253,7 @@ def test_the_source_database_is_not_modified(
     before = file_sha256(source_database)
     before_mode = _journal_mode(source_database)
 
-    create_backup(database_path=source_database, destination=destination)
+    _backup(source_database, destination)
 
     assert file_sha256(source_database) == before
     assert _journal_mode(source_database) == before_mode == "wal"
@@ -226,10 +319,13 @@ def test_the_backup_is_a_single_self_contained_file(
 
     assert not (destination / f"{backup.name}-wal").exists()
     assert not (destination / f"{backup.name}-shm").exists()
-    assert sorted(item.name for item in destination.iterdir()) == [
-        backup.name,
-        manifest_path_for(backup).name,
-    ]
+    assert sorted(item.name for item in destination.iterdir()) == sorted(
+        [
+            backup.name,
+            configuration_path_for(backup).name,
+            manifest_path_for(backup).name,
+        ]
+    )
 
     # Readable with the sidecars provably absent.
     assert _row_count(backup, "observations") == 2
@@ -263,7 +359,7 @@ def test_the_manifest_records_every_required_field(
     source_database: Path, destination: Path
 ) -> None:
     """The manifest is the backup's description; it must be complete."""
-    result = create_backup(database_path=source_database, destination=destination)
+    result = _backup(source_database, destination)
     payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
 
     for name in (
@@ -288,7 +384,7 @@ def test_the_manifest_values_describe_the_published_backup(
     source_database: Path, destination: Path
 ) -> None:
     """Every recorded measurement must match the file on disk."""
-    result = create_backup(database_path=source_database, destination=destination)
+    result = _backup(source_database, destination)
     payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
 
     assert payload["format_version"] == BACKUP_FORMAT_VERSION
@@ -305,7 +401,7 @@ def test_the_manifest_records_a_name_not_a_path(
     source_database: Path, destination: Path
 ) -> None:
     """A manifest travels with its backup; it must leak no filesystem layout."""
-    result = create_backup(database_path=source_database, destination=destination)
+    result = _backup(source_database, destination)
     text = result.manifest_path.read_text(encoding="utf-8")
     payload = json.loads(text)
 
@@ -318,7 +414,7 @@ def test_the_manifest_timestamp_is_utc(
     source_database: Path, destination: Path
 ) -> None:
     """Local time would be ambiguous across a DST change."""
-    result = create_backup(database_path=source_database, destination=destination)
+    result = _backup(source_database, destination)
     payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
 
     moment = datetime.fromisoformat(payload["created_at"])
@@ -331,7 +427,7 @@ def test_the_manifest_is_deterministic_json(
     source_database: Path, destination: Path
 ) -> None:
     """Deterministic output is what lets a test assert on content."""
-    result = create_backup(database_path=source_database, destination=destination)
+    result = _backup(source_database, destination)
     text = result.manifest_path.read_text(encoding="utf-8")
 
     reparsed = BackupManifest.from_dict(json.loads(text))
@@ -342,7 +438,7 @@ def test_the_manifest_carries_no_database_row_content(
     source_database: Path, destination: Path
 ) -> None:
     """Counts are permitted; contents are not."""
-    result = create_backup(database_path=source_database, destination=destination)
+    result = _backup(source_database, destination)
     text = result.manifest_path.read_text(encoding="utf-8")
 
     assert "first observation" not in text
@@ -380,7 +476,7 @@ def test_the_manifest_sits_beside_its_backup(
     source_database: Path, destination: Path
 ) -> None:
     """The pairing rule retention depends on."""
-    result = create_backup(database_path=source_database, destination=destination)
+    result = _backup(source_database, destination)
 
     assert manifest_path_for(result.backup_path) == result.manifest_path
 
@@ -392,7 +488,7 @@ def test_no_temporary_file_survives_a_successful_backup(
     source_database: Path, destination: Path
 ) -> None:
     """A leftover temporary would accumulate on every run."""
-    create_backup(database_path=source_database, destination=destination)
+    _backup(source_database, destination)
 
     assert not [
         item for item in destination.iterdir() if item.name.startswith(TEMPORARY_PREFIX)
@@ -406,7 +502,7 @@ def test_a_failed_backup_publishes_nothing(
     _corrupt(source_database)
 
     with pytest.raises(OperationError):
-        create_backup(database_path=source_database, destination=destination)
+        _backup(source_database, destination)
 
     published = [
         item for item in destination.iterdir() if BACKUP_NAME_PATTERN.match(item.name)
@@ -421,7 +517,7 @@ def test_a_failed_backup_leaves_no_temporary_file(
     _corrupt(source_database)
 
     with pytest.raises(OperationError):
-        create_backup(database_path=source_database, destination=destination)
+        _backup(source_database, destination)
 
     leftovers = [
         item.name
@@ -447,7 +543,7 @@ def test_a_corrupt_source_is_reported_and_not_published(
     _corrupt(source_database)
 
     with pytest.raises(OperationError) as caught:
-        create_backup(database_path=source_database, destination=destination)
+        _backup(source_database, destination)
 
     assert caught.value.code in {
         ErrorCode.BACKUP_SQLITE_FAILED,
@@ -470,9 +566,7 @@ def test_an_existing_backup_name_is_never_overwritten(
     ).replace(tzinfo=UTC)
 
     with pytest.raises(OperationError) as caught:
-        create_backup(
-            database_path=source_database, destination=destination, now=moment
-        )
+        _backup(source_database, destination, now=moment)
 
     assert caught.value.code is ErrorCode.BACKUP_ALREADY_EXISTS
     assert first.read_bytes() == original
@@ -481,9 +575,7 @@ def test_an_existing_backup_name_is_never_overwritten(
 def test_a_missing_source_is_reported(tmp_path: Path, destination: Path) -> None:
     """A clear code beats an SQLite "unable to open database file"."""
     with pytest.raises(OperationError) as caught:
-        create_backup(
-            database_path=tmp_path / "absent.db", destination=destination
-        )
+        _backup(tmp_path / "absent.db", destination, tmp_path / "cfg.toml")
 
     assert caught.value.code is ErrorCode.BACKUP_SOURCE_UNAVAILABLE
 
@@ -496,7 +588,7 @@ def test_a_source_that_is_not_a_file_is_reported(
     directory.mkdir()
 
     with pytest.raises(OperationError) as caught:
-        create_backup(database_path=directory, destination=destination)
+        _backup(directory, destination, tmp_path / "cfg.toml")
 
     assert caught.value.code is ErrorCode.BACKUP_SOURCE_UNAVAILABLE
 
@@ -504,7 +596,7 @@ def test_a_source_that_is_not_a_file_is_reported(
 def test_an_in_memory_source_is_refused(destination: Path) -> None:
     """There is nothing persistent to back up."""
     with pytest.raises(OperationError) as caught:
-        create_backup(database_path=Path(":memory:"), destination=destination)
+        _backup(Path(":memory:"), destination, destination / "cfg.toml")
 
     assert caught.value.code is ErrorCode.BACKUP_SOURCE_UNAVAILABLE
 
@@ -517,7 +609,7 @@ def test_an_unwritable_destination_is_reported(
     blocker.write_text("I am a file, not a directory", encoding="utf-8")
 
     with pytest.raises(OperationError) as caught:
-        create_backup(database_path=source_database, destination=blocker)
+        _backup(source_database, blocker)
 
     assert caught.value.code is ErrorCode.BACKUP_DESTINATION_UNWRITABLE
 
@@ -538,7 +630,7 @@ def test_a_source_newer_than_this_build_is_refused(
         connection.close()
 
     with pytest.raises(OperationError) as caught:
-        create_backup(database_path=source_database, destination=destination)
+        _backup(source_database, destination)
 
     assert caught.value.code is ErrorCode.BACKUP_SCHEMA_INCOMPATIBLE
     assert not [
@@ -561,7 +653,7 @@ def test_a_symlinked_source_is_refused(
         pytest.skip("symlinks are not creatable in this environment")
 
     with pytest.raises(OperationError) as caught:
-        create_backup(database_path=link, destination=destination)
+        _backup(link, destination)
 
     assert caught.value.code is ErrorCode.BACKUP_SOURCE_UNAVAILABLE
     assert "symbolic link" in caught.value.message
@@ -574,7 +666,7 @@ def test_paths_containing_spaces_are_handled(tmp_path: Path) -> None:
     _insert_observation(source, "spaced")
     target = tmp_path / "backup output dir"
 
-    result = create_backup(database_path=source, destination=target)
+    result = _backup(source, target)
 
     assert result.backup_path.is_file()
     assert _row_count(result.backup_path, "observations") == 1
@@ -587,7 +679,7 @@ def test_unicode_in_row_content_does_not_break_a_backup(tmp_path: Path) -> None:
     _insert_observation(source, "café — 日本語 🐦")
     target = tmp_path / "backups"
 
-    result = create_backup(database_path=source, destination=target)
+    result = _backup(source, target)
 
     assert "café — 日本語 🐦" in _summaries(result.backup_path)
     # ...and none of it reaches the manifest.
@@ -599,7 +691,7 @@ def test_published_files_are_not_world_readable(
     source_database: Path, destination: Path
 ) -> None:
     """A backup holds the whole observation history; it is not public."""
-    result = create_backup(database_path=source_database, destination=destination)
+    result = _backup(source_database, destination)
 
     for path in (result.backup_path, result.manifest_path):
         mode = stat.S_IMODE(path.stat().st_mode)
@@ -610,13 +702,20 @@ def test_published_files_are_not_world_readable(
 # --- retention --------------------------------------------------------------
 
 
-def _fabricate_set(directory: Path, stamp: str) -> tuple[Path, Path]:
-    """Create a syntactically valid backup set without running a backup."""
+def _fabricate_set(directory: Path, stamp: str) -> tuple[Path, Path, Path]:
+    """Create a name-shaped three-file set without running a backup.
+
+    Retention and listing recognise a set by its *filenames*, so placeholder
+    contents are enough to exercise them — and using placeholders keeps these
+    tests fast and independent of SQLite.
+    """
     backup = directory / f"mgo-{stamp}.db"
+    configuration = directory / f"mgo-{stamp}.config.toml"
     manifest = directory / f"mgo-{stamp}.manifest.json"
     backup.write_bytes(b"placeholder")
+    configuration.write_text("# placeholder\n", encoding="utf-8")
     manifest.write_text("{}", encoding="utf-8")
-    return backup, manifest
+    return backup, configuration, manifest
 
 
 def test_retention_keeps_the_newest_complete_sets(destination: Path) -> None:
@@ -632,7 +731,7 @@ def test_retention_keeps_the_newest_complete_sets(destination: Path) -> None:
     )
     assert remaining == ["mgo-20260104T000000Z.db", "mgo-20260105T000000Z.db"]
     assert result.keep == 2
-    assert len(result.removed) == 6  # three sets, two files each
+    assert len(result.removed) == 9  # three sets, three files each
 
 
 def test_retention_removes_a_set_as_one_unit(destination: Path) -> None:
@@ -753,9 +852,7 @@ def test_retention_failure_does_not_invalidate_the_new_backup(
 
     monkeypatch.setattr(Path, "unlink", refuse)
 
-    result = create_backup(
-        database_path=source_database, destination=destination, keep=1
-    )
+    result = _backup(source_database, destination, keep=1)
 
     assert result.backup_path.is_file()
     assert verify_backup(result.backup_path).ok
@@ -772,9 +869,7 @@ def test_retention_runs_only_after_a_published_backup(
     _corrupt(source_database)
 
     with pytest.raises(OperationError):
-        create_backup(
-            database_path=source_database, destination=destination, keep=1
-        )
+        _backup(source_database, destination, keep=1)
 
     survivors = sorted(
         item.name for item in destination.iterdir() if item.suffix == ".db"
@@ -798,9 +893,7 @@ def test_a_second_backup_is_refused_while_one_holds_the_lock(
     holder.acquire()
     try:
         with pytest.raises(OperationError) as caught:
-            create_backup(
-                database_path=source_database, destination=destination
-            )
+            _backup(source_database, destination)
     finally:
         holder.release()
 
@@ -811,15 +904,13 @@ def test_the_lock_is_released_after_a_backup(
     source_database: Path, destination: Path
 ) -> None:
     """Two sequential backups must both succeed."""
-    create_backup(database_path=source_database, destination=destination)
+    _backup(source_database, destination)
 
     assert not (destination / LOCK_FILENAME).exists()
 
     later = datetime.now(UTC).replace(microsecond=0)
-    second = create_backup(
-        database_path=source_database,
-        destination=destination,
-        now=later.replace(year=later.year + 1),
+    second = _backup(
+        source_database, destination, now=later.replace(year=later.year + 1)
     )
     assert second.backup_path.is_file()
 
@@ -831,7 +922,7 @@ def test_the_lock_is_released_after_a_failed_backup(
     _corrupt(source_database)
 
     with pytest.raises(OperationError):
-        create_backup(database_path=source_database, destination=destination)
+        _backup(source_database, destination)
 
     assert not (destination / LOCK_FILENAME).exists()
 
@@ -840,7 +931,7 @@ def test_the_lock_file_is_not_mistaken_for_a_backup(
     source_database: Path, destination: Path
 ) -> None:
     """Retention must never remove the lock guarding it."""
-    create_backup(database_path=source_database, destination=destination)
+    _backup(source_database, destination)
     listing = list_backups(destination)
 
     assert all(LOCK_FILENAME not in item.backup_path.name for item in listing.sets)
@@ -884,7 +975,7 @@ def test_listing_can_report_verification_state(
     source_database: Path, destination: Path
 ) -> None:
     """"Is my backup good?" is the question a listing exists to answer."""
-    create_backup(database_path=source_database, destination=destination)
+    _backup(source_database, destination)
 
     listing = list_backups(destination, verify=True)
 
@@ -913,12 +1004,15 @@ def test_a_good_backup_verifies(source_database: Path, destination: Path) -> Non
     assert result.error_code is None
     for check in (
         "backup_present",
-        "manifest_readable",
+        "set_complete",
+        "manifest_structure",
+        "filenames",
         "size",
         "sha256",
         "integrity",
         "schema",
         "expected_tables",
+        "journal_mode",
         "row_counts",
     ):
         assert result.checks[check] == "ok", check
@@ -930,13 +1024,22 @@ def test_verification_is_read_only(
     """Verification must never repair, re-checksum or rewrite anything."""
     backup = _make_backup(source_database, destination)
     manifest = manifest_path_for(backup)
-    before = (file_sha256(backup), manifest.read_bytes())
+    configuration = configuration_path_for(backup)
+    before = (
+        file_sha256(backup),
+        manifest.read_bytes(),
+        configuration.read_bytes(),
+    )
 
     verify_backup(backup)
 
-    assert (file_sha256(backup), manifest.read_bytes()) == before
+    assert (
+        file_sha256(backup),
+        manifest.read_bytes(),
+        configuration.read_bytes(),
+    ) == before
     assert sorted(item.name for item in destination.iterdir()) == sorted(
-        [backup.name, manifest.name]
+        [backup.name, configuration.name, manifest.name]
     )
 
 
@@ -979,7 +1082,7 @@ def test_a_missing_manifest_fails_verification(
     result = verify_backup(backup)
 
     assert not result.ok
-    assert result.error_code is ErrorCode.BACKUP_MANIFEST_FAILED
+    assert result.error_code is ErrorCode.BACKUP_SET_INCOMPLETE
 
 
 def test_a_malformed_manifest_fails_verification(
@@ -1086,23 +1189,20 @@ def test_a_backup_missing_an_expected_table_fails_verification(
 
     target = destination / "mgo-20260101T000000Z.db"
     target.write_bytes(partial.read_bytes())
+    configuration = configuration_path_for(target)
+    configuration.write_text(CONFIGURATION_TEXT, encoding="utf-8")
     manifest_path_for(target).write_text(
         json.dumps(
-            {
-                "format_version": 1,
-                "created_at": "2026-01-01T00:00:00+00:00",
-                "application": "garden-observatory",
-                "application_version": "0.1.0",
-                "source_database_name": "mgo.db",
-                "backup_filename": target.name,
-                "backup_size_bytes": target.stat().st_size,
-                "sha256": file_sha256(target),
-                "schema_version": 1,
-                "expected_schema_version": CURRENT_SCHEMA_VERSION,
-                "integrity": "ok",
-                "journal_mode_of_backup": "delete",
-                "table_row_counts": {},
-            }
+            _manifest_body(
+                target,
+                configuration,
+                schema_version=1,
+                table_row_counts={
+                    "schema_migrations": 1,
+                    "observations": 0,
+                    "captures": 0,
+                },
+            )
         ),
         encoding="utf-8",
     )
@@ -1246,11 +1346,10 @@ def test_a_restore_test_of_a_corrupt_backup_fails(
     result = restore_test(backup)
 
     assert not result.ok
-    assert result.error_code in {
-        ErrorCode.RESTORE_TEST_FAILED,
-        ErrorCode.BACKUP_INTEGRITY_FAILED,
-        ErrorCode.BACKUP_SCHEMA_INCOMPATIBLE,
-    }
+    # Corruption is caught by the set verification that now runs first, so
+    # nothing is ever copied.
+    assert result.error_code is ErrorCode.BACKUP_CHECKSUM_MISMATCH
+    assert "failed verification" in result.detail
 
 
 def test_a_restore_test_of_a_missing_backup_fails(tmp_path: Path) -> None:
@@ -1261,17 +1360,835 @@ def test_a_restore_test_of_a_missing_backup_fails(tmp_path: Path) -> None:
     assert result.error_code is ErrorCode.BACKUP_NOT_FOUND
 
 
+# --- regression: the configuration is part of every recovery set ------------
+#
+# The authoritative requirement is "back up the database and production
+# configuration". The first implementation backed up only the database, so a
+# restore would have recovered the observation history onto a machine whose
+# configuration was gone. These tests exist so that omission cannot return.
+
+
+def test_a_recovery_set_contains_three_files(
+    source_database: Path, source_configuration: Path, destination: Path
+) -> None:
+    """Database, configuration and manifest -- not two of the three."""
+    result = _backup(source_database, destination, source_configuration)
+
+    assert result.backup_path.is_file()
+    assert result.configuration_path.is_file()
+    assert result.manifest_path.is_file()
+    assert len(list(destination.iterdir())) == 3
+
+
+def test_the_configuration_snapshot_is_byte_identical(
+    source_database: Path, source_configuration: Path, destination: Path
+) -> None:
+    """Exact bytes, never a parse-and-rewrite.
+
+    A configuration round-tripped through a TOML parser would lose its comments
+    and its ordering, and a restore would hand the operator something merely
+    equivalent rather than identical.
+    """
+    result = _backup(source_database, destination, source_configuration)
+
+    assert result.configuration_path.read_bytes() == (
+        source_configuration.read_bytes()
+    )
+    text = result.configuration_path.read_text(encoding="utf-8")
+    assert text.startswith("# Matt's Garden Observatory")
+    assert "\n\n" in text, "blank lines must survive"
+
+
+def test_the_manifest_records_the_configuration(
+    source_database: Path, source_configuration: Path, destination: Path
+) -> None:
+    """Four configuration fields, describing the snapshot on disk."""
+    result = _backup(source_database, destination, source_configuration)
+    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+
+    assert payload["configuration_source_name"] == "mgo.toml"
+    assert payload["configuration_filename"] == result.configuration_path.name
+    assert payload["configuration_size_bytes"] == (
+        result.configuration_path.stat().st_size
+    )
+    assert payload["configuration_sha256"] == file_sha256(result.configuration_path)
+
+
+def test_the_configuration_source_name_is_a_basename(
+    source_database: Path, source_configuration: Path, destination: Path
+) -> None:
+    """A manifest must leak no filesystem layout, for either artefact."""
+    result = _backup(source_database, destination, source_configuration)
+    text = result.manifest_path.read_text(encoding="utf-8")
+
+    assert str(source_configuration.parent) not in text
+    assert str(source_configuration) not in text
+
+
+def test_configuration_content_never_reaches_the_manifest(
+    source_database: Path, source_configuration: Path, destination: Path
+) -> None:
+    """The configuration may hold credentials; only its checksum is recorded."""
+    result = _backup(source_database, destination, source_configuration)
+
+    assert "SECRET-TOKEN-MUST-NOT-LEAK" not in result.manifest_path.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_configuration_content_never_reaches_the_event_stream(
+    source_database: Path, source_configuration: Path, destination: Path
+) -> None:
+    """Events go to the journal, which is read by more people than the file."""
+    stream = io.StringIO()
+
+    _backup(
+        source_database,
+        destination,
+        source_configuration,
+        emitter=EventEmitter("mgo-backup", stream=stream),
+    )
+
+    assert "SECRET-TOKEN-MUST-NOT-LEAK" not in stream.getvalue()
+    assert "bot_token" not in stream.getvalue()
+    # ...while the safe descriptors are reported.
+    assert "configuration_sha256" in stream.getvalue()
+
+
+def test_configuration_content_never_reaches_the_command_summary(
+    source_database: Path, source_configuration: Path, destination: Path
+) -> None:
+    """The JSON summary is what an operator pipes into another tool."""
+    result = _backup(source_database, destination, source_configuration)
+
+    assert "SECRET-TOKEN-MUST-NOT-LEAK" not in json.dumps(result.as_dict())
+
+
+def test_a_missing_configuration_fails_the_backup(
+    source_database: Path, destination: Path, tmp_path: Path
+) -> None:
+    """A set without the configuration is incomplete, so nothing is published."""
+    with pytest.raises(OperationError) as caught:
+        _backup(source_database, destination, tmp_path / "absent.toml")
+
+    assert caught.value.code is ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE
+    assert list(destination.iterdir()) == []
+
+
+def test_a_configuration_directory_is_refused(
+    source_database: Path, destination: Path, tmp_path: Path
+) -> None:
+    """A path that is not a regular file cannot be a configuration."""
+    directory = tmp_path / "config-dir"
+    directory.mkdir()
+
+    with pytest.raises(OperationError) as caught:
+        _backup(source_database, destination, directory)
+
+    assert caught.value.code is ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE
+
+
+def test_a_symlinked_configuration_is_refused(
+    source_database: Path, source_configuration: Path, destination: Path, tmp_path: Path
+) -> None:
+    """The link target could be changed between unattended runs."""
+    link = tmp_path / "linked.toml"
+    try:
+        link.symlink_to(source_configuration)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not creatable in this environment")
+
+    with pytest.raises(OperationError) as caught:
+        _backup(source_database, destination, link)
+
+    assert caught.value.code is ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE
+    assert "symbolic link" in caught.value.message
+
+
+def test_an_oversized_configuration_is_refused(
+    source_database: Path, destination: Path, tmp_path: Path
+) -> None:
+    """An unattended job must not read an unbounded file into memory."""
+    oversized = tmp_path / "huge.toml"
+    oversized.write_bytes(b"x" * (MAX_CONFIGURATION_BYTES + 1))
+
+    with pytest.raises(OperationError) as caught:
+        _backup(source_database, destination, oversized)
+
+    assert caught.value.code is ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE
+    assert list(destination.iterdir()) == []
+
+
+def test_a_configuration_at_the_size_limit_is_accepted(
+    source_database: Path, destination: Path, tmp_path: Path
+) -> None:
+    """The bound is inclusive; an off-by-one would reject a legal file."""
+    limit = tmp_path / "exact.toml"
+    limit.write_bytes(b"x" * MAX_CONFIGURATION_BYTES)
+
+    result = _backup(source_database, destination, limit)
+
+    assert result.manifest.configuration_size_bytes == MAX_CONFIGURATION_BYTES
+
+
+def test_a_configuration_changed_during_the_copy_is_refused(
+    source_database: Path, destination: Path, tmp_path: Path
+) -> None:
+    """A snapshot must be one file, not half the old one and half the new."""
+    changing = tmp_path / "changing.toml"
+    changing.write_text("original = true\n", encoding="utf-8")
+
+    real_fstat = os.fstat
+    calls = {"count": 0}
+
+    def shifting(fileno: int) -> os.stat_result:
+        result = real_fstat(fileno)
+        calls["count"] += 1
+        if calls["count"] > 1:
+            # The second fstat is the after-read check; report a changed file.
+            return os.stat_result(
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    result.st_uid,
+                    result.st_gid,
+                    result.st_size + 10,
+                    result.st_atime,
+                    result.st_mtime + 5,
+                    result.st_ctime,
+                )
+            )
+        return result
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "fstat", shifting)
+        with pytest.raises(OperationError) as caught:
+            _backup(source_database, destination, changing)
+
+    assert caught.value.code is ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE
+    assert "changed while it was being copied" in caught.value.message
+
+
+@POSIX_ONLY
+def test_the_configuration_snapshot_is_not_world_readable(
+    source_database: Path, source_configuration: Path, destination: Path
+) -> None:
+    """It may contain credentials; it is the most sensitive file in the set."""
+    result = _backup(source_database, destination, source_configuration)
+
+    mode = stat.S_IMODE(result.configuration_path.stat().st_mode)
+    assert mode == BACKUP_FILE_MODE
+    assert not mode & 0o007
+
+
+# --- regression: publication is all-or-nothing ------------------------------
+
+
+def test_a_failed_manifest_write_removes_the_published_recovery_files(
+    source_database: Path,
+    source_configuration: Path,
+    destination: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No manifest may survive claiming a set that is not there.
+
+    The manifest is the completion marker, so a set whose manifest failed must
+    leave nothing behind that looks restorable.
+    """
+    import mgo.operations.backup as backup_module
+
+    def refuse(target: Path, manifest: object) -> None:
+        raise OperationError(
+            ErrorCode.BACKUP_MANIFEST_FAILED, "manifest write refused"
+        )
+
+    monkeypatch.setattr(backup_module, "_write_manifest", refuse)
+
+    with pytest.raises(OperationError) as caught:
+        _backup(source_database, destination, source_configuration)
+
+    assert caught.value.code is ErrorCode.BACKUP_MANIFEST_FAILED
+    assert list(destination.iterdir()) == []
+
+
+def test_a_failed_configuration_write_removes_the_published_database(
+    source_database: Path,
+    source_configuration: Path,
+    destination: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A database snapshot with no configuration is not a recovery set."""
+    import mgo.operations.backup as backup_module
+
+    def refuse(target: Path, payload: bytes) -> None:
+        raise OperationError(
+            ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE, "config write refused"
+        )
+
+    monkeypatch.setattr(backup_module, "_write_configuration_snapshot", refuse)
+
+    with pytest.raises(OperationError):
+        _backup(source_database, destination, source_configuration)
+
+    assert list(destination.iterdir()) == []
+
+
+def test_a_rollback_failure_is_reported_rather_than_hidden(
+    source_database: Path,
+    source_configuration: Path,
+    destination: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator must be told a stray file was left behind."""
+    import mgo.operations.backup as backup_module
+
+    def refuse_manifest(target: Path, manifest: object) -> None:
+        raise OperationError(ErrorCode.BACKUP_MANIFEST_FAILED, "refused")
+
+    real_unlink = Path.unlink
+
+    def refuse_unlink(self: Path, *args: object, **kwargs: object) -> None:
+        if self.suffix == ".db":
+            raise OSError(13, "Permission denied")
+        real_unlink(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(backup_module, "_write_manifest", refuse_manifest)
+    monkeypatch.setattr(Path, "unlink", refuse_unlink)
+
+    stream = io.StringIO()
+    with pytest.raises(OperationError):
+        _backup(
+            source_database,
+            destination,
+            source_configuration,
+            emitter=EventEmitter("mgo-backup", stream=stream),
+        )
+
+    events = [json.loads(line) for line in stream.getvalue().splitlines()]
+    rollback = [e for e in events if e["event_id"] == "backup.rollback_failed"]
+    assert rollback, "a failed cleanup must be reported"
+    assert rollback[0]["error_code"] == "BACKUP_SET_INCOMPLETE"
+
+
+# --- regression: manifest structural validation -----------------------------
+#
+# The first implementation coerced fields with str()/int() and caught only
+# KeyError/TypeError/ValueError, so a manifest could be "parseable" while being
+# meaningless -- booleans as sizes, negative versions, a checksum that was not a
+# checksum, a filename that was a path. Each case below is now refused.
+
+
+def _valid_body(destination: Path) -> dict[str, Any]:
+    """A structurally valid manifest body, for mutation by the tests below."""
+    backup = destination / "mgo-20260101T000000Z.db"
+    configuration = destination / "mgo-20260101T000000Z.config.toml"
+    backup.write_bytes(b"placeholder")
+    configuration.write_text("x = 1\n", encoding="utf-8")
+    return _manifest_body(backup, configuration)
+
+
+def test_a_valid_manifest_body_parses(destination: Path) -> None:
+    """The baseline the mutation tests below depart from."""
+    manifest = BackupManifest.from_dict(_valid_body(destination))
+
+    assert manifest.format_version == BACKUP_FORMAT_VERSION
+    assert manifest.table_row_counts.keys() == set(EXPECTED_TABLES)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "format_version",
+        "created_at",
+        "application",
+        "application_version",
+        "source_database_name",
+        "backup_filename",
+        "backup_size_bytes",
+        "sha256",
+        "schema_version",
+        "expected_schema_version",
+        "integrity",
+        "journal_mode_of_backup",
+        "table_row_counts",
+        "configuration_source_name",
+        "configuration_filename",
+        "configuration_size_bytes",
+        "configuration_sha256",
+    ],
+)
+def test_every_required_manifest_field_is_required(
+    destination: Path, field: str
+) -> None:
+    """Each field is load-bearing for a restore decision."""
+    body = _valid_body(destination)
+    del body[field]
+
+    with pytest.raises(OperationError) as caught:
+        BackupManifest.from_dict(body)
+
+    assert caught.value.code is ErrorCode.BACKUP_MANIFEST_FAILED
+    assert field in caught.value.message
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("backup_size_bytes", True),
+        ("configuration_size_bytes", False),
+        ("schema_version", True),
+        ("format_version", True),
+    ],
+)
+def test_booleans_are_refused_where_integers_belong(
+    destination: Path, field: str, value: object
+) -> None:
+    """``bool`` subclasses ``int``, so an unchecked field would accept ``true``."""
+    body = _valid_body(destination)
+    body[field] = value
+
+    with pytest.raises(OperationError) as caught:
+        BackupManifest.from_dict(body)
+
+    assert caught.value.code is ErrorCode.BACKUP_MANIFEST_FAILED
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "backup_size_bytes",
+        "configuration_size_bytes",
+        "schema_version",
+        "expected_schema_version",
+    ],
+)
+def test_negative_numbers_are_refused(destination: Path, field: str) -> None:
+    """A negative size or version describes nothing that can exist."""
+    body = _valid_body(destination)
+    body[field] = -1
+
+    with pytest.raises(OperationError) as caught:
+        BackupManifest.from_dict(body)
+
+    assert caught.value.code is ErrorCode.BACKUP_MANIFEST_FAILED
+
+
+@pytest.mark.parametrize("field", ["sha256", "configuration_sha256"])
+@pytest.mark.parametrize(
+    "value",
+    ["", "not-a-digest", "ABCDEF" * 10, "a" * 63, "a" * 65, "z" * 64],
+)
+def test_malformed_checksums_are_refused(
+    destination: Path, field: str, value: str
+) -> None:
+    """A field a later comparison treats as a checksum must look like one."""
+    body = _valid_body(destination)
+    body[field] = value
+
+    with pytest.raises(OperationError) as caught:
+        BackupManifest.from_dict(body)
+
+    assert caught.value.code is ErrorCode.BACKUP_MANIFEST_FAILED
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("backup_filename", "/etc/passwd"),
+        ("backup_filename", "../mgo-20260101T000000Z.db"),
+        ("backup_filename", "sub/mgo-20260101T000000Z.db"),
+        ("backup_filename", "C:\\mgo-20260101T000000Z.db"),
+        ("backup_filename", "not-a-backup.db"),
+        ("configuration_filename", "/etc/garden-observatory/mgo.toml"),
+        ("configuration_filename", "../mgo-20260101T000000Z.config.toml"),
+        ("configuration_filename", "arbitrary.toml"),
+        ("source_database_name", "/var/lib/garden-observatory/db/mgo.db"),
+        ("source_database_name", "db/mgo.db"),
+        ("source_database_name", ".."),
+        ("configuration_source_name", "/etc/garden-observatory/mgo.toml"),
+    ],
+)
+def test_path_like_name_fields_are_refused(
+    destination: Path, field: str, value: str
+) -> None:
+    """A description must not be usable as a traversal."""
+    body = _valid_body(destination)
+    body[field] = value
+
+    with pytest.raises(OperationError) as caught:
+        BackupManifest.from_dict(body)
+
+    assert caught.value.code is ErrorCode.BACKUP_MANIFEST_FAILED
+
+
+@pytest.mark.parametrize("value", ["", "not a timestamp", "2026-13-45"])
+def test_an_invalid_created_at_is_refused(destination: Path, value: str) -> None:
+    """A timestamp that cannot be parsed cannot order a set of backups."""
+    body = _valid_body(destination)
+    body["created_at"] = value
+
+    with pytest.raises(OperationError) as caught:
+        BackupManifest.from_dict(body)
+
+    assert caught.value.code is ErrorCode.BACKUP_MANIFEST_FAILED
+
+
+@pytest.mark.parametrize("version", [0, 2, 99])
+def test_only_the_exact_supported_format_version_is_accepted(
+    destination: Path, version: int
+) -> None:
+    """No compatibility policy is implemented, so none is pretended."""
+    body = _valid_body(destination)
+    body["format_version"] = version
+
+    with pytest.raises(OperationError) as caught:
+        BackupManifest.from_dict(body)
+
+    assert caught.value.code is ErrorCode.BACKUP_MANIFEST_FAILED
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [
+        {},
+        {"observations": 1},
+        {"schema_migrations": 2, "observations": 1},
+        {"schema_migrations": 2, "observations": 1, "captures": 0, "extra": 3},
+        {"schema_migrations": 2, "observations": -1, "captures": 0},
+        {"schema_migrations": 2, "observations": True, "captures": 0},
+    ],
+)
+def test_row_counts_must_cover_exactly_the_expected_tables(
+    destination: Path, counts: dict[str, object]
+) -> None:
+    """An empty or partial map would have verified against any database at all."""
+    body = _valid_body(destination)
+    body["table_row_counts"] = counts
+
+    with pytest.raises(OperationError) as caught:
+        BackupManifest.from_dict(body)
+
+    assert caught.value.code is ErrorCode.BACKUP_MANIFEST_FAILED
+
+
+def test_a_non_object_manifest_is_refused(destination: Path) -> None:
+    """A JSON array or scalar is not a manifest."""
+    for payload in ([], "text", 5, None):
+        with pytest.raises(OperationError):
+            BackupManifest.from_dict(payload)
+
+
+# --- regression: verification binds the manifest to the artefacts ------------
+#
+# Structural validity is not enough: a tidy manifest that describes a different
+# set must not verify. Each test below leaves the manifest internally valid and
+# changes exactly one value so that it no longer matches reality.
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "code"),
+    [
+        (
+            "backup_filename",
+            "mgo-20200101T000000Z.db",
+            ErrorCode.BACKUP_SET_INCOMPLETE,
+        ),
+        (
+            "configuration_filename",
+            "mgo-20200101T000000Z.config.toml",
+            ErrorCode.BACKUP_SET_INCOMPLETE,
+        ),
+        ("backup_size_bytes", 12, ErrorCode.BACKUP_CHECKSUM_MISMATCH),
+        ("configuration_size_bytes", 12, ErrorCode.BACKUP_CHECKSUM_MISMATCH),
+        ("sha256", "b" * 64, ErrorCode.BACKUP_CHECKSUM_MISMATCH),
+        ("configuration_sha256", "c" * 64, ErrorCode.BACKUP_CHECKSUM_MISMATCH),
+        ("schema_version", 1, ErrorCode.BACKUP_SCHEMA_INCOMPATIBLE),
+        ("expected_schema_version", 99, ErrorCode.BACKUP_SCHEMA_INCOMPATIBLE),
+        ("integrity", "suspicious", ErrorCode.BACKUP_INTEGRITY_FAILED),
+        ("journal_mode_of_backup", "wal", ErrorCode.BACKUP_INTEGRITY_FAILED),
+    ],
+)
+def test_a_manifest_that_describes_a_different_set_fails_verification(
+    source_database: Path,
+    destination: Path,
+    field: str,
+    value: object,
+    code: ErrorCode,
+) -> None:
+    """Every recorded value is compared against the artefact it describes."""
+    backup = _make_backup(source_database, destination)
+    _rewrite_manifest(backup, **{field: value})
+
+    result = verify_backup(backup)
+
+    assert not result.ok
+    assert result.error_code is code
+
+
+def test_a_partial_row_count_manifest_fails_verification(
+    source_database: Path, destination: Path
+) -> None:
+    """The defect this correction exists for: an empty map verified anything."""
+    backup = _make_backup(source_database, destination)
+    _rewrite_manifest(backup, table_row_counts={})
+
+    result = verify_backup(backup)
+
+    assert not result.ok
+    assert result.error_code is ErrorCode.BACKUP_MANIFEST_FAILED
+
+
+def test_a_missing_configuration_snapshot_fails_verification(
+    source_database: Path, destination: Path
+) -> None:
+    """Two of three files is not a recovery set."""
+    backup = _make_backup(source_database, destination)
+    configuration_path_for(backup).unlink()
+
+    result = verify_backup(backup)
+
+    assert not result.ok
+    assert result.error_code is ErrorCode.BACKUP_SET_INCOMPLETE
+
+
+def test_a_changed_configuration_snapshot_fails_verification(
+    source_database: Path, destination: Path
+) -> None:
+    """The configuration is checksummed exactly as the database is."""
+    backup = _make_backup(source_database, destination)
+    configuration_path_for(backup).write_text("tampered = true\n", encoding="utf-8")
+
+    result = verify_backup(backup)
+
+    assert not result.ok
+    assert result.error_code is ErrorCode.BACKUP_CHECKSUM_MISMATCH
+
+
+def test_a_foreign_filename_is_not_verified_as_a_backup(
+    destination: Path
+) -> None:
+    """Only names this tooling produces are part of a recovery set."""
+    stray = destination / "some-other-database.db"
+    stray.write_bytes(b"placeholder")
+
+    result = verify_backup(stray)
+
+    assert not result.ok
+    assert result.error_code is ErrorCode.BACKUP_NOT_FOUND
+
+
+# --- regression: restore-test requires a complete verified set ---------------
+
+
+def test_restore_test_requires_a_manifest(
+    source_database: Path, destination: Path
+) -> None:
+    """The "skipped (no manifest)" path must no longer exist."""
+    backup = _make_backup(source_database, destination)
+    manifest_path_for(backup).unlink()
+
+    result = restore_test(backup)
+
+    assert not result.ok
+    assert result.error_code is ErrorCode.BACKUP_SET_INCOMPLETE
+    assert "skipped" not in json.dumps(result.as_dict())
+
+
+def test_restore_test_requires_a_configuration_snapshot(
+    source_database: Path, destination: Path
+) -> None:
+    """A recovery rehearsal must rehearse the whole recovery."""
+    backup = _make_backup(source_database, destination)
+    configuration_path_for(backup).unlink()
+
+    result = restore_test(backup)
+
+    assert not result.ok
+    assert result.error_code is ErrorCode.BACKUP_SET_INCOMPLETE
+
+
+def test_restore_test_never_reports_a_skipped_row_count_check(
+    source_database: Path, destination: Path
+) -> None:
+    """Its most important assertion may never be quietly skipped."""
+    backup = _make_backup(source_database, destination)
+
+    result = restore_test(backup)
+
+    assert result.checks["row_counts"] == "ok"
+    assert "skipped" not in json.dumps(result.checks)
+
+
+def test_restore_test_copies_and_checks_the_configuration(
+    source_database: Path, source_configuration: Path, destination: Path, tmp_path: Path
+) -> None:
+    """Both artefacts are restored; the configuration is checksummed."""
+    backup = _make_backup(source_database, destination)
+    work = tmp_path / "rehearsal"
+
+    result = restore_test(backup, work_directory=work, preserve=True)
+
+    assert result.ok
+    assert result.checks["restored_configuration"] == "ok"
+    assert (work / "restored.db").is_file()
+    assert (work / "restored-mgo.toml").is_file()
+    assert (work / "restored-mgo.toml").read_bytes() == (
+        configuration_path_for(backup).read_bytes()
+    )
+
+
+def test_restore_test_does_not_activate_the_restored_configuration(
+    source_database: Path, destination: Path, tmp_path: Path
+) -> None:
+    """It is checked, never applied: nothing is pointed at it."""
+    backup = _make_backup(source_database, destination)
+    work = tmp_path / "rehearsal"
+
+    before = os.environ.get("MGO_CONFIG_PATH")
+    result = restore_test(backup, work_directory=work, preserve=True)
+
+    assert result.ok
+    assert os.environ.get("MGO_CONFIG_PATH") == before
+    # Only the two restored files exist; nothing was migrated or initialised.
+    assert sorted(item.name for item in work.iterdir()) == [
+        "restored-mgo.toml",
+        "restored.db",
+    ]
+
+
+@pytest.mark.parametrize("existing", ["restored.db", "restored-mgo.toml"])
+def test_restore_test_refuses_to_overwrite_an_existing_target(
+    source_database: Path, destination: Path, tmp_path: Path, existing: str
+) -> None:
+    """An operator-supplied directory may hold anything; never clobber it."""
+    backup = _make_backup(source_database, destination)
+    work = tmp_path / "occupied"
+    work.mkdir()
+    (work / existing).write_text("do not destroy me", encoding="utf-8")
+
+    with pytest.raises(OperationError) as caught:
+        restore_test(backup, work_directory=work)
+
+    assert caught.value.code is ErrorCode.RESTORE_TARGET_EXISTS
+    assert (work / existing).read_text(encoding="utf-8") == "do not destroy me"
+
+
+def test_restore_test_cleans_up_both_artefacts(
+    source_database: Path, destination: Path, tmp_path: Path
+) -> None:
+    """Neither restored file may be left behind in a caller's directory."""
+    backup = _make_backup(source_database, destination)
+    work = tmp_path / "rehearsal"
+
+    result = restore_test(backup, work_directory=work)
+
+    assert result.ok
+    assert list(work.iterdir()) == []
+
+
+# --- regression: three-file listing and retention ---------------------------
+
+
+def test_listing_requires_all_three_files(destination: Path) -> None:
+    """A two-file remnant is an orphan set, not a backup."""
+    _fabricate_set(destination, "20260103T000000Z")
+    (destination / "mgo-20260102T000000Z.db").write_bytes(b"x")
+    (destination / "mgo-20260102T000000Z.manifest.json").write_text(
+        "{}", encoding="utf-8"
+    )
+
+    listing = list_backups(destination)
+
+    assert [item.timestamp for item in listing.sets] == ["20260103T000000Z"]
+    assert listing.orphan_backups == ("mgo-20260102T000000Z.db",)
+    assert listing.orphan_manifests == ("mgo-20260102T000000Z.manifest.json",)
+
+
+def test_listing_reports_orphan_configurations(destination: Path) -> None:
+    """A configuration with no database is its own diagnosable state."""
+    (destination / "mgo-20260101T000000Z.config.toml").write_text(
+        "x = 1\n", encoding="utf-8"
+    )
+
+    listing = list_backups(destination)
+
+    assert listing.sets == ()
+    assert listing.orphan_configurations == ("mgo-20260101T000000Z.config.toml",)
+
+
+def test_retention_removes_all_three_files(destination: Path) -> None:
+    """A set is removed whole, or its remains are recognisable orphans."""
+    for stamp in ("20260101T000000Z", "20260102T000000Z"):
+        _fabricate_set(destination, stamp)
+
+    apply_retention(destination, keep=1)
+
+    for suffix in (".db", ".config.toml", ".manifest.json"):
+        assert not (destination / f"mgo-20260101T000000Z{suffix}").exists()
+    for suffix in (".db", ".config.toml", ".manifest.json"):
+        assert (destination / f"mgo-20260102T000000Z{suffix}").exists()
+
+
+def test_retention_removes_the_manifest_first(
+    destination: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Interrupted deletion must not leave a manifest advertising a gone set."""
+    for stamp in ("20260101T000000Z", "20260102T000000Z"):
+        _fabricate_set(destination, stamp)
+
+    order: list[str] = []
+    real_unlink = Path.unlink
+
+    def record(self: Path, *args: object, **kwargs: object) -> None:
+        order.append(self.name)
+        real_unlink(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "unlink", record)
+    apply_retention(destination, keep=1)
+
+    assert order[0] == "mgo-20260101T000000Z.manifest.json"
+
+
+def test_retention_reports_a_partial_deletion(
+    destination: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A half-removed set must be reported, not silently left behind."""
+    for stamp in ("20260101T000000Z", "20260102T000000Z"):
+        _fabricate_set(destination, stamp)
+
+    real_unlink = Path.unlink
+
+    def refuse_configuration(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name.endswith(".config.toml"):
+            raise OSError(13, "Permission denied")
+        real_unlink(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "unlink", refuse_configuration)
+    result = apply_retention(destination, keep=1)
+
+    assert not result.succeeded
+    assert any(".config.toml" in failure for failure in result.failures)
+    assert (destination / "mgo-20260101T000000Z.config.toml").exists()
+
+
 def test_a_row_count_disagreement_fails_the_restore_test(
     source_database: Path, destination: Path
 ) -> None:
     """The restored copy is compared against the recorded counts."""
     backup = _make_backup(source_database, destination)
-    manifest = manifest_path_for(backup)
-    payload = json.loads(manifest.read_text(encoding="utf-8"))
-    payload["table_row_counts"]["observations"] = 4242
-    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    _rewrite_manifest(
+        backup,
+        table_row_counts={
+            "schema_migrations": 2,
+            "observations": 4242,
+            "captures": 0,
+        },
+    )
 
     result = restore_test(backup)
 
     assert not result.ok
-    assert result.error_code is ErrorCode.RESTORE_TEST_FAILED
+    # Caught by the set verification that runs before anything is copied.
+    assert result.error_code is ErrorCode.BACKUP_INTEGRITY_FAILED
