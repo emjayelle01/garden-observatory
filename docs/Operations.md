@@ -1227,6 +1227,51 @@ uv run mypy src
 uv run pytest
 ```
 
+### 13.1a Record the pre-existing operational state
+
+**Run this before installing anything.** It establishes what this validation is
+allowed to remove afterwards, and it is what makes §13.13 unambiguous:
+**validation removes only the artefacts it proved were absent beforehand and
+then installed itself.**
+
+```bash
+systemctl status mgo-backup.timer --no-pager 2>&1 || true
+```
+
+```bash
+systemctl status mgo-backup.service --no-pager 2>&1 || true
+```
+
+```bash
+test -e /etc/systemd/system/mgo-backup.timer && echo "timer exists" || echo "timer absent"
+```
+
+```bash
+test -e /etc/systemd/system/mgo-backup.service && echo "service exists" || echo "service absent"
+```
+
+```bash
+test -e /etc/logrotate.d/garden-observatory && echo "logrotate exists" || echo "logrotate absent"
+```
+
+For this **first** Task 10 validation the expected state is:
+
+```text
+mgo-backup.timer absent
+mgo-backup.service absent
+garden-observatory logrotate policy absent
+```
+
+If any of the three already exists, **stop**:
+
+* record its content, ownership and state;
+* do **not** overwrite it until its origin is understood;
+* do **not** assume it belongs to this branch — it may predate it, or belong to
+  a different deployment;
+* do **not** delete it.
+
+An artefact this validation did not install is not this validation's to remove.
+
 ### 13.2 Record the "before" state
 
 Record every value; they are compared again at the end.
@@ -1751,7 +1796,7 @@ curl -s -X POST http://127.0.0.1:8080/camera/preview/start
 
 Do **not** capture an image merely to test operations.
 
-### 13.13 Finish
+### 13.13 Review the journal
 
 ```bash
 journalctl -u mgo.service -n 100 --no-pager
@@ -1759,6 +1804,152 @@ journalctl -u mgo.service -n 100 --no-pager
 
 ```bash
 journalctl -u mgo-backup.service --no-pager
+```
+
+### 13.14 Pre-merge operational cleanup
+
+**Mandatory, and it must happen before `git checkout main`.**
+
+Installed systemd units and logrotate policies live in `/etc/systemd/system`
+and `/etc/logrotate.d`. **They are outside Git.** Changing the checkout back to
+`main` does not remove them, does not disable them and does not stop the timer —
+it only removes the code they point at. `mgo-backup.service` has
+
+```text
+ExecStart=/opt/garden-observatory/.venv/bin/python -m mgo.operations.backup_cli ...
+```
+
+and `mgo.operations` does not exist on pre-Task-10 `main`. So a checkout without
+this cleanup leaves an **enabled timer scheduled to run a module that is no
+longer there**, and the next 02:30 run fails — on a branch that was never
+supposed to have installed anything permanently.
+
+Run this only after every check above, including the reboot test, has passed.
+
+Disable and stop the timer:
+
+```bash
+sudo systemctl disable --now mgo-backup.timer
+```
+
+Confirm:
+
+```bash
+systemctl is-enabled mgo-backup.timer 2>&1 || true
+```
+
+```bash
+systemctl is-active mgo-backup.timer 2>&1 || true
+```
+
+Expect `disabled` or `not-found`, and `inactive` or `not-found`.
+
+Remove the two Task 10 unit files — and only those:
+
+```bash
+sudo rm -f /etc/systemd/system/mgo-backup.timer /etc/systemd/system/mgo-backup.service
+```
+
+Remove the Task 10 logrotate policy:
+
+```bash
+sudo rm -f /etc/logrotate.d/garden-observatory
+```
+
+Reload systemd so the removals take effect:
+
+```bash
+sudo systemctl daemon-reload
+```
+
+```bash
+sudo systemctl reset-failed mgo-backup.service mgo-backup.timer 2>/dev/null || true
+```
+
+Verify the removed state:
+
+```bash
+systemctl status mgo-backup.timer --no-pager 2>&1 || true
+```
+
+```bash
+systemctl status mgo-backup.service --no-pager 2>&1 || true
+```
+
+```bash
+test ! -e /etc/systemd/system/mgo-backup.timer
+```
+
+```bash
+test ! -e /etc/systemd/system/mgo-backup.service
+```
+
+```bash
+test ! -e /etc/logrotate.d/garden-observatory
+```
+
+All three `test` commands must exit `0`. Required end state: no Task 10 backup
+unit installed, no Task 10 timer enabled, no Task 10 timer active, no Task 10
+logrotate policy installed.
+
+#### What this cleanup must not touch
+
+```text
+mgo.service
+/etc/garden-observatory/mgo.toml
+/var/lib/garden-observatory
+/var/log/garden-observatory
+/var/backups/garden-observatory
+```
+
+**Removing the scheduled tooling is not the same as deleting recovery data.**
+Nothing in this cleanup deletes:
+
+* the Task 10 validation recovery set;
+* any pre-existing recovery set;
+* the backup directory itself;
+* the production database;
+* the production configuration;
+* captures or observations;
+* support bundles, other than the temporary validation artefacts written under
+  `/tmp`;
+* any log unrelated to the synthetic rotation test.
+
+The validated recovery set **stays** in `/var/backups/garden-observatory`. It is
+the evidence that the backup path worked on real hardware, and it is protected
+by exactly the same rule that protects a pre-existing one.
+
+### 13.15 Restore the pre-validation service state
+
+```bash
+systemctl is-active mgo.service
+```
+
+```bash
+systemctl show mgo.service --property=ActiveState --property=SubState --property=MainPID --property=NRestarts
+```
+
+The API must be **active**. If preview was running in §13.2, confirm it was
+restored:
+
+```bash
+curl -fsS http://127.0.0.1:8080/camera/preview/status | python -m json.tool
+```
+
+If it is not running and it was before:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/camera/preview/start | python -m json.tool
+```
+
+Do **not** capture an image.
+
+### 13.16 Return safely to `main`
+
+Only once §13.14 has removed the installed service, timer and logrotate policy.
+
+```bash
+cd /opt/garden-observatory
 ```
 
 ```bash
@@ -1769,20 +1960,96 @@ git status -sb
 git status --porcelain
 ```
 
-The tree must be clean. Return the Pi to `main` when validation is complete:
+The tree must be clean.
 
 ```bash
 git checkout main
 ```
 
+```bash
+git status -sb
+```
+
+```bash
+git status --porcelain
+```
+
+```bash
+git branch --show-current
+```
+
+```bash
+git rev-parse HEAD
+```
+
+```bash
+git rev-parse origin/main
+```
+
+Required: branch `main`, `HEAD` and `origin/main` both
+`0ef3d04047faef119399c46182103e6f478b8a3a`, working tree clean.
+
+Confirm no orphaned timer survived the checkout:
+
+```bash
+systemctl list-timers --all | grep -F mgo-backup && echo "PROBLEM" || echo "clean"
+```
+
+Expect `clean`. Anything else means §13.14 did not complete and the Pi is
+scheduled to run code that is no longer present.
+
+Confirm the existing API is unaffected:
+
+```bash
+for p in / /version /health /database/status /camera/status /camera/preview/status /motion/status /notifications/status /captures /observations /dashboard; do printf '%s -> ' "$p"; curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:8080$p"; done
+```
+
+### 13.17 What happens next
+
+1. The Pi is back on clean `main`.
+2. Task 10 operational units are no longer installed.
+3. The validated recovery set remains in `/var/backups/garden-observatory`.
+4. The complete validation evidence is returned.
+5. Repository review happens.
+6. **Only then** may a pull request be created.
+7. After merge, normal production deployment installs and enables Task 10
+   permanently — that installation is the one that is meant to persist.
+
+The Pi must not be left running indefinitely from the feature branch, and
+pre-merge units must not be left installed while the checkout is on `main`.
+
 ## 14. Rollback
 
-Task 10 is reversible with no data loss.
+Task 10 is reversible with no data loss. There are **three** distinct states,
+and they do not have the same rollback.
 
-**Before merge** — nothing on `main` was touched; rollback is returning to
-`main`.
+### 14.1 Before any Pi installation validation
 
-**After a future merge**, on the Pi:
+Nothing on `main` was touched and no system artefact was installed. Rollback is
+simply:
+
+```bash
+git checkout main
+```
+
+### 14.2 After pre-merge Pi installation validation, before merge
+
+Units and policies installed under `/etc` are **external to Git** and survive a
+checkout. Returning to `main` alone would leave an enabled timer pointing at a
+module that no longer exists. Rollback is therefore §13.14 in full:
+
+1. `sudo systemctl disable --now mgo-backup.timer`;
+2. remove `/etc/systemd/system/mgo-backup.timer` and
+   `/etc/systemd/system/mgo-backup.service`;
+3. remove `/etc/logrotate.d/garden-observatory`;
+4. `sudo systemctl daemon-reload`;
+5. **preserve every recovery set** — no backup is deleted at any point;
+6. verify `mgo.service` is still active;
+7. return the checkout to `main`.
+
+### 14.3 After Task 10 is merged and deployed
+
+The same unit removal, plus reverting the code through normal Git history:
 
 ```bash
 sudo systemctl disable --now mgo-backup.timer

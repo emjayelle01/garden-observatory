@@ -1722,6 +1722,370 @@ def test_the_documentation_states_the_override_order() -> None:
     assert "set-but-empty" in text or "set but empty" in text
 
 
+# --- regression: pre-merge validation removes what it installed --------------
+#
+# The Pi validation procedure installed mgo-backup.service, installed AND
+# ENABLED mgo-backup.timer, installed the logrotate policy, proved the timer
+# survives a reboot -- and then told the operator to "git checkout main".
+#
+# Installed units live in /etc and are OUTSIDE GIT. A checkout reverts the code
+# they point at, not the units themselves, so that sequence ended with an
+# enabled timer whose ExecStart names mgo.operations.backup_cli -- a module that
+# does not exist on pre-Task-10 main. The next 02:30 run would have failed, on a
+# Pi deliberately returned to a known-good state.
+#
+# These tests assert the ORDER of the documented procedure, not just that the
+# right words appear somewhere in it: cleanup before checkout is the whole
+# finding, and a correctly-worded cleanup placed after the checkout would be
+# exactly as broken as no cleanup at all.
+
+PI_PROCEDURE_HEADING = "## 13. Raspberry Pi validation"
+ROLLBACK_HEADING = "## 14. Rollback"
+TROUBLESHOOTING_HEADING = "## 15. Troubleshooting"
+
+CLEANUP_HEADING = "### 13.14 Pre-merge operational cleanup"
+SERVICE_STATE_HEADING = "### 13.15 Restore the pre-validation service state"
+
+#: The checkout as a *command* -- alone on its line inside a fence. Matching the
+#: bare string would also hit the prose "must happen before `git checkout main`",
+#: which appears earlier and would make every ordering assertion pass wrongly.
+CHECKOUT_MAIN = "\ngit checkout main\n"
+DISABLE_TIMER = "sudo systemctl disable --now mgo-backup.timer"
+DAEMON_RELOAD = "sudo systemctl daemon-reload"
+REMOVE_UNITS = (
+    "sudo rm -f /etc/systemd/system/mgo-backup.timer "
+    "/etc/systemd/system/mgo-backup.service"
+)
+REMOVE_LOGROTATE = "sudo rm -f /etc/logrotate.d/garden-observatory"
+ORPHAN_CHECK = "systemctl list-timers --all | grep -F mgo-backup"
+
+#: Paths a documented ``rm`` must never name. Four of the five are production
+#: data; ``mgo.service`` is the API unit, which Task 10 never installed and
+#: therefore must never remove.
+PROTECTED_PATHS = (
+    "/var/backups/garden-observatory",
+    "/var/lib/garden-observatory",
+    "/var/log/garden-observatory",
+    "/etc/garden-observatory",
+)
+
+#: The one deletion under a protected path the procedure legitimately performs:
+#: the synthetic log file §13.11 creates itself to exercise rotation. It is
+#: allowed by exact spelling, so a widened glob would still be rejected.
+PERMITTED_DELETIONS = ("/var/log/garden-observatory/task10-validation.log*",)
+
+
+def _deletes_protected_data(command: str) -> str | None:
+    """Return the protected path a documented ``rm`` would destroy, if any."""
+    if not re.search(r"(?:^|\s|\|)(?:sudo\s+)?rm\b", command):
+        return None
+
+    remainder = command
+    for permitted in PERMITTED_DELETIONS:
+        remainder = remainder.replace(permitted, "")
+
+    for path in PROTECTED_PATHS:
+        if path in remainder:
+            return path
+    return None
+
+
+def _span(text: str, start: str, end: str) -> str:
+    """Return the documentation between two headings, exclusive of both."""
+    _, opening, remainder = text.partition(start)
+    assert opening, f"{start} is missing"
+    body, closing, _ = remainder.partition(end)
+    assert closing, f"{end} is missing"
+    return body
+
+
+def _procedure() -> str:
+    """The Raspberry Pi validation procedure."""
+    return _span(_read(DOCUMENTATION), PI_PROCEDURE_HEADING, ROLLBACK_HEADING)
+
+
+def _rollback() -> str:
+    """The rollback contract."""
+    return _span(_read(DOCUMENTATION), ROLLBACK_HEADING, TROUBLESHOOTING_HEADING)
+
+
+def _cleanup() -> str:
+    """The mandatory pre-merge cleanup step."""
+    return _span(_procedure(), CLEANUP_HEADING, SERVICE_STATE_HEADING)
+
+
+def test_the_timer_is_disabled_before_the_checkout_to_main() -> None:
+    """The ordering IS the finding: cleanup afterwards would be too late."""
+    procedure = _procedure()
+
+    assert DISABLE_TIMER in procedure
+    assert CHECKOUT_MAIN in procedure
+    assert procedure.index(DISABLE_TIMER) < procedure.index(CHECKOUT_MAIN)
+
+
+@pytest.mark.parametrize(
+    "removal",
+    [REMOVE_UNITS, REMOVE_LOGROTATE],
+    ids=["units", "logrotate"],
+)
+def test_installed_artefacts_are_removed_before_the_checkout_to_main(
+    removal: str,
+) -> None:
+    """A unit file in /etc does not disappear when the checkout changes."""
+    procedure = _procedure()
+
+    assert removal in procedure, removal
+    assert procedure.index(removal) < procedure.index(CHECKOUT_MAIN)
+
+
+def test_the_daemon_reload_follows_the_unit_removal() -> None:
+    """Reloading before the files are gone would reload them back in."""
+    cleanup = _cleanup()
+
+    assert DAEMON_RELOAD in cleanup
+    assert cleanup.index(REMOVE_UNITS) < cleanup.index(DAEMON_RELOAD)
+    assert cleanup.index(REMOVE_LOGROTATE) < cleanup.index(DAEMON_RELOAD)
+    assert "reset-failed mgo-backup.service mgo-backup.timer" in cleanup
+
+
+def test_the_removed_state_is_verified_not_assumed() -> None:
+    """``rm -f`` succeeds whether or not it removed anything."""
+    cleanup = _cleanup()
+
+    for path in (
+        "/etc/systemd/system/mgo-backup.timer",
+        "/etc/systemd/system/mgo-backup.service",
+        "/etc/logrotate.d/garden-observatory",
+    ):
+        assert f"test ! -e {path}" in cleanup, path
+
+    assert "systemctl is-enabled mgo-backup.timer" in cleanup
+    assert "systemctl is-active mgo-backup.timer" in cleanup
+
+
+def test_the_reboot_test_still_precedes_the_cleanup() -> None:
+    """Persistence must be proven before the thing proving it is removed."""
+    procedure = _procedure()
+
+    assert "sudo reboot" in procedure
+    assert procedure.index("sudo reboot") < procedure.index(CLEANUP_HEADING)
+
+
+def test_the_cleanup_deletes_no_recovery_data() -> None:
+    """Removing the scheduled tooling is not deleting the backups."""
+    for command in _bash_commands(_cleanup()):
+        assert _deletes_protected_data(command) is None, command
+
+
+def test_no_documented_command_anywhere_deletes_production_data() -> None:
+    """The same rule, applied to the whole operations document."""
+    for command in _bash_commands(_read(DOCUMENTATION)):
+        assert _deletes_protected_data(command) is None, command
+
+
+def test_the_one_permitted_deletion_is_the_artefact_it_created() -> None:
+    """The synthetic rotation log, named exactly -- not a glob over the logs.
+
+    Allowing it by exact spelling is what keeps the rule above meaningful: a
+    later widening to ``*.log`` or to the directory itself would be rejected
+    rather than quietly inheriting the exemption.
+    """
+    procedure = _procedure()
+    artefact = PERMITTED_DELETIONS[0]
+
+    assert f"sudo rm -f {artefact}" in procedure
+    # The procedure must have created the file it removes.
+    assert artefact.rstrip("*") in procedure.partition(f"sudo rm -f {artefact}")[0]
+    assert _deletes_protected_data(f"sudo rm -f {artefact}") is None
+    assert _deletes_protected_data("sudo rm -f /var/log/garden-observatory/*.log")
+
+
+@pytest.mark.parametrize(
+    "dangerous",
+    [
+        "rm -rf /var/backups/garden-observatory",
+        "rm -f /var/backups/garden-observatory/*",
+        "rm -rf /var/lib/garden-observatory",
+        "rm -f /var/backups/garden-observatory/mgo-*",
+    ],
+)
+def test_the_dangerous_cleanup_commands_are_absent(dangerous: str) -> None:
+    """Named explicitly, because these are the ones that would look plausible."""
+    assert dangerous not in _read(DOCUMENTATION)
+
+
+def test_the_cleanup_names_what_it_must_not_touch() -> None:
+    """The protected list is stated, not left to the operator's judgement."""
+    cleanup = _cleanup()
+
+    for path in (*PROTECTED_PATHS, "mgo.service"):
+        assert path in cleanup, path
+    assert "not the same as deleting recovery data" in cleanup
+
+
+def test_the_cleanup_never_touches_the_api_service() -> None:
+    """mgo.service was never installed by Task 10, so it is never removed."""
+    for command in _bash_commands(_cleanup()):
+        assert "mgo.service" not in command, command
+
+
+def test_the_validated_recovery_set_is_kept_deliberately() -> None:
+    """Evidence that the backup path worked on real hardware."""
+    cleanup = _cleanup()
+
+    assert "validated recovery set" in cleanup
+    assert "/var/backups/garden-observatory" in cleanup
+
+
+def test_the_pre_existing_artefact_check_precedes_installation() -> None:
+    """Validation may remove only what it proved was absent and installed."""
+    procedure = _procedure()
+
+    assert "### 13.1a Record the pre-existing operational state" in procedure
+    assert procedure.index("### 13.1a") < procedure.index("### 13.4 Install")
+
+    for path in (
+        "/etc/systemd/system/mgo-backup.timer",
+        "/etc/systemd/system/mgo-backup.service",
+        "/etc/logrotate.d/garden-observatory",
+    ):
+        assert f"test -e {path}" in procedure, path
+
+    assert "do **not** delete it" in procedure
+
+
+def test_the_procedure_explains_that_units_are_outside_git() -> None:
+    """The category error behind the defect, named where it is corrected."""
+    procedure = _procedure()
+
+    assert "outside Git" in procedure
+    assert "mgo.operations" in procedure
+
+
+def test_the_orphaned_timer_is_checked_after_returning_to_main() -> None:
+    """The one check that would have caught the original defect."""
+    procedure = _procedure()
+
+    assert ORPHAN_CHECK in procedure
+    assert procedure.index(CHECKOUT_MAIN) < procedure.index(ORPHAN_CHECK)
+
+
+def test_the_api_is_re_verified_after_returning_to_main() -> None:
+    """Cleanup must be proven not to have disturbed the service."""
+    procedure = _procedure()
+    sweep = procedure.rindex("/notifications/status")
+
+    assert procedure.index(CHECKOUT_MAIN) < sweep
+    assert "systemctl is-active mgo.service" in procedure
+    assert "/camera/preview/status" in procedure
+
+
+def test_the_procedure_keeps_every_existing_validation_step() -> None:
+    """The correction adds steps; it must not have removed any."""
+    procedure = _procedure()
+
+    for heading in (
+        "### 13.1 Start from a clean tree",
+        "### 13.2 Record the \"before\" state",
+        "### 13.3 Confirm the existing service is unaffected",
+        "### 13.3a Record the configuration state",
+        "### 13.4 Install",
+        "### 13.5 Check what was provisioned",
+        "### 13.5a Prove the manual wrapper selects the production configuration",
+        "### 13.6 Take a backup while the API is serving",
+        "### 13.6a Source-identity checks",
+        "### 13.7 Confirm production data is untouched",
+        "### 13.8 Scheduled run",
+        "### 13.9 Backup failure does not affect the API",
+        "### 13.10 Support bundle",
+        "### 13.11 Journal and rotation",
+        "### 13.12 Restart and boot persistence",
+    ):
+        assert heading in procedure, heading
+
+    for command in ("uv run ruff check .", "uv run mypy src", "uv run pytest"):
+        assert command in procedure, command
+
+
+# --- regression: the rollback contract has three states ----------------------
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "### 14.1 Before any Pi installation validation",
+        "### 14.2 After pre-merge Pi installation validation, before merge",
+        "### 14.3 After Task 10 is merged and deployed",
+    ],
+    ids=["before-install", "pre-merge-post-install", "post-merge"],
+)
+def test_the_rollback_distinguishes_three_states(heading: str) -> None:
+    """One sentence covered all three, and was wrong for two of them."""
+    assert heading in _rollback()
+
+
+def test_the_inaccurate_pre_merge_rollback_claim_is_gone() -> None:
+    """The exact wording that was false once installation had happened."""
+    text = _read(DOCUMENTATION)
+
+    assert "nothing on `main` was touched; rollback is returning to" not in text
+    assert "There are **three** distinct states" in _rollback()
+
+
+def test_the_pre_merge_rollback_state_requires_the_full_cleanup() -> None:
+    """Returning to main is the last step of that rollback, not the whole of it."""
+    state = _span(
+        _rollback(),
+        "### 14.2 After pre-merge Pi installation validation, before merge",
+        "### 14.3 After Task 10 is merged and deployed",
+    )
+
+    assert "systemctl disable --now mgo-backup.timer" in state
+    assert "/etc/systemd/system/mgo-backup.timer" in state
+    assert "/etc/systemd/system/mgo-backup.service" in state
+    assert "/etc/logrotate.d/garden-observatory" in state
+    assert "systemctl daemon-reload" in state
+    assert "preserve every recovery set" in state
+    assert "mgo.service" in state
+    assert "external to Git" in state
+
+
+def test_the_before_install_rollback_state_stays_simple() -> None:
+    """Where nothing was installed, nothing has to be uninstalled."""
+    state = _span(
+        _rollback(),
+        "### 14.1 Before any Pi installation validation",
+        "### 14.2 After pre-merge Pi installation validation, before merge",
+    )
+
+    assert CHECKOUT_MAIN in state
+    assert "no system artefact was installed" in state
+    assert "systemctl" not in state
+
+
+def test_the_post_merge_rollback_state_reverts_the_code_too() -> None:
+    """The only state where Git history is involved."""
+    _, heading, state = _rollback().partition(
+        "### 14.3 After Task 10 is merged and deployed"
+    )
+
+    assert heading
+    assert "git revert" in state
+    assert "install-service-identity.sh --no-operations" in state
+    assert "left intact" in state
+
+
+def test_permanent_installation_is_documented_as_a_post_merge_act() -> None:
+    """A feature branch must not leave a permanent installation behind."""
+    procedure = _procedure()
+
+    assert "**Only then** may a pull request be created." in procedure
+    assert "after merge" in procedure.lower()
+    assert "must not be left running indefinitely from the feature branch" in (
+        procedure
+    )
+
+
 # --- generated artefacts stay untracked -------------------------------------
 
 

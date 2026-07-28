@@ -55,6 +55,13 @@ Tracked deployment assets that are installed rather than run:
 | `deploy/mgo-backup.timer` | `/etc/systemd/system/mgo-backup.timer` | Daily 02:30 local, `Persistent=true`, randomised 30 m delay. Installed verbatim. |
 | `deploy/garden-observatory.logrotate` | `/etc/logrotate.d/garden-observatory` | Rotates only `/var/log/garden-observatory/*.log`. Does **not** rotate the journal. |
 
+These installed files live in `/etc` and are **outside Git**. Changing the
+checkout back to `main` does not remove them, does not disable the timer and
+does not stop it — it only removes the code they point at. A pre-merge
+validation install must therefore be undone explicitly before returning to
+`main` (`docs/Operations.md` §13.14); permanent installation belongs after the
+merge.
+
 See [`docs/Operations.md`](../docs/Operations.md) for the backup architecture,
 the deliberate absence of an automatic production restore, the disaster-recovery
 outline, bundle contents and exclusions, and the Raspberry Pi validation

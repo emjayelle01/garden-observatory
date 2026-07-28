@@ -2,7 +2,7 @@
 
 ## Status
 
-**Implementation complete; operator configuration-default correction in
+**Implementation complete; pre-merge validation cleanup correction in
 progress.**
 
 A repository review of the five implementation commits found nine genuine
@@ -25,6 +25,11 @@ implementation: the manual wrappers did not select the production
 configuration. It is recorded in
 [§ Operator configuration-default review](#operator-configuration-default-review)
 and corrected in a commit after `d991d3b`.
+
+A review of the *validation procedure itself* then found that it installed
+systemd artefacts and never removed them, recorded in
+[§ Pre-merge validation cleanup review](#pre-merge-validation-cleanup-review)
+and corrected in a commit after `7e4fb63`.
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -396,6 +401,94 @@ forwarding, `--config` precedence, exit-status preservation, the missing
 interpreter error and that the wrapper writes nothing. Nothing touches `/etc`,
 `/var`, `/opt` or the production virtual environment.
 
+## Pre-merge validation cleanup review
+
+The implementation and the operator-wrapper correction both passed review. The
+remaining defect was in the **procedure written to validate them**.
+
+### 17. Pre-merge validation left installed Task 10 units behind
+
+The Raspberry Pi validation procedure:
+
+* installed `mgo-backup.service`;
+* installed **and enabled** `mgo-backup.timer`;
+* installed `/etc/logrotate.d/garden-observatory`;
+* tested reboot persistence, deliberately proving the timer survives a restart;
+* and then instructed the operator merely to `git checkout main`.
+
+Every one of those steps is correct in isolation. Together they end with an
+**enabled timer** whose `ExecStart` is
+
+```text
+/opt/garden-observatory/.venv/bin/python -m mgo.operations.backup_cli
+```
+
+After the checkout, `mgo.operations` does not exist — it arrives with Task 10
+and pre-Task-10 `main` has never had it. The next scheduled 02:30 run would
+therefore fail, on a Pi that had been deliberately returned to a known-good
+state, from a branch that was never meant to install anything permanently. The
+reboot-persistence check makes it worse rather than better: it proves the timer
+outlives everything the operator does to the checkout afterwards.
+
+The root cause is a category error worth naming, because it is not specific to
+this task: **installed systemd units and logrotate policies live in `/etc` and
+are outside Git.** `git checkout` reverts the code they point at; it does not
+revert them. Rollback of a Git branch and rollback of a system installation are
+two different operations, and the documentation had collapsed them into one.
+
+The statement
+
+```text
+Before merge — rollback is returning to main.
+```
+
+was true before any installation validation and false after it. It is not that
+the sentence was imprecise; once §13.4 has run, it is wrong.
+
+**Corrected.** The procedure now has three new steps and the rollback section
+has three explicit states:
+
+* **§13.1a** records whether the three artefacts already exist **before
+  anything is installed**. This is what makes the later removal safe: validation
+  removes only what it proved was absent and then installed itself. If an
+  artefact already exists the operator stops, records it, and does not delete
+  it — it may predate this branch or belong to another deployment.
+* **§13.14** is a mandatory pre-merge cleanup that runs after every check
+  including the reboot test: disable and stop the timer, remove the two unit
+  files and the logrotate policy, `daemon-reload`, `reset-failed`, then verify
+  the removed state with `test !`.
+* **§13.15/§13.16** restore the pre-validation service state and only then
+  return to `main`, ending with
+  `systemctl list-timers --all | grep -F mgo-backup` to prove nothing orphaned
+  survived, and an endpoint sweep to prove the API is unaffected.
+
+### Removing the tooling is not deleting the data
+
+Stated explicitly in the procedure and asserted by tests. The cleanup touches
+`/etc/systemd/system` and `/etc/logrotate.d` only. It never removes
+`/var/backups/garden-observatory`, any recovery set inside it, the production
+database, the production configuration, captures, observations, or
+`mgo.service`. The **validated** recovery set stays deliberately: it is the
+evidence that the backup path worked on real hardware, and it is protected by
+the same rule that protects a pre-existing one.
+
+### Three rollback states
+
+`docs/Operations.md` §14 now distinguishes them rather than collapsing them:
+
+| State | Rollback |
+| ----- | -------- |
+| Before any Pi installation validation | `git checkout main`, because nothing was installed |
+| After pre-merge installation validation, before merge | The full §13.14 cleanup, then return to `main` |
+| After merge and deployment | The same unit removal, plus `git revert` and reinstalling the reverted service-identity state |
+
+### Permanent installation is a post-merge act
+
+The procedure now closes by saying what happens next: the Pi returns to clean
+`main`, the units are gone, the recovery set remains, evidence is returned,
+repository review happens, and only then may a pull request be created. The
+installation that is *meant* to persist is the one that follows the merge.
+
 ## Authoritative definition
 
 > **Operations — Create systemd service, log rotation, backup and diagnostic
@@ -704,13 +797,19 @@ version 2 and no migration is added. `pyproject.toml` gains no dependency.
 
 ## Rollback model
 
-Reversible with no data loss.
+Reversible with no data loss. **Three** states, not two — see finding 17.
 
-- **Before merge** — return to `main`; nothing on `main` is touched.
-- **After a future merge** — disable and remove the backup timer and service,
-  remove `/etc/logrotate.d/garden-observatory`, revert the Task 10 commits,
-  re-run the installer from the reverted code, and verify `mgo.service`. The API
-  unit needs no restart because it never changed.
+- **Before any Pi installation validation** — return to `main`; nothing on
+  `main` is touched and no system artefact was installed.
+- **After pre-merge Pi installation validation, before merge** — the installed
+  units are external to Git and survive a checkout, so returning to `main` is
+  the *last* step rather than the whole of it: disable and stop
+  `mgo-backup.timer`, remove the two unit files and the logrotate policy,
+  `systemctl daemon-reload`, preserve every recovery set, verify `mgo.service`,
+  then return to `main`.
+- **After a future merge** — the same unit removal, plus revert the Task 10
+  commits, re-run the installer from the reverted code, and verify
+  `mgo.service`. The API unit needs no restart because it never changed.
 
 Existing backups are left intact unless the operator explicitly removes them.
 No rollback step deletes the production database, captures or support bundles,
@@ -730,6 +829,13 @@ pre-existing preview after any intentional restart, uses a unique Task 10
 validation backup, deletes no existing backup, rotates only a synthetic log file
 created for the test, and confirms the support bundle contains no private
 content before it is copied off the Pi.
+
+It now also **records whether the three operational artefacts already exist
+before installing anything** (§13.1a), and **removes what it installed before
+returning to `main`** (§13.14) — disabling and stopping the timer, deleting the
+two unit files and the logrotate policy, reloading systemd and verifying the
+removed state — while deleting no recovery data. Permanent installation is a
+post-merge act; a feature branch must not leave one behind.
 
 Backups are **not** described as working until that validation has been
 performed and confirmed by Matthew.
