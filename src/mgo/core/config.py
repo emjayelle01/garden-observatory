@@ -71,6 +71,15 @@ SYSTEM_RUNTIME_STATE_DIRECTORY = SYSTEM_STATE_DIRECTORY / "state"
 #: this exists for any file-based log destination and for ``log_directory``.
 SYSTEM_LOG_DIRECTORY = PurePosixPath("/var/log/garden-observatory")
 
+#: Backup root, owned by the runtime account at mode 0750. It sits under
+#: ``/var/backups`` rather than beneath the state root on purpose: a backup that
+#: lives inside the directory it protects is lost to the same ``rm -rf``, the
+#: same failed migration and the same accidental ``StateDirectory=`` cleanup as
+#: the original. Backups and media are also the two things most likely to be
+#: moved to separate storage later, and only a distinct root makes that a mount
+#: rather than a rewrite.
+SYSTEM_BACKUP_DIRECTORY = PurePosixPath("/var/backups/garden-observatory")
+
 #: Production database file.
 SYSTEM_DATABASE_PATH = SYSTEM_DATABASE_DIRECTORY / "mgo.db"
 
