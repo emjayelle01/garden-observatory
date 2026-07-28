@@ -1,0 +1,109 @@
+# Matt's Garden Observatory — scheduled database backup, systemd unit TEMPLATE.
+#
+# This file is a template, not an installed unit. The placeholders below are
+# substituted by scripts/deploy/install-service-identity.sh, which renders it
+# to /etc/systemd/system/mgo-backup.service:
+#
+#   @APP_ROOT@       absolute path of the application checkout on the Pi
+#   @SERVICE_USER@   dedicated non-login runtime account (default: mgo)
+#   @SERVICE_GROUP@  primary runtime group (default: mgo)
+#   @CONFIG_PATH@    production configuration file
+#   @BACKUP_DIR@     backup root (default: /var/backups/garden-observatory)
+#   @DATABASE_DIR@   database directory (default: /var/lib/garden-observatory/db)
+#   @KEEP@           number of complete backup sets to retain
+#
+# It is a ONE-SHOT job triggered by mgo-backup.timer. It runs as the same
+# unprivileged account as the API, takes a consistent online backup while the
+# API keeps serving, and exits. It never starts, stops or restarts mgo.service,
+# never opens the camera and never reads the media archive.
+
+[Unit]
+Description=Matt's Garden Observatory database backup
+Documentation=https://github.com/emjayelle01/garden-observatory
+
+# After= orders this behind the API when both are starting, but there is
+# deliberately NO Requires=, Wants= or BindsTo=: a backup is most valuable when
+# the API is unwell, so it must run whether or not mgo.service is up. Equally,
+# nothing here can affect the API — a failed backup leaves it untouched.
+After=mgo.service
+
+[Service]
+Type=oneshot
+
+# --- runtime identity ------------------------------------------------------
+# The same non-login account that owns the database and the backup directory.
+# No SupplementaryGroups: unlike the API, this job needs no camera access.
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+
+# --- the job ---------------------------------------------------------------
+# The virtualenv interpreter is invoked directly with an argument vector — no
+# shell is involved, so no value here can be word-split or interpreted.
+WorkingDirectory=@APP_ROOT@
+Environment=MGO_CONFIG_PATH=@CONFIG_PATH@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@APP_ROOT@/.venv/bin/python -m mgo.operations.backup_cli backup --config @CONFIG_PATH@ --output-directory @BACKUP_DIR@ --keep @KEEP@
+
+# A bounded run. A backup of this database takes well under a second; fifteen
+# minutes is a generous ceiling that still guarantees a wedged job cannot sit
+# holding the backup lock until the stale timeout.
+TimeoutStartSec=900
+
+# Never restart. This is a scheduled one-shot: if it fails, the timer will run
+# it again tomorrow, and retrying immediately would most likely repeat the same
+# failure against the same full disk or the same corrupt database.
+Restart=no
+
+# --- politeness -------------------------------------------------------------
+# The Pi has one SD card and the API is serving from it. Idle CPU and I/O
+# scheduling keep a backup from competing with live requests.
+Nice=10
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+
+# --- least privilege -------------------------------------------------------
+UMask=0027
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+# The backup makes no network connection of any kind. AF_UNIX alone is enough
+# for the runtime's own internal use.
+RestrictAddressFamilies=AF_UNIX
+
+# Unlike mgo.service, this unit CAN hide the real device nodes: the backup never
+# opens a camera. This is the sandbox difference between the two units.
+PrivateDevices=yes
+
+# --- writable paths ---------------------------------------------------------
+# ProtectSystem=strict makes the whole filesystem read-only, so the two
+# locations this job legitimately writes are named explicitly.
+#
+# @BACKUP_DIR@ is obvious: it is where the backup is published.
+#
+# @DATABASE_DIR@ is NOT obvious and is load-bearing. SQLite cannot read a WAL
+# database without shared-memory access: a reader must be able to create or map
+# the -shm file, which requires the directory holding the database to be
+# writable even for a purely read-only reader. Without this the backup would
+# fail with "unable to open database file" against a perfectly healthy database.
+#
+# This grants filesystem write access, NOT database write access. The backup
+# opens the database through SQLite's mode=ro URI, so no statement it issues can
+# modify, checkpoint or vacuum the production data.
+ReadWritePaths=@BACKUP_DIR@ @DATABASE_DIR@

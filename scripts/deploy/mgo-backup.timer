@@ -1,0 +1,43 @@
+# Matt's Garden Observatory — daily database backup schedule.
+#
+# Installed verbatim to /etc/systemd/system/mgo-backup.timer by
+# scripts/deploy/install-service-identity.sh. Unlike the service unit this file
+# has no placeholders: nothing in a schedule depends on where the checkout
+# lives, so there is nothing to substitute.
+#
+# Triggers mgo-backup.service once a day. It never runs the backup itself and
+# never touches mgo.service.
+
+[Unit]
+Description=Daily Matt's Garden Observatory database backup
+Documentation=https://github.com/emjayelle01/garden-observatory
+
+[Timer]
+# 02:30 in the Pi's LOCAL timezone (Africa/Johannesburg). Chosen deliberately:
+# it is well after dusk, so no daylight capture or motion activity is competing
+# for the SD card, and well before dawn, so a slow run still finishes before the
+# garden becomes interesting again.
+OnCalendar=*-*-* 02:30:00
+
+# Spread the start over half an hour. With a single host this is not about
+# thundering herds; it is about not writing to the same SD-card region at
+# exactly the same wall-clock second every day for years.
+RandomizedDelaySec=30m
+
+# A Raspberry Pi is not always powered. Persistent=true records the last run on
+# disk and catches up a missed backup once the Pi is back, rather than silently
+# skipping every day the machine happened to be off.
+#
+# The installer creates the timestamp file when it first enables this timer, so
+# enabling it does NOT trigger an immediate catch-up run: installing a schedule
+# must never be the thing that starts a backup.
+Persistent=true
+
+# A backup does not need second accuracy; a looser value lets systemd batch
+# wake-ups and keeps the CPU asleep.
+AccuracySec=1m
+
+Unit=mgo-backup.service
+
+[Install]
+WantedBy=timers.target

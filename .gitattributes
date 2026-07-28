@@ -7,3 +7,11 @@
 # and the unit would fail to start.
 *.service text eol=lf
 *.service.template text eol=lf
+
+# Timers are systemd units too: a CR would land inside OnCalendar= and the
+# schedule would be rejected.
+*.timer text eol=lf
+
+# logrotate configuration is installed verbatim into /etc/logrotate.d. A CR
+# would become part of a directive and break rotation for the whole host.
+*.logrotate text eol=lf

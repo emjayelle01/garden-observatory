@@ -40,15 +40,32 @@ config_dir="/etc/garden-observatory"
 config_path="${config_dir}/mgo.toml"
 state_dir="/var/lib/garden-observatory"
 log_dir="/var/log/garden-observatory"
+backup_dir="/var/backups/garden-observatory"
+database_dir="${state_dir}/db"
 
 bind_host="0.0.0.0"
 bind_port="8080"
 
+# Task 10 operations units. The backup service is a template (it needs the
+# checkout path substituted); the timer and the logrotate policy are installed
+# verbatim because nothing in a schedule or a rotation rule is deployment-local.
+backup_unit="mgo-backup.service"
+backup_timer="mgo-backup.timer"
+backup_keep="14"
+backup_unit_template="${script_dir}/mgo-backup.service.template"
+backup_timer_source="${script_dir}/mgo-backup.timer"
+logrotate_source="${script_dir}/garden-observatory.logrotate"
+logrotate_destination="/etc/logrotate.d/garden-observatory"
+timer_stamp="/var/lib/systemd/timers/stamp-${backup_timer}"
+
 unit_template="${script_dir}/mgo.service.template"
 unit_destination="/etc/systemd/system/${service_unit}"
+backup_unit_destination="/etc/systemd/system/${backup_unit}"
+backup_timer_destination="/etc/systemd/system/${backup_timer}"
 config_example="${app_root}/config/mgo.production.example.toml"
 
 install_unit=1
+install_operations=1
 dry_run=0
 
 # Every persistent data directory, parents first.
@@ -72,8 +89,14 @@ Options:
   --camera-group NAME Supplementary camera group (default: video)
   --host ADDRESS      Bind address for the unit  (default: 0.0.0.0)
   --port PORT         Bind port for the unit     (default: 8080)
+  --backup-dir PATH   Backup root
+                      (default: /var/backups/garden-observatory)
+  --keep N            Complete backup sets the scheduled job retains
+                      (default: 14)
   --no-unit           Provision identity and directories only; do not touch
                       /etc/systemd/system/mgo.service
+  --no-operations     Skip the Task 10 operations provisioning: no backup
+                      directory, no backup service or timer, no logrotate policy
   --dry-run           Print what would change without changing anything
   -h, --help          Show this help
 USAGE
@@ -89,7 +112,10 @@ while [[ $# -gt 0 ]]; do
     --camera-group) camera_group="$2"; shift 2 ;;
     --host)         bind_host="$2"; shift 2 ;;
     --port)         bind_port="$2"; shift 2 ;;
+    --backup-dir)   backup_dir="$2"; shift 2 ;;
+    --keep)         backup_keep="$2"; shift 2 ;;
     --no-unit)      install_unit=0; shift ;;
+    --no-operations) install_operations=0; shift ;;
     --dry-run)      dry_run=1; shift ;;
     -h|--help)      usage; exit 0 ;;
     *)              printf 'Unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
@@ -136,11 +162,20 @@ if (( install_unit )); then
   [[ -f "${unit_template}" ]] || fail "Unit template not found: ${unit_template}"
 fi
 
+if (( install_operations )); then
+  for asset in "${backup_unit_template}" "${backup_timer_source}" "${logrotate_source}"; do
+    [[ -f "${asset}" ]] || fail "Operations asset not found: ${asset}"
+  done
+  [[ "${backup_keep}" =~ ^[1-9][0-9]*$ ]] \
+    || fail "--keep must be a positive integer (got '${backup_keep}')."
+fi
+
 printf 'MGO service identity provisioning\n'
 note "application root : ${app_root}"
 note "runtime account  : ${service_user}:${service_group} (+${camera_group})"
 note "configuration    : ${config_path}"
 note "persistent data  : ${state_dir}"
+(( install_operations )) && note "backups          : ${backup_dir} (keep ${backup_keep})"
 (( dry_run )) && note "mode             : DRY RUN (no changes)"
 
 # --- 1. runtime group ------------------------------------------------------
@@ -246,6 +281,13 @@ done
 
 run install -d -o "${service_user}" -g "${service_group}" -m 0750 "${log_dir}"
 note "${log_dir}  ${service_user}:${service_group}  0750"
+
+# The backup root deliberately sits OUTSIDE the state directory: a backup kept
+# inside the tree it protects is lost to the same accident as the original.
+if (( install_operations )); then
+  run install -d -o "${service_user}" -g "${service_group}" -m 0750 "${backup_dir}"
+  note "${backup_dir}  ${service_user}:${service_group}  0750"
+fi
 
 # --- 5. application checkout access ----------------------------------------
 
@@ -381,7 +423,10 @@ else
     fi
   fi
 
-  for directory in "${state_dir}" "${state_subdirectories[@]}" "${log_dir}"; do
+  writable_targets=("${state_dir}" "${state_subdirectories[@]}" "${log_dir}")
+  (( install_operations )) && writable_targets+=("${backup_dir}")
+
+  for directory in "${writable_targets[@]}"; do
     if ! as_service_user test -w "${directory}" 2>/dev/null; then
       warn "'${service_user}' cannot write ${directory}"
       access_ok=0
@@ -450,12 +495,143 @@ else
   note "skipped (--no-unit)"
 fi
 
+# --- 10. operations units and log rotation ----------------------------------
+#
+# Backup scheduling and log rotation. Everything here is additive: nothing in
+# this section touches mgo.service, and the API is never restarted to install a
+# timer or a rotation rule.
+
+# Install a tracked file to a system location, but only when it differs from
+# what is already there. Backing up a *different* existing file preserves any
+# local edit; skipping an identical one keeps re-runs quiet and avoids
+# rewriting a file for no reason.
+install_managed_file() {
+  local source="$1" destination="$2" mode="$3" label="$4"
+
+  if [[ -f "${destination}" ]] && cmp -s "${source}" "${destination}"; then
+    note "${destination} is already up to date"
+    return 0
+  fi
+
+  if [[ -f "${destination}" ]]; then
+    local backup="${destination}.bak-$(date +%Y%m%d%H%M%S)"
+    run cp -a "${destination}" "${backup}"
+    note "backed up the existing ${label} to ${backup}"
+  fi
+
+  if (( dry_run )); then
+    printf '  [dry-run] would install %s -> %s (root:root %s)\n' \
+      "${source}" "${destination}" "${mode}"
+  else
+    install -o root -g root -m "${mode}" "${source}" "${destination}"
+    note "installed ${destination} (root:root ${mode})"
+  fi
+}
+
+if (( install_operations )); then
+  step "Backup service and timer"
+
+  rendered_backup="$(
+    sed \
+      -e "s|@APP_ROOT@|${app_root}|g" \
+      -e "s|@SERVICE_USER@|${service_user}|g" \
+      -e "s|@SERVICE_GROUP@|${service_group}|g" \
+      -e "s|@CONFIG_PATH@|${config_path}|g" \
+      -e "s|@BACKUP_DIR@|${backup_dir}|g" \
+      -e "s|@DATABASE_DIR@|${database_dir}|g" \
+      -e "s|@KEEP@|${backup_keep}|g" \
+      "${backup_unit_template}"
+  )"
+
+  if (( dry_run )); then
+    printf '  [dry-run] would write %s:\n\n' "${backup_unit_destination}"
+    printf '%s\n' "${rendered_backup}"
+  else
+    rendered_tmp="$(mktemp)"
+    printf '%s\n' "${rendered_backup}" > "${rendered_tmp}"
+    if [[ -f "${backup_unit_destination}" ]] \
+       && cmp -s "${rendered_tmp}" "${backup_unit_destination}"; then
+      note "${backup_unit_destination} is already up to date"
+    else
+      if [[ -f "${backup_unit_destination}" ]]; then
+        backup_copy="${backup_unit_destination}.bak-$(date +%Y%m%d%H%M%S)"
+        cp -a "${backup_unit_destination}" "${backup_copy}"
+        note "backed up the existing unit to ${backup_copy}"
+      fi
+      install -o root -g root -m 0644 "${rendered_tmp}" "${backup_unit_destination}"
+      note "wrote ${backup_unit_destination} (User=${service_user}, keep=${backup_keep})"
+    fi
+    rm -f "${rendered_tmp}"
+  fi
+
+  install_managed_file "${backup_timer_source}" "${backup_timer_destination}" \
+    0644 "backup timer"
+
+  step "Log rotation"
+
+  # Validate the tracked policy before installing it where logrotate will read
+  # it: a syntax error in /etc/logrotate.d breaks rotation for the WHOLE host,
+  # not just for MGO.
+  if command -v logrotate >/dev/null 2>&1; then
+    if logrotate --debug "${logrotate_source}" >/dev/null 2>&1; then
+      note "the tracked logrotate policy parses cleanly"
+    else
+      warn "logrotate could not parse ${logrotate_source}; not installing it."
+      logrotate --debug "${logrotate_source}" >&2 || true
+      fail "refusing to install a logrotate policy that does not parse."
+    fi
+  else
+    note "logrotate is not installed; skipping policy validation"
+  fi
+
+  install_managed_file "${logrotate_source}" "${logrotate_destination}" \
+    0644 "logrotate policy"
+
+  step "Enabling the backup timer"
+
+  if (( dry_run )); then
+    note "[dry-run] would reload systemd, seed the timer stamp and enable ${backup_timer}"
+  elif ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemctl is unavailable; the backup timer was not enabled."
+  else
+    systemctl daemon-reload
+    note "reloaded the systemd daemon"
+
+    # Seed the timer's persistence stamp BEFORE enabling it. Persistent=true
+    # makes systemd catch up a run it believes was missed; with no stamp file
+    # and today's 02:30 already past, enabling the timer would fire a backup
+    # immediately. Installing a schedule must never be the thing that starts a
+    # backup, so the stamp is created first, as if the timer had just run.
+    if [[ ! -e "${timer_stamp}" ]]; then
+      install -d -o root -g root -m 0755 "$(dirname "${timer_stamp}")"
+      : > "${timer_stamp}"
+      chown root:root "${timer_stamp}"
+      chmod 0644 "${timer_stamp}"
+      note "seeded ${timer_stamp} so enabling the timer triggers no catch-up run"
+    else
+      note "timer stamp already present — left unchanged"
+    fi
+
+    systemctl enable "${backup_timer}" >/dev/null 2>&1 || true
+    systemctl start "${backup_timer}" >/dev/null 2>&1 || true
+    note "enabled and started ${backup_timer} (the backup itself was NOT run)"
+  fi
+else
+  step "Operations units"
+  note "skipped (--no-operations)"
+fi
+
 # --- summary ---------------------------------------------------------------
 
 printf '\n== Next steps\n'
 note "1. Review ${config_path}"
 note "2. sudo systemctl restart ${service_unit}"
 note "3. bash ${app_root}/scripts/deploy/verify-service-identity.sh"
+if (( install_operations )); then
+  note "4. bash ${app_root}/scripts/deploy/verify-operations.sh"
+  note "5. Take the first backup by hand when convenient:"
+  note "     sudo -u ${service_user} ${app_root}/scripts/operations/backup-database.sh backup"
+fi
 
 if (( ! access_ok )); then
   printf '\n'

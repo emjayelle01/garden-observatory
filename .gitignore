@@ -23,6 +23,25 @@ data/*
 *-shm
 *.db-journal
 
+# Operations artefacts (Task 10).
+#
+# These are RUNTIME output, produced on the Pi or by a local test run, and must
+# never be committed: a backup or a support bundle carries real observation
+# data. The patterns are deliberately specific to the naming this tooling
+# produces — a broad rule like "*.json" or "backups/" would also hide tracked
+# fixtures, documentation examples and migrations.
+mgo-*.manifest.json
+mgo-support-*.tar.gz
+.mgo-backup-*.tmp
+.mgo-support-*.tmp
+.mgo-backup.lock
+mgo-restore-test-*/
+# Synthetic log files created only by the Raspberry Pi log-rotation validation.
+*.log
+*.log.[0-9]
+*.log-[0-9]*
+*.log.gz
+
 # macOS
 .DS_Store
 

@@ -1,0 +1,71 @@
+# Matt's Garden Observatory — log rotation policy.
+#
+# Installed to /etc/logrotate.d/garden-observatory by
+# scripts/deploy/install-service-identity.sh.
+#
+# WHAT THIS ROTATES
+# -----------------
+# Only *.log files that MGO itself owns, inside /var/log/garden-observatory.
+# The glob is deliberately narrow: no parent directory, no wildcard directory
+# component, and nothing under /var/lib (the database and the media archive
+# live there and must never be handed to logrotate).
+#
+# WHAT THIS DOES *NOT* ROTATE
+# ---------------------------
+# The application's runtime log. MGO logs to stdout/stderr and systemd captures
+# that into the JOURNAL, which is where production logs actually live. journald
+# has its own retention, configured host-wide in /etc/systemd/journald.conf and
+# inspected with:
+#
+#   journalctl --disk-usage
+#   journalctl -u mgo.service
+#
+# logrotate cannot rotate the journal, and this policy does not pretend to.
+# Task 10 deliberately does not change the host's global journald retention
+# either: that setting governs every service on the machine, not just MGO, and
+# quietly shrinking it from an application deployment would be a surprising,
+# system-wide change.
+#
+# Because journald is primary, there may currently be NO *.log files here at
+# all. That is the expected state, not a fault: "missingok" and "notifempty"
+# make this policy a safe no-op when the glob matches nothing, so it can be
+# installed now and be correct both today and if a file-based log is ever added.
+
+/var/log/garden-observatory/*.log {
+    # Rotate daily, keeping a fortnight — the same window as backup retention,
+    # so "how far back can I look?" has one answer for logs and backups alike.
+    daily
+    rotate 14
+
+    # No files is the normal case today; an empty file is not worth a rotation.
+    missingok
+    notifempty
+
+    # Compress, but never the most recent rotation: a writer that still holds
+    # the old descriptor would otherwise have its final lines compressed away.
+    compress
+    delaycompress
+
+    # Date suffixes rather than sequence numbers: mgo.log-20260728 is
+    # self-explanatory during an incident, mgo.log.7 is not.
+    dateext
+    dateformat -%Y%m%d
+
+    # Rotate as the runtime account. Required because the log directory is
+    # owned by mgo:mgo and is not world-readable; without "su" logrotate
+    # refuses to act on a directory it does not own.
+    su mgo mgo
+
+    # Replacements are owner read/write, group read. Never world-readable.
+    create 0640 mgo mgo
+
+    # Run any script once for the whole glob rather than once per file.
+    sharedscripts
+
+    # NOTE: copytruncate is deliberately NOT used. It is only needed when a
+    # writer holds the file open and cannot be told to reopen it, and it trades
+    # a race (log lines written between the copy and the truncate are lost) for
+    # that convenience. Nothing currently writes these files, so there is no
+    # such writer to accommodate. If a file-based logger is ever added, the
+    # correct fix is a postrotate signal to reopen, not copytruncate.
+}
