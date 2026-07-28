@@ -34,7 +34,6 @@ import os
 import re
 import shutil
 import sqlite3
-import stat
 import tempfile
 from collections.abc import Iterable
 from contextlib import suppress
@@ -46,6 +45,8 @@ from typing import Any
 from mgo.core.config import (
     SYSTEM_DATABASE_DIRECTORY,
     SYSTEM_STATE_DIRECTORY,
+    MGOConfig,
+    parse_config_bytes,
 )
 from mgo.core.database import (
     CURRENT_SCHEMA_VERSION,
@@ -58,6 +59,12 @@ from mgo.core.identity import get_application_version
 from mgo.operations.errors import ErrorCode, OperationError
 from mgo.operations.events import EventEmitter
 from mgo.operations.locking import operation_lock
+from mgo.operations.source_identity import (
+    SourceAnchor,
+    SourceIdentity,
+    anchored_source,
+    read_regular_file,
+)
 
 #: The manifest schema this build writes and understands. A manifest recording a
 #: *higher* version was written by a newer build and is refused rather than
@@ -787,6 +794,12 @@ def _validated_keep(keep: int) -> int:
 def _validated_source(database_path: Path) -> Path:
     """Return the source database path, refusing anything unsafe to read.
 
+    These are the cheap, early checks that produce a clear message for the
+    ordinary mistakes: an in-memory database, a missing file, a directory, a
+    symlink. They are **not** the security boundary — a path can change between
+    this check and SQLite's open of it. That gap is closed separately by the
+    identity anchor held across the connection in :func:`_copy_database`.
+
     A **symlinked** source is refused outright and there is no override. The
     backup runs unattended as a service account with write access to the backup
     root; if the configured database path could be a symlink, replacing it would
@@ -825,113 +838,97 @@ def _validated_source(database_path: Path) -> Path:
     return database_path
 
 
-def read_configuration_bytes(configuration_path: Path) -> bytes:
-    """Read the production configuration for inclusion in a recovery set.
+@dataclass(frozen=True, repr=False)
+class ConfigurationSnapshot:
+    """One securely-read configuration: the bytes, and what they parse to.
 
-    The bytes are preserved **exactly**: the file is never parsed, normalised
-    or rewritten. A configuration that round-tripped through a TOML parser
-    would lose its comments and its ordering, and a restore would then hand the
-    operator something that is merely equivalent rather than identical.
+    This exists so that a backup run reads the configuration **exactly once**.
+    Previously the file was parsed to find the database and then opened again
+    later to be snapshotted, which left a window in which an administrator
+    replacing the configuration would have paired a database chosen from one
+    version with bytes from another — a recovery set that describes a pairing
+    that never existed.
 
-    Every check here exists because this runs unattended as a service account:
+    The bytes are authoritative. ``config`` is parsed *from these bytes*, not
+    from a second read of the file, so the snapshot in the recovery set is
+    provably the configuration that selected the database.
 
-    * a **symlink** is refused, because the link target could be changed
-      between runs to point at any file the account can read;
-    * the file is validated through its own **file descriptor** after opening,
-      not through the path, so the thing that was checked is the thing that was
-      read;
-    * the size is bounded before and during the read, so a path pointed at
-      something unexpected cannot be pulled into memory or onto the SD card;
-    * size and modification time are re-checked afterwards, so a configuration
-      rewritten mid-copy is reported rather than captured half-old and half-new.
+    ``repr`` is overridden. A configuration may hold credentials, and a
+    dataclass's generated ``repr`` would print them into any traceback, log
+    line or test failure that happened to include this object.
+    """
 
-    The contents are never logged, never placed in an event, never put in the
+    source_name: str
+    data: bytes
+    sha256: str
+    identity: SourceIdentity
+    config: MGOConfig
+
+    @property
+    def size_bytes(self) -> int:
+        """The size of the captured configuration."""
+        return len(self.data)
+
+    def __repr__(self) -> str:
+        """Return a description that cannot leak configuration content."""
+        return (
+            f"ConfigurationSnapshot(source_name={self.source_name!r}, "
+            f"size_bytes={self.size_bytes}, sha256={self.sha256!r})"
+        )
+
+
+def capture_configuration(configuration_path: Path) -> ConfigurationSnapshot:
+    """Read, validate and parse the production configuration exactly once.
+
+    The bytes are preserved **exactly**: the file is never normalised or
+    rewritten. A configuration that round-tripped through a TOML parser would
+    lose its comments and its ordering, and a restore would then hand the
+    operator something merely equivalent rather than identical.
+
+    Reading is delegated to :func:`~mgo.operations.source_identity.read_regular_file`,
+    which refuses a symbolic link **at the open itself** (``O_NOFOLLOW`` on
+    Linux) rather than by checking the path first and opening it afterwards,
+    and which proves that the path still names the object that was opened. The
+    previous check-then-open sequence was correct only for a path that did not
+    change underneath it.
+
+    The parsed configuration comes from these same bytes, via the application's
+    own parser, so there is no second read and no second schema.
+
+    Contents are never logged, never placed in an event, never put in the
     manifest and never included in a support bundle.
     """
-    if configuration_path.is_symlink():
-        raise OperationError(
-            ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
-            f"The configuration {configuration_path.name} is a symbolic link. "
-            "Backing up through a link is refused: the target could be "
-            "changed between runs.",
-        )
+    data, identity = read_regular_file(
+        configuration_path,
+        max_bytes=MAX_CONFIGURATION_BYTES,
+        subject=f"The configuration {configuration_path.name}",
+        code=ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
+    )
 
     try:
-        handle = configuration_path.open("rb")
-    except FileNotFoundError as exc:
+        parsed = parse_config_bytes(data)
+    except UnicodeDecodeError as exc:
         raise OperationError(
             ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
-            f"The configuration {configuration_path.name} does not exist. A "
-            "recovery set without the configuration is incomplete.",
+            f"The configuration {configuration_path.name} is not valid UTF-8.",
         ) from exc
-    except IsADirectoryError as exc:
+    except (ValueError, KeyError, TypeError) as exc:
+        # Deliberately does not echo the exception's text: a TOML parse error
+        # quotes the offending line, which may be the line holding a secret.
         raise OperationError(
             ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
-            f"The configuration path {configuration_path.name} is a directory.",
-        ) from exc
-    except OSError as exc:
-        raise OperationError(
-            ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
-            f"The configuration {configuration_path.name} could not be read: "
-            f"{exc.strerror or exc}.",
+            f"The configuration {configuration_path.name} could not be parsed "
+            f"({type(exc).__name__}); a recovery set must contain a "
+            "configuration the application can actually load.",
         ) from exc
 
-    with handle:
-        try:
-            before = os.fstat(handle.fileno())
-        except OSError as exc:
-            raise OperationError(
-                ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
-                f"The configuration {configuration_path.name} could not be "
-                f"inspected: {exc.strerror or exc}.",
-            ) from exc
-
-        if not stat.S_ISREG(before.st_mode):
-            raise OperationError(
-                ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
-                f"The configuration path {configuration_path.name} is not a "
-                "regular file.",
-            )
-
-        if before.st_size > MAX_CONFIGURATION_BYTES:
-            raise OperationError(
-                ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
-                f"The configuration {configuration_path.name} is "
-                f"{before.st_size} bytes, above the {MAX_CONFIGURATION_BYTES} "
-                "byte limit for a recovery set.",
-            )
-
-        try:
-            # One byte beyond the limit: enough to detect a file that grew
-            # between the stat and the read, without reading it all.
-            data = handle.read(MAX_CONFIGURATION_BYTES + 1)
-            after = os.fstat(handle.fileno())
-        except OSError as exc:
-            raise OperationError(
-                ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
-                f"The configuration {configuration_path.name} could not be "
-                f"read: {exc.strerror or exc}.",
-            ) from exc
-
-    if len(data) > MAX_CONFIGURATION_BYTES:
-        raise OperationError(
-            ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
-            f"The configuration {configuration_path.name} exceeds the "
-            f"{MAX_CONFIGURATION_BYTES} byte limit for a recovery set.",
-        )
-
-    if (after.st_size, after.st_mtime_ns) != (
-        before.st_size,
-        before.st_mtime_ns,
-    ) or len(data) != before.st_size:
-        raise OperationError(
-            ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE,
-            f"The configuration {configuration_path.name} changed while it was "
-            "being copied; the snapshot would be neither the old file nor the "
-            "new one.",
-        )
-
-    return data
+    return ConfigurationSnapshot(
+        source_name=configuration_path.name,
+        data=data,
+        sha256=hashlib.sha256(data).hexdigest(),
+        identity=identity,
+        config=parsed,
+    )
 
 
 def _write_configuration_snapshot(target: Path, payload: bytes) -> None:
@@ -983,7 +980,7 @@ def _prepared_destination(destination: Path) -> Path:
 # --- backup -----------------------------------------------------------------
 
 
-def _copy_database(source: Path, target: Path) -> str:
+def _copy_database(source: Path, target: Path, anchor: SourceAnchor) -> str:
     """Copy ``source`` into ``target`` as one consistent snapshot.
 
     Returns the journal mode the finished copy reports.
@@ -994,6 +991,16 @@ def _copy_database(source: Path, target: Path) -> str:
     Raspberry Pi is small, one step yields the strongest consistency guarantee,
     and it removes the possibility of a busy writer restarting the copy
     repeatedly.
+
+    ``anchor`` pins the identity of the file that was validated for this run.
+    SQLite opens the database **by name**, so between validation and that open
+    the path could be repointed at another file; the anchor is therefore held
+    open across the connect and the path re-checked immediately afterwards. A
+    substitution in that window fails the run before anything is published.
+
+    ``immutable=1`` is deliberately not used to sidestep this: the production
+    database is live and carries WAL state, and telling SQLite it cannot change
+    would produce an inconsistent read rather than a safe one.
 
     The copy is then switched out of WAL. Without this the finished backup would
     depend on ``-wal``/``-shm`` sidecars that the single published file does not
@@ -1011,6 +1018,17 @@ def _copy_database(source: Path, target: Path) -> str:
             ErrorCode.BACKUP_SOURCE_UNAVAILABLE,
             f"The source database path is not usable: {exc.strerror or exc}.",
         ) from exc
+
+    # SQLite has now opened the path. Prove it opened the file this run
+    # validated, before a single page is copied out of it.
+    try:
+        anchor.verify(
+            subject="The source database",
+            code=ErrorCode.BACKUP_SOURCE_IDENTITY_CHANGED,
+        )
+    except OperationError:
+        source_connection.close()
+        raise
 
     try:
         target_connection = sqlite3.connect(target)
@@ -1039,7 +1057,7 @@ def _copy_database(source: Path, target: Path) -> str:
 def create_backup(
     *,
     database_path: Path,
-    configuration_path: Path,
+    configuration: ConfigurationSnapshot,
     destination: Path,
     keep: int = DEFAULT_RETENTION_COUNT,
     emitter: EventEmitter | None = None,
@@ -1055,18 +1073,24 @@ def create_backup(
 
     The sequence is deliberate and each step guards the next:
 
-    1. validate the retention count, the source database and the configuration
-       *before* anything is created;
+    1. validate the retention count and the source database *before* anything
+       is created;
     2. take the destination lock, so no second run can interleave;
     3. refuse if any of the three final names already exists;
-    4. build the database copy in a temporary file **in the destination
+    4. hold an **identity anchor** on the source database, and keep it open
+       across SQLite's own open of that path;
+    5. build the database copy in a temporary file **in the destination
        filesystem**, so the final rename is atomic rather than a cross-device
        copy;
-    5. open the copy independently and prove it is a sound, compatible MGO
+    6. open the copy independently and prove it is a sound, compatible MGO
        database;
-    6. read the configuration under its own safety checks;
     7. publish the database, then the configuration, then -- **last** -- the
        manifest.
+
+    The configuration is **not read here**. It arrives already captured, as a
+    :class:`ConfigurationSnapshot`, because the same bytes must be the ones that
+    chose the database path: reading the file a second time at this point would
+    reintroduce exactly the pairing hazard the snapshot exists to remove.
 
     The manifest is written last on purpose: it is the completion marker, so a
     set is only ever complete once every file it describes is already in place.
@@ -1088,7 +1112,7 @@ def create_backup(
         "backup.started",
         "Starting a consistent SQLite backup with its configuration.",
         source_database_name=source.name,
-        configuration_source_name=configuration_path.name,
+        configuration_source_name=configuration.source_name,
         keep=keep,
     )
 
@@ -1123,18 +1147,20 @@ def create_backup(
         temporary = Path(temporary_name)
 
         try:
-            mode = _copy_database(source, temporary)
+            # The anchor is opened before SQLite and held until the copy is
+            # finished, so the inode cannot be recycled underneath the check.
+            with anchored_source(
+                source,
+                subject="The source database",
+                code=ErrorCode.BACKUP_SOURCE_UNAVAILABLE,
+            ) as anchor:
+                mode = _copy_database(source, temporary, anchor)
 
             facts = _inspect_database(temporary)
             backup_schema = _require_sound_database(facts, "The backup just taken")
 
             size = temporary.stat().st_size
             checksum = file_sha256(temporary)
-
-            # Read the configuration before publishing anything: a failure here
-            # must leave the destination untouched, not leave a database
-            # snapshot with no configuration beside it.
-            configuration_bytes = read_configuration_bytes(configuration_path)
 
             manifest = BackupManifest(
                 format_version=BACKUP_FORMAT_VERSION,
@@ -1150,12 +1176,10 @@ def create_backup(
                 integrity=facts.integrity,
                 journal_mode_of_backup=mode,
                 table_row_counts=facts.row_counts,
-                configuration_source_name=configuration_path.name,
+                configuration_source_name=configuration.source_name,
                 configuration_filename=final_configuration.name,
-                configuration_size_bytes=len(configuration_bytes),
-                configuration_sha256=hashlib.sha256(
-                    configuration_bytes
-                ).hexdigest(),
+                configuration_size_bytes=configuration.size_bytes,
+                configuration_sha256=configuration.sha256,
             )
 
             _set_file_mode(temporary, BACKUP_FILE_MODE)
@@ -1175,7 +1199,7 @@ def create_backup(
         # From here the database snapshot is published. Any later failure must
         # roll the set back so no manifest claims a set that is incomplete.
         try:
-            _write_configuration_snapshot(final_configuration, configuration_bytes)
+            _write_configuration_snapshot(final_configuration, configuration.data)
         except OperationError:
             _rollback_partial_set(events, final_backup)
             raise
@@ -1993,12 +2017,14 @@ __all__ = [
     "BackupManifest",
     "BackupResult",
     "BackupSet",
+    "ConfigurationSnapshot",
     "RestoreTestResult",
     "RetentionResult",
     "VerificationResult",
     "apply_retention",
     "backup_filename",
     "backup_timestamp",
+    "capture_configuration",
     "configuration_filename",
     "configuration_path_for",
     "create_backup",
@@ -2006,7 +2032,6 @@ __all__ = [
     "list_backups",
     "manifest_filename",
     "manifest_path_for",
-    "read_configuration_bytes",
     "restore_test",
     "verify_backup",
 ]

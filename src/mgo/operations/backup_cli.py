@@ -37,6 +37,7 @@ from mgo.core.config import (
 from mgo.operations.backup import (
     BACKUP_SERVICE,
     DEFAULT_RETENTION_COUNT,
+    capture_configuration,
     create_backup,
     list_backups,
     restore_test,
@@ -77,12 +78,12 @@ def _resolve_configuration_path(explicit: Path | None) -> Path:
 def _resolve_database_path(
     explicit: Path | None, configuration_path: Path
 ) -> Path:
-    """Resolve the database to back up.
+    """Resolve the database path for a command that is not taking a backup.
 
-    Precedence is ``--database`` then the selected MGO configuration. There is
-    no third source and no second configuration system: the application already
-    has one authority for where its database lives, and a backup tool that
-    disagreed with it would faithfully back up the wrong file.
+    Used only by ``restore-test``, which needs to know the production database
+    directory in order to *protect* it. The ``backup`` command deliberately
+    does **not** use this: it derives the database from the bytes it captured,
+    so the configuration is never read twice in one run.
     """
     if explicit is not None:
         return explicit
@@ -218,14 +219,32 @@ def _print_summary(payload: dict[str, Any], stream: IO[str]) -> None:
 def _run_backup(
     arguments: argparse.Namespace, events: EventEmitter, stream: IO[str]
 ) -> int:
-    """Execute the ``backup`` subcommand."""
-    configuration = _resolve_configuration_path(arguments.config)
-    database = _resolve_database_path(arguments.database, configuration)
+    """Execute the ``backup`` subcommand.
+
+    The configuration is read **once**, securely, and everything else in the run
+    follows from those exact bytes: the database path is parsed from them, and
+    the same bytes become the recovery set's configuration snapshot. Reading the
+    file twice — once to find the database, once to snapshot it — would allow an
+    administrative edit in between to produce a set pairing a database chosen
+    from one configuration version with bytes from another.
+    """
+    configuration_path = _resolve_configuration_path(arguments.config)
+    snapshot = capture_configuration(configuration_path)
     destination = _default_output_directory(arguments.output_directory)
+
+    # An explicit --database is a deliberate operator override. The captured
+    # configuration is still what the recovery set contains; it is simply not
+    # what chose the database in this mode, and the summary says so.
+    overridden = arguments.database is not None
+    database = (
+        arguments.database
+        if overridden
+        else snapshot.config.storage.database_path
+    )
 
     result = create_backup(
         database_path=database,
-        configuration_path=configuration,
+        configuration=snapshot,
         destination=destination,
         keep=arguments.keep,
         emitter=events,
@@ -234,7 +253,19 @@ def _run_backup(
     summary = result.as_dict()
     retention_ok = result.retention is None or result.retention.succeeded
     summary["result"] = "success" if retention_ok else "retention_failed"
+    summary["database_source"] = (
+        "explicit_override" if overridden else "configuration"
+    )
     _print_summary(summary, stream)
+
+    if overridden:
+        events.warning(
+            "backup.database_overridden",
+            "The database was selected by an explicit --database override, "
+            "not by the captured configuration. The recovery set still "
+            "contains that configuration, but it does not describe where this "
+            "database came from.",
+        )
 
     # A published, valid backup with a failed retention pass is still a backup,
     # but the operator must be told the directory is growing. Non-zero is the

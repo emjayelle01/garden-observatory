@@ -43,6 +43,7 @@ from mgo.operations.backup import (
     TEMPORARY_PREFIX,
     BackupManifest,
     apply_retention,
+    capture_configuration,
     configuration_path_for,
     create_backup,
     file_sha256,
@@ -88,6 +89,9 @@ def source_database(tmp_path: Path) -> Path:
     return database
 
 
+#: A **complete, loadable** configuration — a recovery set must contain one the
+#: application can actually load, so ``capture_configuration`` parses it.
+#:
 #: Deliberately contains a comment, a blank line and a secret-looking value.
 #: The comment and blank line prove the snapshot preserves exact bytes rather
 #: than round-tripping through a TOML parser; the value proves configuration
@@ -97,6 +101,30 @@ CONFIGURATION_TEXT = """\
 
 [application]
 name = "MGO"
+environment = "production"
+host = "0.0.0.0"
+port = 8080
+
+[storage]
+data_directory = "data"
+log_directory = "logs"
+database_path = "data/mgo.db"
+
+[camera]
+enabled = false
+backend = "null"
+detection_interval_seconds = 60
+capture_directory = "data/captures"
+
+[health]
+enabled = true
+collection_interval_seconds = 60
+temperature_warning_celsius = 70.0
+temperature_critical_celsius = 80.0
+disk_warning_percent = 80.0
+disk_critical_percent = 90.0
+memory_warning_percent = 85.0
+memory_critical_percent = 95.0
 
 [future_transport]
 bot_token = "SECRET-TOKEN-MUST-NOT-LEAK"
@@ -148,14 +176,17 @@ def _backup(
     configuration: Path | None = None,
     **kwargs: object,
 ) -> Any:
-    """Take a complete recovery set, defaulting the configuration."""
+    """Take a complete recovery set, defaulting the configuration.
+
+    Captures the configuration the way the CLI does — securely, once — so the
+    tests exercise the real capture path rather than a shortcut around it.
+    """
+    snapshot = capture_configuration(
+        configuration if configuration is not None else _configuration_beside(source)
+    )
     return create_backup(
         database_path=source,
-        configuration_path=(
-            configuration
-            if configuration is not None
-            else _configuration_beside(source)
-        ),
+        configuration=snapshot,
         destination=target,
         **kwargs,  # type: ignore[arg-type]
     )
@@ -575,7 +606,7 @@ def test_an_existing_backup_name_is_never_overwritten(
 def test_a_missing_source_is_reported(tmp_path: Path, destination: Path) -> None:
     """A clear code beats an SQLite "unable to open database file"."""
     with pytest.raises(OperationError) as caught:
-        _backup(tmp_path / "absent.db", destination, tmp_path / "cfg.toml")
+        _backup(tmp_path / "absent.db", destination)
 
     assert caught.value.code is ErrorCode.BACKUP_SOURCE_UNAVAILABLE
 
@@ -588,15 +619,21 @@ def test_a_source_that_is_not_a_file_is_reported(
     directory.mkdir()
 
     with pytest.raises(OperationError) as caught:
-        _backup(directory, destination, tmp_path / "cfg.toml")
+        _backup(directory, destination)
 
     assert caught.value.code is ErrorCode.BACKUP_SOURCE_UNAVAILABLE
 
 
-def test_an_in_memory_source_is_refused(destination: Path) -> None:
+def test_an_in_memory_source_is_refused(
+    destination: Path, tmp_path: Path
+) -> None:
     """There is nothing persistent to back up."""
     with pytest.raises(OperationError) as caught:
-        _backup(Path(":memory:"), destination, destination / "cfg.toml")
+        _backup(
+            Path(":memory:"),
+            destination,
+            _configuration_beside(tmp_path / "placeholder"),
+        )
 
     assert caught.value.code is ErrorCode.BACKUP_SOURCE_UNAVAILABLE
 
@@ -1522,9 +1559,17 @@ def test_an_oversized_configuration_is_refused(
 def test_a_configuration_at_the_size_limit_is_accepted(
     source_database: Path, destination: Path, tmp_path: Path
 ) -> None:
-    """The bound is inclusive; an off-by-one would reject a legal file."""
+    """The bound is inclusive; an off-by-one would reject a legal file.
+
+    Padded with a comment rather than arbitrary bytes: the configuration is now
+    parsed as part of capture, so a file at the limit must still be loadable.
+    """
     limit = tmp_path / "exact.toml"
-    limit.write_bytes(b"x" * MAX_CONFIGURATION_BYTES)
+    body = CONFIGURATION_TEXT.encode("utf-8")
+    padding = MAX_CONFIGURATION_BYTES - len(body) - len("\n# \n")
+    limit.write_bytes(body + b"\n# " + (b"x" * padding) + b"\n")
+
+    assert limit.stat().st_size == MAX_CONFIGURATION_BYTES
 
     result = _backup(source_database, destination, limit)
 
@@ -1536,7 +1581,7 @@ def test_a_configuration_changed_during_the_copy_is_refused(
 ) -> None:
     """A snapshot must be one file, not half the old one and half the new."""
     changing = tmp_path / "changing.toml"
-    changing.write_text("original = true\n", encoding="utf-8")
+    changing.write_text(CONFIGURATION_TEXT, encoding="utf-8")
 
     real_fstat = os.fstat
     calls = {"count": 0}
@@ -1568,7 +1613,7 @@ def test_a_configuration_changed_during_the_copy_is_refused(
             _backup(source_database, destination, changing)
 
     assert caught.value.code is ErrorCode.BACKUP_CONFIGURATION_UNAVAILABLE
-    assert "changed while it was being copied" in caught.value.message
+    assert "changed while it was being read" in caught.value.message
 
 
 @POSIX_ONLY

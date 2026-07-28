@@ -468,13 +468,43 @@ def load_config(path: Path | None = None) -> MGOConfig:
     :func:`resolve_config_path`, honouring the ``MGO_CONFIG_PATH`` environment
     variable. A missing file raises :class:`FileNotFoundError` with the resolved
     path; there is no silent fallback to the repository default.
+
+    This is *read then parse*: the file is read into memory and handed to
+    :func:`parse_config_bytes`. Splitting it that way lets a caller that has
+    already read the bytes -- the backup tooling, which must snapshot exactly
+    the bytes it parsed -- reuse the identical parsing and validation without
+    re-reading the file or inventing a second configuration schema.
     """
     path = resolve_config_path(path)
     if not path.exists():
         raise FileNotFoundError(f"Configuration file not found: {path}")
 
     with path.open("rb") as config_file:
-        raw = tomllib.load(config_file)
+        data = config_file.read()
+
+    return parse_config_bytes(data)
+
+
+def parse_config_bytes(data: bytes) -> MGOConfig:
+    """Parse and validate configuration from raw TOML bytes.
+
+    TOML is UTF-8 by specification, which is exactly what ``tomllib.load``
+    assumes when it reads a binary file, so decoding here is equivalent to the
+    previous behaviour rather than a change to it.
+    """
+    return parse_config_text(data.decode("utf-8"))
+
+
+def parse_config_text(text: str) -> MGOConfig:
+    """Parse and validate configuration from TOML text.
+
+    The single place configuration is interpreted. :func:`load_config` reaches
+    it by reading a file; the backup tooling reaches it with bytes it has
+    already captured, so the configuration used to choose the database and the
+    configuration stored in a recovery set cannot be two different reads of a
+    file that changed in between.
+    """
+    raw = tomllib.loads(text)
 
     application_data = raw["application"]
     storage_data = raw["storage"]

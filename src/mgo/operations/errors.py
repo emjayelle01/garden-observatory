@@ -54,6 +54,14 @@ class ErrorCode(StrEnum):
     #: files may each be intact while the set as a whole cannot be restored.
     BACKUP_SET_INCOMPLETE = "BACKUP_SET_INCOMPLETE"
 
+    #: A source file was replaced, or became a symbolic link, between being
+    #: validated and being read. Deliberately distinct from
+    #: :attr:`BACKUP_SOURCE_UNAVAILABLE`: "the file I checked is not the file I
+    #: opened" is a very different incident from "the file is missing", and an
+    #: operator seeing this should look for something replacing paths rather
+    #: than for a deployment mistake.
+    BACKUP_SOURCE_IDENTITY_CHANGED = "BACKUP_SOURCE_IDENTITY_CHANGED"
+
     # --- restore verification ----------------------------------------------
     RESTORE_TEST_FAILED = "RESTORE_TEST_FAILED"
     RESTORE_TARGET_REJECTED = "RESTORE_TARGET_REJECTED"
