@@ -584,10 +584,16 @@ def test_install_script_prints_the_remediation_steps() -> None:
 
 
 def test_install_script_refuses_to_install_a_broken_unit() -> None:
-    """Detection must stop provisioning, not merely warn."""
+    """Detection must stop provisioning, not merely warn.
+
+    Task 10 made the refusal *target-specific* -- it now names whichever unit
+    is actually being installed, because ``--no-unit`` skips ``mgo.service``
+    while still installing the backup service. The guarantee asserted here is
+    unchanged: an unusable environment ends the run rather than warning.
+    """
     text = _read(INSTALL_SCRIPT)
 
-    assert 'fail "refusing to install ${service_unit}' in text
+    assert 'fail "refusing to install ${selected_target}' in text
 
     # The check has to run before the unit is written, or a broken unit would
     # already be installed by the time the problem is reported.

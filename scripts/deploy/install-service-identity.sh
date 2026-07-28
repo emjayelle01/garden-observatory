@@ -52,6 +52,11 @@ bind_port="8080"
 backup_unit="mgo-backup.service"
 backup_timer="mgo-backup.timer"
 backup_keep="14"
+# Must match MAX_RETENTION_COUNT in src/mgo/operations/backup.py. Installing a
+# unit whose --keep the Python CLI rejects would produce a service that fails
+# every single scheduled run, so the installer applies the same contract rather
+# than a weaker "is it positive?" check.
+backup_keep_max="3650"
 backup_unit_template="${script_dir}/mgo-backup.service.template"
 backup_timer_source="${script_dir}/mgo-backup.timer"
 logrotate_source="${script_dir}/garden-observatory.logrotate"
@@ -166,8 +171,12 @@ if (( install_operations )); then
   for asset in "${backup_unit_template}" "${backup_timer_source}" "${logrotate_source}"; do
     [[ -f "${asset}" ]] || fail "Operations asset not found: ${asset}"
   done
+  # Identical to the runtime contract: 1 <= keep <= backup_keep_max. No leading
+  # sign, no zero, no non-integer, no value the CLI would reject.
   [[ "${backup_keep}" =~ ^[1-9][0-9]*$ ]] \
-    || fail "--keep must be a positive integer (got '${backup_keep}')."
+    || fail "--keep must be a positive integer with no leading sign (got '${backup_keep}')."
+  (( backup_keep <= backup_keep_max )) \
+    || fail "--keep must not exceed ${backup_keep_max} (got '${backup_keep}')."
 fi
 
 printf 'MGO service identity provisioning\n'
@@ -312,6 +321,16 @@ step "Virtual environment"
 # service with status=203/EXEC. Detect that here rather than installing a unit
 # that cannot possibly start.
 #
+# Validation is TARGET-SPECIFIC, because the two units this script installs
+# execute different programs:
+#
+#   mgo.service        -> .venv/bin/uvicorn   (checked by the block below)
+#   mgo-backup.service -> .venv/bin/python    (checked by the second block)
+#
+# Checking only the uvicorn launcher was wrong once --no-unit existed: that flag
+# skips mgo.service but NOT the backup service, so a broken environment could
+# still be handed to a unit that could never start.
+#
 # The block between the markers below is self-contained: it reads only
 # ``venv_dir`` and ``venv_launcher`` and sets ``venv_problem`` to a description
 # of the first problem found (empty when the environment is usable). Keeping it
@@ -319,6 +338,7 @@ step "Virtual environment"
 
 venv_dir="${app_root}/.venv"
 venv_launcher="${venv_dir}/bin/uvicorn"
+venv_python="${venv_dir}/bin/python"
 interpreter=""
 
 # >>> venv-detection >>>
@@ -348,9 +368,39 @@ else
 fi
 # <<< venv-detection <<<
 
-if [[ -n "${venv_problem}" ]]; then
+# The backup service runs the interpreter directly (python -m ...), so it has
+# its own, simpler requirement: the interpreter must exist and be executable.
+# Kept between markers for the same reason as the block above — the tests
+# execute this logic rather than asserting on its text.
+
+# >>> python-detection >>>
+python_problem=""
+
+if [[ ! -d "${venv_dir}" ]]; then
+  python_problem="no virtual environment at ${venv_dir}"
+elif [[ ! -f "${venv_python}" ]]; then
+  python_problem="no interpreter at ${venv_python}"
+elif [[ ! -x "${venv_python}" ]]; then
+  python_problem="${venv_python} is not executable"
+fi
+# <<< python-detection <<<
+
+# Only a problem with a target that is actually being installed may stop the
+# run. Report whichever selected target is broken.
+selected_problem=""
+selected_target=""
+
+if (( install_unit )) && [[ -n "${venv_problem}" ]]; then
+  selected_problem="${venv_problem}"
+  selected_target="${service_unit} (${venv_launcher})"
+elif (( install_operations )) && [[ -n "${python_problem}" ]]; then
+  selected_problem="${python_problem}"
+  selected_target="${backup_unit} (${venv_python})"
+fi
+
+if [[ -n "${selected_problem}" ]]; then
   printf '\n'
-  warn "${venv_problem}"
+  warn "${selected_problem}"
   cat >&2 <<EOF
 
          A Python virtual environment is LOCATION-DEPENDENT. Every launcher in
@@ -373,14 +423,25 @@ EOF
   # recreated automatically: "uv sync" must run as the administrative user, and
   # silently deleting a virtual environment from a root-run installer would be
   # a surprising, unrequested action.
-  if (( install_unit )); then
-    fail "refusing to install ${service_unit} against an unusable virtual environment."
-  fi
-
-  warn "continuing only because --no-unit was given: no systemd unit will be pointed at this virtual environment."
+  #
+  # The message names the SELECTED target, so "--no-unit" no longer produces
+  # the misleading claim that nothing will reference this environment while the
+  # backup service is still about to be installed against it.
+  fail "refusing to install ${selected_target} against an unusable virtual environment."
 else
-  note "${venv_dir} belongs to this checkout"
-  note "launcher interpreter: ${interpreter}"
+  if (( install_unit || install_operations )); then
+    note "${venv_dir} belongs to this checkout"
+    (( install_unit )) && note "API launcher interpreter: ${interpreter}"
+    (( install_operations )) && note "backup interpreter: ${venv_python}"
+  else
+    # Neither systemd target is selected, so no executable is being installed.
+    # Report any problem for information and continue.
+    if [[ -n "${venv_problem}${python_problem}" ]]; then
+      warn "the virtual environment is unusable (${venv_problem:-${python_problem}}), but neither ${service_unit} nor ${backup_unit} is being installed."
+    else
+      note "${venv_dir} belongs to this checkout (no unit selected)"
+    fi
+  fi
 fi
 
 # --- 7. access verification -------------------------------------------------
@@ -589,12 +650,19 @@ if (( install_operations )); then
 
   step "Enabling the backup timer"
 
+  # Every step below is checked. Previously these ended in "|| true" and the
+  # script then announced success unconditionally, so a timer that failed to
+  # enable or start was reported as enabled and active — the operator would
+  # believe backups were scheduled when nothing was scheduled at all. A silent
+  # backup failure is the worst possible failure mode for this task, so each
+  # step now fails loudly and names itself.
   if (( dry_run )); then
-    note "[dry-run] would reload systemd, seed the timer stamp and enable ${backup_timer}"
+    note "[dry-run] would reload systemd, seed the timer stamp, enable ${backup_timer}, start it and verify both states"
   elif ! command -v systemctl >/dev/null 2>&1; then
-    warn "systemctl is unavailable; the backup timer was not enabled."
+    fail "systemctl is unavailable, so ${backup_timer} cannot be enabled. The unit files are installed but NO BACKUP IS SCHEDULED."
   else
-    systemctl daemon-reload
+    systemctl daemon-reload \
+      || fail "step 'daemon-reload' failed. The unit files are installed but ${backup_timer} is NOT scheduled."
     note "reloaded the systemd daemon"
 
     # Seed the timer's persistence stamp BEFORE enabling it. Persistent=true
@@ -603,18 +671,39 @@ if (( install_operations )); then
     # immediately. Installing a schedule must never be the thing that starts a
     # backup, so the stamp is created first, as if the timer had just run.
     if [[ ! -e "${timer_stamp}" ]]; then
-      install -d -o root -g root -m 0755 "$(dirname "${timer_stamp}")"
-      : > "${timer_stamp}"
-      chown root:root "${timer_stamp}"
-      chmod 0644 "${timer_stamp}"
+      install -d -o root -g root -m 0755 "$(dirname "${timer_stamp}")" \
+        || fail "step 'seed-stamp' failed: could not create $(dirname "${timer_stamp}")."
+      : > "${timer_stamp}" \
+        || fail "step 'seed-stamp' failed: could not write ${timer_stamp}."
+      chown root:root "${timer_stamp}" \
+        || fail "step 'seed-stamp' failed: could not set ownership on ${timer_stamp}."
+      chmod 0644 "${timer_stamp}" \
+        || fail "step 'seed-stamp' failed: could not set the mode on ${timer_stamp}."
       note "seeded ${timer_stamp} so enabling the timer triggers no catch-up run"
     else
       note "timer stamp already present — left unchanged"
     fi
 
-    systemctl enable "${backup_timer}" >/dev/null 2>&1 || true
-    systemctl start "${backup_timer}" >/dev/null 2>&1 || true
-    note "enabled and started ${backup_timer} (the backup itself was NOT run)"
+    systemctl enable "${backup_timer}" >/dev/null \
+      || fail "step 'enable' failed for ${backup_timer}. The unit files are installed but NO BACKUP IS SCHEDULED."
+    note "enabled ${backup_timer}"
+
+    systemctl start "${backup_timer}" >/dev/null \
+      || fail "step 'start' failed for ${backup_timer}. It is enabled (so it would start at the next boot) but is NOT running now."
+    note "started ${backup_timer}"
+
+    # Enabling and starting can both report success while the resulting state is
+    # not what was asked for, so the state itself is confirmed rather than
+    # inferred from the exit codes above.
+    systemctl is-enabled --quiet "${backup_timer}" \
+      || fail "step 'verify-enabled' failed: ${backup_timer} does not report itself as enabled."
+    note "verified ${backup_timer} is enabled"
+
+    systemctl is-active --quiet "${backup_timer}" \
+      || fail "step 'verify-active' failed: ${backup_timer} does not report itself as active."
+    note "verified ${backup_timer} is active"
+
+    note "${backup_timer} is enabled and active (the backup itself was NOT run)"
   fi
 else
   step "Operations units"

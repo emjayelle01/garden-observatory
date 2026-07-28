@@ -32,7 +32,8 @@ from mgo.core.config import (
     SYSTEM_LOG_DIRECTORY,
     SYSTEM_STATE_DIRECTORY,
 )
-from mgo.operations.backup import DEFAULT_RETENTION_COUNT
+from mgo.operations.backup import DEFAULT_RETENTION_COUNT, MAX_RETENTION_COUNT
+from mgo.operations.errors import OperationError
 
 DEPLOY = PROJECT_ROOT / "scripts" / "deploy"
 OPERATIONS = PROJECT_ROOT / "scripts" / "operations"
@@ -592,7 +593,10 @@ def test_the_installer_supports_dry_run_for_the_new_work() -> None:
         "[dry-run] would write %s" in text
     )
     assert "[dry-run] would install %s -> %s" in text
-    assert "would reload systemd, seed the timer stamp and enable" in text
+    assert (
+        "would reload systemd, seed the timer stamp, enable" in text
+        and "verify both states" in text
+    )
 
 
 def test_the_installer_never_restarts_the_api_for_operations_work() -> None:
@@ -831,6 +835,369 @@ def test_every_tracked_script_is_executable_in_git() -> None:
 
     for path, mode in modes.items():
         assert mode == "100755", f"{path} is {mode}, expected 100755"
+
+
+# --- regression: target-specific virtual-environment validation --------------
+#
+# The installer originally failed a broken virtual environment only when the API
+# unit was selected. Once Task 10 could install mgo-backup.service, "--no-unit"
+# skipped mgo.service while still installing a backup service against an
+# unusable interpreter. Validation is now per-target, and the tests below run
+# the REAL bash logic rather than asserting on its text.
+
+PYTHON_DETECTION_START = "# >>> python-detection >>>"
+PYTHON_DETECTION_END = "# <<< python-detection <<<"
+
+#: Fixture builders for the interpreter check. Each is bash populating "$root".
+PYTHON_SCENARIOS: dict[str, str] = {
+    "missing_venv": "",
+    "missing_python": 'mkdir -p "$root/.venv/bin"',
+    "python_not_executable": (
+        # Not a shebang file: MSYS2 treats any "#!" file as executable
+        # regardless of its mode, so a plain file is the only portable way to
+        # exercise this branch.
+        'mkdir -p "$root/.venv/bin"\n'
+        'printf \'interpreter\\n\' > "$root/.venv/bin/python"\n'
+        'chmod 644 "$root/.venv/bin/python"'
+    ),
+    "healthy": (
+        'mkdir -p "$root/.venv/bin"\n'
+        'printf \'#!/bin/sh\\n\' > "$root/.venv/bin/python"\n'
+        'chmod 755 "$root/.venv/bin/python"'
+    ),
+}
+
+
+def _find_bash() -> str | None:
+    """Locate bash, including a Git Bash not on ``PATH``.
+
+    Mirrors the helper in ``tests/test_service_identity.py``: on this Windows
+    box bash ships with Git but is usually not on ``PATH``, and skipping would
+    mean never running these tests on the platform they are written on.
+    """
+    found = shutil.which("bash")
+    if found is not None:
+        return found
+
+    git = shutil.which("git")
+    if git is None:  # pragma: no cover - git is present wherever this repo is
+        return None
+
+    git_root = Path(git).resolve().parent.parent
+    for candidate in (
+        git_root / "bin" / "bash.exe",
+        git_root / "usr" / "bin" / "bash.exe",
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    return None  # pragma: no cover - Git without bash is not a supported setup
+
+
+def _python_detection_block() -> str:
+    """Extract the self-contained interpreter check from the install script."""
+    text = _read(INSTALL_SCRIPT)
+    _, start, remainder = text.partition(PYTHON_DETECTION_START)
+    block, end, _ = remainder.partition(PYTHON_DETECTION_END)
+
+    assert start, f"{PYTHON_DETECTION_START} marker is missing"
+    assert end, f"{PYTHON_DETECTION_END} marker is missing"
+    return block
+
+
+def _detect_python(scenario: str) -> str:
+    """Run the real interpreter-detection logic and return its verdict."""
+    program = "\n".join(
+        (
+            "set -u",
+            'root="$(mktemp -d)"',
+            PYTHON_SCENARIOS[scenario],
+            'venv_dir="$root/.venv"',
+            'venv_python="$root/.venv/bin/python"',
+            _python_detection_block(),
+            'printf \'%s\' "$python_problem"',
+            'rm -rf "$root"',
+        )
+    )
+    bash = _find_bash()
+    if bash is None:  # pragma: no cover - bash is present on Windows and the Pi
+        pytest.skip("bash is unavailable")
+
+    completed = subprocess.run(
+        [bash, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout.strip()
+
+
+def test_the_backup_service_interpreter_is_validated() -> None:
+    """The backup service runs python directly, so python is what is checked."""
+    assert "no virtual environment at" in _detect_python("missing_venv")
+    assert "no interpreter at" in _detect_python("missing_python")
+    assert "is not executable" in _detect_python("python_not_executable")
+
+
+def test_a_healthy_interpreter_is_accepted() -> None:
+    """A usable interpreter must not be reported as a problem."""
+    assert _detect_python("healthy") == ""
+
+
+def test_the_installer_validates_the_executable_each_target_uses() -> None:
+    """The API unit runs uvicorn; the backup unit runs python."""
+    text = _read(INSTALL_SCRIPT)
+
+    assert 'venv_launcher="${venv_dir}/bin/uvicorn"' in text
+    assert 'venv_python="${venv_dir}/bin/python"' in text
+    # The backup unit's ExecStart must use the interpreter that is validated.
+    assert "/.venv/bin/python -m mgo.operations.backup_cli" in _read(BACKUP_UNIT)
+
+
+@pytest.mark.parametrize(
+    ("install_unit", "install_operations", "should_fail"),
+    [
+        (1, 1, True),   # default: both targets selected
+        (0, 1, True),   # --no-unit: the backup service is still selected
+        (1, 0, True),   # --no-operations: the API service is still selected
+        (0, 0, False),  # neither: no systemd executable is being installed
+    ],
+    ids=["default", "no-unit", "no-operations", "no-unit-no-operations"],
+)
+def test_flag_combinations_decide_whether_a_broken_venv_is_fatal(
+    install_unit: int, install_operations: int, should_fail: bool
+) -> None:
+    """The selection logic, executed rather than asserted on as text.
+
+    ``--no-unit`` must still fail: it skips ``mgo.service`` but Task 10 would
+    otherwise install ``mgo-backup.service`` against the same broken
+    environment.
+    """
+    text = _read(INSTALL_SCRIPT)
+    _, _, remainder = text.partition(PYTHON_DETECTION_END)
+    selection, _, _ = remainder.partition('if [[ -n "${selected_problem}" ]]')
+    assert "selected_problem=" in selection
+
+    program = "\n".join(
+        (
+            "set -u",
+            f"install_unit={install_unit}",
+            f"install_operations={install_operations}",
+            'venv_problem="uvicorn is broken"',
+            'python_problem="python is broken"',
+            'service_unit="mgo.service"',
+            'backup_unit="mgo-backup.service"',
+            'venv_launcher="/opt/app/.venv/bin/uvicorn"',
+            'venv_python="/opt/app/.venv/bin/python"',
+            selection,
+            'printf \'%s|%s\' "${selected_problem}" "${selected_target}"',
+        )
+    )
+    bash = _find_bash()
+    if bash is None:  # pragma: no cover
+        pytest.skip("bash is unavailable")
+
+    completed = subprocess.run(
+        [bash, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    problem, _, target = completed.stdout.partition("|")
+
+    if should_fail:
+        assert problem, "a selected target with a broken environment must fail"
+        assert target
+    else:
+        assert problem == ""
+
+
+def test_no_unit_no_longer_claims_nothing_will_use_the_environment() -> None:
+    """The old message was untrue once the backup service existed."""
+    text = _read(INSTALL_SCRIPT)
+
+    assert "no systemd unit will be pointed at this virtual environment" not in text
+    assert 'fail "refusing to install ${selected_target}' in text
+
+
+# --- regression: installer retention validation ------------------------------
+
+
+def test_the_installer_shares_the_runtime_retention_bound() -> None:
+    """One documented maximum, not two that agree by luck."""
+    text = _read(INSTALL_SCRIPT)
+
+    assert f'backup_keep_max="{MAX_RETENTION_COUNT}"' in text
+    assert "(( backup_keep <= backup_keep_max ))" in text
+
+
+def _installer_accepts_keep(keep: str) -> bool:
+    """Run the installer's real ``--keep`` guards against a candidate value."""
+    text = _read(INSTALL_SCRIPT)
+    bash = _find_bash()
+    if bash is None:  # pragma: no cover
+        pytest.skip("bash is unavailable")
+
+    # The guards are lifted verbatim from the installer, and their presence is
+    # asserted, so this test cannot drift away from the script it describes.
+    assert '[[ "${backup_keep}" =~ ^[1-9][0-9]*$ ]]' in text
+    assert "(( backup_keep <= backup_keep_max ))" in text
+
+    program = "\n".join(
+        (
+            "set -u",
+            f'backup_keep="{keep}"',
+            f'backup_keep_max="{MAX_RETENTION_COUNT}"',
+            '[[ "${backup_keep}" =~ ^[1-9][0-9]*$ ]] || exit 1',
+            "(( backup_keep <= backup_keep_max )) || exit 1",
+            "exit 0",
+        )
+    )
+    completed = subprocess.run(
+        [bash, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def _python_accepts_keep(keep: str) -> bool:
+    """Run the runtime retention validation against the same candidate."""
+    from mgo.operations.backup import _validated_keep
+
+    try:
+        _validated_keep(int(keep))
+    except (ValueError, OperationError):
+        return False
+    return True
+
+
+@pytest.mark.parametrize(
+    "keep", ["0", "3651", "-1", "1.5", "abc", "", "999999"]
+)
+def test_the_installer_rejects_every_unusable_retention_value(keep: str) -> None:
+    """Installing a unit that fails every scheduled run helps nobody."""
+    assert not _installer_accepts_keep(keep)
+
+
+@pytest.mark.parametrize("keep", ["1", "14", "3650"])
+def test_the_installer_accepts_the_documented_retention_range(keep: str) -> None:
+    """The boundary values named in the operations policy."""
+    assert _installer_accepts_keep(keep)
+    assert _python_accepts_keep(keep)
+
+
+@pytest.mark.parametrize(
+    "keep",
+    ["0", "1", "14", "3650", "3651", "-1", "+5", "07", "1.5", "abc", "", "999999"],
+)
+def test_the_installer_never_accepts_what_the_runtime_would_reject(
+    keep: str,
+) -> None:
+    """The invariant that actually matters, in the direction that matters.
+
+    The installer writes a ``--keep`` into a unit file that the Python CLI then
+    parses on every scheduled run, so the installer accepting something Python
+    rejects would produce a service guaranteed to fail nightly. The reverse is
+    harmless: the installer refuses ``+5`` and ``07`` where ``int()`` would
+    coerce them, and being stricter than the runtime costs nothing.
+    """
+    if _installer_accepts_keep(keep):
+        assert _python_accepts_keep(keep), (
+            f"the installer accepts {keep!r} but the runtime rejects it"
+        )
+
+
+# --- regression: timer activation truthfulness -------------------------------
+#
+# Every timer step originally ended in "|| true" and the script then announced
+# success unconditionally, so a timer that failed to enable was reported as
+# enabled. A silently unscheduled backup is the worst failure this task has.
+
+
+def test_no_timer_operation_is_allowed_to_fail_silently() -> None:
+    """No ``|| true`` may guard a Task 10 timer command."""
+    text = _read(INSTALL_SCRIPT)
+    operations_section = text.partition("step \"Enabling the backup timer\"")[2]
+
+    assert operations_section, "the timer section should exist"
+    for line in operations_section.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if "systemctl" in stripped and "backup_timer" in stripped:
+            assert "|| true" not in stripped, stripped
+
+
+@pytest.mark.parametrize(
+    "step",
+    ["daemon-reload", "enable", "start", "verify-enabled", "verify-active"],
+)
+def test_every_timer_step_can_fail_the_installer(step: str) -> None:
+    """Each step names itself in a failure message and exits non-zero."""
+    text = _read(INSTALL_SCRIPT)
+
+    assert f"step '{step}' failed" in text, step
+
+
+def test_the_timer_state_is_verified_not_inferred() -> None:
+    """enable/start can both succeed while the state is not what was asked."""
+    text = _read(INSTALL_SCRIPT)
+
+    assert 'systemctl is-enabled --quiet "${backup_timer}"' in text
+    assert 'systemctl is-active --quiet "${backup_timer}"' in text
+    # Verification must come after the actions it verifies.
+    assert text.index('systemctl start "${backup_timer}"') < text.index(
+        'systemctl is-active --quiet "${backup_timer}"'
+    )
+
+
+def test_success_is_only_claimed_after_every_check() -> None:
+    """The old code printed "enabled and started" regardless of the outcome."""
+    text = _read(INSTALL_SCRIPT)
+
+    assert 'note "enabled and started ${backup_timer}' not in text
+    claim = 'note "${backup_timer} is enabled and active'
+    assert claim in text
+    assert text.index('systemctl is-active --quiet "${backup_timer}"') < text.index(
+        claim
+    )
+
+
+def test_a_missing_systemctl_is_a_failure_not_a_warning() -> None:
+    """Files installed with no scheduler is not a successful installation."""
+    text = _read(INSTALL_SCRIPT)
+
+    assert (
+        'fail "systemctl is unavailable, so ${backup_timer} cannot be enabled'
+        in text
+    )
+    assert "NO BACKUP IS SCHEDULED" in text
+
+
+def test_a_failed_activation_does_not_run_the_backup_or_touch_the_api() -> None:
+    """A failure path must not escalate into starting or restarting anything.
+
+    Assertions are on the commands the section *runs*, not on the operator
+    guidance it prints: the closing summary legitimately tells the operator to
+    restart the service themselves.
+    """
+    text = _read(INSTALL_SCRIPT)
+    section = text.partition('step "Enabling the backup timer"')[2]
+    commands = "\n".join(
+        line
+        for line in _code(section).splitlines()
+        if not line.strip().startswith(("note ", "printf ", "warn ", "fail "))
+    )
+
+    assert 'systemctl start "${backup_unit}"' not in commands
+    assert "systemctl restart" not in commands
+    assert "backup_cli" not in commands
 
 
 # --- generated artefacts stay untracked -------------------------------------
