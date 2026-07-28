@@ -514,9 +514,17 @@ contention — check for a second instance of the service.
 
 Implemented here is the database **foundation** only.
 
+**Backup and restore were delivered later, by Task 10.** See
+[`Operations.md`](Operations.md): a consistent online backup taken while the API
+keeps serving, a JSON manifest, checksum verification, isolated restore testing,
+bounded retention and a daily timer. Production *restore* remains deliberately
+manual — `restore-test` proves recoverability, and restoring over the live
+database is an explicit operator procedure. Nothing in that tooling changes the
+schema, the migration files or any row: the backup reads through SQLite's
+`mode=ro` URI, so it cannot modify, checkpoint or vacuum this database.
+
 Not implemented, and not claimed to be:
 
-- **backup and restore** — no script, no tooling, nothing tested;
 - full `integrity_check` diagnostics, `VACUUM`, or any repair capability;
 - retention or deletion of old rows;
 - media reconciliation between the `captures` table and files on disk;

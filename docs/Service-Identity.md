@@ -354,7 +354,37 @@ bash /opt/garden-observatory/scripts/deploy/update-main.sh
 
 ---
 
-## 10. Scope
+## 10. Operations units added later
+
+Task 10 added operations provisioning **without changing anything above**. The
+`mgo.service` template is byte-for-byte unchanged: its identity, camera access,
+restart policy, boot behaviour and sandbox already satisfied the requirement, so
+it was not edited, and the API needs no restart to adopt Task 10.
+
+What the installer now also provisions:
+
+| Item | Detail |
+| ---- | ------ |
+| `/var/backups/garden-observatory` | `mgo:mgo 0750`. Outside the state tree, so a backup is not lost to the same accident as the original. |
+| `mgo-backup.service` | One-shot, `mgo:mgo`, no capabilities, `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateDevices=yes` (it needs no camera), `RestrictAddressFamilies=AF_UNIX`. Never starts, stops or requires `mgo.service`. |
+| `mgo-backup.timer` | Daily 02:30 local, `Persistent=true`, 30-minute randomised delay. |
+| `/etc/logrotate.d/garden-observatory` | Rotates only MGO-owned `*.log` files. Does not rotate the journal. |
+
+The backup unit's `ReadWritePaths` includes the **database directory** as well
+as the backup root. That is required, not incidental: SQLite needs shared-memory
+access to read a WAL database, so the directory must be writable even for a
+read-only reader. It grants filesystem write access, not database write access.
+
+Verify the operations provisioning with its own read-only script:
+
+```bash
+bash scripts/deploy/verify-operations.sh
+```
+
+See [`Operations.md`](Operations.md) for the full architecture, including why no
+worker unit exists yet.
+
+## 11. Scope
 
 Out of scope for this foundation, and deliberately unchanged:
 

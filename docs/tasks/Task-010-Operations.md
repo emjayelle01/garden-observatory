@@ -2,11 +2,58 @@
 
 ## Status
 
-**Definition. Implementation follows in separate commits on
-`task-010-operations`.**
+**Implemented on `task-010-operations`. Awaiting review and Raspberry Pi
+validation.**
 
-No pull request is opened, nothing is merged, and no Raspberry Pi is accessed by
-this task.
+| Gate | Outcome |
+| ---- | ------- |
+| Architecture review | Complete |
+| Implementation | Complete |
+| Local static and automated validation | Passed |
+| Raspberry Pi validation | **Not performed** — procedure prepared for Matthew |
+
+Delivered as decided below:
+
+- `src/mgo/operations/` — `errors.py`, `events.py`, `locking.py`, `backup.py`,
+  `backup_cli.py`, `support_bundle.py`, `support_bundle_cli.py`;
+- `SYSTEM_BACKUP_DIRECTORY` in `mgo.core.config`;
+- `scripts/operations/backup-database.sh`,
+  `scripts/operations/create-support-bundle.sh`;
+- `scripts/deploy/mgo-backup.service.template`,
+  `scripts/deploy/mgo-backup.timer`,
+  `scripts/deploy/garden-observatory.logrotate`,
+  `scripts/deploy/verify-operations.sh`;
+- installer integration in `scripts/deploy/install-service-identity.sh`;
+- `docs/Operations.md`, plus `README.md`, `scripts/README.md`,
+  `docs/Service-Identity.md` and `docs/Database.md` updates;
+- 262 added tests across `tests/test_operations_events.py`,
+  `tests/test_operations_backup.py`, `tests/test_operations_support_bundle.py`
+  and `tests/test_operations_deployment.py`.
+
+`scripts/deploy/mgo.service.template` is **byte-for-byte unchanged**, asserted
+by a test that diffs it against `main`. No dependency was added; `pyproject.toml`
+and `uv.lock` are unchanged. No migration, no configuration field, no API
+endpoint and no dashboard change.
+
+Validation on the development workstation: `ruff` passed, `mypy src` passed (47
+source files), `pytest` 891 passed / 4 skipped (baseline 633 + 262 added). The
+four skips are POSIX mode-bit and symlink-creation assertions that cannot be
+made on Windows.
+
+Two real defects were found and fixed during implementation, both caused by
+Windows resolving a rooted POSIX path against the current drive:
+
+- the `restore-test` protected-location guard compared `/var/lib/...` against a
+  resolved path carrying a drive letter, so it never matched and the guard was
+  inert wherever the tests run. Comparison is now drive-agnostic;
+- the SQLite backup destination inherited WAL from the copied header, leaving
+  `-wal`/`-shm` sidecars, so the single published file was an incomplete
+  database whose checksum described only part of its contents. The copy is now
+  collapsed with `journal_mode=DELETE`, and a test asserts the sidecars are
+  absent.
+
+No pull request is opened, nothing is merged, and no Raspberry Pi was accessed.
+No Task 11 or Task 12 work has been started.
 
 ## Authoritative definition
 
