@@ -2,20 +2,24 @@
 
 ## Status
 
-**Implementation complete; repository corrections in progress.**
+**Implementation complete; final source-identity hardening in progress.**
 
 A repository review of the five implementation commits found nine genuine
 defects — one requirement omitted outright, several checks that were weaker
 than they appeared, and three places where a failure was reported as a
-success. They are recorded in [§ Repository review](#repository-review) below
-and corrected in commits after `a5c9776`.
+success. They are recorded in [§ Repository review](#repository-review) and
+were corrected in commits after `a5c9776`.
+
+A final re-review then found one further class of problem — source *identity*
+— recorded in [§ Final re-review](#final-re-review) and corrected in commits
+after `a020f83`.
 
 | Gate | Outcome |
 | ---- | ------- |
 | Architecture review | Complete |
 | Implementation | Complete |
-| Repository review | Complete — nine findings |
-| Corrections | Complete, **awaiting re-review** |
+| Repository review | Complete — nine findings, corrected |
+| Final re-review | Complete — source-identity findings, corrected |
 | Local static and automated validation | Passed |
 | Raspberry Pi validation | **Not performed** — procedure prepared for Matthew |
 
@@ -24,8 +28,9 @@ passed review.
 
 Delivered as decided below:
 
-- `src/mgo/operations/` — `errors.py`, `events.py`, `locking.py`, `backup.py`,
-  `backup_cli.py`, `support_bundle.py`, `support_bundle_cli.py`;
+- `src/mgo/operations/` — `errors.py`, `events.py`, `locking.py`,
+  `source_identity.py`, `backup.py`, `backup_cli.py`, `support_bundle.py`,
+  `support_bundle_cli.py`;
 - `SYSTEM_BACKUP_DIRECTORY` in `mgo.core.config`;
 - `scripts/operations/backup-database.sh`,
   `scripts/operations/create-support-bundle.sh`;
@@ -36,10 +41,11 @@ Delivered as decided below:
 - installer integration in `scripts/deploy/install-service-identity.sh`;
 - `docs/Operations.md`, plus `README.md`, `scripts/README.md`,
   `docs/Service-Identity.md` and `docs/Database.md` updates;
-- 460 added tests across `tests/test_operations_events.py`,
-  `tests/test_operations_backup.py`, `tests/test_operations_support_bundle.py`
-  and `tests/test_operations_deployment.py` (262 with the implementation, 198
-  more with the corrections below).
+- 497 added tests across `tests/test_operations_events.py`,
+  `tests/test_operations_backup.py`, `tests/test_operations_support_bundle.py`,
+  `tests/test_operations_deployment.py` and
+  `tests/test_operations_source_identity.py` (262 with the implementation, 198
+  with the repository corrections, 37 with the source-identity hardening).
 
 `scripts/deploy/mgo.service.template` is **byte-for-byte unchanged**, asserted
 by a test that diffs it against `main`. No dependency was added; `pyproject.toml`
@@ -47,9 +53,9 @@ and `uv.lock` are unchanged. No migration, no configuration field, no API
 endpoint and no dashboard change.
 
 Validation on the development workstation after the corrections: `ruff` passed,
-`mypy src` passed (47 source files), `pytest` **1084 passed / 9 skipped**
-(baseline 633 + 460 added). Every skip is a POSIX mode-bit or symlink-creation
-assertion that cannot be made on Windows.
+`mypy src` passed (48 source files), `pytest` **1119 passed / 11 skipped**
+(baseline 633 + 497 added). Every skip is a POSIX mode-bit, POSIX-behaviour or
+symlink-creation assertion that cannot be made on Windows.
 
 Two real defects were found and fixed during implementation, both caused by
 Windows resolving a rooted POSIX path against the current drive:
@@ -168,6 +174,69 @@ walk, or looped forever.
 
 **Corrected.** Bounded iterative traversal that never descends a symlink and
 reports truncation.
+
+## Final re-review
+
+One further class of defect, found after the nine above were corrected. All
+three instances share a root cause: **trusting a path across two operations**.
+
+### 10. Symlink refusal was check-then-open
+
+Both the configuration and the database were guarded like this:
+
+```python
+if path.is_symlink():
+    raise ...
+handle = path.open("rb")
+```
+
+That is correct for a path that does not change, and only for that. Between the
+check and the open, a path can be replaced — what was validated as a regular
+file can be opened as a symlink pointing somewhere else entirely. This is the
+classic check-to-open (TOCTOU) gap.
+
+The `fstat` added in the previous round did **not** close it. `fstat` proves the
+*opened object* is a regular file; it says nothing about whether a symlink was
+followed to reach it. Two different questions, and only one was being asked.
+
+**Corrected.** Refusal now happens at the open itself — `O_NOFOLLOW` on Linux —
+and the object opened is proven to still be the object the path names.
+
+### 11. The configuration was read twice
+
+The configuration was parsed once to resolve the database path, and then opened
+again later to be copied into the recovery set. A concurrent administrative
+replacement between those two reads would have produced a set pairing a database
+chosen from **one** configuration version with bytes from **another** — a
+recovery set describing a pairing that never existed, and one that would look
+perfectly consistent to every verification check, because each file is
+individually valid.
+
+**Corrected.** The configuration is read exactly once into an immutable
+snapshot; the bytes are authoritative for the whole run.
+
+### 12. The database had the same identity gap
+
+Between validation and SQLite's own open, the database path could be repointed.
+SQLite opens **by name**, so the tooling cannot simply hand it a descriptor.
+
+**Corrected.** An identity anchor is opened first and held across the connect —
+holding it is what prevents the inode being recycled — and the path is
+re-verified immediately afterwards, before a page is copied.
+
+### What was deliberately not done
+
+- **`immutable=1`** was rejected as a way to sidestep the database race: the
+  production database is live and carries WAL state, so telling SQLite it cannot
+  change would produce an *inconsistent* read rather than a safe one.
+- **A `/proc/self/fd` URI** was rejected: it would need proof that WAL sidecars
+  stay correctly associated, that committed WAL data is still included, and that
+  the source stays read-only. The identity-anchor design achieves the same
+  guarantee without that burden of proof.
+- **The Linux guarantee was not weakened** to make Windows tests convenient.
+  Windows has no `O_NOFOLLOW`, so its fallback *detects* a substitution rather
+  than *preventing* it. That difference is documented in the module and asserted
+  by a test, rather than glossed over.
 
 ## Authoritative definition
 

@@ -253,6 +253,12 @@ that binds them. The manifest is written last and is the completion marker.
 Verification compares every recorded value against the artefact it describes,
 and the newest 14 complete sets are retained.
 
+The configuration is read **once** per run, and those exact bytes both select
+the database and become the stored snapshot — so a set can never describe a
+pairing that did not happen. Symlinked sources are refused by the kernel at the
+open itself on Linux, and the database opened by SQLite is proven to be the one
+that was validated.
+
 > The configuration snapshot may contain credentials. It lives only in
 > `/var/backups/garden-observatory` (`mgo:mgo 0750`, files `0640`) and is
 > **never** included in a support bundle.

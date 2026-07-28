@@ -525,6 +525,14 @@ procedure. Nothing in that tooling changes the schema, the migration files or an
 row: the backup reads through SQLite's `mode=ro` URI, so it cannot modify,
 checkpoint or vacuum this database.
 
+The database it reads is also proven to be the database it validated. SQLite
+opens by name, so the backup holds an identity anchor (`O_NOFOLLOW` on Linux)
+across SQLite's own open and re-checks the path afterwards; a substitution in
+that window fails the run before anything is published. `immutable=1` is
+deliberately **not** used — this database is live and carries WAL state, and
+asserting that it cannot change would produce an inconsistent read rather than a
+safe one.
+
 Not implemented, and not claimed to be:
 
 - full `integrity_check` diagnostics, `VACUUM`, or any repair capability;

@@ -113,9 +113,56 @@ The application's existing resolution rules, and no others:
 3. the tracked development default.
 
 The scheduled backup unit sets both `MGO_CONFIG_PATH` and `--config`, so in
-production this is always `/etc/garden-observatory/mgo.toml`. One answer serves
-both purposes — locating the database and choosing the configuration — so a set
-can never pair a database with a configuration that does not belong to it.
+production this is always `/etc/garden-observatory/mgo.toml`.
+
+#### It is read exactly once
+
+The configuration is read **once per run**, and those exact bytes are
+authoritative for everything that follows:
+
+```text
+read the file once, securely
+        │
+        ├─ parse it  ──► the database path this run backs up
+        │
+        └─ store it  ──► the configuration snapshot in the recovery set
+```
+
+This matters because the two used to be separate reads — parse the file to find
+the database, open it again later to snapshot it. An administrator replacing the
+configuration between those reads would have produced a set pairing a database
+chosen from *one* version with bytes from *another*. Every file in that set
+would be individually valid and every checksum would match, so nothing would
+have detected it; the set would simply describe a pairing that never existed.
+
+Because the bytes are the authority, editing the live configuration after a
+backup has begun cannot change what that backup contains.
+
+The configuration must also be **loadable**: a recovery set exists to restore a
+working system, so one containing a configuration the application cannot parse
+would not be a recovery. A parse failure fails the backup, and the error
+deliberately does not quote the offending line — that line may be the one
+holding a secret.
+
+#### Secure reading
+
+Opening is race-resistant, not merely checked:
+
+- on **Linux** the kernel refuses to open a symbolic link at all (`O_NOFOLLOW`).
+  There is deliberately no fallback to following the link afterwards — retrying
+  without the flag would reinstate exactly the hole it closes;
+- the file is validated through its own **descriptor**, and the path is then
+  re-examined to prove it still names that same object (`st_dev`, `st_ino`);
+- on **Windows** — the development machine only — `O_NOFOLLOW` does not exist,
+  so the fallback uses `lstat` before the open, `fstat` on the descriptor and
+  `lstat` afterwards. A substitution is therefore **detected** on Windows rather
+  than **prevented**. The Linux guarantee was not weakened to make the tests
+  convenient; the difference is stated here and asserted by a test.
+
+A plain `path.is_symlink()` followed by `path.open()` is *not* equivalent. It is
+correct only for a path that does not change, and `fstat` does not rescue it:
+`fstat` proves the opened object is a regular file, not that no symlink was
+followed to reach it.
 
 #### Safety and secrecy
 
@@ -176,6 +223,37 @@ The whole copy is taken in a single step rather than incrementally: the
 observation database is small, one step gives the strongest consistency
 guarantee, and it removes any possibility of a busy writer restarting the copy
 repeatedly.
+
+### 3.1.1 The database that is opened is the one that was validated
+
+SQLite opens the database **by name**, so a path validated a moment earlier
+could in principle be repointed before SQLite gets to it. Validating and then
+opening is two operations on a path that anything with write access to the
+directory could change in between.
+
+The backup therefore holds an **identity anchor**:
+
+1. the database is opened with `O_NOFOLLOW` and its `(device, inode)` recorded;
+2. that descriptor is **held open** while SQLite connects — holding it is the
+   load-bearing part, because it stops the kernel recycling that inode and so
+   keeps the comparison meaningful;
+3. once SQLite has opened the path, the path is re-examined and must still name
+   the anchored file;
+4. only then is a single page copied.
+
+A mismatch fails with `BACKUP_SOURCE_IDENTITY_CHANGED` and publishes nothing.
+That code is deliberately distinct from `BACKUP_SOURCE_UNAVAILABLE`: "the file I
+checked is not the file I opened" is a very different incident from "the file is
+missing", and an operator seeing it should be looking for something replacing
+paths rather than for a deployment mistake.
+
+**`immutable=1` is deliberately not used** to sidestep this. It would tell
+SQLite the file cannot change, which is false for a live database carrying WAL
+state, and would produce an inconsistent read rather than a safe one. A
+`/proc/self/fd` URI was also rejected: it would require proving that WAL
+sidecars stay correctly associated, that committed WAL data is still included
+and that the source stays read-only, and the anchor achieves the same guarantee
+without that.
 
 ### 3.2 The backup is a single self-contained file
 
@@ -423,6 +501,28 @@ scripts/operations/backup-database.sh backup
 ```
 
 No step in the normal backup procedure requires stopping `mgo.service`.
+
+The summary reports which configuration decided what was backed up:
+
+```json
+"database_source": "configuration"
+```
+
+#### `--database` is a deliberate override
+
+```bash
+scripts/operations/backup-database.sh backup --database /some/other/mgo.db
+```
+
+The recovery set still contains the selected configuration, but that
+configuration is **not** what chose the database in this mode. The summary says
+so (`"database_source": "explicit_override"`) and a warning event is emitted, so
+nothing claims a pairing that did not happen.
+
+Use it when you genuinely mean to back up a database other than the configured
+one — recovering a copy set aside during an incident, for example. In that mode
+the set's configuration documents the deployment, not the origin of the
+database beside it.
 
 ### 5.2 List backups
 
@@ -884,8 +984,9 @@ is the contract; the message is the explanation.
 | `BACKUP_RETENTION_FAILED` | Expired sets could not be removed. |
 | `BACKUP_CHECKSUM_MISMATCH` | Size or SHA-256 disagrees with the manifest. |
 | `BACKUP_NOT_FOUND` | The named backup or directory does not exist. |
-| `BACKUP_CONFIGURATION_UNAVAILABLE` | The configuration is missing, not a regular file, a symlink, unreadable, over 1 MiB, or changed mid-copy. |
+| `BACKUP_CONFIGURATION_UNAVAILABLE` | The configuration is missing, not a regular file, a symlink, unreadable, over 1 MiB, unparseable, changed mid-read, or replaced while being read. |
 | `BACKUP_SET_INCOMPLETE` | The three files are not all present, or do not describe each other. |
+| `BACKUP_SOURCE_IDENTITY_CHANGED` | The database was replaced, or became a symlink, between validation and SQLite's open of it. Nothing was published. |
 | `RESTORE_TEST_FAILED` | The restored copy did not pass its checks. |
 | `RESTORE_TARGET_REJECTED` | A production data location was named as a target. |
 | `RESTORE_TARGET_EXISTS` | A restore-test target file already exists; it is never overwritten. |
@@ -1242,6 +1343,80 @@ Both must exit `0`. In the restore-test output confirm `set_verified`,
 `restored_configuration` and `row_counts` are all `ok`, and that **nothing
 reports `skipped`**.
 
+### 13.6a Source-identity checks
+
+These prove the hardening works on the Pi. **Both negative tests use temporary
+files created outside the production locations** — the production database and
+the production configuration are never replaced, moved or symlinked.
+
+First confirm the normal cases already passed (§13.6): a real production
+configuration was accepted, a live WAL database backed up, the snapshot matches
+the live configuration checksum, and the database verifies. Then:
+
+```bash
+sudo -u mgo mkdir -p /tmp/mgo-identity && sudo -u mgo cp /etc/garden-observatory/mgo.toml /tmp/mgo-identity/real.toml
+```
+
+```bash
+sudo -u mgo ln -s /tmp/mgo-identity/real.toml /tmp/mgo-identity/linked.toml
+```
+
+```bash
+sudo -u mgo /opt/garden-observatory/scripts/operations/backup-database.sh backup --config /tmp/mgo-identity/linked.toml --output-directory /tmp/mgo-identity/out
+```
+
+Must exit non-zero with `BACKUP_CONFIGURATION_UNAVAILABLE` and the message
+naming a symbolic link.
+
+```bash
+sudo -u mgo cp /var/backups/garden-observatory/<backup>.db /tmp/mgo-identity/real.db && sudo -u mgo ln -s /tmp/mgo-identity/real.db /tmp/mgo-identity/linked.db
+```
+
+```bash
+sudo -u mgo /opt/garden-observatory/scripts/operations/backup-database.sh backup --database /tmp/mgo-identity/linked.db --output-directory /tmp/mgo-identity/out
+```
+
+Must exit non-zero with `BACKUP_SOURCE_UNAVAILABLE`.
+
+**Confirm neither negative test published anything:**
+
+```bash
+sudo ls -la /tmp/mgo-identity/out 2>/dev/null; echo "exit: $?"
+```
+
+The directory must be absent or empty — no `.db`, no `.config.toml`, no
+`.manifest.json`, no temporary file.
+
+**Confirm the production locations are untouched** and the API never noticed:
+
+```bash
+sudo sha256sum /etc/garden-observatory/mgo.toml /var/lib/garden-observatory/db/mgo.db
+```
+
+```bash
+systemctl is-active mgo.service
+```
+
+Both hashes must match §13.2 / §13.3a, and the service must still be `active`.
+
+```bash
+sudo rm -rf /tmp/mgo-identity
+```
+
+**Confirm the override is labelled honestly.** Take one deliberate
+override backup into a temporary directory and read its summary:
+
+```bash
+sudo -u mgo /opt/garden-observatory/scripts/operations/backup-database.sh backup --database /var/lib/garden-observatory/db/mgo.db --output-directory /tmp/mgo-override
+```
+
+The summary must report `"database_source": "explicit_override"` and the journal
+must carry a `backup.database_overridden` warning. Then:
+
+```bash
+sudo rm -rf /tmp/mgo-override
+```
+
 ### 13.7 Confirm production data is untouched
 
 ```bash
@@ -1536,7 +1711,8 @@ deletes backups is precisely the thing that must not exist.
 | `BACKUP_SCHEMA_INCOMPATIBLE` | The database records a newer schema than this build supports — the checkout is older than the data. Update the application. |
 | `BACKUP_CHECKSUM_MISMATCH` on verify | The backup changed since it was written; suspect SD-card bit rot. Verify the other backups and replace the card if more than one is affected. |
 | `BACKUP_RETENTION_FAILED` | The new backup succeeded; old sets could not be removed. Check ownership in the backup directory — the directory will otherwise keep growing. |
-| `BACKUP_CONFIGURATION_UNAVAILABLE` | The selected configuration is missing, a symlink, over 1 MiB, or was edited while the backup ran. Check `MGO_CONFIG_PATH` and the unit's `--config`; re-run once any edit has settled. |
+| `BACKUP_CONFIGURATION_UNAVAILABLE` | The selected configuration is missing, a symlink, over 1 MiB, not loadable, or was edited while the backup ran. Check `MGO_CONFIG_PATH` and the unit's `--config`; re-run once any edit has settled. |
+| `BACKUP_SOURCE_IDENTITY_CHANGED` | The database path was repointed while the backup was opening it. Nothing was published. Investigate what is replacing files under `/var/lib/garden-observatory/db` — this is not an ordinary deployment error. |
 | `BACKUP_SET_INCOMPLETE` | A recovery set is missing one of its three files, or the manifest describes a different set. Run `list` to see which orphans exist; the set is not restorable. |
 | `RESTORE_TARGET_EXISTS` | The `--work-directory` already holds `restored.db` or `restored-mgo.toml`. Choose an empty directory; the test never overwrites. |
 | Installer fails on `--keep` | The value is outside `1..3650`. The bound matches the runtime, so a rejected value would have failed every scheduled run. |
@@ -1564,7 +1740,12 @@ deletes backups is precisely the thing that must not exist.
   explicit timeout and bounded captured output.
 - No archive member may be absolute, contain `..` or be a symlink.
 - A symlinked source database **or configuration** is refused outright, with no
-  override.
+  override — refused by the kernel at the open on Linux (`O_NOFOLLOW`), not by a
+  check that a later open could race.
+- Both sources are proven, after opening, to still be the object the path names.
+  The database's identity is held across SQLite's own open of it.
+- The configuration is read once; the bytes stored in a recovery set are the
+  bytes that chose the database it sits beside.
 - Storage aggregation never descends a symlinked directory and never stat-s a
   symlink's target.
 - `restore-test` refuses to write into the production database directory or the
