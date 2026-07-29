@@ -1751,6 +1751,8 @@ LOGROTATE_STAGING_START = "# >>> logrotate-staging >>>"
 LOGROTATE_STAGING_END = "# <<< logrotate-staging <<<"
 MANAGED_FILE_START = "# >>> managed-file >>>"
 MANAGED_FILE_END = "# <<< managed-file <<<"
+RUN_HELPER_START = "# >>> run-helper >>>"
+RUN_HELPER_END = "# <<< run-helper <<<"
 
 
 def _marked_block(text: str, start: str, end: str) -> str:
@@ -1777,6 +1779,16 @@ def _managed_file_block() -> str:
     )
 
 
+def _run_helper_block() -> str:
+    """The dry-run-aware command runner, verbatim.
+
+    Extracted rather than reimplemented: ``install_managed_file`` backs up an
+    existing destination through it, so a test that stubbed it could not prove
+    the real backup failure path.
+    """
+    return _marked_block(_read(INSTALL_SCRIPT), RUN_HELPER_START, RUN_HELPER_END)
+
+
 def _bash_path(path: Path) -> str:
     """Render a path the way MSYS bash accepts it on either platform."""
     return str(path).replace("\\", "/")
@@ -1790,13 +1802,21 @@ def _run_logrotate_staging(
     dry_run: int = 0,
     as_root: bool = True,
     install_fails: bool = False,
+    real_helper: bool = False,
+    destination_install_fails: bool = False,
 ) -> tuple[int, dict[str, list[str]], str]:
     """Execute the real staging block against recording stubs.
 
     Everything the block touches is stubbed at the shell level -- ``note``,
-    ``warn``, ``fail``, ``install_managed_file``, ``install``, ``logrotate``,
-    ``id`` and, where needed, ``command`` -- so the test observes exactly which
-    paths were handed to which operation.
+    ``warn``, ``fail``, ``install``, ``logrotate``, ``id`` and, where needed,
+    ``command`` -- so the test observes exactly which paths were handed to which
+    operation.
+
+    ``real_helper`` swaps the ``install_managed_file`` stub for the real
+    extracted implementation, so an end-to-end run exercises staging,
+    validation, installation and cleanup as one piece. The ``install`` double
+    then distinguishes the two call sites by destination: the staging copy
+    succeeds, and the managed destination can be made to fail.
     """
     bash = _find_bash()
     if bash is None:  # pragma: no cover - bash is present on Windows and the Pi
@@ -1824,26 +1844,42 @@ def _run_logrotate_staging(
         'note() { printf "NOTE %s\\n" "$*" >> "$record"; }',
         'warn() { printf "WARN %s\\n" "$*" >> "$record"; }',
         'fail() { printf "FAIL %s\\n" "$*" >> "$record"; exit 1; }',
-        (
+        # id -u decides whether the root ownership flags are requested.
+        f'id() {{ if [ "${{1:-}}" = "-u" ]; then printf "{uid}"; '
+        'else builtin command id "$@"; fi; }',
+    ]
+
+    if real_helper:
+        # The real helper, so a failure inside it has to propagate for real.
+        stubs.extend([_run_helper_block(), _managed_file_block()])
+    else:
+        stubs.append(
             "install_managed_file() { "
             'printf "MANAGED_SOURCE %s\\n" "$1" >> "$record"; '
             'printf "MANAGED_DEST %s\\n" "$2" >> "$record"; '
             'printf "MANAGED_MODE %s\\n" "$3" >> "$record"; '
             'printf "MANAGED_DISPLAY %s\\n" "${5:-$1}" >> "$record"; '
             f"return {install_status}; }}"
-        ),
-        # id -u decides whether the root ownership flags are requested.
-        f'id() {{ if [ "${{1:-}}" = "-u" ]; then printf "{uid}"; '
-        'else builtin command id "$@"; fi; }',
-        # Record the exact argument vector, then really create the file so the
-        # rest of the block behaves as it would in production.
-        (
-            "install() { "
-            'printf "INSTALL_ARGS %s\\n" "$*" >> "$record"; '
-            'printf "STAGED_PATH %s\\n" "${@: -1}" >> "$record"; '
-            'builtin command install -m 0644 "${@: -2:1}" "${@: -1}"; }'
-        ),
-    ]
+        )
+
+    # Record the exact argument vector, then really create the file so the rest
+    # of the block behaves as it would in production. The staging copy and the
+    # managed destination are told apart by their target.
+    destination_branch = (
+        f'if [ "${{@: -1}}" = "{destination}" ]; then '
+        'printf "DESTINATION_INSTALL_ATTEMPTED\\n" >> "$record"; return 1; fi; '
+        if destination_install_fails
+        else ""
+    )
+    stubs.append(
+        "install() { "
+        'printf "INSTALL_ARGS %s\\n" "$*" >> "$record"; '
+        'printf "INSTALL_TARGET %s\\n" "${@: -1}" >> "$record"; '
+        f"{destination_branch}"
+        f'if [ "${{@: -1}}" != "{destination}" ]; then '
+        'printf "STAGED_PATH %s\\n" "${@: -1}" >> "$record"; fi; '
+        'builtin command install -m 0644 "${@: -2:1}" "${@: -1}"; }'
+    )
 
     if logrotate_available:
         stubs.append(
@@ -2050,6 +2086,57 @@ def test_a_missing_logrotate_still_installs_the_staged_policy(
     assert entries["STAGING_DIR_REMAINS"] == ["no"]
 
 
+def test_the_whole_staging_flow_fails_when_the_destination_install_fails(
+    tmp_path: Path,
+) -> None:
+    """Staging, validation, real helper and cleanup, exercised as one piece.
+
+    This is the end-to-end version of the finding: everything up to the
+    destination write succeeds, the write fails, and the run must still fail.
+    A stubbed helper could not prove this.
+    """
+    status, entries, _ = _run_logrotate_staging(
+        tmp_path, real_helper=True, destination_install_fails=True
+    )
+
+    # Staging succeeded and validation ran against the staged copy.
+    staged = entries["STAGED_PATH"][0]
+    assert staged.startswith("/tmp/mgo-logrotate-")
+    assert entries["LOGROTATE_ARG"] == [staged]
+    assert any("parses cleanly" in note for note in entries["NOTE"])
+
+    # The destination write was attempted, and failed.
+    assert "DESTINATION_INSTALL_ATTEMPTED" in entries
+    assert entries["INSTALL_TARGET"][-1].endswith(
+        "/etc/logrotate.d/garden-observatory"
+    )
+
+    # The failure reached the caller rather than being announced as success.
+    assert status == 1
+    assert not any("installed" in note for note in entries["NOTE"])
+    assert any("could not install the logrotate policy" in f for f in entries["FAIL"])
+
+    # And the staging directory still went away.
+    assert entries["STAGING_DIR_REMAINS"] == ["no"]
+    assert entries["STAGED_REMAINS"] == ["no"]
+
+
+def test_the_whole_staging_flow_succeeds_through_the_real_helper(
+    tmp_path: Path,
+) -> None:
+    """The same wiring with nothing failing, so the failure test means something."""
+    status, entries, _ = _run_logrotate_staging(tmp_path, real_helper=True)
+
+    assert status == 0
+    assert "DESTINATION_INSTALL_ATTEMPTED" not in entries
+    assert any("installed" in note for note in entries["NOTE"])
+    # The staged copy is what reached the destination.
+    assert entries["INSTALL_ARGS"][-1].endswith(
+        f"{entries['STAGED_PATH'][0]} {entries['INSTALL_TARGET'][-1]}"
+    )
+    assert entries["STAGING_DIR_REMAINS"] == ["no"]
+
+
 def test_every_staging_step_is_explicitly_checked(tmp_path: Path) -> None:
     """Fail-closed: no required operation may be allowed to fail quietly."""
     block = _logrotate_block()
@@ -2182,6 +2269,187 @@ def test_the_reported_path_defaults_to_the_installed_path(
 
     assert "source.conf ->" in without
     assert "/tracked/policy ->" in with_display
+
+
+# --- regression: a failure inside the helper must reach the caller -----------
+#
+# The staged-policy caller is written as
+#
+#     install_managed_file ... || fail "could not install the logrotate policy."
+#
+# and bash suppresses errexit for the WHOLE BODY of a function called on the
+# left of "||". So a failing "install" inside the helper did not stop it: control
+# fell through to the "installed ..." note, the note succeeded, the function
+# returned zero, and the "|| fail" never ran. The installer would have announced
+# a policy it had not written.
+#
+# The previous coverage could not have caught this. It replaced
+# install_managed_file with a stub that returned the requested status, which
+# proves the CALLER reacts to a non-zero return but says nothing about whether a
+# failure inside the REAL helper produces one. These tests run the real helper.
+
+
+def _run_real_managed_file(
+    tmp_path: Path,
+    *,
+    install_fails: bool = False,
+    backup_fails: bool = False,
+    existing: str | None = None,
+    dry_run: int = 0,
+) -> tuple[int, str, str]:
+    """Run the real helper in the exact ``helper || fail`` context."""
+    bash = _find_bash()
+    if bash is None:  # pragma: no cover
+        pytest.skip("bash is unavailable")
+
+    root = _bash_path(tmp_path)
+    source = f"{root}/source.conf"
+    destination = f"{root}/dest/garden-observatory"
+
+    lines = [
+        "set -euo pipefail",
+        f'mkdir -p "{root}/dest"',
+        f'printf "policy-v2\\n" > "{source}"',
+        f"dry_run={dry_run}",
+        'note() { printf "NOTE %s\\n" "$*"; }',
+        'fail() { printf "FAIL %s\\n" "$*"; exit 1; }',
+    ]
+    if existing is not None:
+        lines.append(f'printf "{existing}\\n" > "{destination}"')
+
+    if install_fails:
+        lines.append('install() { printf "INSTALL-ATTEMPTED\\n"; return 1; }')
+    else:
+        lines.append(
+            'install() { builtin command install -m "${@: -3:1}" '
+            '"${@: -2:1}" "${@: -1}"; }'
+        )
+
+    if backup_fails:
+        lines.append('cp() { printf "BACKUP-ATTEMPTED\\n"; return 1; }')
+
+    lines.extend(
+        [
+            _run_helper_block(),
+            _managed_file_block(),
+            f'install_managed_file "{source}" "{destination}" 0644 '
+            '"logrotate policy" \\',
+            '  || fail "could not install the logrotate policy."',
+            'printf "REACHED-END\\n"',
+        ]
+    )
+
+    completed = subprocess.run(
+        [bash, "-c", "\n".join(lines)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    return completed.returncode, completed.stdout, completed.stderr
+
+
+def test_a_failed_destination_install_reaches_the_caller(
+    tmp_path: Path,
+) -> None:
+    """The defect itself, against the real helper in the real call shape."""
+    status, output, _ = _run_real_managed_file(tmp_path, install_fails=True)
+
+    assert status == 1
+    assert "INSTALL-ATTEMPTED" in output
+    assert "NOTE installed" not in output, "success was announced after a failure"
+    assert "FAIL could not install the logrotate policy." in output
+    assert "REACHED-END" not in output
+    assert not (tmp_path / "dest" / "garden-observatory").exists()
+
+
+def test_a_failed_destination_backup_reaches_the_caller(
+    tmp_path: Path,
+) -> None:
+    """A lost backup is a lost local edit, so it must stop the replacement."""
+    status, output, _ = _run_real_managed_file(
+        tmp_path, backup_fails=True, existing="locally-edited"
+    )
+
+    assert status == 1
+    assert "BACKUP-ATTEMPTED" in output
+    assert "NOTE backed up" not in output
+    assert "NOTE installed" not in output, "the destination must not be replaced"
+    assert "FAIL could not install the logrotate policy." in output
+    assert "REACHED-END" not in output
+    # The operator's edit is still there, untouched.
+    assert (tmp_path / "dest" / "garden-observatory").read_text(
+        encoding="utf-8"
+    ).strip() == "locally-edited"
+
+
+def test_the_helper_still_succeeds_when_nothing_fails(tmp_path: Path) -> None:
+    """The corrections must not have made the success path fail closed too."""
+    status, output, _ = _run_real_managed_file(tmp_path)
+
+    assert status == 0
+    assert "NOTE installed" in output
+    assert "REACHED-END" in output
+    assert (tmp_path / "dest" / "garden-observatory").is_file()
+
+
+def test_a_dry_run_through_the_real_helper_still_succeeds(
+    tmp_path: Path,
+) -> None:
+    """--dry-run writes nothing, so it cannot fail on a write."""
+    status, output, _ = _run_real_managed_file(tmp_path, dry_run=1)
+
+    assert status == 0
+    assert "would install" in output
+    assert "REACHED-END" in output
+    assert not (tmp_path / "dest" / "garden-observatory").exists()
+
+
+def test_errexit_does_not_protect_a_helper_called_in_an_or_list() -> None:
+    """The bash behaviour behind the finding, pinned so it cannot be forgotten.
+
+    This documents *why* the explicit ``|| return 1`` lines exist. It is
+    supplementary: the production proof is the real-helper tests above.
+    """
+    bash = _find_bash()
+    if bash is None:  # pragma: no cover
+        pytest.skip("bash is unavailable")
+
+    program = "\n".join(
+        (
+            "set -euo pipefail",
+            "helper() { false; printf 'CONTINUED\\n'; }",
+            "helper || printf 'HANDLER\\n'",
+            "printf 'END\\n'",
+        )
+    )
+    completed = subprocess.run(
+        [bash, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    # errexit did not stop the function, and the handler never ran.
+    assert completed.returncode == 0
+    assert "CONTINUED" in completed.stdout
+    assert "HANDLER" not in completed.stdout
+    assert "END" in completed.stdout
+
+
+def test_every_mutating_step_in_the_helper_returns_on_failure() -> None:
+    """Structural guard: the explicit returns are what make the above work."""
+    block = _managed_file_block()
+
+    assert 'run cp -a "${destination}" "${backup}" \\\n      || return 1' in block
+    assert (
+        'install -o root -g root -m "${mode}" "${source}" "${destination}" \\\n'
+        "      || return 1" in block
+    )
+    # Each success note comes only after its guarded command.
+    assert block.index("|| return 1") < block.index('note "backed up')
+    assert block.rindex("|| return 1") < block.index('note "installed')
 
 
 # --- regression: pre-merge validation removes what it installed --------------

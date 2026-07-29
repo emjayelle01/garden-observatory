@@ -2,7 +2,8 @@
 
 ## Status
 
-**Implementation complete; logrotate validation correction in progress.**
+**Implementation complete; managed-file failure-propagation correction in
+progress.**
 
 A repository review of the five implementation commits found nine genuine
 defects — one requirement omitted outright, several checks that were weaker
@@ -46,6 +47,11 @@ the installer — where it stopped again, on a check that could never have
 succeeded. Recorded in
 [§ Logrotate validation review](#logrotate-validation-review) and corrected in a
 commit after `0227458`.
+
+Review of that correction accepted the staged-policy architecture but found its
+failure path was not fail-closed. Recorded in
+[§ Managed-file failure-propagation review](#managed-file-failure-propagation-review)
+and corrected in a commit after `5adace7`.
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -819,6 +825,115 @@ Writing them also caught a defect in one of my own stubs: the fake `install`
 indexed its arguments from the left, so it silently wrote nothing. The
 filesystem assertions failed and exposed it; the stub now takes mode, source and
 destination from the end of the argument vector, where they always are.
+
+## Managed-file failure-propagation review
+
+The staged-policy architecture from finding 21 was **accepted**: the private
+unpredictable staging directory, the safe staged metadata, the staged file being
+what logrotate validates, the same staged bytes reaching installation, the
+subshell-local `EXIT` trap, the non-root dry-run behaviour and the refusal of a
+malformed policy all stand unchanged.
+
+Its failure path did not.
+
+### 22. The staged installer's outer failure handler suppressed errexit inside the managed-file helper
+
+The staged-policy function calls:
+
+```bash
+install_managed_file "${staged}" "${logrotate_destination}" \
+  0644 "logrotate policy" "${logrotate_source}" \
+  || fail "could not install the logrotate policy."
+```
+
+That `|| fail` looks like the careful thing to write. It is what made the
+problem invisible.
+
+**Bash suppresses `errexit` for the entire body of a function invoked on the
+left of `||`.** So inside the helper:
+
+```bash
+install -o root -g root -m "${mode}" "${source}" "${destination}"
+note "installed ${destination} (root:root ${mode})"
+```
+
+a failing `install` did **not** stop the function. Execution fell through to
+`note`, `note` succeeded, and because a function returns the status of its last
+command the helper returned **zero**. The `|| fail` was never entered, the
+installer carried on, and it had just printed `installed …` for a file it had
+not written.
+
+The destination backup had the identical shape and the identical exposure:
+
+```bash
+run cp -a "${destination}" "${backup}"
+note "backed up the existing ${label} to ${backup}"
+```
+
+A failed backup would have been announced as a success and then followed by the
+overwrite it was supposed to protect — losing an operator's local edit and
+reporting that it had been preserved.
+
+Demonstrated rather than assumed:
+
+```bash
+set -euo pipefail
+helper() { false; printf 'CONTINUED\n'; }
+helper || printf 'HANDLER\n'
+printf 'END\n'
+```
+
+prints `CONTINUED` and `END`, never `HANDLER`, and exits `0`.
+
+### The previous test could not have caught it
+
+The staging harness replaced `install_managed_file` with a stub that returned
+the requested status directly. That proves the **caller** reacts to a non-zero
+return; it says nothing about whether a failure inside the **real** helper ever
+produces one. The stub was standing exactly where the defect was. That is a
+coverage defect in its own right, and it is why the new tests run the real
+extracted helper.
+
+**Corrected.** Every mutating command in the helper now propagates explicitly:
+
+```bash
+run cp -a "${destination}" "${backup}" \
+  || return 1
+note "backed up the existing ${label} to ${backup}"
+```
+
+```bash
+install -o root -g root -m "${mode}" "${source}" "${destination}" \
+  || return 1
+note "installed ${destination} (root:root ${mode})"
+```
+
+Each success note is now reachable only after the command it describes has
+succeeded. `set -e` is no longer the sole protection anywhere in this path — and
+this fixes the timer installation through the same helper too, which had the
+same latent exposure.
+
+### How this was confirmed
+
+The regression tests execute the **real** `install_managed_file`, extracted with
+markers, in the real `helper || fail` call shape, with the underlying `install`
+or `cp` made to fail. One end-to-end test wires the real staging block to the
+real helper with a command double that lets the staging copy succeed and makes
+the destination write fail, distinguishing the two by target.
+
+Six mutations, each reverted byte-for-byte afterwards:
+
+| Mutation | Tests failed |
+| -------- | ------------ |
+| Destination `install` unguarded | 3 |
+| Destination backup unguarded | 2 |
+| `installed` note moved before the install | 3 |
+| `backed up` note moved before the backup | 2 |
+| Install the source instead of the staged copy | 4 |
+| Remove the staging cleanup | 7 |
+
+**Pi validation has not resumed** and is not claimed. It must restart from
+repository preflight once this correction is reviewed and a new SHA approved.
 
 ## Authoritative definition
 

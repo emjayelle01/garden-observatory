@@ -138,6 +138,7 @@ warn()  { printf 'WARNING: %s\n' "$*" >&2; }
 fail()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 # Run a mutating command, or describe it under --dry-run.
+# >>> run-helper >>>
 run() {
   if (( dry_run )); then
     printf '  [dry-run] %s\n' "$*"
@@ -145,6 +146,7 @@ run() {
     "$@"
   fi
 }
+# <<< run-helper <<<
 
 # Run a command as the runtime account. Used for read-only access probes.
 as_service_user() {
@@ -572,6 +574,14 @@ fi
 # they would edit, not a temporary path that will not exist a moment later.
 # Every other caller omits it and reports the file it installs.
 # >>> managed-file >>>
+#
+# Every mutating command below returns explicitly on failure. That is NOT
+# belt-and-braces over "set -e": one caller invokes this function as
+# "install_managed_file ... || fail ...", and bash suppresses errexit for the
+# whole body of a function called on the left of "||". Without the explicit
+# returns, a failed "install" would fall through to the "installed ..." note,
+# the note would succeed, the function would return zero, the "|| fail" would
+# never run -- and the installer would report a policy it had not written.
 install_managed_file() {
   local source="$1" destination="$2" mode="$3" label="$4"
   local display="${5:-$1}"
@@ -583,7 +593,10 @@ install_managed_file() {
 
   if [[ -f "${destination}" ]]; then
     local backup="${destination}.bak-$(date +%Y%m%d%H%M%S)"
-    run cp -a "${destination}" "${backup}"
+    # A lost backup is a lost local edit, so a failure here stops the
+    # replacement rather than proceeding to overwrite it.
+    run cp -a "${destination}" "${backup}" \
+      || return 1
     note "backed up the existing ${label} to ${backup}"
   fi
 
@@ -591,7 +604,8 @@ install_managed_file() {
     printf '  [dry-run] would install %s -> %s (root:root %s)\n' \
       "${display}" "${destination}" "${mode}"
   else
-    install -o root -g root -m "${mode}" "${source}" "${destination}"
+    install -o root -g root -m "${mode}" "${source}" "${destination}" \
+      || return 1
     note "installed ${destination} (root:root ${mode})"
   fi
 }
