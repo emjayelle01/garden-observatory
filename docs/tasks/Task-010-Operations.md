@@ -2,7 +2,7 @@
 
 ## Status
 
-**Direct Pi validation complete; final hardware-findings correction in
+**Direct Pi validation complete; logrotate verifier privilege correction in
 progress.**
 
 A repository review of the five implementation commits found nine genuine
@@ -71,13 +71,18 @@ revalidation.
 | Identity-ordering review | Complete — three findings, corrected |
 | Local static and automated validation | Passed |
 | Raspberry Pi implementation validation | **Complete** at `4e1e5d38ab0189b62d0763c0b1301b142d7151a6` |
-| Focused Pi revalidation of the `177f4a9` correction | **Pending** repository approval and SHA authorisation |
+| Focused Pi validation — bytecode cleanup (finding 23) | **Complete** at `fb36a718413efdd976597d5b3a29aed1448d2c9d` |
+| Focused Pi validation — wrapper help (finding 25) | **Complete** at `fb36a718413efdd976597d5b3a29aed1448d2c9d` |
+| Focused Pi validation — operations verifier (finding 24) | **Incomplete** at `fb36a718413efdd976597d5b3a29aed1448d2c9d` — discovery passed, parse probe failed unprivileged |
+| Focused Pi revalidation of the verifier privilege correction | **Pending** repository review and SHA approval |
 
-The operations implementation has passed direct Raspberry Pi validation.
-Pull-request readiness is **not** claimed until the final hardware-findings
-correction has passed focused Pi revalidation. The two are deliberately
-separate: what is validated is the implementation; what is not yet revalidated
-is the cleanup and reporting correction built on top of it.
+The operations implementation has passed direct Raspberry Pi validation, and
+findings 23 and 25 have passed focused revalidation on hardware. Pull-request
+readiness is **not** claimed until the logrotate verifier privilege correction
+has also passed focused Pi revalidation. The distinction is deliberate: what is
+validated is the implementation and two of the three hardware-finding
+corrections; what is not yet revalidated is the verifier change built on top of
+them.
 
 Delivered as decided below:
 
@@ -110,7 +115,7 @@ and `uv.lock` are unchanged. No migration, no configuration field, no API
 endpoint and no dashboard change.
 
 Validation on the development workstation after the corrections: `ruff` passed,
-`mypy src` passed (48 source files), `pytest` **1316 passed / 12 skipped**.
+`mypy src` passed (48 source files), `pytest` **1327 passed / 12 skipped**.
 Every skip is a POSIX mode-bit, POSIX-behaviour or symlink-creation assertion
 that cannot be made on Windows; on the Raspberry Pi they run, which is why the
 Linux total is correspondingly higher.
@@ -1051,11 +1056,85 @@ imports.
   changed, and `list --config` deliberately remains an error rather than being
   made valid to retrofit the old wording.
 
+## Logrotate verifier privilege review
+
+Focused Raspberry Pi revalidation at `fb36a718413efdd976597d5b3a29aed1448d2c9d`
+passed its gates — `uv sync`, Ruff, mypy (48 source files) and pytest
+(**1328 passed, 0 failed, 0 skipped**) — and proved findings 23 and 25 on
+hardware: generated Task 10 bytecode was removed before the checkout, tracked
+source remained intact, `src/mgo/operations` was absent on `main`, path-scoped
+ignored Git status was empty, `find_spec("mgo.operations")` returned `None`, the
+wrapper help carried command-specific sections, and `list --config` remained an
+exit-2 usage error.
+
+Finding 24 did not pass.
+
+### 26. The unprivileged verifier treated logrotate's required credential switch as invalid policy
+
+1. Finding 24's **executable discovery worked**. The search order — `PATH`, then
+   `/usr/sbin/logrotate`, then `/sbin/logrotate` — did its job.
+2. `/usr/sbin/logrotate` was found on the Pi with `/usr/sbin` absent from the
+   `claude` account's `PATH` (`/usr/local/bin:/usr/bin:/bin:/usr/games`).
+3. The false **"logrotate is not installed on this host"** wording was gone, and
+   the caller's `PATH` was unchanged before and after.
+4. The installed policy contains the **required** `su mgo mgo`. It is not
+   optional: `/var/log/garden-observatory` is `mgo:mgo 0750`, so logrotate must
+   drop to the service account to act on it.
+5. **`logrotate --debug` still performs that credential switch.** `--debug`
+   suppresses the *rotation*, not the privilege change.
+6. An unprivileged operator cannot switch euid/egid to `mgo`:
+   ```text
+   switching euid from 1001 to 999 and egid from 1001 to 984 (pid 10141)
+   error: error switching euid from 1001 to 999 and egid from 1001 to 984: Operation not permitted
+   ```
+7. The resulting non-zero status **does not prove invalid syntax**. It proves
+   only that the caller lacked privilege, and the verifier reported it as
+   `FAIL logrotate cannot parse /etc/logrotate.d/garden-observatory` — failing on
+   a correctly provisioned host.
+8. The installer had **already validated the same policy successfully as root**,
+   printing `the tracked logrotate policy parses cleanly` minutes earlier in the
+   same session. The syntax was never in doubt.
+9. The verifier's own header promises: *"Some probes need root; without it they
+   are reported as SKIP rather than failing."* This probe broke that contract.
+10. Root execution must still **fail** on a genuine parse error. The fix is a
+    privilege boundary, not a blanket amnesty.
+
+Before the discovery fix this was invisible: `command -v logrotate` failed, the
+probe was skipped, and the verifier passed. Correcting discovery made a
+previously unreachable check reachable — and it could not pass. **Fixing a
+discovery bug can unmask an unsatisfiable check hiding behind it.**
+
+### How this was corrected
+
+The privilege decision is made **before** invocation, from the effective UID and
+the known policy contract:
+
+```text
+no executable found      -> SKIP, naming the searched locations
+effective UID is not 0   -> SKIP, naming the executable, root, and su mgo mgo
+otherwise                -> run logrotate --debug; 0 is PASS, non-zero is FAIL
+```
+
+Deciding afterwards, by matching logrotate's stderr for `Operation not
+permitted`, was rejected: it cannot distinguish a privilege failure from a
+syntax error that happens to mention permissions, and it would let a real defect
+through on the strength of a message. A regression test pins that — a root run
+returning non-zero fails regardless of what it printed.
+
+The parse probe is supplemental. Every structural check still runs unprivileged
+with unchanged meaning, and a missing or wrong `su` directive is still a `FAIL`
+even when the probe is skipped — the privilege skip must not conceal a
+policy-structure defect. The verifier gained no `sudo`, `su`, `runuser`,
+`setpriv` or capability: an operator who wants the probe runs the whole
+read-only script under sudo.
+
 ### What this correction does and does not claim
 
-The operations implementation is validated on hardware. **This correction is
-not**: the bytecode cleanup, the corrected logrotate discovery and the
-corrected help all await focused Pi revalidation. The cleanup procedure must not
+The operations implementation is validated on hardware, and focused revalidation
+has since confirmed the bytecode cleanup and the corrected wrapper help — see
+[§ Logrotate verifier privilege review](#logrotate-verifier-privilege-review).
+The logrotate discovery fix is confirmed too; only its parse probe failed, and
+the correction for that **awaits focused Pi revalidation**. The verifier must not
 be described as fully corrected until that revalidation passes.
 
 ## Authoritative definition

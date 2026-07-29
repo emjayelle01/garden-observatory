@@ -15,9 +15,16 @@ fault is diagnosed without attaching a monitor and keyboard to the Raspberry Pi.
 > ignored Task 10 bytecode survived the return to `main` ([§13.14](#1314-pre-merge-operational-cleanup)),
 > the operations verifier mistook an unprivileged `PATH` omission for an absent
 > logrotate installation, and the backup wrapper's help described
-> command-specific arguments as common options. All three are corrected here.
-> **That correction itself awaits focused Pi revalidation** — the operations
-> implementation is validated, the corrected cleanup procedure is not yet.
+> command-specific arguments as common options.
+>
+> Focused revalidation then **passed the bytecode cleanup and the wrapper help**
+> on hardware, and passed the logrotate *discovery* fix — but exposed that the
+> newly reachable parse probe cannot succeed unprivileged, because the policy's
+> required `su mgo mgo` makes `logrotate --debug` attempt a credential switch.
+> The verifier now skips that one probe truthfully unless it is running as root
+> ([§12.1](#121-every-structural-check-runs-unprivileged)). **That correction
+> awaits focused Pi revalidation** — the operations implementation is validated;
+> this verifier change is not yet.
 
 ## 1. Scope
 
@@ -1189,9 +1196,81 @@ information and cross-checks that `mgo.service` is still active as `mgo`.
 It never takes a backup, never forces a rotation, never enables anything and
 never repairs a failed check.
 
+### 12.1 Every structural check runs unprivileged
+
+Run both scripts as your ordinary administrative account. All the checks listed
+above are structural — they read metadata and file content — and none of them
+needs root.
+
+There is exactly **one** exception, and it is worth understanding rather than
+working around.
+
+To locate logrotate the verifier searches `PATH`, then `/usr/sbin/logrotate`,
+then `/sbin/logrotate`, and invokes whichever it finds by its full path. That
+fallback matters because logrotate lives in `/usr/sbin` on Debian, which is not
+on an unprivileged account's `PATH`. The verifier never modifies `PATH`.
+
+Having found it, the verifier would like to ask `logrotate --debug` whether the
+installed policy parses. It cannot, unprivileged. The policy contains:
+
+```text
+su mgo mgo
+```
+
+which is **required** — the log directory is `mgo:mgo 0750`, so logrotate has to
+drop to the service account to act on it. logrotate performs that credential
+switch even under `--debug`, and an ordinary account cannot switch its effective
+UID and GID to `mgo`. A perfectly valid policy therefore exits non-zero with:
+
+```text
+error switching euid from 1001 to 999 ...: Operation not permitted
+```
+
+So an unprivileged run reports that one probe as a `SKIP`:
+
+```text
+SKIP  logrotate found at /usr/sbin/logrotate; parse check skipped because the
+      policy uses su mgo mgo and credential switching requires root
+```
+
+**That `SKIP` does not mean logrotate is missing, and it does not mean the policy
+is invalid.** It means one optional probe needs privilege the caller does not
+have. The verifier still exits `0` when every structural check passes.
+
+To run the optional probe as well, run the whole read-only verifier under sudo:
+
+```bash
+sudo bash scripts/deploy/verify-operations.sh
+```
+
+Then the parse check executes, and a genuine syntax error is a real `FAIL` — the
+skip applies to the privilege case only, never to a policy that truly does not
+parse. **The verifier itself never escalates**: it contains no `sudo`, `su`,
+`runuser` or `setpriv`, so it stays safe to run from anywhere and its behaviour
+never depends on ambient privilege it acquired for itself.
+
+In practice the parse result is already known regardless: the installer
+validates a staged root-owned copy of the policy *before* installing it and
+refuses to install one that does not parse, so a policy that reached
+`/etc/logrotate.d/` has been parsed by logrotate as root at least once.
+
 ## 13. Raspberry Pi validation
 
-**Not yet performed.** Run this on the Pi, in order, and record the results.
+**Performed and passed** at `4e1e5d38ab0189b62d0763c0b1301b142d7151a6`; focused
+revalidation of the later corrections is in progress. Run this on the Pi, in
+order, and record the results.
+
+When running §12's operations verifier as the unprivileged operator, the run is
+**successful** when every required structural check passes, the logrotate parse
+probe is the single `SKIP`, and the verifier exits `0`. That one skip is
+expected and is not a defect. Where a root-privileged installer run is available,
+record its
+
+```text
+the tracked logrotate policy parses cleanly
+```
+
+line separately — that, not the verifier, is the proof that the policy parsed.
 
 ### 13.1 Start from a clean tree
 

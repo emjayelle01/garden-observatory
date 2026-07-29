@@ -3547,15 +3547,41 @@ def test_an_unexpected_cache_file_is_preserved_and_stops_the_cleanup(
 
 LOGROTATE_DISCOVERY_START = "# >>> logrotate-discovery >>>"
 LOGROTATE_DISCOVERY_END = "# <<< logrotate-discovery <<<"
+LOGROTATE_PARSE_START = "# >>> logrotate-parse >>>"
+LOGROTATE_PARSE_END = "# <<< logrotate-parse <<<"
+LOGROTATE_SU_START = "# >>> logrotate-su-check >>>"
+LOGROTATE_SU_END = "# <<< logrotate-su-check <<<"
+
+#: The production call site: the real effective UID, not a value tests can set.
+PRODUCTION_PARSE_CALL = (
+    'verify_logrotate_parse "${logrotate_bin}" "${logrotate_path}" "${EUID}"'
+)
+
+#: The three facts the unprivileged skip must state.
+PRIVILEGE_SKIP_FACTS = ("logrotate found at", "requires root", "su mgo mgo")
 
 CANONICAL_LOGROTATE = ("/usr/sbin/logrotate", "/sbin/logrotate")
 DISCOVERY_SKIP = "no logrotate executable found in PATH, /usr/sbin or /sbin"
 
 
 def _logrotate_discovery_block() -> str:
-    """The executable discovery and parse check, verbatim."""
+    """The executable discovery loop, verbatim."""
     return _marked_block(
         _read(VERIFY_OPERATIONS), LOGROTATE_DISCOVERY_START, LOGROTATE_DISCOVERY_END
+    )
+
+
+def _logrotate_parse_block() -> str:
+    """The privilege-gated parse helper, verbatim."""
+    return _marked_block(
+        _read(VERIFY_OPERATIONS), LOGROTATE_PARSE_START, LOGROTATE_PARSE_END
+    )
+
+
+def _logrotate_su_block() -> str:
+    """The static ``su`` directive check, verbatim."""
+    return _marked_block(
+        _read(VERIFY_OPERATIONS), LOGROTATE_SU_START, LOGROTATE_SU_END
     )
 
 
@@ -3616,8 +3642,15 @@ def _run_logrotate_discovery(
     at_usr_sbin: bool = False,
     at_sbin: bool = False,
     parses: bool = True,
+    effective_uid: str = "1001",
 ) -> str:
-    """Run the real discovery logic against controlled stub locations."""
+    """Run the real discovery and parse logic against controlled stubs.
+
+    ``effective_uid`` is what makes both branches reachable from an ordinary
+    test process. Production passes bash's own ``$EUID``; the harness passes a
+    value, so the root branch can be exercised without the runner being root
+    and the non-root branch without pretending to drop privilege.
+    """
     bash = _find_bash()
     if bash is None:  # pragma: no cover - bash is present on Windows and the Pi
         pytest.skip("bash is unavailable")
@@ -3647,6 +3680,8 @@ def _run_logrotate_discovery(
             'pass() { printf "PASS %s\\n" "$*"; }',
             'fail() { printf "FAIL %s\\n" "$*"; }',
             'skip() { printf "SKIP %s\\n" "$*"; }',
+            'service_user="mgo"',
+            'service_group="mgo"',
             f'logrotate_path="{policy.as_posix()}"',
             # Bash searches PATH itself, and MSYS bash needs a POSIX entry to
             # do it -- a "C:/..." element is honoured by -x but not by the PATH
@@ -3656,6 +3691,9 @@ def _run_logrotate_discovery(
             "export PATH",
             'printf "PATH_BEFORE=%s\\n" "$PATH"',
             block,
+            _logrotate_parse_block(),
+            f'verify_logrotate_parse "${{logrotate_bin}}" "${{logrotate_path}}"'
+            f' "{effective_uid}"',
             'printf "PATH_AFTER=%s\\n" "$PATH"',
         )
     )
@@ -3683,12 +3721,27 @@ def test_the_discovery_searches_path_then_the_canonical_locations() -> None:
     assert block.index('"/usr/sbin/logrotate"') < block.index('"/sbin/logrotate"')
 
 
-def test_the_discovery_runs_the_executable_it_selected() -> None:
+def test_the_parse_runs_the_executable_that_was_selected() -> None:
     """A bare ``logrotate`` would go straight back through PATH."""
-    block = _logrotate_discovery_block()
+    block = _logrotate_parse_block()
 
-    assert '"${logrotate_bin}" --debug "${logrotate_path}"' in block
-    assert "\n    if logrotate --debug" not in block
+    assert '"${executable}" --debug "${policy}"' in block
+    assert "if logrotate --debug" not in block
+
+
+def test_production_passes_the_real_effective_uid() -> None:
+    """The helper exists for testability; production must not exploit it.
+
+    A call site passing anything other than ``$EUID`` -- a variable, a constant,
+    an environment override -- would make the privilege boundary configurable,
+    which is precisely what it must not be.
+    """
+    verifier = _read(VERIFY_OPERATIONS)
+
+    assert PRODUCTION_PARSE_CALL in verifier
+    # The call belongs outside the extractable helper, so tests can supply their
+    # own UID without also re-running production's.
+    assert PRODUCTION_PARSE_CALL not in _logrotate_parse_block()
 
 
 def test_the_verifier_never_claims_logrotate_is_uninstalled() -> None:
@@ -3707,12 +3760,37 @@ def test_the_verifier_never_modifies_the_callers_path() -> None:
     assert "export PATH" not in block
 
 
-def test_a_path_discovered_logrotate_is_used(tmp_path: Path) -> None:
-    """The ordinary case: logrotate on PATH, policy parses."""
+def test_the_verifier_never_escalates_privilege() -> None:
+    """The fix is a boundary, not a way to acquire the privilege it lacks."""
+    body = _code(_read(VERIFY_OPERATIONS))
+
+    for escalation in ("sudo", "su ", "runuser", "setpriv", "setcap"):
+        assert not _runs(body, escalation.strip()), escalation
+
+
+# --- finding 26: the parse probe needs root, and must say so ----------------
+#
+# The installed policy says "su mgo mgo" -- required, because the log directory
+# is mgo:mgo 0750. logrotate performs that credential switch even under --debug,
+# so an unprivileged operator gets "Operation not permitted" on a policy that is
+# perfectly valid, and the verifier read that as a parse failure.
+#
+# The decision is now made BEFORE invocation, from the effective UID. Deciding
+# afterwards by matching stderr was rejected: it cannot tell a privilege failure
+# from a syntax error that happens to mention permissions.
+
+
+def test_a_path_discovered_logrotate_is_named_in_the_skip(tmp_path: Path) -> None:
+    """Discovery is proven by the executable the skip names, not by a PASS.
+
+    An ordinary test process is not root, so the parse probe is skipped -- which
+    is the correct behaviour and still shows which executable was selected.
+    """
     output = _run_logrotate_discovery(tmp_path, on_path=True)
 
-    assert "PASS" in output
+    assert "SKIP" in output
     assert "pathbin/logrotate" in output
+    assert "FAIL" not in output
 
 
 def test_a_canonical_usr_sbin_logrotate_is_found_without_path(
@@ -3721,29 +3799,170 @@ def test_a_canonical_usr_sbin_logrotate_is_found_without_path(
     """The exact Pi condition: installed in /usr/sbin, absent from PATH."""
     output = _run_logrotate_discovery(tmp_path, at_usr_sbin=True)
 
-    assert "PASS" in output
     assert "usr/sbin/logrotate" in output
-    assert "SKIP" not in output
+    assert "FAIL" not in output
+    assert DISCOVERY_SKIP not in output, "the executable was found, not missing"
 
 
 def test_a_canonical_sbin_logrotate_is_found_without_path(tmp_path: Path) -> None:
     """The second fallback, for hosts that do not split /sbin and /usr/sbin."""
     output = _run_logrotate_discovery(tmp_path, at_sbin=True)
 
-    assert "PASS" in output
     assert "/sbin/logrotate" in output
-    assert "SKIP" not in output
+    assert "FAIL" not in output
+    assert DISCOVERY_SKIP not in output
 
 
-def test_a_discovered_logrotate_that_rejects_the_policy_fails(
-    tmp_path: Path,
+@pytest.mark.parametrize("location", ("on_path", "at_usr_sbin", "at_sbin"))
+def test_an_unprivileged_caller_skips_truthfully(
+    tmp_path: Path, location: str
 ) -> None:
-    """A real parse failure must stay a FAIL, not soften into a SKIP."""
+    """The skip must state all three facts, wherever the executable was found."""
+    output = _run_logrotate_discovery(tmp_path, **{location: True})
+
+    assert "SKIP" in output
+    for fact in PRIVILEGE_SKIP_FACTS:
+        assert fact in output, fact
+
+    # It must not claim an outcome it never obtained, nor blame the package.
+    assert "parses cleanly" not in output
+    assert "not installed" not in output
+    assert "FAIL" not in output
+
+
+def test_an_unprivileged_caller_never_invokes_logrotate(tmp_path: Path) -> None:
+    """The privilege check must come BEFORE invocation, not after.
+
+    The stub here exits non-zero, so invoking it would produce a FAIL naming a
+    parse failure. Its absence is the evidence that it was never run -- a
+    distinctive exit status standing in for an invocation marker, which a
+    shell-script stub could not portably provide.
+    """
     output = _run_logrotate_discovery(tmp_path, at_usr_sbin=True, parses=False)
+
+    assert "SKIP" in output
+    assert "FAIL" not in output
+    assert "cannot parse" not in output
+
+
+def test_a_root_caller_validates_a_good_policy(tmp_path: Path) -> None:
+    """With privilege the probe runs, and a valid policy passes."""
+    output = _run_logrotate_discovery(
+        tmp_path, at_usr_sbin=True, effective_uid="0"
+    )
+
+    assert "PASS" in output
+    assert "parses cleanly" in output
+    assert "usr/sbin/logrotate" in output
+    assert "SKIP" not in output
+    assert "FAIL" not in output
+
+
+def test_a_root_caller_still_fails_an_invalid_policy(tmp_path: Path) -> None:
+    """The privilege skip must never become an amnesty for a real defect."""
+    output = _run_logrotate_discovery(
+        tmp_path, at_usr_sbin=True, parses=False, effective_uid="0"
+    )
 
     assert "FAIL" in output
     assert "cannot parse" in output
     assert "PASS" not in output
+    assert "SKIP" not in output
+
+
+def test_the_root_decision_ignores_the_reason_for_failure(tmp_path: Path) -> None:
+    """Classification must not depend on what logrotate printed.
+
+    Matching stderr for "Operation not permitted" would have been the obvious
+    shortcut and a bad one: a syntax error that happens to mention permissions
+    would be waved through. The root branch looks only at the exit status, which
+    this asserts by failing a non-zero run whose output says nothing at all.
+    """
+    block = _logrotate_parse_block()
+
+    for text in ("Operation not permitted", "permission denied", "switching euid"):
+        assert text not in block, text
+
+    output = _run_logrotate_discovery(
+        tmp_path, at_usr_sbin=True, parses=False, effective_uid="0"
+    )
+
+    assert "FAIL" in output
+
+
+def test_the_privilege_decision_precedes_invocation() -> None:
+    """Structural counterpart to the behavioural ordering test."""
+    block = _logrotate_parse_block()
+
+    guard = block.index('"${effective_uid}" != "0"')
+    invocation = block.index('"${executable}" --debug')
+
+    assert guard < invocation
+
+
+def test_the_header_contract_matches_the_parse_branch() -> None:
+    """The script promises root-only probes SKIP; this is the probe.
+
+    Asserting the sentence exists proves nothing on its own, so this ties it to
+    the branch that has to honour it: the non-root path must reach ``skip`` and
+    must not reach ``fail``.
+    """
+    verifier = _read(VERIFY_OPERATIONS)
+    block = _logrotate_parse_block()
+
+    assert (
+        "Some probes need root; without it they are reported as SKIP rather than"
+        in verifier
+    )
+
+    _, _, unprivileged = block.partition('"${effective_uid}" != "0"')
+    branch, _, _ = unprivileged.partition("fi")
+
+    assert "skip " in branch
+    assert "fail " not in branch
+
+
+def test_a_static_policy_failure_survives_the_privilege_skip(
+    tmp_path: Path,
+) -> None:
+    """A skipped probe must not hide a policy-structure defect.
+
+    The ``su`` directive is what makes the probe need root in the first place, so
+    a policy missing it is exactly the case where the two checks could collide.
+    """
+    bash = _find_bash()
+    if bash is None:  # pragma: no cover - bash is present on Windows and the Pi
+        pytest.skip("bash is unavailable")
+
+    policy = tmp_path / "garden-observatory"
+    policy.write_text("/var/log/garden-observatory/*.log {\n    daily\n}\n", "utf-8")
+
+    program = "\n".join(
+        (
+            "set -u",
+            "failures=0",
+            'pass() { printf "PASS %s\\n" "$*"; }',
+            'fail() { printf "FAIL %s\\n" "$*"; failures=$((failures + 1)); }',
+            'skip() { printf "SKIP %s\\n" "$*"; }',
+            'service_user="mgo"',
+            'service_group="mgo"',
+            f'logrotate_path="{policy.as_posix()}"',
+            _logrotate_su_block(),
+            _logrotate_parse_block(),
+            'verify_logrotate_parse "" "${logrotate_path}" "1001"',
+            'printf "FAILURES=%s\\n" "$failures"',
+        )
+    )
+
+    completed = subprocess.run(
+        [bash, "-c", program], capture_output=True, text=True, timeout=60, check=False
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "FAIL" in completed.stdout
+    assert "does not rotate as mgo:mgo" in completed.stdout
+    assert "SKIP" in completed.stdout
+    assert "FAILURES=1" in completed.stdout
 
 
 def test_a_genuinely_absent_logrotate_skips_truthfully(tmp_path: Path) -> None:
@@ -3762,9 +3981,15 @@ def test_the_discovery_leaves_path_untouched(tmp_path: Path) -> None:
     ``PATH`` to reach ``/usr/sbin`` would be a tempting fix and a bad one, since
     it would change how every later command in the verifier resolves.
     """
-    for index, scenario in enumerate(
-        ({"on_path": True}, {"at_usr_sbin": True}, {})
-    ):
+    scenarios: tuple[dict[str, object], ...] = (
+        {"on_path": True},                                    # PATH discovery
+        {"at_usr_sbin": True},                                # canonical fallback
+        {"at_sbin": True},                                    # unprivileged skip
+        {"at_usr_sbin": True, "effective_uid": "0"},          # root parse
+        {},                                                   # missing executable
+    )
+
+    for index, scenario in enumerate(scenarios):
         output = _run_logrotate_discovery(tmp_path / f"scenario{index}", **scenario)
         before = re.search(r"^PATH_BEFORE=(.*)$", output, re.MULTILINE)
         after = re.search(r"^PATH_AFTER=(.*)$", output, re.MULTILINE)

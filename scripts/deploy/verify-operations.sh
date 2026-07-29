@@ -274,9 +274,11 @@ if [[ -f "${logrotate_path}" ]]; then
     && pass "rotated files are created 0640 (never world-readable)" \
     || fail "the policy does not create rotated files with a secure mode"
 
+  # >>> logrotate-su-check >>>
   grep -qE "^[[:space:]]*su[[:space:]]+${service_user}[[:space:]]+${service_group}" "${logrotate_path}" \
     && pass "su ${service_user} ${service_group}" \
     || fail "the policy does not rotate as ${service_user}:${service_group}"
+  # <<< logrotate-su-check <<<
 
   # logrotate ships in /usr/sbin on Debian, and /usr/sbin is NOT on an
   # unprivileged account's PATH. "command -v logrotate" therefore fails on a
@@ -297,19 +299,51 @@ if [[ -f "${logrotate_path}" ]]; then
       break
     fi
   done
-
-  if [[ -n "${logrotate_bin}" ]]; then
-    if "${logrotate_bin}" --debug "${logrotate_path}" >/dev/null 2>&1; then
-      pass "the installed policy parses cleanly (${logrotate_bin})"
-    else
-      fail "logrotate cannot parse ${logrotate_path}"
-    fi
-  else
-    # Deliberately a statement about DISCOVERY, not about the package: this
-    # check cannot tell an uninstalled logrotate from one it failed to find.
-    skip "no logrotate executable found in PATH, /usr/sbin or /sbin"
-  fi
   # <<< logrotate-discovery <<<
+
+  # The parse probe is the ONE check here that genuinely needs root, and the
+  # reason is the policy itself: it says "su mgo mgo", and logrotate performs
+  # that credential switch even under --debug. An unprivileged operator cannot
+  # switch euid/egid to the service account, so logrotate exits non-zero on a
+  # perfectly valid policy:
+  #
+  #   error switching euid from 1001 to 999 ...: Operation not permitted
+  #
+  # Reading that as "the policy does not parse" is what made this verifier fail
+  # on a correctly provisioned Pi. The privilege decision is therefore made
+  # BEFORE invocation, from the effective UID and the known policy contract --
+  # never afterwards by inspecting logrotate's stderr, which could not tell a
+  # privilege failure from a genuine syntax error without guessing.
+  #
+  # Skipping is honest here because the policy has already been validated as
+  # root: the installer parses a staged copy before installing it, and refuses
+  # to install one that does not parse. An operator who wants this probe too can
+  # run the whole read-only verifier under sudo. The verifier never escalates.
+  # >>> logrotate-parse >>>
+  verify_logrotate_parse() {
+    local executable="$1" policy="$2" effective_uid="$3"
+
+    if [[ -z "${executable}" ]]; then
+      # Deliberately a statement about DISCOVERY, not about the package: this
+      # check cannot tell an uninstalled logrotate from one it failed to find.
+      skip "no logrotate executable found in PATH, /usr/sbin or /sbin"
+      return 0
+    fi
+
+    if [[ "${effective_uid}" != "0" ]]; then
+      skip "logrotate found at ${executable}; parse check skipped because the policy uses su ${service_user} ${service_group} and credential switching requires root"
+      return 0
+    fi
+
+    if "${executable}" --debug "${policy}" >/dev/null 2>&1; then
+      pass "the installed policy parses cleanly (${executable})"
+    else
+      fail "logrotate cannot parse ${policy}"
+    fi
+  }
+  # <<< logrotate-parse <<<
+
+  verify_logrotate_parse "${logrotate_bin}" "${logrotate_path}" "${EUID}"
 else
   fail "${logrotate_path} is missing"
 fi
