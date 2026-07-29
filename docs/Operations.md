@@ -1919,30 +1919,38 @@ The validated recovery set **stays** in `/var/backups/garden-observatory`. It is
 the evidence that the backup path worked on real hardware, and it is protected
 by exactly the same rule that protects a pre-existing one.
 
-### 13.15 Restore the pre-validation service state
+### 13.15 Record the feature-branch runtime
+
+Cleanup must not have disturbed the API:
 
 ```bash
 systemctl is-active mgo.service
 ```
 
-```bash
-systemctl show mgo.service --property=ActiveState --property=SubState --property=MainPID --property=NRestarts
-```
-
-The API must be **active**. If preview was running in §13.2, confirm it was
-restored:
+The API must be **active**. Now record *which process* is serving, immediately
+before the checkout. Run every command in §13.15 to §13.19 in the **same shell
+session**, because the recorded values are shell variables.
 
 ```bash
-curl -fsS http://127.0.0.1:8080/camera/preview/status | python -m json.tool
+FEATURE_RUNTIME_PID="$(systemctl show mgo.service --property=MainPID --value)"
 ```
-
-If it is not running and it was before:
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:8080/camera/preview/start | python -m json.tool
+FEATURE_RUNTIME_STARTED="$(systemctl show mgo.service --property=ActiveEnterTimestamp --value)"
 ```
 
-Do **not** capture an image.
+```bash
+printf 'Feature runtime PID: %s\n' "$FEATURE_RUNTIME_PID"; printf 'Feature runtime started: %s\n' "$FEATURE_RUNTIME_STARTED"
+```
+
+```bash
+systemctl show mgo.service --property=ActiveState --property=SubState --property=MainPID --property=NRestarts --property=ActiveEnterTimestamp
+```
+
+This is the evidence of the process that was running **feature-branch code**.
+§13.17 proves it was replaced.
+
+Do not stop the API before the operational cleanup in §13.14 is complete.
 
 ### 13.16 Return safely to `main`
 
@@ -1998,25 +2006,175 @@ systemctl list-timers --all | grep -F mgo-backup && echo "PROBLEM" || echo "clea
 Expect `clean`. Anything else means §13.14 did not complete and the Pi is
 scheduled to run code that is no longer present.
 
-Confirm the existing API is unaffected:
+**The checkout is now on `main`. The running API is not.** Continue to §13.17
+before treating the return to `main` as complete.
+
+### 13.17 Restart the API onto `main`
+
+**Git changes files on disk. It does not reload modules a running process has
+already imported.** Python reads a module's source once, at import, and keeps
+the compiled objects in memory for the life of the interpreter. A long-lived
+Uvicorn process therefore keeps serving whatever it imported at start-up, no
+matter what happens to the files underneath it.
+
+That matters here because validation deliberately restarts §13.12 and reboots
+the Pi **while `task-010-operations` is checked out** — so the process serving
+the API has feature-branch `mgo.api`, `mgo.core` and `mgo.camera` modules in
+memory. After §13.16, Git reports `main` and the files on disk are `main`'s, but
+the live service is still running Task 10 code. Checkout plus an earlier restart
+is **not** a complete rollback; the restart has to happen *after* the checkout.
+
+Restart only once the Git checks in §13.16 have passed:
+
+```bash
+sudo systemctl restart mgo.service
+```
+
+```bash
+systemctl is-active mgo.service
+```
+
+Expect `active`. Use `restart`, never `systemctl reload` — the Python process
+must be **replaced**, and reloading would leave the same interpreter in place
+with the same modules.
+
+Record the new runtime:
+
+```bash
+MAIN_RUNTIME_PID="$(systemctl show mgo.service --property=MainPID --value)"
+```
+
+```bash
+MAIN_RUNTIME_STARTED="$(systemctl show mgo.service --property=ActiveEnterTimestamp --value)"
+```
+
+```bash
+systemctl show mgo.service --property=ActiveState --property=SubState --property=MainPID --property=NRestarts --property=ActiveEnterTimestamp
+```
+
+```bash
+printf 'Feature runtime: PID %s started %s\n' "$FEATURE_RUNTIME_PID" "$FEATURE_RUNTIME_STARTED"; printf 'Main runtime:    PID %s started %s\n' "$MAIN_RUNTIME_PID" "$MAIN_RUNTIME_STARTED"
+```
+
+`MAIN_RUNTIME_STARTED` must be **later** than `FEATURE_RUNTIME_STARTED`, and the
+process must have been created after the checkout. A changed PID is expected,
+but the **timestamp and the successful restart are the authoritative evidence**
+— an operating system is free to reuse a PID, so a differing PID alone would be
+a weaker claim than it looks.
+
+#### Prove the restarted process uses the checkout
+
+```bash
+sudo tr '\0' ' ' <"/proc/${MAIN_RUNTIME_PID}/cmdline"; printf '\n'
+```
+
+```bash
+sudo readlink -f "/proc/${MAIN_RUNTIME_PID}/cwd"
+```
+
+The command must include `/opt/garden-observatory/.venv/bin/uvicorn` and
+`mgo.api.app:app`; the working directory must be `/opt/garden-observatory`.
+
+Confirm the source a fresh interpreter under the service account imports:
+
+```bash
+sudo -u mgo /opt/garden-observatory/.venv/bin/python -c 'import mgo.api.app, mgo.core.config; print(mgo.api.app.__file__); print(mgo.core.config.__file__)'
+```
+
+Both paths must be under `/opt/garden-observatory/src/mgo/`. This **supplements**
+the restart rather than replacing it: it shows what the checkout would import
+now, which is not the same claim as what the running process already imported.
+
+### 13.18 Restore preview to its original state
+
+The restart in §13.17 stopped any running preview process. Use the original
+pre-validation state recorded in §13.2 — not whatever the preview happened to be
+doing during validation.
+
+```bash
+curl -fsS http://127.0.0.1:8080/camera/preview/status | python -m json.tool
+```
+
+If preview **was running** before validation, restore it:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/camera/preview/start | python -m json.tool
+```
+
+```bash
+curl -fsS http://127.0.0.1:8080/camera/preview/status | python -m json.tool
+```
+
+Required when it was originally running: `state: running`, `owner: preview`,
+`last_error: null`.
+
+If preview was originally **stopped**, leave it stopped.
+
+Do **not** capture an image.
+
+### 13.19 Final API check
+
+This sweep must run **after** the checkout, the restart and the preview
+restoration — anything earlier would be describing the feature-branch process.
 
 ```bash
 for p in / /version /health /database/status /camera/status /camera/preview/status /motion/status /notifications/status /captures /observations /dashboard; do printf '%s -> ' "$p"; curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:8080$p"; done
 ```
 
-### 13.17 What happens next
+Every endpoint must return its expected successful status. Then confirm the
+dashboard in a browser at `http://mgo-core:8080/dashboard`: it must show real Pi
+values and continue refreshing.
 
-1. The Pi is back on clean `main`.
-2. Task 10 operational units are no longer installed.
-3. The validated recovery set remains in `/var/backups/garden-observatory`.
-4. The complete validation evidence is returned.
-5. Repository review happens.
-6. **Only then** may a pull request be created.
-7. After merge, normal production deployment installs and enables Task 10
+### 13.20 Review the main-branch restart journal
+
+```bash
+journalctl -u mgo.service --since "10 minutes ago" --no-pager
+```
+
+Required: the intentional stop is recorded, the application shuts down cleanly,
+a new process starts, start-up completes, and there is **no** traceback, import
+failure, missing module, permission error or restart loop.
+
+`mgo.operations` does not exist on `main`, and that must not matter: every
+Task 10 unit was removed in §13.14, and the API has never invoked those modules.
+An `ImportError` naming `mgo.operations` here would mean §13.14 did not complete.
+
+### 13.21 Required final state
+
+A clean Git checkout alone is **not** sufficient. All of the following must
+hold:
+
+```text
+Git checkout:              main
+HEAD:                      0ef3d04047faef119399c46182103e6f478b8a3a
+Working tree:              clean
+mgo.service:               active
+mgo.service process:       started after checkout to main
+API endpoints:             healthy
+Dashboard:                 healthy
+Preview:                   restored to original state
+mgo-backup.timer:          absent
+mgo-backup.service:        absent
+Task 10 logrotate policy:  absent
+Validated recovery set:    preserved
+```
+
+### 13.22 What happens next
+
+1. The Pi checkout is clean `main`.
+2. `mgo.service` has been **restarted after that checkout**.
+3. The running API therefore corresponds to `main`, not to the feature branch.
+4. Task 10 operational units are absent.
+5. The validated recovery set remains in `/var/backups/garden-observatory`.
+6. The complete validation evidence is returned.
+7. Repository review happens.
+8. **Only then** may a pull request be created.
+9. After merge, normal production deployment installs and enables Task 10
    permanently — that installation is the one that is meant to persist.
 
-The Pi must not be left running indefinitely from the feature branch, and
-pre-merge units must not be left installed while the checkout is on `main`.
+The Pi must not be left running indefinitely from the feature branch,
+pre-merge units must not be left installed while the checkout is on `main`, and
+the checkout must not be left disagreeing with the running process.
 
 ## 14. Rollback
 
@@ -2036,7 +2194,10 @@ git checkout main
 
 Units and policies installed under `/etc` are **external to Git** and survive a
 checkout. Returning to `main` alone would leave an enabled timer pointing at a
-module that no longer exists. Rollback is therefore §13.14 in full:
+module that no longer exists. And validation restarts and reboots the API while
+the feature branch is checked out, so the **running process** holds Task 10
+modules in memory that no checkout can evict. Rollback is therefore §13.14
+through §13.19 in full:
 
 1. `sudo systemctl disable --now mgo-backup.timer`;
 2. remove `/etc/systemd/system/mgo-backup.timer` and
@@ -2044,8 +2205,18 @@ module that no longer exists. Rollback is therefore §13.14 in full:
 3. remove `/etc/logrotate.d/garden-observatory`;
 4. `sudo systemctl daemon-reload`;
 5. **preserve every recovery set** — no backup is deleted at any point;
-6. verify `mgo.service` is still active;
-7. return the checkout to `main`.
+6. verify `mgo.service` is still active, and record its PID and
+   `ActiveEnterTimestamp` as the feature-branch runtime;
+7. `git checkout main`;
+8. `sudo systemctl restart mgo.service` — **after** the checkout;
+9. verify the new main-branch runtime: `active`, a later
+   `ActiveEnterTimestamp`, and `/proc/<pid>/cmdline` and `/proc/<pid>/cwd`
+   pointing at `/opt/garden-observatory`;
+10. restore preview to its original pre-validation state;
+11. re-run the eleven-endpoint API sweep.
+
+**The return to `main` is not complete until step 8 has succeeded.** Steps 1–7
+leave the Pi with a `main` checkout and a feature-branch process.
 
 ### 14.3 After Task 10 is merged and deployed
 
@@ -2085,7 +2256,20 @@ sudo bash scripts/deploy/install-service-identity.sh --no-operations
 bash scripts/deploy/verify-service-identity.sh
 ```
 
-`mgo.service` needs **no restart**, because it never changed.
+Then restart the API, for the same reason as §13.17 — the **unit file** never
+changed, but the revert changes `src/mgo/core/config.py`, which the API imports,
+and a running interpreter does not pick that up:
+
+```bash
+sudo systemctl restart mgo.service
+```
+
+```bash
+systemctl is-active mgo.service && systemctl show mgo.service --property=MainPID --property=ActiveEnterTimestamp
+```
+
+Restore preview to its previous state if it was running, then re-run the
+endpoint sweep.
 
 Existing backups in `/var/backups/garden-observatory` are **left intact** unless
 the operator explicitly chooses to remove them. No rollback step deletes the

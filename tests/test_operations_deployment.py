@@ -1744,7 +1744,15 @@ ROLLBACK_HEADING = "## 14. Rollback"
 TROUBLESHOOTING_HEADING = "## 15. Troubleshooting"
 
 CLEANUP_HEADING = "### 13.14 Pre-merge operational cleanup"
-SERVICE_STATE_HEADING = "### 13.15 Restore the pre-validation service state"
+SERVICE_STATE_HEADING = "### 13.15 Record the feature-branch runtime"
+RESTART_HEADING = "### 13.17 Restart the API onto `main`"
+PREVIEW_HEADING = "### 13.18 Restore preview to its original state"
+FINAL_CHECK_HEADING = "### 13.19 Final API check"
+
+RESTART_API = "sudo systemctl restart mgo.service"
+ENDPOINT_SWEEP = "/notifications/status /captures /observations /dashboard"
+DASHBOARD_CHECK = "http://mgo-core:8080/dashboard"
+PREVIEW_START = "curl -fsS -X POST http://127.0.0.1:8080/camera/preview/start"
 
 #: The checkout as a *command* -- alone on its line inside a fence. Matching the
 #: bare string would also hit the prose "must happen before `git checkout main`",
@@ -2007,6 +2015,208 @@ def test_the_procedure_keeps_every_existing_validation_step() -> None:
         assert command in procedure, command
 
 
+# --- regression: the runtime is restored, not just the checkout --------------
+#
+# Finding 17 was "installed state is not Git state". This is the same error one
+# level deeper: RUNTIME state is not Git state either.
+#
+# Validation deliberately restarts and reboots the API while the feature branch
+# is checked out, so the serving process has feature-branch modules in memory.
+# Python reads a module once, at import, and keeps it for the life of the
+# interpreter -- `git checkout main` replaces the files and changes nothing
+# about the running process. The procedure ended with a clean `main` checkout
+# serving code that was no longer anywhere in the checkout, and nothing about
+# that state looks wrong from the outside.
+#
+# As with §13.14, ORDER is the finding. A restart that happens before the
+# checkout -- which validation already performs, twice -- satisfies every
+# "is the service restarted?" assertion while leaving the defect in place.
+
+
+def test_the_checkout_to_main_precedes_the_api_restart() -> None:
+    """A restart before the checkout is what the defect already did.
+
+    §13.12 legitimately restarts the API *during* validation, on the feature
+    branch, so "the document contains a restart" proves nothing. What has to be
+    true is that a restart appears **after** the checkout.
+    """
+    after_checkout = _procedure().partition(CHECKOUT_MAIN)[2]
+
+    assert after_checkout, "the checkout should not be the last step"
+    assert RESTART_API in after_checkout
+
+
+def test_the_restart_follows_the_operational_cleanup() -> None:
+    """Units first, then checkout, then runtime -- in that order."""
+    procedure = _procedure()
+
+    assert procedure.index(CLEANUP_HEADING) < procedure.index(CHECKOUT_MAIN)
+    assert procedure.index(CHECKOUT_MAIN) < procedure.index(RESTART_HEADING)
+
+
+def _after_main_restart() -> str:
+    """Everything documented after the post-checkout restart.
+
+    Anchored to the checkout first: §13.12 restarts the API during validation,
+    so ``index(RESTART_API)`` alone would find the feature-branch restart and
+    every ordering assertion below would pass for the wrong reason.
+    """
+    after_checkout = _procedure().partition(CHECKOUT_MAIN)[2]
+    _, restart, remainder = after_checkout.partition(RESTART_API)
+
+    assert restart, "no restart is documented after the checkout"
+    return remainder
+
+
+def test_the_final_endpoint_sweep_follows_the_restart() -> None:
+    """Sweeping before the restart would be describing the wrong process."""
+    assert ENDPOINT_SWEEP in _after_main_restart()
+
+
+def test_the_dashboard_confirmation_follows_the_restart() -> None:
+    """The browser check must exercise the main-branch process."""
+    assert DASHBOARD_CHECK in _after_main_restart()
+
+
+def test_preview_restoration_follows_the_restart() -> None:
+    """The restart stops preview, so restoring it earlier would be undone."""
+    after_restart = _after_main_restart()
+
+    assert PREVIEW_HEADING in after_restart
+    assert PREVIEW_START in after_restart
+    # And the sweep reports the restored state, not the state during the restart.
+    assert after_restart.index(PREVIEW_HEADING) < after_restart.index(
+        FINAL_CHECK_HEADING
+    )
+
+
+def test_preview_is_restored_to_its_original_recorded_state() -> None:
+    """§13.2's recording, not whatever preview was doing during validation."""
+    preview = _span(_procedure(), PREVIEW_HEADING, FINAL_CHECK_HEADING)
+
+    assert "§13.2" in preview
+    assert "was running" in preview
+    assert "originally **stopped**, leave it stopped" in preview
+    assert "Do **not** capture an image" in preview
+
+
+def test_the_feature_branch_runtime_is_recorded_before_the_checkout() -> None:
+    """Without a recorded "before", "it was replaced" is not provable."""
+    procedure = _procedure()
+
+    assert "FEATURE_RUNTIME_PID=" in procedure
+    assert "FEATURE_RUNTIME_STARTED=" in procedure
+    assert procedure.index("FEATURE_RUNTIME_PID=") < procedure.index(CHECKOUT_MAIN)
+    assert procedure.index("FEATURE_RUNTIME_STARTED=") < procedure.index(
+        CHECKOUT_MAIN
+    )
+
+
+def test_the_main_runtime_is_recorded_after_the_restart() -> None:
+    """MainPID and ActiveEnterTimestamp, taken from the replacement process."""
+    restart = _span(_procedure(), RESTART_HEADING, PREVIEW_HEADING)
+
+    assert "MAIN_RUNTIME_PID=" in restart
+    assert "MAIN_RUNTIME_STARTED=" in restart
+    assert "--property=MainPID" in restart
+    assert "--property=ActiveEnterTimestamp" in restart
+    assert restart.index(RESTART_API) < restart.index("MAIN_RUNTIME_PID=")
+
+
+def test_the_timestamp_is_the_authoritative_evidence_not_the_pid() -> None:
+    """An operating system may reuse a PID; it cannot reuse a start time."""
+    restart = _span(_procedure(), RESTART_HEADING, PREVIEW_HEADING)
+
+    assert "reuse a PID" in restart
+    assert "authoritative evidence" in restart
+    # A reload would leave the same interpreter holding the same modules.
+    assert "never `systemctl reload`" in restart
+    assert "systemctl reload mgo.service" not in _read(DOCUMENTATION)
+
+
+def test_the_restarted_process_is_traced_to_the_checkout() -> None:
+    """/proc is what ties the live process to the directory on disk."""
+    restart = _span(_procedure(), RESTART_HEADING, PREVIEW_HEADING)
+
+    assert '/proc/${MAIN_RUNTIME_PID}/cmdline' in restart
+    assert '/proc/${MAIN_RUNTIME_PID}/cwd' in restart
+    assert "/opt/garden-observatory/.venv/bin/uvicorn" in restart
+    assert "mgo.api.app:app" in restart
+
+
+def test_the_fresh_import_check_is_documented_as_a_supplement() -> None:
+    """It shows what the checkout would import, not what is already loaded."""
+    restart = _span(_procedure(), RESTART_HEADING, PREVIEW_HEADING)
+
+    assert "import mgo.api.app, mgo.core.config" in restart
+    assert "/opt/garden-observatory/src/mgo/" in restart
+    assert "supplements" in restart
+
+
+def test_the_procedure_explains_why_a_checkout_does_not_reload_modules() -> None:
+    """The reasoning has to be in the document, not only in the commit."""
+    procedure = _procedure()
+
+    assert "does not reload modules" in procedure
+    assert "not** a complete rollback" in procedure
+
+
+def test_the_restart_journal_is_reviewed() -> None:
+    """A restart that fails silently would leave no API at all."""
+    procedure = _procedure()
+
+    assert 'journalctl -u mgo.service --since "10 minutes ago" --no-pager' in (
+        _after_main_restart()
+    )
+    assert "mgo.operations" in procedure
+
+
+def test_the_required_final_state_names_runtime_as_well_as_git() -> None:
+    """A clean checkout on its own was exactly the insufficient evidence."""
+    final_state = _span(
+        _procedure(), "### 13.21 Required final state", "### 13.22 What happens next"
+    )
+
+    assert "not** sufficient" in final_state
+    for requirement in (
+        "Git checkout:              main",
+        "mgo.service:               active",
+        "mgo.service process:       started after checkout to main",
+        "Preview:                   restored to original state",
+        "mgo-backup.timer:          absent",
+        "mgo-backup.service:        absent",
+        "Task 10 logrotate policy:  absent",
+        "Validated recovery set:    preserved",
+    ):
+        assert requirement in final_state, requirement
+
+
+def test_the_merge_sequence_states_the_runtime_matches_main() -> None:
+    """The reason the restart exists, carried into what happens next."""
+    _, heading, sequence = _procedure().partition("### 13.22 What happens next")
+
+    assert heading
+    assert "restarted after that checkout" in sequence
+    assert "corresponds to `main`" in sequence
+    assert "**Only then** may a pull request be created." in sequence
+    assert "disagreeing with the running process" in sequence
+
+
+def test_the_restart_reinstalls_no_task_10_artefact() -> None:
+    """Restoring the runtime must not undo the cleanup that preceded it."""
+    restoration = _procedure().partition(CLEANUP_HEADING)[2].partition(
+        CHECKOUT_MAIN
+    )[2]
+
+    assert restoration, "there should be steps after the checkout"
+    for command in _bash_commands(restoration):
+        assert "install-service-identity.sh" not in command, command
+        assert "systemctl enable" not in command, command
+        assert "mgo-backup" not in command or command.startswith(
+            "systemctl list-timers"
+        ), command
+
+
 # --- regression: the rollback contract has three states ----------------------
 
 
@@ -2048,6 +2258,38 @@ def test_the_pre_merge_rollback_state_requires_the_full_cleanup() -> None:
     assert "preserve every recovery set" in state
     assert "mgo.service" in state
     assert "external to Git" in state
+
+
+def test_the_pre_merge_rollback_restarts_after_the_checkout() -> None:
+    """Steps 1-7 leave a main checkout serving feature-branch code."""
+    state = _span(
+        _rollback(),
+        "### 14.2 After pre-merge Pi installation validation, before merge",
+        "### 14.3 After Task 10 is merged and deployed",
+    )
+
+    assert "`git checkout main`" in state
+    assert RESTART_API in state
+    assert state.index("`git checkout main`") < state.index(RESTART_API)
+    assert "not complete until step 8" in state
+    assert "feature-branch runtime" in state
+    assert "restore preview" in state
+
+
+def test_the_post_merge_rollback_also_restarts_the_service() -> None:
+    """The unit never changed; the code the API imports did."""
+    _, heading, state = _rollback().partition(
+        "### 14.3 After Task 10 is merged and deployed"
+    )
+
+    assert heading
+    assert RESTART_API in state
+    assert state.index("git revert") < state.index(RESTART_API)
+    assert "src/mgo/core/config.py" in state
+    # The old claim was true of the unit file and false of the code.
+    assert "needs **no restart**, because it never changed" not in _read(
+        DOCUMENTATION
+    )
 
 
 def test_the_before_install_rollback_state_stays_simple() -> None:

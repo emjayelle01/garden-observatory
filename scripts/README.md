@@ -60,7 +60,9 @@ checkout back to `main` does not remove them, does not disable the timer and
 does not stop it — it only removes the code they point at. A pre-merge
 validation install must therefore be undone explicitly before returning to
 `main` (`docs/Operations.md` §13.14); permanent installation belongs after the
-merge.
+merge. The same applies to the running service: a checkout does not reload
+modules a live process already imported, so `mgo.service` is restarted **after**
+the checkout (§13.17) and the return to `main` is not complete until it has.
 
 See [`docs/Operations.md`](../docs/Operations.md) for the backup architecture,
 the deliberate absence of an automatic production restore, the disaster-recovery

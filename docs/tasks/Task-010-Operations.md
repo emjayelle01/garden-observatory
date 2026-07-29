@@ -2,7 +2,7 @@
 
 ## Status
 
-**Implementation complete; pre-merge validation cleanup correction in
+**Implementation complete; post-validation runtime restoration correction in
 progress.**
 
 A repository review of the five implementation commits found nine genuine
@@ -30,6 +30,11 @@ A review of the *validation procedure itself* then found that it installed
 systemd artefacts and never removed them, recorded in
 [§ Pre-merge validation cleanup review](#pre-merge-validation-cleanup-review)
 and corrected in a commit after `7e4fb63`.
+
+Reviewing that correction found the same class of mistake one level deeper:
+the procedure restored the *checkout* but not the *running process*. Recorded in
+[§ Post-validation runtime restoration review](#post-validation-runtime-restoration-review)
+and corrected in a commit after `3066422`.
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -489,6 +494,86 @@ The procedure now closes by saying what happens next: the Pi returns to clean
 repository review happens, and only then may a pull request be created. The
 installation that is *meant* to persist is the one that follows the merge.
 
+## Post-validation runtime restoration review
+
+Finding 17 corrected the *installed system state* — units and policies that a
+checkout cannot remove. Reviewing that correction surfaced the same class of
+mistake one level deeper.
+
+### 18. Checkout state and runtime state were treated as identical
+
+The corrected procedure removed Task 10's installed units and checked out
+`main`, but did not restart `mgo.service` afterwards.
+
+**A Python service does not reload modules because Git changed the files
+underneath it.** The interpreter reads each module's source once, at import, and
+keeps the compiled objects for the life of the process. Whatever a long-lived
+Uvicorn process imported at start-up is what it keeps serving.
+
+Validation deliberately restarts the API (§13.12) and reboots the Pi **while
+`task-010-operations` is checked out**, so the process serving requests has
+feature-branch `mgo.api`, `mgo.core` and `mgo.camera` modules in memory. After
+`git checkout main`:
+
+* Git reports `main`;
+* the files on disk are `main`'s;
+* the live Uvicorn process still holds feature-branch modules;
+* the Pi is therefore **not** restored to its pre-validation runtime state.
+
+Nothing would have looked wrong. `git status` is clean, the endpoints answer,
+the dashboard refreshes — and the process answering them is running code that is
+no longer anywhere in the checkout. The mismatch would persist silently until
+the next unrelated restart, which is exactly the kind of state that makes a
+later, unrelated failure impossible to attribute.
+
+The finding generalises the previous one. Finding 17 was *installed state is not
+Git state*; this is *runtime state is not Git state either*. Both are the same
+error: treating `git checkout` as though it rolled back everything a branch had
+touched, when what it rolls back is files.
+
+**Corrected.** `docs/Operations.md` §13 gains four steps and a required
+final-state table:
+
+* **§13.15** records the feature-branch runtime — `MainPID` and
+  `ActiveEnterTimestamp` — immediately before the checkout, as evidence of the
+  process that was serving Task 10 code.
+* **§13.17** restarts `mgo.service` *after* the checkout, records the new
+  `MainPID` and `ActiveEnterTimestamp`, and requires the new timestamp to be
+  later than the recorded one. It also reads `/proc/<pid>/cmdline` and
+  `/proc/<pid>/cwd` to prove the process is the checkout's `uvicorn` running
+  `mgo.api.app:app` from `/opt/garden-observatory`, and imports
+  `mgo.api.app`/`mgo.core.config` under a fresh service-account interpreter to
+  show where the checkout resolves them from.
+* **§13.18** restores preview *after* that restart, to the state recorded in
+  §13.2 rather than to whatever it was doing during validation.
+* **§13.19/§13.20** move the endpoint sweep and dashboard check after the
+  restart, and review the restart journal.
+
+### Why the timestamp, not the PID
+
+A changed `MainPID` is expected but is not proof: an operating system may reuse
+a PID. The authoritative evidence is a successful `restart` plus an
+`ActiveEnterTimestamp` later than the recorded feature-branch one. `systemctl
+reload` is explicitly forbidden — the interpreter must be **replaced**, and a
+reload would leave the same process with the same modules.
+
+### Why the fresh-import check is a supplement, not a substitute
+
+`sudo -u mgo .venv/bin/python -c 'import mgo.api.app; print(...)'` shows what
+the checkout would import *now*. That is a different claim from what the running
+process imported at start-up, and it would have passed just as happily before
+this correction. It is recorded as supporting evidence and the procedure says
+so.
+
+### The post-merge rollback carried a related error
+
+§14.3 stated that `mgo.service` needs no restart "because it never changed".
+True of the **unit file**; not true of the code. Task 10 modifies
+`src/mgo/core/config.py`, which the API imports, so reverting the Task 10
+commits changes what a *new* process would load while the running one is
+unaffected. §14.3 now restarts the service and restores preview after the
+revert, for the same reason as §13.17.
+
 ## Authoritative definition
 
 > **Operations — Create systemd service, log rotation, backup and diagnostic
@@ -797,19 +882,23 @@ version 2 and no migration is added. `pyproject.toml` gains no dependency.
 
 ## Rollback model
 
-Reversible with no data loss. **Three** states, not two — see finding 17.
+Reversible with no data loss. **Three** states, not two — see finding 17 — and
+in two of them a `git checkout` is not the end of the rollback, see finding 18.
 
 - **Before any Pi installation validation** — return to `main`; nothing on
   `main` is touched and no system artefact was installed.
 - **After pre-merge Pi installation validation, before merge** — the installed
-  units are external to Git and survive a checkout, so returning to `main` is
-  the *last* step rather than the whole of it: disable and stop
+  units are external to Git and survive a checkout, and the running process
+  holds feature-branch modules that a checkout cannot evict. Disable and stop
   `mgo-backup.timer`, remove the two unit files and the logrotate policy,
-  `systemctl daemon-reload`, preserve every recovery set, verify `mgo.service`,
-  then return to `main`.
+  `systemctl daemon-reload`, preserve every recovery set, record the
+  feature-branch runtime, return to `main`, **then restart `mgo.service`**,
+  verify the new runtime, restore preview and re-run the endpoint sweep. The
+  return to `main` is not complete until the restart has succeeded.
 - **After a future merge** — the same unit removal, plus revert the Task 10
-  commits, re-run the installer from the reverted code, and verify
-  `mgo.service`. The API unit needs no restart because it never changed.
+  commits, re-run the installer from the reverted code, verify `mgo.service`,
+  and restart it: the *unit file* never changed, but the revert changes
+  `src/mgo/core/config.py`, which the API imports.
 
 Existing backups are left intact unless the operator explicitly removes them.
 No rollback step deletes the production database, captures or support bundles,
@@ -836,6 +925,14 @@ returning to `main`** (§13.14) — disabling and stopping the timer, deleting t
 two unit files and the logrotate policy, reloading systemd and verifying the
 removed state — while deleting no recovery data. Permanent installation is a
 post-merge act; a feature branch must not leave one behind.
+
+It then **restarts `mgo.service` after the checkout** (§13.17), because Git
+changing files does not reload modules a running process already imported, and
+proves the replacement by a later `ActiveEnterTimestamp` plus `/proc` command
+and working directory. Preview is restored after that restart (§13.18), and the
+endpoint sweep, dashboard check and journal review all follow it
+(§13.19–§13.20). §13.21 states the required final state: a clean `main` checkout
+is not on its own sufficient.
 
 Backups are **not** described as working until that validation has been
 performed and confirmed by Matthew.
