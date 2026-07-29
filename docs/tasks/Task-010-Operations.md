@@ -2,7 +2,7 @@
 
 ## Status
 
-**Implementation complete; Linux protected-path test correction in progress.**
+**Implementation complete; logrotate validation correction in progress.**
 
 A repository review of the five implementation commits found nine genuine
 defects — one requirement omitted outright, several checks that were weaker
@@ -40,6 +40,12 @@ quality gate**: two tests failed on the Pi and none on Windows. The defect was
 in a test, not in the product — recorded in
 [§ Pi validation review](#pi-validation-review) and corrected in a commit after
 `b2df393`.
+
+With that corrected the Pi quality gates passed outright, and validation reached
+the installer — where it stopped again, on a check that could never have
+succeeded. Recorded in
+[§ Logrotate validation review](#logrotate-validation-review) and corrected in a
+commit after `0227458`.
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -689,6 +695,130 @@ were first written as **bound methods**. A bound method is not a descriptor, so
 traceback machinery, which turned every genuine failure into an unreadable
 `INTERNALERROR`. It passed cleanly only because a correct run never reaches
 either interceptor. They are now plain functions.
+
+## Logrotate validation review
+
+With the protected-path tests corrected, the Raspberry Pi quality gates passed
+outright:
+
+```text
+uv sync: passed
+Ruff:    passed
+mypy:    passed — 48 source files
+pytest:  1242 passed, 0 failed, 0 skipped
+```
+
+Validation then reached the installer and stopped there.
+
+### 21. The installer validated an operator-owned source as though it were an installed system policy
+
+Both dry runs failed:
+
+```text
+error: Ignoring /opt/garden-observatory/scripts/deploy/garden-observatory.logrotate
+       because the file owner is wrong (should be root or user with uid 0).
+ERROR: refusing to install a logrotate policy that does not parse.
+```
+
+This is the **second** failure at the same step, and the pair is what makes the
+diagnosis conclusive. logrotate refuses a configuration file on two independent
+grounds: one that is group- or other-writable, and one whose owner is neither
+root nor the invoking user.
+
+1. The first attempt failed the **writability** check — the checkout carried a
+   POSIX default ACL, so tracked files landed `0660`. That was environmental and
+   was corrected: sessions now use `umask 0022` and the policy became
+   `claude:mgo 0644`, no longer group-writable.
+2. Clearing it exposed the **ownership** check, and that one is not
+   environmental. The checkout is owned by the administrative operator *by
+   design* — `docs/Service-Identity.md` requires it, so the runtime account can
+   read the application and never write it. A checkout can therefore never be
+   root-owned, and `logrotate --debug "${logrotate_source}"` can never succeed
+   on a correctly provisioned host.
+
+**The check was unsatisfiable, not merely unlucky.** Fixing the environment
+moved the failure from the first guard to the second; nothing about the
+environment could clear the second.
+
+Three things were *not* the defect, and none of them was changed:
+
+* **the policy content**, which is valid and installs and parses correctly at
+  `/etc/logrotate.d/garden-observatory` as `root:root 0644`;
+* **the checkout ownership**, which is the deployment model working as intended;
+* **the validation itself**, which exists because a syntax error in
+  `/etc/logrotate.d` breaks rotation for the whole host, not just for MGO.
+  Deleting it to make the installer proceed would have traded a blocked install
+  for a silently broken one.
+
+**Corrected.** The policy is now validated as the file it will *become*:
+
+1. a private staging directory is created with `mktemp -d /tmp/mgo-logrotate-XXXXXXXX`
+   and `chmod 0700` — random, outside the repository, root-only;
+2. the tracked policy is copied into it with `install -o root -g root -m 0644`,
+   exactly the metadata the destination will carry;
+3. `logrotate --debug` validates **the staged file**;
+4. **the same staged file** is handed to `install_managed_file`;
+5. the staging directory is removed on every path out.
+
+### The same bytes are validated and installed
+
+Step 4 is the part that is easy to get subtly wrong. Validating the staged copy
+and then installing a second copy of the source would look correct and would
+reintroduce a gap between what was checked and what is written. The staged path
+is passed straight through, and a test fails if it is not.
+
+`install_managed_file` gained an optional fifth argument naming the path to
+*report*. Without it a `--dry-run` would show an operator a random `/tmp` path
+that will not exist a moment later, instead of the tracked file they would edit.
+Every other caller omits it and is unchanged.
+
+### Cleanup, and why a subshell
+
+The staging function has a body in `( … )` rather than `{ … }`, with its own
+`EXIT` trap. Bash traps are global: setting one inside a normal function would
+silently replace any trap the rest of the installer might later rely on. A
+subshell keeps the trap local, so the directory is removed on success, on
+refusal, and on an unexpected failure, without affecting anything else.
+
+### Non-root dry runs
+
+`--dry-run` may legitimately run without root, and cannot `chown`. The
+ownership flags are therefore requested only when running as uid 0; otherwise
+the staged file belongs to the invoking user — which logrotate accepts equally,
+since its rule is *root or the invoking user*. The parse check stays meaningful
+on both paths, and the real installation always runs as root and always stages
+`root:root 0644`.
+
+### State at the point validation stopped
+
+No Task 10 service, timer or logrotate policy was installed; no backup
+directory was created; no backup or support bundle was produced; no production
+data was changed by validation; `mgo.service` stayed on its original PID with
+zero restarts; preview ran continuously throughout; the Pi returned to clean
+`main`; and Phase B halted at the required pre-install gate.
+
+**Task 10 Pi validation is not complete.** It must restart from repository
+preflight once this correction is reviewed and a new SHA is approved.
+
+### How this was confirmed
+
+The tests execute the real extracted shell logic against recording stubs rather
+than grepping for words. Six mutations of the installer, each reverted
+byte-for-byte afterwards:
+
+| Mutation | Tests failed |
+| -------- | ------------ |
+| Validate `${logrotate_source}` again | 4 |
+| Validate the staged copy but install the source | 3 |
+| Remove the cleanup trap | 5 |
+| Downgrade the refusal to a warning | 1 |
+| Stage with mode `0666` | 2 |
+| Drop `-o root -g root` | 1 |
+
+Writing them also caught a defect in one of my own stubs: the fake `install`
+indexed its arguments from the left, so it silently wrote nothing. The
+filesystem assertions failed and exposed it; the stub now takes mode, source and
+destination from the end of the argument vector, where they always are.
 
 ## Authoritative definition
 

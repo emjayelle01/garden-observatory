@@ -566,8 +566,15 @@ fi
 # what is already there. Backing up a *different* existing file preserves any
 # local edit; skipping an identical one keeps re-runs quiet and avoids
 # rewriting a file for no reason.
+# The optional fifth argument is the path to *report*. It exists because one
+# caller installs from a private staging copy whose name is deliberately
+# unpredictable: an operator reading a --dry-run needs to see the tracked file
+# they would edit, not a temporary path that will not exist a moment later.
+# Every other caller omits it and reports the file it installs.
+# >>> managed-file >>>
 install_managed_file() {
   local source="$1" destination="$2" mode="$3" label="$4"
+  local display="${5:-$1}"
 
   if [[ -f "${destination}" ]] && cmp -s "${source}" "${destination}"; then
     note "${destination} is already up to date"
@@ -582,12 +589,13 @@ install_managed_file() {
 
   if (( dry_run )); then
     printf '  [dry-run] would install %s -> %s (root:root %s)\n' \
-      "${source}" "${destination}" "${mode}"
+      "${display}" "${destination}" "${mode}"
   else
     install -o root -g root -m "${mode}" "${source}" "${destination}"
     note "installed ${destination} (root:root ${mode})"
   fi
 }
+# <<< managed-file <<<
 
 if (( install_operations )); then
   step "Backup service and timer"
@@ -633,20 +641,72 @@ if (( install_operations )); then
   # Validate the tracked policy before installing it where logrotate will read
   # it: a syntax error in /etc/logrotate.d breaks rotation for the WHOLE host,
   # not just for MGO.
-  if command -v logrotate >/dev/null 2>&1; then
-    if logrotate --debug "${logrotate_source}" >/dev/null 2>&1; then
-      note "the tracked logrotate policy parses cleanly"
-    else
-      warn "logrotate could not parse ${logrotate_source}; not installing it."
-      logrotate --debug "${logrotate_source}" >&2 || true
-      fail "refusing to install a logrotate policy that does not parse."
-    fi
-  else
-    note "logrotate is not installed; skipping policy validation"
-  fi
+  #
+  # The policy is validated as the file it will BECOME, not as the file it
+  # currently is. logrotate refuses a configuration that is group- or
+  # other-writable, and also one whose owner is neither root nor the invoking
+  # user. A checkout is deliberately owned by the administrative operator so the
+  # runtime account can only read it -- so pointing logrotate at the checkout
+  # source fails on a *correctly* provisioned host however valid the policy is.
+  # That is not hypothetical: it is what stopped Raspberry Pi validation with
+  # "the file owner is wrong (should be root or user with uid 0)".
+  #
+  # So the policy is staged into a private root-owned directory carrying exactly
+  # the metadata it will have at the destination, and that staged file is both
+  # validated and installed. Validating one file and then installing a second
+  # copy of the source would leave a gap between what was checked and what is
+  # written.
+# >>> logrotate-staging >>>
+  stage_and_install_logrotate_policy() (
+    # A subshell with its own EXIT trap: the staging directory is removed on
+    # every path out of here -- success, refusal, or an unexpected failure --
+    # without installing or disturbing a trap anywhere else in this script.
+    staging=""
+    trap 'if [[ -n "${staging}" ]]; then rm -rf "${staging}"; fi' EXIT
 
-  install_managed_file "${logrotate_source}" "${logrotate_destination}" \
-    0644 "logrotate policy"
+    staging="$(mktemp -d /tmp/mgo-logrotate-XXXXXXXX)" \
+      || fail "could not create a private directory in which to validate the logrotate policy."
+    chmod 0700 "${staging}" \
+      || fail "could not restrict the logrotate staging directory."
+
+    staged="${staging}/garden-observatory"
+
+    # root:root 0644 is what the destination will carry and what logrotate
+    # wants. A --dry-run may legitimately run as a non-root user and cannot
+    # chown; there the staged file belongs to the invoking user, which logrotate
+    # accepts equally, so the parse check stays meaningful either way.
+    stage_flags=(-m 0644)
+    if [[ "$(id -u)" == "0" ]]; then
+      stage_flags+=(-o root -g root)
+    fi
+    install "${stage_flags[@]}" "${logrotate_source}" "${staged}" \
+      || fail "could not stage the logrotate policy for validation."
+
+    if command -v logrotate >/dev/null 2>&1; then
+      # One invocation, and its exit status is the decision. Capturing the
+      # output means a refusal can show the operator why without parsing the
+      # policy a second time.
+      if diagnostics="$(logrotate --debug "${staged}" 2>&1)"; then
+        note "the tracked logrotate policy parses cleanly"
+      else
+        warn "logrotate could not parse ${logrotate_source}; not installing it."
+        printf '%s\n' "${diagnostics}" >&2
+        fail "refusing to install a logrotate policy that does not parse."
+      fi
+    else
+      note "logrotate is not installed; skipping policy validation"
+    fi
+
+    # The bytes logrotate accepted are the bytes that get installed. Both
+    # branches above install the same staged file, so one code path decides what
+    # reaches the destination.
+    install_managed_file "${staged}" "${logrotate_destination}" \
+      0644 "logrotate policy" "${logrotate_source}" \
+      || fail "could not install the logrotate policy."
+  )
+
+  stage_and_install_logrotate_policy
+# <<< logrotate-staging <<<
 
   step "Enabling the backup timer"
 

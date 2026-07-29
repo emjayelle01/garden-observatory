@@ -577,6 +577,10 @@ def test_the_installer_validates_the_logrotate_policy_before_installing() -> Non
 
     assert "logrotate --debug" in text
     assert "refusing to install a logrotate policy that does not parse" in text
+    # It validates the staged copy, never the checkout source. The behavioural
+    # proof is below; this guards the shape against a careless revert.
+    assert 'logrotate --debug "${staged}"' in text
+    assert 'logrotate --debug "${logrotate_source}"' not in text
 
 
 def test_the_installer_validates_the_retention_argument() -> None:
@@ -1720,6 +1724,464 @@ def test_the_documentation_states_the_override_order() -> None:
         f"default `{CONFIG_PATH_ENV}`" in text
     )
     assert "set-but-empty" in text or "set but empty" in text
+
+
+# --- regression: the logrotate policy is validated as what it will become -----
+#
+# The installer used to run "logrotate --debug" against the tracked file inside
+# the checkout. Modern logrotate refuses a configuration file that is group- or
+# other-writable, and also one whose owner is neither root nor the invoking
+# user -- and a checkout is DELIBERATELY owned by the administrative operator so
+# the runtime account can only read it. The check was therefore unsatisfiable on
+# a correctly provisioned host: it failed on the Raspberry Pi with "the file
+# owner is wrong (should be root or user with uid 0)" while the policy content
+# was perfectly valid.
+#
+# Making the checkout root-owned would contradict the service-identity model,
+# and dropping the validation would remove the guard that stops a malformed
+# policy breaking rotation for the WHOLE host. The boundary is a transient
+# root-owned staged copy: validate the file as it will exist at the destination,
+# and install those same bytes.
+#
+# These tests execute the real extracted shell logic against stubs rather than
+# grepping for words, so a mutation that validates the staged copy and then
+# installs the source again fails them.
+
+LOGROTATE_STAGING_START = "# >>> logrotate-staging >>>"
+LOGROTATE_STAGING_END = "# <<< logrotate-staging <<<"
+MANAGED_FILE_START = "# >>> managed-file >>>"
+MANAGED_FILE_END = "# <<< managed-file <<<"
+
+
+def _marked_block(text: str, start: str, end: str) -> str:
+    """Extract a self-contained, executable region of the install script."""
+    _, opening, remainder = text.partition(start)
+    block, closing, _ = remainder.partition(end)
+
+    assert opening, f"{start} marker is missing"
+    assert closing, f"{end} marker is missing"
+    return block
+
+
+def _logrotate_block() -> str:
+    """The staging, validation and installation logic, verbatim."""
+    return _marked_block(
+        _read(INSTALL_SCRIPT), LOGROTATE_STAGING_START, LOGROTATE_STAGING_END
+    )
+
+
+def _managed_file_block() -> str:
+    """The managed-file installer, verbatim."""
+    return _marked_block(
+        _read(INSTALL_SCRIPT), MANAGED_FILE_START, MANAGED_FILE_END
+    )
+
+
+def _bash_path(path: Path) -> str:
+    """Render a path the way MSYS bash accepts it on either platform."""
+    return str(path).replace("\\", "/")
+
+
+def _run_logrotate_staging(
+    tmp_path: Path,
+    *,
+    policy_parses: bool = True,
+    logrotate_available: bool = True,
+    dry_run: int = 0,
+    as_root: bool = True,
+    install_fails: bool = False,
+) -> tuple[int, dict[str, list[str]], str]:
+    """Execute the real staging block against recording stubs.
+
+    Everything the block touches is stubbed at the shell level -- ``note``,
+    ``warn``, ``fail``, ``install_managed_file``, ``install``, ``logrotate``,
+    ``id`` and, where needed, ``command`` -- so the test observes exactly which
+    paths were handed to which operation.
+    """
+    bash = _find_bash()
+    if bash is None:  # pragma: no cover - bash is present on Windows and the Pi
+        pytest.skip("bash is unavailable")
+
+    root = _bash_path(tmp_path)
+    source = f"{root}/checkout/garden-observatory.logrotate"
+    destination = f"{root}/etc/logrotate.d/garden-observatory"
+    record = f"{root}/record"
+
+    uid = "0" if as_root else "1000"
+    install_status = "1" if install_fails else "0"
+
+    stubs = [
+        "set -uo pipefail",
+        f'mkdir -p "{root}/checkout" "{root}/etc/logrotate.d"',
+        f'printf "/var/log/x/*.log {{\\n  daily\\n  rotate 14\\n}}\\n" > "{source}"',
+        f'chmod 0644 "{source}"',
+        f'logrotate_source="{source}"',
+        f'logrotate_destination="{destination}"',
+        f"dry_run={dry_run}",
+        f'record="{record}"',
+        ': > "$record"',
+        # --- helper stubs, each recording what it was given -----------------
+        'note() { printf "NOTE %s\\n" "$*" >> "$record"; }',
+        'warn() { printf "WARN %s\\n" "$*" >> "$record"; }',
+        'fail() { printf "FAIL %s\\n" "$*" >> "$record"; exit 1; }',
+        (
+            "install_managed_file() { "
+            'printf "MANAGED_SOURCE %s\\n" "$1" >> "$record"; '
+            'printf "MANAGED_DEST %s\\n" "$2" >> "$record"; '
+            'printf "MANAGED_MODE %s\\n" "$3" >> "$record"; '
+            'printf "MANAGED_DISPLAY %s\\n" "${5:-$1}" >> "$record"; '
+            f"return {install_status}; }}"
+        ),
+        # id -u decides whether the root ownership flags are requested.
+        f'id() {{ if [ "${{1:-}}" = "-u" ]; then printf "{uid}"; '
+        'else builtin command id "$@"; fi; }',
+        # Record the exact argument vector, then really create the file so the
+        # rest of the block behaves as it would in production.
+        (
+            "install() { "
+            'printf "INSTALL_ARGS %s\\n" "$*" >> "$record"; '
+            'printf "STAGED_PATH %s\\n" "${@: -1}" >> "$record"; '
+            'builtin command install -m 0644 "${@: -2:1}" "${@: -1}"; }'
+        ),
+    ]
+
+    if logrotate_available:
+        stubs.append(
+            "logrotate() { "
+            'printf "LOGROTATE_ARG %s\\n" "$2" >> "$record"; '
+            + (
+                'printf "parsed\\n"; return 0; }'
+                if policy_parses
+                else 'printf "error: simulated syntax error\\n"; return 1; }'
+            )
+        )
+    else:
+        # Deterministic on a host that does have logrotate installed.
+        stubs.append(
+            'command() { if [ "${1:-}" = "-v" ] && [ "${2:-}" = "logrotate" ]; '
+            'then return 1; fi; builtin command "$@"; }'
+        )
+
+    program = "\n".join(
+        [
+            *stubs,
+            # The block defines the function and calls it. Wrapping it lets the
+            # harness observe the status and then inspect the filesystem, which
+            # a bare top-level "exit 1" would prevent.
+            "run_block() {",
+            _logrotate_block(),
+            "}",
+            "run_block",
+            'printf "STATUS %s\\n" "$?" >> "$record"',
+            'staged="$(sed -n "s/^STAGED_PATH //p" "$record" | head -1)"',
+            'if [ -n "$staged" ]; then',
+            '  if [ -e "$staged" ]; then remains=yes; else remains=no; fi',
+            '  printf "STAGED_REMAINS %s\\n" "$remains" >> "$record"',
+            '  if [ -d "$(dirname "$staged")" ]; then dir=yes; else dir=no; fi',
+            '  printf "STAGING_DIR_REMAINS %s\\n" "$dir" >> "$record"',
+            "fi",
+        ]
+    )
+
+    completed = subprocess.run(
+        [bash, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    entries: dict[str, list[str]] = {}
+    record_file = tmp_path / "record"
+    if record_file.is_file():
+        for line in record_file.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(" ")
+            entries.setdefault(key, []).append(value)
+
+    status = int(entries.get("STATUS", ["-1"])[0])
+    return status, entries, completed.stderr
+
+
+def test_logrotate_is_given_a_staged_copy_not_the_checkout_source(
+    tmp_path: Path,
+) -> None:
+    """The defect itself: the checkout can never satisfy logrotate's owner check."""
+    status, entries, _ = _run_logrotate_staging(tmp_path)
+
+    assert status == 0
+    validated = entries["LOGROTATE_ARG"][0]
+    source = entries["MANAGED_DISPLAY"][0]
+
+    assert validated != source
+    assert "/checkout/" not in validated
+    assert validated.startswith("/tmp/mgo-logrotate-")
+
+
+def test_the_staged_policy_carries_the_destination_metadata(
+    tmp_path: Path,
+) -> None:
+    """root:root 0644 -- exactly what /etc/logrotate.d will hold."""
+    _, entries, _ = _run_logrotate_staging(tmp_path, as_root=True)
+    arguments = entries["INSTALL_ARGS"][0].split()
+
+    assert "-m" in arguments
+    assert arguments[arguments.index("-m") + 1] == "0644"
+    assert "-o" in arguments
+    assert arguments[arguments.index("-o") + 1] == "root"
+    assert "-g" in arguments
+    assert arguments[arguments.index("-g") + 1] == "root"
+
+
+def test_the_staging_directory_is_private_and_unpredictable(
+    tmp_path: Path,
+) -> None:
+    """A fixed name in /tmp is a symlink attack waiting for a slow day."""
+    block = _logrotate_block()
+
+    assert "mktemp -d /tmp/mgo-logrotate-XXXXXXXX" in block
+    assert "chmod 0700" in block
+    # Never a fixed filename, and never inside the repository.
+    assert "/tmp/garden-observatory.logrotate" not in block
+    assert "${app_root}" not in block
+    assert "${script_dir}" not in block
+
+    _, entries, _ = _run_logrotate_staging(tmp_path)
+    first = entries["STAGED_PATH"][0]
+    _, second_entries, _ = _run_logrotate_staging(tmp_path / "again")
+
+    assert first != second_entries["STAGED_PATH"][0], "the path must vary"
+
+
+def test_the_validated_bytes_are_the_installed_bytes(tmp_path: Path) -> None:
+    """A mutation that re-installs the source instead must fail here."""
+    status, entries, _ = _run_logrotate_staging(tmp_path)
+
+    assert status == 0
+    assert entries["LOGROTATE_ARG"][0] == entries["MANAGED_SOURCE"][0]
+    assert entries["MANAGED_SOURCE"][0] != entries["MANAGED_DISPLAY"][0]
+
+
+def test_a_valid_policy_is_validated_then_installed(tmp_path: Path) -> None:
+    """The whole success path, end to end."""
+    status, entries, _ = _run_logrotate_staging(tmp_path)
+
+    assert status == 0
+    assert any("parses cleanly" in note for note in entries["NOTE"])
+    assert entries["MANAGED_DEST"][0].endswith("/etc/logrotate.d/garden-observatory")
+    assert entries["MANAGED_MODE"] == ["0644"]
+    assert "WARN" not in entries
+    assert "FAIL" not in entries
+
+
+def test_a_malformed_policy_fails_closed(tmp_path: Path) -> None:
+    """Nothing reaches the destination when logrotate refuses the policy."""
+    status, entries, stderr = _run_logrotate_staging(tmp_path, policy_parses=False)
+
+    assert status == 1
+    assert "MANAGED_SOURCE" not in entries, "installation must not be attempted"
+    assert any("could not parse" in warning for warning in entries["WARN"])
+    assert any("does not parse" in failure for failure in entries["FAIL"])
+    # The operator is shown why, not merely that.
+    assert "simulated syntax error" in stderr
+
+
+def test_staging_is_removed_after_successful_validation(tmp_path: Path) -> None:
+    """Success must not litter /tmp with copies of the policy."""
+    _, entries, _ = _run_logrotate_staging(tmp_path)
+
+    assert entries["STAGED_REMAINS"] == ["no"]
+    assert entries["STAGING_DIR_REMAINS"] == ["no"]
+
+
+def test_staging_is_removed_after_failed_validation(tmp_path: Path) -> None:
+    """The refusal path exits through the same trap."""
+    _, entries, _ = _run_logrotate_staging(tmp_path, policy_parses=False)
+
+    assert entries["STAGED_REMAINS"] == ["no"]
+    assert entries["STAGING_DIR_REMAINS"] == ["no"]
+
+
+def test_staging_is_removed_when_installation_fails(tmp_path: Path) -> None:
+    """An unexpected failure after validation still cleans up, and fails."""
+    status, entries, _ = _run_logrotate_staging(tmp_path, install_fails=True)
+
+    assert status == 1
+    assert entries["STAGING_DIR_REMAINS"] == ["no"]
+
+
+def test_a_dry_run_validates_but_leaves_nothing_behind(tmp_path: Path) -> None:
+    """--dry-run may stage privately; it may not leave a trace."""
+    status, entries, _ = _run_logrotate_staging(tmp_path, dry_run=1, as_root=False)
+
+    assert status == 0
+    # Validation genuinely happened.
+    assert entries["LOGROTATE_ARG"][0] == entries["MANAGED_SOURCE"][0]
+    assert entries["STAGED_REMAINS"] == ["no"]
+    assert entries["STAGING_DIR_REMAINS"] == ["no"]
+    # A non-root dry run cannot chown, and must not pretend to.
+    assert "-o root" not in entries["INSTALL_ARGS"][0]
+    assert "-m 0644" in entries["INSTALL_ARGS"][0]
+
+
+def test_a_dry_run_reports_the_tracked_policy_not_the_staging_path(
+    tmp_path: Path,
+) -> None:
+    """An operator must see the file they would edit, not a temporary name."""
+    _, entries, _ = _run_logrotate_staging(tmp_path, dry_run=1, as_root=False)
+    display = entries["MANAGED_DISPLAY"][0]
+
+    assert display.endswith("/checkout/garden-observatory.logrotate")
+    assert not display.startswith("/tmp/mgo-logrotate-")
+
+
+def test_a_missing_logrotate_still_installs_the_staged_policy(
+    tmp_path: Path,
+) -> None:
+    """The documented behaviour, and one code path decides the bytes."""
+    status, entries, _ = _run_logrotate_staging(
+        tmp_path, logrotate_available=False
+    )
+
+    assert status == 0
+    assert any("skipping policy validation" in note for note in entries["NOTE"])
+    assert "LOGROTATE_ARG" not in entries
+    # Still the staged copy, not the source.
+    assert entries["MANAGED_SOURCE"][0].startswith("/tmp/mgo-logrotate-")
+    assert entries["STAGING_DIR_REMAINS"] == ["no"]
+
+
+def test_every_staging_step_is_explicitly_checked(tmp_path: Path) -> None:
+    """Fail-closed: no required operation may be allowed to fail quietly."""
+    block = _logrotate_block()
+
+    for required in (
+        "mktemp -d",
+        "chmod 0700",
+        'install "${stage_flags[@]}"',
+        "install_managed_file",
+    ):
+        assert required in block, required
+
+    for line in block.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        assert "|| true" not in stripped, stripped
+
+    # Each mutating step names its own failure.
+    assert block.count("|| fail") >= 4
+
+
+# --- regression: managed-file installation behaviour -------------------------
+
+
+def _run_managed_file(
+    tmp_path: Path,
+    *,
+    existing: str | None,
+    dry_run: int = 0,
+    display: str | None = None,
+) -> tuple[int, str]:
+    """Execute the real install_managed_file against a temporary destination."""
+    bash = _find_bash()
+    if bash is None:  # pragma: no cover
+        pytest.skip("bash is unavailable")
+
+    root = _bash_path(tmp_path)
+    source = f"{root}/source.conf"
+    destination = f"{root}/dest/garden-observatory"
+
+    setup = [
+        "set -uo pipefail",
+        f'mkdir -p "{root}/dest"',
+        f'printf "policy-v2\\n" > "{source}"',
+        f"dry_run={dry_run}",
+        'note() { printf "NOTE %s\\n" "$*"; }',
+        'run() { if (( dry_run )); then printf "  [dry-run] %s\\n" "$*"; '
+        'else "$@"; fi; }',
+        # The real coreutils install, minus the ownership flags an unprivileged
+        # test user cannot set. The last three arguments are always mode,
+        # source, destination. Ownership is asserted separately, statically.
+        'install() { builtin command install -m "${@: -3:1}" "${@: -2:1}" '
+        '"${@: -1}"; }',
+    ]
+    if existing is not None:
+        setup.append(f'printf "{existing}\\n" > "{destination}"')
+
+    call = f'install_managed_file "{source}" "{destination}" 0644 "logrotate policy"'
+    if display is not None:
+        call += f' "{display}"'
+
+    program = "\n".join([*setup, _managed_file_block(), call])
+    completed = subprocess.run(
+        [bash, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    return completed.returncode, completed.stdout
+
+
+def test_an_identical_destination_is_left_alone(tmp_path: Path) -> None:
+    """Re-running provisioning must be quiet and must not churn files."""
+    status, output = _run_managed_file(tmp_path, existing="policy-v2")
+
+    assert status == 0
+    assert "already up to date" in output
+    assert "backed up" not in output
+
+
+def test_a_different_destination_is_backed_up_before_replacement(
+    tmp_path: Path,
+) -> None:
+    """A local edit must never be silently discarded."""
+    status, output = _run_managed_file(tmp_path, existing="locally-edited")
+
+    assert status == 0
+    assert "backed up the existing logrotate policy" in output
+    backups = list((tmp_path / "dest").glob("garden-observatory.bak-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8").strip() == "locally-edited"
+    assert (tmp_path / "dest" / "garden-observatory").read_text(
+        encoding="utf-8"
+    ).strip() == "policy-v2"
+
+
+def test_a_new_destination_is_installed(tmp_path: Path) -> None:
+    """The first install writes the policy and says so."""
+    status, output = _run_managed_file(tmp_path, existing=None)
+
+    assert status == 0
+    assert "(root:root 0644)" in output
+    assert (tmp_path / "dest" / "garden-observatory").is_file()
+
+
+def test_the_destination_metadata_is_always_root_root_0644() -> None:
+    """The one place the installed ownership and mode are decided."""
+    block = _managed_file_block()
+
+    assert 'install -o root -g root -m "${mode}" "${source}" "${destination}"' in (
+        block
+    )
+    assert 'note "installed ${destination} (root:root ${mode})"' in block
+    # Every caller for Task 10 assets asks for 0644.
+    text = _read(INSTALL_SCRIPT)
+    assert text.count("0644 \"logrotate policy\"") == 1
+    assert "0644 \"backup timer\"" in text
+
+
+def test_the_reported_path_defaults_to_the_installed_path(
+    tmp_path: Path,
+) -> None:
+    """The display argument is optional; omitting it must change nothing."""
+    _, without = _run_managed_file(tmp_path, existing=None, dry_run=1)
+    _, with_display = _run_managed_file(
+        tmp_path / "b", existing=None, dry_run=1, display="/tracked/policy"
+    )
+
+    assert "source.conf ->" in without
+    assert "/tracked/policy ->" in with_display
 
 
 # --- regression: pre-merge validation removes what it installed --------------
