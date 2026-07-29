@@ -3942,3 +3942,141 @@ def test_list_still_accepts_its_own_options() -> None:
 
     assert arguments.output_directory == Path("/var/backups/garden-observatory")
     assert arguments.no_verify is True
+
+
+# --- the Task 10 record's front matter must describe the present -------------
+#
+# The status heading said direct Pi validation was complete while the gate table
+# a few lines later still read "Not performed"; the readiness sentence still
+# withheld a claim that had already been met; the Windows total was 166 tests out
+# of date; and the record still asserted that no Raspberry Pi had been accessed,
+# after it had been -- through the restricted gateway, but accessed.
+#
+# Every one of those phrases is legitimate HISTORY elsewhere in the same
+# document. A numbered review finding describes the state at the moment it was
+# written and must keep saying so, so these assertions are scoped to the front
+# matter. A test that rejected the wording wherever it appeared would force the
+# review sections to lie about their own past, and would be the wrong test.
+
+TASK_RECORD = PROJECT_ROOT / "docs" / "tasks" / "Task-010-Operations.md"
+
+RECORD_TITLE = "# Task 10 — Operations foundation"
+FIRST_REVIEW_HEADING = "## Repository review"
+
+#: The commit whose direct Raspberry Pi validation passed.
+PI_VALIDATED_SHA = "4e1e5d38ab0189b62d0763c0b1301b142d7151a6"
+
+#: The verified Windows total at the starting SHA. The recorded figure may only
+#: grow from here; it may never return to a stale value.
+VERIFIED_WINDOWS_TOTAL = 1300
+
+OBSOLETE_FRONT_MATTER = (
+    "Not performed",
+    "procedure prepared for Matthew",
+    "Readiness for Pi validation is **not** claimed until the corrections have",
+    "1134 passed",
+    "no Raspberry Pi was accessed",
+    "513 added tests",
+)
+
+
+def _front_matter() -> str:
+    """The record's current-status summary, excluding every review section."""
+    return _span(_read(TASK_RECORD), RECORD_TITLE, FIRST_REVIEW_HEADING)
+
+
+def test_the_record_states_direct_pi_validation_is_complete() -> None:
+    """The headline claim, and the gate that has to agree with it."""
+    front_matter = _front_matter()
+
+    assert "Direct Pi validation complete" in front_matter
+    assert "Raspberry Pi implementation validation | **Complete**" in front_matter
+
+
+def test_the_record_names_the_validated_sha() -> None:
+    """"Validated" is only meaningful with the commit it validated."""
+    assert PI_VALIDATED_SHA in _front_matter()
+
+
+def test_the_record_states_focused_revalidation_is_pending() -> None:
+    """The correction built on the validated implementation is not validated."""
+    front_matter = _front_matter()
+
+    assert "Focused Pi revalidation" in front_matter
+    assert "**Pending**" in front_matter
+    assert "focused Pi revalidation" in front_matter
+
+
+def test_the_two_pi_gates_are_distinct() -> None:
+    """One row could not have carried both states without contradicting itself."""
+    front_matter = _front_matter()
+
+    implementation = front_matter.index("Raspberry Pi implementation validation")
+    revalidation = front_matter.index("Focused Pi revalidation")
+
+    assert implementation < revalidation
+
+
+@pytest.mark.parametrize("stale", OBSOLETE_FRONT_MATTER)
+def test_the_front_matter_carries_no_obsolete_claim(stale: str) -> None:
+    """Each phrase was true once and is now false in the present tense."""
+    assert stale not in _front_matter(), stale
+
+
+def test_the_front_matter_reports_a_current_windows_total() -> None:
+    """A summary total that drifts is worse than no summary total."""
+    stated = re.search(r"\*\*(\d+) passed / (\d+) skipped\*\*", _front_matter())
+
+    assert stated is not None, "no Windows total is recorded"
+    assert int(stated.group(1)) >= VERIFIED_WINDOWS_TOTAL, stated.group(1)
+    assert int(stated.group(2)) == 12
+
+
+def test_only_one_current_windows_total_is_stated() -> None:
+    """Two conflicting 'current' totals would restore the original defect."""
+    totals = re.findall(r"\*\*(\d+) passed / (\d+) skipped\*\*", _front_matter())
+
+    assert len(totals) == 1, totals
+
+
+def test_the_front_matter_records_how_pi_access_was_constrained() -> None:
+    """Replacing a false denial with silence would be no better."""
+    front_matter = _front_matter()
+
+    assert "dedicated `claude` account" in front_matter
+    assert "/usr/local/sbin/mgo-validate" in front_matter
+    assert "root-owned approval file" in front_matter
+    for forbidden in ("unrestricted", "`pi` account", "root login"):
+        assert forbidden in front_matter, forbidden
+
+
+def test_the_front_matter_keeps_the_merge_status_truthful() -> None:
+    """The two facts that must stay true until Matthew decides otherwise."""
+    front_matter = _front_matter()
+
+    assert "No pull request is opened and nothing is merged." in front_matter
+    assert "No Task 11 or Task 12 work has" in front_matter
+
+
+def test_the_front_matter_describes_test_coverage_without_a_fixed_aggregate() -> None:
+    """A stage-by-stage count in the summary drifts the moment a stage is added."""
+    front_matter = _front_matter()
+
+    assert "every subsequent repository" in front_matter
+    assert re.search(r"\b\d+ added tests\b", front_matter) is None
+
+
+def test_the_historical_findings_keep_their_original_wording() -> None:
+    """The correction is to the present tense, not to the record of the past.
+
+    A global search-and-replace would have been the quick way to clear the stale
+    phrases, and it would have rewritten history: each review section describes
+    what was true when it was written, and has to go on doing so.
+    """
+    record = _read(TASK_RECORD)
+    history = record.partition(FIRST_REVIEW_HEADING)[2]
+
+    assert "**Pi validation had not resumed** at the time this correction was" in (
+        history
+    )
+    assert "Pi validation had not resumed" not in _front_matter()

@@ -53,6 +53,15 @@ failure path was not fail-closed. Recorded in
 [§ Managed-file failure-propagation review](#managed-file-failure-propagation-review)
 and corrected in a commit after `5adace7`.
 
+Direct Raspberry Pi validation then ran at `4e1e5d3` and **passed**: the
+operations implementation was exercised end to end on real hardware. It exposed
+three further defects — all of them in validation cleanup, verification
+truthfulness and operator help rather than in the operations code. They are
+recorded in
+[§ Direct Pi validation findings](#direct-pi-validation-findings) and corrected
+in a commit after `4e1e5d3`. That correction is what now awaits focused
+revalidation.
+
 | Gate | Outcome |
 | ---- | ------- |
 | Architecture review | Complete |
@@ -61,10 +70,14 @@ and corrected in a commit after `5adace7`.
 | Final re-review | Complete — source-identity findings, corrected |
 | Identity-ordering review | Complete — three findings, corrected |
 | Local static and automated validation | Passed |
-| Raspberry Pi validation | **Not performed** — procedure prepared for Matthew |
+| Raspberry Pi implementation validation | **Complete** at `4e1e5d38ab0189b62d0763c0b1301b142d7151a6` |
+| Focused Pi revalidation of the `177f4a9` correction | **Pending** repository approval and SHA authorisation |
 
-Readiness for Pi validation is **not** claimed until the corrections have
-passed review.
+The operations implementation has passed direct Raspberry Pi validation.
+Pull-request readiness is **not** claimed until the final hardware-findings
+correction has passed focused Pi revalidation. The two are deliberately
+separate: what is validated is the implementation; what is not yet revalidated
+is the cleanup and reporting correction built on top of it.
 
 Delivered as decided below:
 
@@ -81,12 +94,15 @@ Delivered as decided below:
 - installer integration in `scripts/deploy/install-service-identity.sh`;
 - `docs/Operations.md`, plus `README.md`, `scripts/README.md`,
   `docs/Service-Identity.md` and `docs/Database.md` updates;
-- 513 added tests across `tests/test_operations_events.py`,
+- tests across `tests/test_operations_events.py`,
   `tests/test_operations_backup.py`, `tests/test_operations_support_bundle.py`,
   `tests/test_operations_deployment.py` and
-  `tests/test_operations_source_identity.py` (262 with the implementation, 198
-  with the repository corrections, 37 with the source-identity hardening, 16
-  with the identity-ordering correction).
+  `tests/test_operations_source_identity.py`, covering the operations
+  implementation and every subsequent repository, source-identity,
+  identity-ordering, operator-boundary, validation-procedure and
+  hardware-finding correction. The authoritative suite total is the one stated
+  in the validation paragraph below; the exact number added at each stage is
+  recorded in that stage's own review section, which is where it stays accurate.
 
 `scripts/deploy/mgo.service.template` is **byte-for-byte unchanged**, asserted
 by a test that diffs it against `main`. No dependency was added; `pyproject.toml`
@@ -94,9 +110,10 @@ and `uv.lock` are unchanged. No migration, no configuration field, no API
 endpoint and no dashboard change.
 
 Validation on the development workstation after the corrections: `ruff` passed,
-`mypy src` passed (48 source files), `pytest` **1134 passed / 12 skipped**
-(baseline 633 + 513 added). Every skip is a POSIX mode-bit, POSIX-behaviour or
-symlink-creation assertion that cannot be made on Windows.
+`mypy src` passed (48 source files), `pytest` **1316 passed / 12 skipped**.
+Every skip is a POSIX mode-bit, POSIX-behaviour or symlink-creation assertion
+that cannot be made on Windows; on the Raspberry Pi they run, which is why the
+Linux total is correspondingly higher.
 
 Two real defects were found and fixed during implementation, both caused by
 Windows resolving a rooted POSIX path against the current drive:
@@ -110,8 +127,17 @@ Windows resolving a rooted POSIX path against the current drive:
   collapsed with `journal_mode=DELETE`, and a test asserts the sidecars are
   absent.
 
-No pull request is opened, nothing is merged, and no Raspberry Pi was accessed.
-No Task 11 or Task 12 work has been started.
+Raspberry Pi access has been narrow and auditable throughout. No unrestricted
+SSH session, arbitrary `sudo`, `pi` account or root login was ever used. Direct
+validation was performed through the dedicated `claude` account, and every
+privileged action went through `/usr/local/sbin/mgo-validate`, the gateway that
+refuses to act unless the checkout matches the reviewed SHA installed in a
+root-owned approval file. No Pi access occurred during the implementation of
+the final hardware-findings correction, or during this documentation
+correction.
+
+No pull request is opened and nothing is merged. No Task 11 or Task 12 work has
+been started.
 
 ## Repository review
 
