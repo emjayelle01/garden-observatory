@@ -278,15 +278,38 @@ if [[ -f "${logrotate_path}" ]]; then
     && pass "su ${service_user} ${service_group}" \
     || fail "the policy does not rotate as ${service_user}:${service_group}"
 
-  if command -v logrotate >/dev/null 2>&1; then
-    if logrotate --debug "${logrotate_path}" >/dev/null 2>&1; then
-      pass "the installed policy parses cleanly"
+  # logrotate ships in /usr/sbin on Debian, and /usr/sbin is NOT on an
+  # unprivileged account's PATH. "command -v logrotate" therefore fails on a
+  # host where logrotate is installed and working perfectly well -- which is
+  # exactly what happened during Pi validation, where this check reported
+  # "logrotate is not installed" about the very binary the installer had just
+  # used successfully. Search PATH first, then the canonical administrative
+  # locations. The caller's PATH is never modified and no root is needed.
+  # >>> logrotate-discovery >>>
+  logrotate_bin=""
+  for candidate in \
+    "$(command -v logrotate 2>/dev/null || true)" \
+    "/usr/sbin/logrotate" \
+    "/sbin/logrotate"
+  do
+    if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+      logrotate_bin="${candidate}"
+      break
+    fi
+  done
+
+  if [[ -n "${logrotate_bin}" ]]; then
+    if "${logrotate_bin}" --debug "${logrotate_path}" >/dev/null 2>&1; then
+      pass "the installed policy parses cleanly (${logrotate_bin})"
     else
       fail "logrotate cannot parse ${logrotate_path}"
     fi
   else
-    skip "logrotate is not installed on this host"
+    # Deliberately a statement about DISCOVERY, not about the package: this
+    # check cannot tell an uninstalled logrotate from one it failed to find.
+    skip "no logrotate executable found in PATH, /usr/sbin or /sbin"
   fi
+  # <<< logrotate-discovery <<<
 else
   fail "${logrotate_path} is missing"
 fi

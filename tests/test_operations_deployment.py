@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
@@ -39,6 +40,7 @@ from mgo.core.config import (
     resolve_config_path,
 )
 from mgo.operations.backup import DEFAULT_RETENTION_COUNT, MAX_RETENTION_COUNT
+from mgo.operations.backup_cli import _build_parser
 from mgo.operations.errors import OperationError
 
 DEPLOY = PROJECT_ROOT / "scripts" / "deploy"
@@ -2991,7 +2993,7 @@ def test_the_pre_merge_rollback_state_requires_the_full_cleanup() -> None:
 
 
 def test_the_pre_merge_rollback_restarts_after_the_checkout() -> None:
-    """Steps 1-7 leave a main checkout serving feature-branch code."""
+    """Every step before the restart leaves a main checkout on feature code."""
     state = _span(
         _rollback(),
         "### 14.2 After pre-merge Pi installation validation, before merge",
@@ -3001,9 +3003,20 @@ def test_the_pre_merge_rollback_restarts_after_the_checkout() -> None:
     assert "`git checkout main`" in state
     assert RESTART_API in state
     assert state.index("`git checkout main`") < state.index(RESTART_API)
-    assert "not complete until step 8" in state
     assert "feature-branch runtime" in state
     assert "restore preview" in state
+
+    # The prose names the step the rollback is not complete without. Tie it to
+    # the list rather than to a literal: inserting a step renumbers the list but
+    # would silently leave the sentence pointing at the wrong one.
+    claimed = re.search(r"not complete until step (\d+)", state)
+    restart_step = re.search(
+        rf"^(\d+)\. `{re.escape(RESTART_API)}`", state, re.MULTILINE
+    )
+
+    assert claimed is not None, "the rollback must name its completing step"
+    assert restart_step is not None, "the restart must be a numbered step"
+    assert claimed.group(1) == restart_step.group(1)
 
 
 def test_the_post_merge_rollback_also_restarts_the_service() -> None:
@@ -3151,3 +3164,781 @@ def test_the_verifier_and_installer_agree_on_every_location() -> None:
     for name in ("mgo-backup.service", "mgo-backup.timer"):
         assert name in install, name
         assert name in verify, name
+
+
+# --- finding 23: ignored bytecode must not survive the return to main --------
+#
+# Direct Pi validation returned to `main` and left src/mgo/operations/ behind: a
+# directory holding nothing but git-ignored .pyc files. Git does not remove
+# ignored files on checkout, and it will not delete a directory that still holds
+# them, so the package directory outlived the branch that created it.
+#
+# `git status --porcelain` reported the tree CLEAN throughout -- not mentioning
+# ignored files is precisely its job -- so the procedure's own cleanliness check
+# could not see the residue. And the survivor was importable: a directory with
+# no __init__.py is a PEP 420 implicit namespace package, so
+# find_spec("mgo.operations") answered on a checkout meant to predate Task 10.
+#
+# These tests assert the ORDER (cleanup before the checkout, proofs after it)
+# and then prove the behaviour against a real temporary Git repository. Order is
+# the whole finding: a correct cleanup placed after the checkout is exactly as
+# useless as no cleanup, because by then the tracked sources are gone and only
+# the bytecode remains to identify.
+
+BYTECODE_HEADING = "#### Remove Task 10 compiled bytecode"
+MUST_NOT_TOUCH_HEADING = "#### What this cleanup must not touch"
+PACKAGE_PROOF_HEADING = "#### Prove the Task 10 package is gone"
+FINAL_STATE_HEADING = "### 13.21 Required final state"
+WHAT_NEXT_HEADING = "### 13.22 What happens next"
+
+TASK_10_PACKAGE = "src/mgo/operations"
+IGNORED_STATUS = f"git status --ignored --porcelain -- {TASK_10_PACKAGE}"
+PACKAGE_RESIDUE_STATE = (
+    "Task 10 Python package residue: absent and not import-discoverable"
+)
+
+
+def _bytecode_cleanup() -> str:
+    """The mandatory bytecode-removal step, which precedes the checkout."""
+    return _span(_procedure(), BYTECODE_HEADING, MUST_NOT_TOUCH_HEADING)
+
+
+def _package_proof() -> str:
+    """The three post-checkout absence proofs."""
+    return _span(_procedure(), PACKAGE_PROOF_HEADING, RESTART_HEADING)
+
+
+def test_the_bytecode_cleanup_precedes_the_checkout() -> None:
+    """Removing bytecode after the checkout would be too late to be scoped."""
+    procedure = _procedure()
+
+    assert BYTECODE_HEADING in procedure
+    assert procedure.index(BYTECODE_HEADING) < procedure.index(CHECKOUT_MAIN)
+
+
+def test_the_bytecode_cleanup_follows_the_system_artefact_removal() -> None:
+    """Units first, then bytecode, then the checkout."""
+    procedure = _procedure()
+
+    assert procedure.index(REMOVE_LOGROTATE) < procedure.index(BYTECODE_HEADING)
+
+
+def test_the_package_proofs_follow_the_checkout() -> None:
+    """Absence can only be proven once the checkout has happened."""
+    procedure = _procedure()
+
+    assert PACKAGE_PROOF_HEADING in procedure
+    assert procedure.index(CHECKOUT_MAIN) < procedure.index(PACKAGE_PROOF_HEADING)
+
+
+def test_the_bytecode_deletion_is_confined_to_the_task_10_package() -> None:
+    """Every deletion names the one package it is allowed to touch."""
+    deletions = [
+        command
+        for command in _bash_commands(_bytecode_cleanup())
+        if "-delete" in command
+    ]
+
+    assert deletions, "the cleanup deletes nothing"
+    for command in deletions:
+        assert command.startswith(f"find {TASK_10_PACKAGE} "), command
+
+
+def test_only_compiled_artefacts_and_empty_cache_directories_are_deleted() -> None:
+    """Two deletions: compiled files, then the directories left empty."""
+    deletions = [
+        command
+        for command in _bash_commands(_bytecode_cleanup())
+        if "-delete" in command
+    ]
+
+    assert len(deletions) == 2, deletions
+    files, directories = deletions
+
+    assert "-type f" in files
+    assert "-name '*.pyc'" in files
+    assert "-name '*.pyo'" in files
+
+    assert "-type d" in directories
+    assert "-name '__pycache__'" in directories
+    # Without -empty this would remove a cache directory holding anything at all.
+    assert "-empty" in directories
+
+
+def test_the_bytecode_cleanup_never_names_python_source() -> None:
+    """A cleanup that could match ``*.py`` would delete tracked source."""
+    for command in _bash_commands(_bytecode_cleanup()):
+        assert re.search(r"-name\s+'\*\.py'", command) is None, command
+
+
+def test_the_cleanup_uses_no_broad_git_clean() -> None:
+    """``git clean -fdx``/``-fdX`` would work, and would destroy far more."""
+    for command in _bash_commands(_procedure()):
+        assert "git clean" not in command, command
+
+
+def test_the_procedure_never_removes_the_package_directory_wholesale() -> None:
+    """On the feature branch that directory still holds tracked source."""
+    for command in _bash_commands(_procedure()):
+        assert f"rm -rf {TASK_10_PACKAGE}" not in command, command
+
+
+def test_ignored_state_is_not_proven_by_ordinary_git_status() -> None:
+    """The defect hid behind exactly the check the procedure used to trust."""
+    proof = _package_proof()
+
+    assert IGNORED_STATUS in proof
+
+    for command in _bash_commands(proof):
+        if command.startswith("git status"):
+            assert "--ignored" in command, command
+
+
+def test_the_filesystem_absence_is_proven_after_the_checkout() -> None:
+    """The plainest check, and the one the residue defeated."""
+    assert f"test ! -e {TASK_10_PACKAGE}" in _package_proof()
+
+
+def test_the_import_check_uses_a_fresh_interpreter_without_bytecode() -> None:
+    """A probe that writes bytecode would recreate what it is testing for."""
+    probes = [
+        command
+        for command in _bash_commands(_package_proof())
+        if "find_spec" in command
+    ]
+
+    assert probes, "no import-resolution check is documented"
+    for command in probes:
+        assert "python -B" in command, command
+        assert 'find_spec("mgo.operations")' in command, command
+
+
+def test_the_required_final_state_demands_no_package_residue() -> None:
+    """A clean checkout is explicitly not sufficient."""
+    state = _span(_read(DOCUMENTATION), FINAL_STATE_HEADING, WHAT_NEXT_HEADING)
+
+    assert PACKAGE_RESIDUE_STATE in state
+
+
+def test_the_pre_installation_rollback_explains_when_it_stays_simple() -> None:
+    """Section 14.1 may stay simple only where nothing imported the package."""
+    simple = _span(
+        _rollback(),
+        "### 14.1 Before any Pi installation validation",
+        "### 14.2 After pre-merge Pi installation validation, before merge",
+    )
+
+    assert "never imported" in simple
+    assert "*.pyc" in simple
+
+
+def test_the_pre_merge_rollback_removes_bytecode_and_proves_absence() -> None:
+    """The full rollback carries the cleanup and all three proofs, in order."""
+    full = _span(
+        _rollback(),
+        "### 14.2 After pre-merge Pi installation validation, before merge",
+        "### 14.3 After Task 10 is merged and deployed",
+    )
+
+    assert "bytecode" in full
+    assert f"test ! -e {TASK_10_PACKAGE}" in full
+    assert IGNORED_STATUS in full
+    assert 'find_spec("mgo.operations")' in full
+    assert full.index("bytecode") < full.index("git checkout main")
+    assert full.index("git checkout main") < full.index(IGNORED_STATUS)
+
+
+# --- finding 23: behavioural proof against a real repository -----------------
+
+
+def _git_run(repo: Path, *args: str) -> str:
+    """Run git inside a scratch repository."""
+    completed = subprocess.run(
+        [_git(), *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    return completed.stdout
+
+
+def _scratch_checkout(tmp_path: Path) -> Path:
+    """A repository shaped like the Pi: ``main`` without the operations package.
+
+    The feature branch adds tracked sources under ``src/mgo/operations``, and
+    ``__pycache__`` is ignored -- the same arrangement that produced the
+    finding.
+    """
+    repo = tmp_path / "checkout"
+    (repo / "src" / "mgo").mkdir(parents=True)
+
+    _git_run(repo, "init", "--initial-branch=main")
+    _git_run(repo, "config", "user.email", "validation@example.invalid")
+    _git_run(repo, "config", "user.name", "Validation")
+
+    (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+    (repo / "src" / "mgo" / "__init__.py").write_text("", encoding="utf-8")
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-m", "main without the operations package")
+
+    _git_run(repo, "checkout", "-b", "task-010-operations")
+    package = repo / "src" / "mgo" / "operations"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "backup_cli.py").write_text("", encoding="utf-8")
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-m", "add the operations package")
+
+    return repo
+
+
+def _leave_bytecode(repo: Path) -> Path:
+    """Reproduce what importing the package leaves behind."""
+    cache = repo / "src" / "mgo" / "operations" / "__pycache__"
+    cache.mkdir(exist_ok=True)
+    for module in ("__init__", "backup_cli"):
+        (cache / f"{module}.cpython-313.pyc").write_bytes(b"\x00\x00\x00\x00")
+    return cache
+
+
+def _resolves_operations(repo: Path) -> str:
+    """Ask a fresh interpreter whether ``mgo.operations`` resolves in ``repo``.
+
+    ``-S`` is load-bearing. This repository is installed in editable mode, and
+    an editable install registers a meta-path finder consulted *before*
+    ``sys.path`` -- so without it the probe would answer for the developer's own
+    source tree and both halves of the regression would pass for entirely the
+    wrong reason. ``-B`` stops the probe writing the bytecode it looks for.
+    """
+    probe = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "import importlib.util; "
+        "spec = importlib.util.find_spec('mgo.operations'); "
+        "print('NONE' if spec is None else "
+        "(spec.origin or ';'.join(spec.submodule_search_locations)))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-B", "-S", "-c", probe, str(repo / "src")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout.strip()
+
+
+def _run_documented_cleanup(repo: Path) -> subprocess.CompletedProcess[str]:
+    """Execute the documented bytecode cleanup verbatim inside ``repo``."""
+    bash = _find_bash()
+    if bash is None:  # pragma: no cover - bash is present on Windows and the Pi
+        pytest.skip("bash is unavailable")
+
+    commands = _bash_commands(_bytecode_cleanup())
+    assert len(commands) == 3, commands
+
+    # Git Bash's coreutils must win over C:\\Windows\\System32\\find.exe, which
+    # is a text search tool and would silently do something else entirely.
+    environment = dict(os.environ)
+    environment["PATH"] = os.pathsep.join(
+        (str(Path(bash).parent), environment.get("PATH", ""))
+    )
+
+    return subprocess.run(
+        [bash, "-c", "set -u\n" + "\n".join(commands)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        env=environment,
+    )
+
+
+def test_ignored_bytecode_survives_a_bare_checkout_and_stays_importable(
+    tmp_path: Path,
+) -> None:
+    """The defect itself, reproduced before the correction is asserted."""
+    repo = _scratch_checkout(tmp_path)
+    _leave_bytecode(repo)
+    package = repo / "src" / "mgo" / "operations"
+
+    _git_run(repo, "checkout", "main")
+
+    assert (
+        _git_run(repo, "status", "--porcelain") == ""
+    ), "ordinary git status reports a clean tree -- which is the trap"
+    assert package.is_dir(), "the ignored bytecode kept the directory alive"
+    assert not list(package.glob("*.py")), "no tracked source survived"
+
+    resolved = _resolves_operations(repo)
+    assert resolved != "NONE", "the residue is discoverable as a namespace package"
+    assert str(tmp_path) in resolved, resolved
+
+
+def test_the_documented_cleanup_removes_the_residue_before_the_checkout(
+    tmp_path: Path,
+) -> None:
+    """The correction: cleanup on the branch, then all three proofs on main."""
+    repo = _scratch_checkout(tmp_path)
+    _leave_bytecode(repo)
+    package = repo / "src" / "mgo" / "operations"
+
+    completed = _run_documented_cleanup(repo)
+
+    assert completed.returncode == 0, completed.stderr
+    assert (
+        completed.stdout.strip() == ""
+    ), f"the residue check should print nothing, printed: {completed.stdout}"
+    assert (package / "backup_cli.py").is_file(), "tracked source was destroyed"
+
+    _git_run(repo, "checkout", "main")
+
+    assert not package.exists()
+    assert (
+        _git_run(repo, "status", "--ignored", "--porcelain", "--", TASK_10_PACKAGE)
+        == ""
+    )
+    assert _resolves_operations(repo) == "NONE"
+
+
+def test_an_unexpected_cache_file_is_preserved_and_stops_the_cleanup(
+    tmp_path: Path,
+) -> None:
+    """The cleanup must fail closed rather than widen itself to succeed."""
+    repo = _scratch_checkout(tmp_path)
+    cache = _leave_bytecode(repo)
+    for stale in cache.glob("*.pyc"):
+        stale.unlink()
+
+    (cache / "expected_module.pyc").write_bytes(b"\x00\x00\x00\x00")
+    unexpected = cache / "unexpected-preserve-me.txt"
+    unexpected.write_text("someone put this here", encoding="utf-8")
+
+    completed = _run_documented_cleanup(repo)
+
+    assert not (cache / "expected_module.pyc").exists(), "the .pyc was not removed"
+    assert unexpected.is_file(), "an unexpected file must never be deleted"
+    assert unexpected.read_text(encoding="utf-8") == "someone put this here"
+    assert cache.is_dir(), "a non-empty cache directory must survive"
+
+    residue = completed.stdout.strip()
+    assert residue, "the check must report the surviving directory"
+    assert "__pycache__" in residue, residue
+
+
+# --- finding 24: logrotate discovery must not depend on an operator's PATH ---
+#
+# During Pi validation the verifier printed "logrotate is not installed on this
+# host" about the very binary the installer had just used successfully. It lives
+# at /usr/sbin/logrotate, and /usr/sbin is not on an unprivileged account's
+# PATH, so `command -v logrotate` failed. The result was a SKIP rather than a
+# false PASS -- the check stayed safe -- but it drew a conclusion about the
+# PACKAGE from evidence that only concerned COMMAND DISCOVERY.
+#
+# The discovery loop is marker-extracted and executed here against stub
+# executables. The two canonical locations are absolute, so the harness rewrites
+# them into tmp_path; it asserts each literal was present before substituting,
+# because a substitution that silently matched nothing would make every scenario
+# below pass for the wrong reason.
+
+LOGROTATE_DISCOVERY_START = "# >>> logrotate-discovery >>>"
+LOGROTATE_DISCOVERY_END = "# <<< logrotate-discovery <<<"
+
+CANONICAL_LOGROTATE = ("/usr/sbin/logrotate", "/sbin/logrotate")
+DISCOVERY_SKIP = "no logrotate executable found in PATH, /usr/sbin or /sbin"
+
+
+def _logrotate_discovery_block() -> str:
+    """The executable discovery and parse check, verbatim."""
+    return _marked_block(
+        _read(VERIFY_OPERATIONS), LOGROTATE_DISCOVERY_START, LOGROTATE_DISCOVERY_END
+    )
+
+
+def _exit_binary(*, parses: bool) -> Path | None:
+    """Locate a real binary that exits ``0`` or ``1``.
+
+    A shebang script is the natural stub, but Git Bash does not report one as
+    executable -- ``-x`` is false for a file Python created, and ``chmod`` does
+    not stick on a ``noacl`` mount. The discovery loop would then reject the
+    stub for reasons that have nothing to do with the logic under test. A copied
+    ``true``/``false`` binary is recognised on every supported host, so the
+    scenarios below run on Windows and on the Pi alike.
+    """
+    name = "true" if parses else "false"
+    candidates = [Path("/usr/bin") / name, Path("/bin") / name]
+
+    bash = _find_bash()
+    if bash is not None:
+        directory = Path(bash).parent
+        candidates.insert(0, directory / f"{name}.exe")
+        candidates.insert(1, directory.parent / "usr" / "bin" / f"{name}.exe")
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None  # pragma: no cover - every supported host ships true and false
+
+
+def _stub_logrotate(target: Path, *, parses: bool) -> None:
+    """Install an executable stand-in that accepts or rejects the policy.
+
+    The scenarios below deliberately run with a minimal ``PATH`` -- that is the
+    whole point of the finding -- so a copied MSYS binary cannot find its
+    runtime through ``PATH``. Windows searches an executable's own directory
+    first, so the sibling DLLs travel with it. On Linux the glob matches
+    nothing and ordinary library resolution applies.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    source = _exit_binary(parses=parses)
+    if source is None:  # pragma: no cover - fallback for an unusual host
+        status = 0 if parses else 1
+        target.write_text(f"#!/bin/sh\nexit {status}\n", encoding="utf-8")
+    else:
+        shutil.copy2(source, target)
+        for runtime in source.parent.glob("msys-*.dll"):
+            companion = target.parent / runtime.name
+            if not companion.exists():
+                shutil.copy2(runtime, companion)
+
+    target.chmod(0o755)
+
+
+def _run_logrotate_discovery(
+    tmp_path: Path,
+    *,
+    on_path: bool = False,
+    at_usr_sbin: bool = False,
+    at_sbin: bool = False,
+    parses: bool = True,
+) -> str:
+    """Run the real discovery logic against controlled stub locations."""
+    bash = _find_bash()
+    if bash is None:  # pragma: no cover - bash is present on Windows and the Pi
+        pytest.skip("bash is unavailable")
+
+    block = _logrotate_discovery_block()
+    root = tmp_path.as_posix()
+    for canonical in CANONICAL_LOGROTATE:
+        assert f'"{canonical}"' in block, canonical
+        block = block.replace(f'"{canonical}"', f'"{root}{canonical}"')
+
+    path_directory = tmp_path / "pathbin"
+    path_directory.mkdir(parents=True, exist_ok=True)
+
+    if on_path:
+        _stub_logrotate(path_directory / "logrotate", parses=parses)
+    if at_usr_sbin:
+        _stub_logrotate(tmp_path / "usr" / "sbin" / "logrotate", parses=parses)
+    if at_sbin:
+        _stub_logrotate(tmp_path / "sbin" / "logrotate", parses=parses)
+
+    policy = tmp_path / "garden-observatory"
+    policy.write_text("# policy\n", encoding="utf-8")
+
+    program = "\n".join(
+        (
+            "set -u",
+            'pass() { printf "PASS %s\\n" "$*"; }',
+            'fail() { printf "FAIL %s\\n" "$*"; }',
+            'skip() { printf "SKIP %s\\n" "$*"; }',
+            f'logrotate_path="{policy.as_posix()}"',
+            # Bash searches PATH itself, and MSYS bash needs a POSIX entry to
+            # do it -- a "C:/..." element is honoured by -x but not by the PATH
+            # lookup, which would make the on-PATH scenario silently skip.
+            f"PATH=\"$(cygpath -u '{path_directory.as_posix()}' 2>/dev/null"
+            f" || printf '%s' '{path_directory.as_posix()}')\"",
+            "export PATH",
+            'printf "PATH_BEFORE=%s\\n" "$PATH"',
+            block,
+            'printf "PATH_AFTER=%s\\n" "$PATH"',
+        )
+    )
+
+    completed = subprocess.run(
+        [bash, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout
+
+
+def test_the_discovery_searches_path_then_the_canonical_locations() -> None:
+    """Order matters: an operator's own logrotate should win if there is one."""
+    block = _logrotate_discovery_block()
+
+    assert "command -v logrotate" in block
+    for canonical in CANONICAL_LOGROTATE:
+        assert f'"{canonical}"' in block, canonical
+
+    assert block.index("command -v logrotate") < block.index('"/usr/sbin/logrotate"')
+    assert block.index('"/usr/sbin/logrotate"') < block.index('"/sbin/logrotate"')
+
+
+def test_the_discovery_runs_the_executable_it_selected() -> None:
+    """A bare ``logrotate`` would go straight back through PATH."""
+    block = _logrotate_discovery_block()
+
+    assert '"${logrotate_bin}" --debug "${logrotate_path}"' in block
+    assert "\n    if logrotate --debug" not in block
+
+
+def test_the_verifier_never_claims_logrotate_is_uninstalled() -> None:
+    """The old wording asserted a fact the check could not establish."""
+    verifier = _read(VERIFY_OPERATIONS)
+
+    assert "logrotate is not installed on this host" not in verifier
+    assert DISCOVERY_SKIP in verifier
+
+
+def test_the_verifier_never_modifies_the_callers_path() -> None:
+    """Discovery must not repair PATH for the rest of the script."""
+    block = _logrotate_discovery_block()
+
+    assert "PATH=" not in block
+    assert "export PATH" not in block
+
+
+def test_a_path_discovered_logrotate_is_used(tmp_path: Path) -> None:
+    """The ordinary case: logrotate on PATH, policy parses."""
+    output = _run_logrotate_discovery(tmp_path, on_path=True)
+
+    assert "PASS" in output
+    assert "pathbin/logrotate" in output
+
+
+def test_a_canonical_usr_sbin_logrotate_is_found_without_path(
+    tmp_path: Path,
+) -> None:
+    """The exact Pi condition: installed in /usr/sbin, absent from PATH."""
+    output = _run_logrotate_discovery(tmp_path, at_usr_sbin=True)
+
+    assert "PASS" in output
+    assert "usr/sbin/logrotate" in output
+    assert "SKIP" not in output
+
+
+def test_a_canonical_sbin_logrotate_is_found_without_path(tmp_path: Path) -> None:
+    """The second fallback, for hosts that do not split /sbin and /usr/sbin."""
+    output = _run_logrotate_discovery(tmp_path, at_sbin=True)
+
+    assert "PASS" in output
+    assert "/sbin/logrotate" in output
+    assert "SKIP" not in output
+
+
+def test_a_discovered_logrotate_that_rejects_the_policy_fails(
+    tmp_path: Path,
+) -> None:
+    """A real parse failure must stay a FAIL, not soften into a SKIP."""
+    output = _run_logrotate_discovery(tmp_path, at_usr_sbin=True, parses=False)
+
+    assert "FAIL" in output
+    assert "cannot parse" in output
+    assert "PASS" not in output
+
+
+def test_a_genuinely_absent_logrotate_skips_truthfully(tmp_path: Path) -> None:
+    """Nothing anywhere: skip, and say what was searched rather than guessing."""
+    output = _run_logrotate_discovery(tmp_path)
+
+    assert "SKIP" in output
+    assert DISCOVERY_SKIP in output
+    assert "not installed" not in output
+
+
+def test_the_discovery_leaves_path_untouched(tmp_path: Path) -> None:
+    """Whatever it finds, the caller's environment is unchanged.
+
+    Compared before against after rather than against a literal: repairing
+    ``PATH`` to reach ``/usr/sbin`` would be a tempting fix and a bad one, since
+    it would change how every later command in the verifier resolves.
+    """
+    for index, scenario in enumerate(
+        ({"on_path": True}, {"at_usr_sbin": True}, {})
+    ):
+        output = _run_logrotate_discovery(tmp_path / f"scenario{index}", **scenario)
+        before = re.search(r"^PATH_BEFORE=(.*)$", output, re.MULTILINE)
+        after = re.search(r"^PATH_AFTER=(.*)$", output, re.MULTILINE)
+
+        assert before is not None and after is not None, output
+        assert before.group(1) == after.group(1), scenario
+
+
+# --- finding 25: wrapper help must describe options per command --------------
+#
+# The wrapper listed --config, --database, --output-directory and --keep under a
+# single "Common options" heading. Only -h/--help is genuinely common: `list`
+# reads no configuration and rejects --config, `verify` takes only a positional
+# backup file. The CLI was always right; the help was not, and it invited an
+# operator to type a command the parser refuses.
+
+HELP_COMMANDS = ("backup", "verify", "restore-test", "list")
+
+
+def _wrapper_help() -> str:
+    """The wrapper's own ``--help`` output, produced by running it."""
+    bash = _find_bash()
+    if bash is None:  # pragma: no cover - bash is present on Windows and the Pi
+        pytest.skip("bash is unavailable")
+
+    completed = subprocess.run(
+        [bash, str(BACKUP_WRAPPER).replace("\\", "/"), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout
+
+
+def _help_sections(help_text: str) -> dict[str, str]:
+    """Split the per-command option blocks out of the help.
+
+    A section runs from its ``name:`` heading until the first line that is not
+    indented, so the explanatory prose after the last block is not silently
+    absorbed into it -- which would let ``--config`` appear to belong to
+    ``list`` purely because a sentence mentions it.
+    """
+    sections: dict[str, str] = {}
+    current: str | None = None
+
+    for line in help_text.splitlines():
+        heading = re.match(r"^([a-z-]+):$", line)
+        if heading is not None and heading.group(1) in HELP_COMMANDS:
+            current = heading.group(1)
+            sections[current] = ""
+            continue
+        if current is None:
+            continue
+        if line and not line.startswith("  "):
+            current = None
+            continue
+        sections[current] += line + "\n"
+
+    return sections
+
+
+def test_the_wrapper_help_no_longer_claims_common_options() -> None:
+    """The heading that made the classification wrong is gone."""
+    help_text = _wrapper_help()
+
+    assert "Common options:" not in help_text
+    assert "not shared between commands" in help_text
+
+
+def test_the_wrapper_help_documents_every_command() -> None:
+    """Each command gets its own block."""
+    sections = _help_sections(_wrapper_help())
+
+    for command in HELP_COMMANDS:
+        assert command in sections, command
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    (
+        ("backup", ("--config", "--database", "--output-directory", "--keep")),
+        ("verify", ()),
+        ("restore-test", ("--work-directory", "--preserve", "--config")),
+        ("list", ("--output-directory", "--no-verify")),
+    ),
+)
+def test_each_option_is_documented_under_its_own_command(
+    command: str, expected: tuple[str, ...]
+) -> None:
+    """Every option appears beneath the command that actually defines it."""
+    sections = _help_sections(_wrapper_help())
+    body = sections[command]
+
+    for option in expected:
+        assert option in body, f"{command} should document {option}"
+
+
+@pytest.mark.parametrize(
+    ("command", "forbidden"),
+    (
+        ("list", ("--config", "--database", "--keep")),
+        ("verify", ("--config", "--database", "--keep", "--output-directory")),
+        ("backup", ("--work-directory", "--preserve", "--no-verify")),
+        ("restore-test", ("--database", "--keep", "--no-verify")),
+    ),
+)
+def test_no_command_documents_an_option_it_does_not_accept(
+    command: str, forbidden: tuple[str, ...]
+) -> None:
+    """The defect was breadth, so the absences are what must be asserted."""
+    sections = _help_sections(_wrapper_help())
+    body = sections[command]
+
+    for option in forbidden:
+        assert option not in body, f"{command} must not document {option}"
+
+
+def test_the_positional_backup_argument_is_documented() -> None:
+    """``verify`` and ``restore-test`` take a file, not an option."""
+    sections = _help_sections(_wrapper_help())
+
+    assert "<backup>" in sections["verify"]
+    assert "<backup>" in sections["restore-test"]
+
+
+def test_help_remains_available_everywhere() -> None:
+    """``-h/--help`` really is common, and is still offered as such."""
+    help_text = _wrapper_help()
+
+    assert "Accepted by every command:" in help_text
+    assert "-h, --help" in help_text
+    assert 'Run "<command> --help" for the full options of a single command.' in (
+        help_text
+    )
+
+
+def test_the_wrapper_still_forwards_every_argument_unchanged() -> None:
+    """Help text changed; the wrapper's transparency did not."""
+    body = _code(_read(BACKUP_WRAPPER))
+
+    assert 'exec "${python_bin}" -m mgo.operations.backup_cli "$@"' in body
+
+
+def test_list_still_rejects_a_configuration_option() -> None:
+    """The help was corrected to match the CLI, not the CLI to match the help."""
+    parser = _build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["list", "--config", "mgo.toml"])
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ["backup", "--config", "mgo.toml"],
+        ["restore-test", "backup.db", "--config", "mgo.toml"],
+    ),
+)
+def test_the_commands_that_take_a_configuration_still_accept_one(
+    argv: list[str],
+) -> None:
+    """Nothing about argument parsing changed."""
+    arguments = _build_parser().parse_args(argv)
+
+    assert arguments.config == Path("mgo.toml")
+
+
+def test_list_still_accepts_its_own_options() -> None:
+    """``list`` keeps exactly the two options the help now shows for it."""
+    arguments = _build_parser().parse_args(
+        ["list", "--output-directory", "/var/backups/garden-observatory", "--no-verify"]
+    )
+
+    assert arguments.output_directory == Path("/var/backups/garden-observatory")
+    assert arguments.no_verify is True

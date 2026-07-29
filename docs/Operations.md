@@ -3,11 +3,21 @@
 How Matt's Garden Observatory is backed up, how its logs are bounded, and how a
 fault is diagnosed without attaching a monitor and keyboard to the Raspberry Pi.
 
-> **Status.** Everything here is implemented and covered by automated tests on
-> the development machine. The Raspberry Pi validation in
-> [§13](#13-raspberry-pi-validation) has **not yet been performed**. Until
-> Matthew has run it and confirmed the result, treat backups as *configured*,
-> not as *proven on the Pi*.
+> **Status.** Direct Raspberry Pi validation completed successfully at approved
+> commit `4e1e5d38ab0189b62d0763c0b1301b142d7151a6`, and the operations
+> implementation **passed**. Backups are therefore *proven on the Pi*, not merely
+> configured: a consistent online backup, a complete database/configuration/
+> manifest recovery set, verification, isolated restore testing and forced log
+> rotation were all exercised on real hardware, and the validated recovery sets
+> are preserved in `/var/backups/garden-observatory` as the evidence.
+>
+> Validation also found **one cleanup gap and two operator-reporting defects**:
+> ignored Task 10 bytecode survived the return to `main` ([§13.14](#1314-pre-merge-operational-cleanup)),
+> the operations verifier mistook an unprivileged `PATH` omission for an absent
+> logrotate installation, and the backup wrapper's help described
+> command-specific arguments as common options. All three are corrected here.
+> **That correction itself awaits focused Pi revalidation** — the operations
+> implementation is validated, the corrected cleanup procedure is not yet.
 
 ## 1. Scope
 
@@ -1892,6 +1902,68 @@ All three `test` commands must exit `0`. Required end state: no Task 10 backup
 unit installed, no Task 10 timer enabled, no Task 10 timer active, no Task 10
 logrotate policy installed.
 
+#### Remove Task 10 compiled bytecode
+
+**Also mandatory, and also before `git checkout main`.**
+
+Validation imports `mgo.operations`, so Python writes compiled bytecode into
+`src/mgo/operations/__pycache__/`. That bytecode is **git-ignored**, and Git
+neither removes ignored files on checkout nor deletes a directory that still
+contains them. `git checkout main` therefore leaves `src/mgo/operations/`
+behind as a directory holding nothing but `.pyc` files — and
+`git status --porcelain` reports the tree **clean**, by design, because ignored
+files are exactly what it is built not to mention.
+
+The residue is not a runtime rollback failure: no `.py` source survives, so
+`import mgo.operations.backup_cli` correctly fails. But the surviving directory
+**is** importable as a [PEP 420](https://peps.python.org/pep-0420/) implicit
+namespace package, with `__file__` of `None` and a `__path__` pointing at the
+stale directory. So `importlib.util.find_spec("mgo.operations")` returns a
+specification on a checkout that is supposed to predate Task 10 entirely, and
+any later check written around it would be misled.
+
+Do this **now**, while `task-010-operations` is still checked out, because the
+tracked `.py` files still exist and the deletion can therefore be confined
+precisely to the Task 10 package.
+
+Remove only compiled artefacts:
+
+```bash
+find src/mgo/operations -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+```
+
+Then remove the `__pycache__` directories that are now empty. `-delete` implies
+depth-first traversal, so nested directories are removed before their parents:
+
+```bash
+find src/mgo/operations -type d -name '__pycache__' -empty -delete
+```
+
+Now confirm nothing compiled remains:
+
+```bash
+find src/mgo/operations \( -type d -name '__pycache__' -o -type f -name '*.pyc' -o -type f -name '*.pyo' \) -print
+```
+
+**This must print nothing.** If it prints a path, a `__pycache__` directory
+survived because it holds a file that is neither `.pyc` nor `.pyo`. **Stop.** Do
+not delete it, do not widen the pattern, and do not continue to the checkout:
+something put an unexpected file inside a build directory, and that is worth a
+human looking at. A cleanup that broadens itself until its own check passes is
+not a cleanup.
+
+Note what is deliberately **not** used here:
+
+```text
+git clean -fdx        removes untracked work anywhere in the tree
+git clean -fdX        removes every ignored file, including the virtualenv
+rm -rf src/mgo/operations   would delete tracked source on this branch
+```
+
+Each would "work" and each would destroy far more than the compiled bytecode of
+one package. The scope of this deletion is `src/mgo/operations` and the file
+types are `.pyc` and `.pyo` — nothing else, and no other package.
+
 #### What this cleanup must not touch
 
 ```text
@@ -2005,6 +2077,43 @@ systemctl list-timers --all | grep -F mgo-backup && echo "PROBLEM" || echo "clea
 
 Expect `clean`. Anything else means §13.14 did not complete and the Pi is
 scheduled to run code that is no longer present.
+
+#### Prove the Task 10 package is gone
+
+The checkout is clean, but **a clean checkout is not proof that the Task 10
+package is absent** — that is precisely what the ignored bytecode defect
+exploited. Three independent checks are required, because each one alone can be
+satisfied while the package is still discoverable.
+
+The path must not exist:
+
+```bash
+test ! -e src/mgo/operations
+```
+
+This must exit `0`.
+
+Nothing may remain there even in **ignored** state. Ordinary
+`git status --porcelain` cannot answer this and must not be substituted:
+
+```bash
+git status --ignored --porcelain -- src/mgo/operations
+```
+
+Required output: nothing at all.
+
+Finally, the package must not be importable. Run this in a **fresh** interpreter
+with bytecode writing disabled, so the check cannot recreate the very artefact
+it is testing for:
+
+```bash
+uv run python -B -c 'import importlib.util, sys; spec = importlib.util.find_spec("mgo.operations"); print(spec); sys.exit(0 if spec is None else 1)'
+```
+
+Required: `None`, and exit `0`. A returned specification is a **failure** even
+when its `__file__` is `None`, even when no submodule can be imported, and even
+when Git reports the tree clean — a namespace package is still a package, and
+`find_spec` still finds it.
 
 **The checkout is now on `main`. The running API is not.** Continue to §13.17
 before treating the return to `main` as complete.
@@ -2156,6 +2265,7 @@ Preview:                   restored to original state
 mgo-backup.timer:          absent
 mgo-backup.service:        absent
 Task 10 logrotate policy:  absent
+Task 10 Python package residue: absent and not import-discoverable
 Validated recovery set:    preserved
 ```
 
@@ -2190,6 +2300,23 @@ simply:
 git checkout main
 ```
 
+This stays simple **only while the Task 10 package was never imported on the
+Pi**, which is what makes this state different from §14.2. Nothing imported
+means Python wrote no bytecode under `src/mgo/operations`, so there is no
+ignored residue for the checkout to leave behind and nothing for Git's silence
+about ignored files to conceal.
+
+That condition is checkable rather than assumed:
+
+```bash
+find src/mgo/operations -name '*.pyc' -o -name '*.pyo'
+```
+
+If that prints nothing, the checkout above is a complete rollback. If it prints
+anything — a test run, a `--help`, a single import is enough — this is no longer
+the simple case: use the bytecode cleanup and the three absence proofs from
+§14.2 instead.
+
 ### 14.2 After pre-merge Pi installation validation, before merge
 
 Units and policies installed under `/etc` are **external to Git** and survive a
@@ -2205,18 +2332,31 @@ through §13.19 in full:
 3. remove `/etc/logrotate.d/garden-observatory`;
 4. `sudo systemctl daemon-reload`;
 5. **preserve every recovery set** — no backup is deleted at any point;
-6. verify `mgo.service` is still active, and record its PID and
+6. remove Task 10 compiled bytecode — `.pyc` and `.pyo` beneath
+   `src/mgo/operations` and the `__pycache__` directories left empty — **while
+   the feature branch is still checked out**, stopping if anything unexpected
+   survives;
+7. verify `mgo.service` is still active, and record its PID and
    `ActiveEnterTimestamp` as the feature-branch runtime;
-7. `git checkout main`;
-8. `sudo systemctl restart mgo.service` — **after** the checkout;
-9. verify the new main-branch runtime: `active`, a later
-   `ActiveEnterTimestamp`, and `/proc/<pid>/cmdline` and `/proc/<pid>/cwd`
-   pointing at `/opt/garden-observatory`;
-10. restore preview to its original pre-validation state;
-11. re-run the eleven-endpoint API sweep.
+8. `git checkout main`;
+9. prove the package is gone: `test ! -e src/mgo/operations`,
+   `git status --ignored --porcelain -- src/mgo/operations` empty, and
+   `find_spec("mgo.operations")` is `None` in a fresh `python -B`;
+10. `sudo systemctl restart mgo.service` — **after** the checkout;
+11. verify the new main-branch runtime: `active`, a later
+    `ActiveEnterTimestamp`, and `/proc/<pid>/cmdline` and `/proc/<pid>/cwd`
+    pointing at `/opt/garden-observatory`;
+12. restore preview to its original pre-validation state;
+13. re-run the eleven-endpoint API sweep.
 
-**The return to `main` is not complete until step 8 has succeeded.** Steps 1–7
+**The return to `main` is not complete until step 10 has succeeded.** Steps 1–9
 leave the Pi with a `main` checkout and a feature-branch process.
+
+Steps 6 and 9 are a pair, and the order matters as much as it does for the
+units. Step 6 must precede the checkout because that is while the tracked
+sources still exist and the deletion can be scoped to one package; step 9 must
+follow it because Git's own cleanliness report is blind to ignored files and
+cannot answer the question on its own.
 
 ### 14.3 After Task 10 is merged and deployed
 

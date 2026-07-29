@@ -52,7 +52,9 @@ Commands:
   restore-test   Restore a backup into an isolated directory and verify it.
   list           List the complete backup sets in the backup directory.
 
-Common options:
+Options belong to a command; they are not shared between commands.
+
+backup:
   --config PATH             Configuration file to read the database path from
                             (default: MGO_CONFIG_PATH, which this wrapper sets
                             to /etc/garden-observatory/mgo.toml when unset)
@@ -60,7 +62,30 @@ Common options:
   --output-directory PATH   Backup directory
                             (default: /var/backups/garden-observatory)
   --keep N                  Complete backup sets to retain (default: 14)
+
+verify:
+  <backup>                  Backup file to verify (positional)
+
+restore-test:
+  <backup>                  Backup file to restore (positional)
+  --work-directory PATH     Directory to restore into
+                            (default: a new temporary directory;
+                            production data locations are refused)
+  --preserve                Keep the restored copy for inspection
+  --config PATH             Configuration file, used only to protect its
+                            database directory
+
+list:
+  --output-directory PATH   Directory to list
+                            (default: /var/backups/garden-observatory)
+  --no-verify               List without verifying each set
+
+Accepted by every command:
   -h, --help                Show this help
+
+"list" reads no configuration, so it accepts no --config; "verify" takes only
+the backup file. The CLI rejects an option the command does not define, so this
+help exists to make the right command obvious, not to police the arguments.
 
 There is deliberately no "restore" command. restore-test proves a backup can be
 recovered; restoring over the live production database is an explicit operator

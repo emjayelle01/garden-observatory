@@ -2,7 +2,7 @@
 
 ## Status
 
-**Implementation complete; managed-file failure-propagation correction in
+**Direct Pi validation complete; final hardware-findings correction in
 progress.**
 
 A repository review of the five implementation commits found nine genuine
@@ -932,8 +932,105 @@ Six mutations, each reverted byte-for-byte afterwards:
 | Install the source instead of the staged copy | 4 |
 | Remove the staging cleanup | 7 |
 
-**Pi validation has not resumed** and is not claimed. It must restart from
-repository preflight once this correction is reviewed and a new SHA approved.
+**Pi validation had not resumed** at the time this correction was written. It
+subsequently did, and it **passed** — see
+[§ Direct Pi validation findings](#direct-pi-validation-findings).
+
+## Direct Pi validation findings
+
+Direct Raspberry Pi validation ran against approved commit
+`4e1e5d38ab0189b62d0763c0b1301b142d7151a6` and **completed successfully**:
+`uv sync`, Ruff, mypy (48 source files) and pytest (**1268 passed, 0 failed, 0
+skipped** on Linux) all passed, both installer dry runs succeeded, the staged
+root-owned logrotate validation worked, the exact validated policy was
+installed, and the full operational surface was exercised on real hardware —
+service-identity and operations verification, timer enablement and reboot
+persistence, an online database backup, complete
+database/configuration/manifest recovery sets, listing and verification,
+isolated restore testing, protected-target refusal, explicit database-override
+labelling, source and configuration negative paths, the one-shot backup
+service, failure isolation from `mgo.service`, bounded support-bundle
+generation, proxy bypass prevention, forced log rotation, API restart and
+reboot persistence, mandatory system-artefact cleanup, the return to `main`,
+the restart onto `main`, preview restoration, and the final endpoint and
+journal checks. Every Task 10 system artefact was removed afterwards; the
+validated recovery sets were deliberately preserved.
+
+The operations implementation therefore passed. Validation nevertheless exposed
+three repository defects, all of them in *validation cleanup*, *verification
+truthfulness* and *operator help* rather than in the operations code itself.
+
+### 23. Ignored Task 10 bytecode survived the return to `main`
+
+1. Feature-branch validation imported `mgo.operations` — the CLI, the backup
+   engine and the support bundle all run through it.
+2. Python therefore wrote compiled bytecode into
+   `src/mgo/operations/__pycache__/`, which is git-ignored.
+3. `git checkout main` removed the tracked `.py` sources but **preserved the
+   ignored files**, and Git will not remove a directory that still contains
+   them — so `src/mgo/operations/` survived the checkout.
+4. Ordinary `git status --porcelain` reported the tree **clean**, because not
+   mentioning ignored files is exactly what it is designed to do.
+5. The surviving directory became a **PEP 420 implicit namespace package**:
+   `import mgo.operations` succeeded, `__file__` was `None`, and `__path__`
+   referenced the stale feature-branch directory.
+6. No executable Task 10 module remained — `import mgo.operations.backup_cli`
+   correctly failed with `ModuleNotFoundError`, because a `.pyc` inside
+   `__pycache__/` is not importable without its source. **The observed state
+   was therefore not a runtime rollback failure**, and nothing stale could
+   execute.
+7. The documented claim that `mgo.operations` **does not exist** on
+   pre-Task-10 `main` was nevertheless false on the host.
+8. `importlib.util.find_spec("mgo.operations")` could return a misleading
+   positive result on a checkout that is supposed to predate the package
+   entirely, so any later check built on it would be misled.
+9. **Bytecode must be removed before the checkout**, while the tracked sources
+   still exist and the deletion can be confined to the one package.
+10. **Path and import absence must be proven after the checkout** — by
+    `test ! -e`, by a path-scoped `git status --ignored --porcelain`, and by
+    `find_spec` in a fresh `python -B`.
+
+The general lesson is worth keeping: **a clean checkout is not a clean
+filesystem.** A directory holding nothing but ignored build artefacts is
+invisible to `git status` by design, and it can still change what Python
+imports.
+
+### 24. The verifier confused an unprivileged `PATH` omission with an absent logrotate installation
+
+* logrotate was installed and used successfully at `/usr/sbin/logrotate` — the
+  installer had just validated and installed the policy with it.
+* The unprivileged SSH account's `PATH` was
+  `/usr/local/bin:/usr/bin:/bin:/usr/games`, omitting `/usr/sbin`.
+* `command -v logrotate` therefore failed.
+* The verifier printed `logrotate is not installed on this host`.
+* The result was a safe **`SKIP`**, never a false `PASS`, so nothing was
+  wrongly certified.
+* The wording and the detection were still factually wrong: the check reported
+  a conclusion about the *package* from evidence that only concerned *command
+  discovery*.
+* Canonical system-administration paths must be searched explicitly, and the
+  unavailable message must describe what was searched rather than what is
+  installed.
+
+### 25. The wrapper help described command-specific arguments as common options
+
+* `--config` applies to `backup` and `restore-test`, not to `list`.
+* `--database` and `--keep` apply to `backup` only.
+* `--output-directory` applies to `backup` and `list`.
+* Presenting all four under a single "Common options" heading makes valid
+  command syntax unclear, and invites an operator to type `list --config`.
+* The CLI itself is correct and rejects invalid combinations with a usage
+  error; only the wrapper's help **classification** was wrong.
+* The fix is help text alone — no argument parsing and no command behaviour
+  changed, and `list --config` deliberately remains an error rather than being
+  made valid to retrofit the old wording.
+
+### What this correction does and does not claim
+
+The operations implementation is validated on hardware. **This correction is
+not**: the bytecode cleanup, the corrected logrotate discovery and the
+corrected help all await focused Pi revalidation. The cleanup procedure must not
+be described as fully corrected until that revalidation passes.
 
 ## Authoritative definition
 
