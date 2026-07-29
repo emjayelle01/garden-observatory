@@ -2,8 +2,7 @@
 
 ## Status
 
-**Implementation complete; post-validation runtime restoration correction in
-progress.**
+**Implementation complete; Linux protected-path test correction in progress.**
 
 A repository review of the five implementation commits found nine genuine
 defects — one requirement omitted outright, several checks that were weaker
@@ -35,6 +34,12 @@ Reviewing that correction found the same class of mistake one level deeper:
 the procedure restored the *checkout* but not the *running process*. Recorded in
 [§ Post-validation runtime restoration review](#post-validation-runtime-restoration-review)
 and corrected in a commit after `3066422`.
+
+The first attempt at Raspberry Pi validation then **stopped at the mandatory
+quality gate**: two tests failed on the Pi and none on Windows. The defect was
+in a test, not in the product — recorded in
+[§ Pi validation review](#pi-validation-review) and corrected in a commit after
+`b2df393`.
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -573,6 +578,117 @@ True of the **unit file**; not true of the code. Task 10 modifies
 commits changes what a *new* process would load while the running one is
 unaffected. §14.3 now restarts the service and restores preview after the
 revert, for the same reason as §13.17.
+
+## Pi validation review
+
+The first Raspberry Pi validation attempt stopped where it was supposed to
+stop: at the quality gate, before installing anything.
+
+```text
+1237 passed, 2 failed
+```
+
+### 19. A protected-location test inspected a path it was written never to touch
+
+Both failures came from one parameterised test:
+
+```text
+tests/test_operations_backup.py::
+test_a_production_data_location_is_refused_as_a_restore_target
+```
+
+for the targets `/var/lib/garden-observatory/db` and
+`/var/lib/garden-observatory/db/nested`. The third parameter,
+`/var/lib/garden-observatory`, passed — which is itself the clue.
+
+The test ran this **before** calling `restore_test()`:
+
+```python
+existed_before = Path(target).exists()
+```
+
+`/var/lib/garden-observatory` is owned `mgo:mgo` with mode `0750`, and the suite
+runs as an unprivileged interactive account. Stat-ing the directory *itself*
+needs only search permission on `/var/lib`, which everyone has — so the third
+parameter succeeded. Stat-ing anything *inside* it needs search permission on
+`garden-observatory`, which that account does not have, so `Path.exists()`
+raised:
+
+```text
+PermissionError: [Errno 13] Permission denied
+```
+
+`EACCES` is not in pathlib's ignored-errno set, so `exists()` propagates it
+rather than returning `False`. The production guard was never reached. Nothing
+in `restore_test()` was wrong; the test failed in its own first statement.
+
+**The Pi's permissions are correct and the test was wrong to see through
+them.** A test whose subject is "this code never touches production" must not
+touch production to find out. The old assertion was *observational* — compare
+the directory before and after — where the only sound proof is *behavioural*:
+the guard raised `RESTORE_TARGET_REJECTED` before `mkdir`, copy or write.
+
+State at the point validation stopped:
+
+* the Pi correctly ran the suite as an unprivileged account;
+* no Task 10 unit, timer or logrotate policy had been installed;
+* no backup and no support bundle had been created;
+* no production data had been changed;
+* validation halted at the quality gate, exactly as designed;
+* validation must restart from repository preflight after this correction.
+
+**Corrected.** A `ProtectedTargetWatch` helper intercepts `Path.mkdir` and
+`Path.exists` for the protected path **only**, installed after `_make_backup()`
+so ordinary temporary-directory work is untouched. A `mkdir` of the protected
+target raises before the real call, an `exists()` on it raises `EACCES`
+deterministically on every platform, and the test asserts both lists are empty.
+The real `/var/lib` hierarchy is never inspected, on any host, by any account.
+
+Replacing `Path.exists()` with `os.path.exists`, `Path.stat`, `Path.is_dir`,
+`os.lstat`, `scandir` or similar was rejected outright: those are the same
+environmental observation wearing a different name.
+
+### 20. The resolve fallback was never exercised
+
+`_comparable()` deliberately catches `OSError` from `path.resolve()` and falls
+back to lexical comparison. That branch exists for precisely the locked-down
+host this finding came from, and nothing exercised it.
+
+An unexercised fallback inside a *refusal* guard is the worst possible place to
+have one: if it were wrong, the guard would let a protected target through on
+exactly the machine whose permissions were strictest — failing open, on the
+machine that most needed it to fail closed.
+
+**Corrected.** `test_a_protected_target_is_refused_when_it_cannot_be_resolved`
+simulates `PermissionError(EACCES)` from `Path.resolve()` for the protected path
+only, and asserts the refusal still happens, the fallback was genuinely taken,
+and `mkdir` was never called.
+
+### No runtime change was required
+
+`_PROTECTED_ROOTS`, `_comparable()`, `_reject_protected_target()` and
+`restore_test()` were reviewed and left untouched. The order is already correct:
+verify the complete recovery set, derive protected roots, normalise the
+requested target, reject a protected target, and only then `mkdir` — with copy
+and restored filenames strictly after that.
+
+### How this was confirmed
+
+Mutation-tested against the real guard, with `src/mgo/operations/backup.py`
+restored byte-for-byte afterwards:
+
+| Mutation | Result |
+| -------- | ------ |
+| Remove the `_reject_protected_target` call | all 7 selected tests fail |
+| Strip the drive-normalisation from `_comparable` | the 3 canonical tests fail |
+| Remove the `except OSError` resolve fallback | the 3 resolve tests fail |
+
+That exercise also found a defect in the new harness itself: the interceptors
+were first written as **bound methods**. A bound method is not a descriptor, so
+`some_path.exists()` called it with no arguments — including from pytest's own
+traceback machinery, which turned every genuine failure into an unreadable
+`INTERNALERROR`. It passed cleanly only because a correct run never reaches
+either interceptor. They are now plain functions.
 
 ## Authoritative definition
 

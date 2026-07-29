@@ -16,6 +16,7 @@ production path and no root.
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -1327,34 +1328,142 @@ def test_a_restore_test_never_touches_the_production_database(
     assert file_sha256(source_database) == before
 
 
-@pytest.mark.parametrize(
-    "target",
-    [
-        "/var/lib/garden-observatory/db",
-        "/var/lib/garden-observatory/db/nested",
-        "/var/lib/garden-observatory",
-    ],
-)
+#: The production locations a restore test must never write into.
+PROTECTED_RESTORE_TARGETS = [
+    "/var/lib/garden-observatory/db",
+    "/var/lib/garden-observatory/db/nested",
+    "/var/lib/garden-observatory",
+]
+
+
+class ProtectedTargetWatch:
+    """Record whether a protected path is created or stat-ed, without doing it.
+
+    The point of this class is what it *refuses to do*. The obvious way to
+    prove "the refusal happened before the directory was created" is to look at
+    the directory before and after -- which is what this test used to do, and
+    which fails on a correctly configured Raspberry Pi. ``/var/lib/garden-
+    observatory`` is owned ``mgo:mgo`` with mode ``0750``, the suite runs as an
+    unprivileged account, and so ``Path.exists()`` raises ``PermissionError``
+    (``EACCES`` is not in pathlib's ignored-errno set) before the guard is ever
+    reached. The restrictive permissions are correct and desirable; the test was
+    wrong to depend on being able to see through them.
+
+    The proof is therefore behavioural rather than observational: intercept
+    ``mkdir`` and ``exists`` for the protected path only, and assert neither was
+    ever called for it. A test of "this code never touches production" must not
+    itself touch production to find out.
+    """
+
+    def __init__(self, protected: Path) -> None:
+        self.protected = protected
+        self.created: list[Path] = []
+        self.probed: list[Path] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Patch ``Path`` -- only ever *after* the recovery set exists.
+
+        The replacements are plain functions rather than bound methods on
+        purpose. A bound method is not a descriptor, so assigning one to
+        ``Path.exists`` would make ``some_path.exists()`` call it with **no**
+        arguments -- including from pytest's own traceback machinery, which
+        turns any genuine failure here into an unreadable INTERNALERROR.
+        """
+        original_mkdir = Path.mkdir
+        original_exists = Path.exists
+        watch = self
+
+        def guarded_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+            if path == watch.protected:
+                watch.created.append(path)
+                raise AssertionError(
+                    f"restore_test tried to create the protected {path}"
+                )
+            original_mkdir(path, *args, **kwargs)
+
+        def guarded_exists(path: Path, *args: Any, **kwargs: Any) -> bool:
+            if path == watch.protected:
+                watch.probed.append(path)
+                # Exactly what the Pi does, made deterministic: if anything
+                # depends on stat-ing a protected path, this surfaces it
+                # everywhere rather than only on a locked-down host.
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return original_exists(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", guarded_mkdir)
+        monkeypatch.setattr(Path, "exists", guarded_exists)
+
+    def assert_untouched(self) -> None:
+        """Assert the protected path was neither created nor inspected."""
+        assert self.created == [], f"{self.protected} was created"
+        assert self.probed == [], f"{self.protected} was stat-ed"
+
+
+@pytest.mark.parametrize("target", PROTECTED_RESTORE_TARGETS)
 def test_a_production_data_location_is_refused_as_a_restore_target(
-    source_database: Path, destination: Path, target: str
+    source_database: Path,
+    destination: Path,
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A restore test writing to the live database directory is unthinkable.
 
-    The refusal must happen *before* the directory is created. Existence is
-    compared before and after rather than asserted absolutely: the test must
-    neither depend on the state of the machine running it nor leave anything
-    behind on one where the path happens to exist.
+    The refusal must happen *before* the directory is created, and the proof of
+    that must not require permission to look at the directory -- see
+    :class:`ProtectedTargetWatch`. The recovery set is built before the patches
+    are installed so that ordinary temporary-directory work is unaffected.
     """
     backup = _make_backup(source_database, destination)
-    existed_before = Path(target).exists()
+    protected = Path(target)
+    watch = ProtectedTargetWatch(protected)
+    watch.install(monkeypatch)
 
     with pytest.raises(OperationError) as caught:
-        restore_test(backup, work_directory=Path(target))
+        restore_test(backup, work_directory=protected)
 
     assert caught.value.code is ErrorCode.RESTORE_TARGET_REJECTED
-    assert Path(target).exists() == existed_before, (
-        "the refusal must happen before the target directory is created"
-    )
+    assert protected not in watch.created
+    watch.assert_untouched()
+
+
+@pytest.mark.parametrize("target", PROTECTED_RESTORE_TARGETS)
+def test_a_protected_target_is_refused_when_it_cannot_be_resolved(
+    source_database: Path,
+    destination: Path,
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_comparable`` falls back to the lexical path when ``resolve`` fails.
+
+    That ``except OSError`` branch exists precisely for a locked-down host, and
+    an unexercised fallback in a refusal guard is the worst place to have one:
+    if it were wrong, the guard would let a protected target through on exactly
+    the machine whose permissions were strictest. Simulating ``EACCES`` from
+    ``Path.resolve()`` makes the branch deterministic on both platforms.
+    """
+    backup = _make_backup(source_database, destination)
+    protected = Path(target)
+    watch = ProtectedTargetWatch(protected)
+    resolved: list[Path] = []
+    original_resolve = Path.resolve
+
+    def guarded_resolve(path: Path, *args: Any, **kwargs: Any) -> Path:
+        if path == protected:
+            resolved.append(path)
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return original_resolve(path, *args, **kwargs)
+
+    watch.install(monkeypatch)
+    monkeypatch.setattr(Path, "resolve", guarded_resolve)
+
+    with pytest.raises(OperationError) as caught:
+        restore_test(backup, work_directory=protected)
+
+    assert caught.value.code is ErrorCode.RESTORE_TARGET_REJECTED
+    # The fallback was genuinely taken, not skipped past.
+    assert resolved == [protected]
+    assert protected not in watch.created
+    watch.assert_untouched()
 
 
 def test_the_configured_database_directory_is_also_refused(
