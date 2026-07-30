@@ -14,6 +14,9 @@ Responsibilities are split across:
   implementations (``RPiCamBackend``, ``MockBackend``, ``NullBackend``);
 * :mod:`mgo.camera.capture` -- the :class:`CaptureService` that orchestrates a
   capture and depends only on the backend interface;
+* :mod:`mgo.camera.coordinator` -- the :class:`CameraCoordinator` that serialises
+  every camera-*mutating* operation (preview start/stop, still capture,
+  shutdown) and applies the managed-preview policies;
 * :mod:`mgo.camera.simulator` -- the deterministic, hardware-free ``simulator``
   backend (capture, preview and MJPEG stream) selected through configuration.
 """
@@ -28,6 +31,7 @@ from mgo.camera.backend import (
     build_capture_backend,
 )
 from mgo.camera.capture import CaptureService, build_capture_filename
+from mgo.camera.coordinator import CameraCoordinator
 from mgo.camera.exceptions import (
     BackendCaptureError,
     CameraCaptureError,
@@ -83,6 +87,7 @@ __all__ = [
     "SIMULATOR_SEQUENCE_LENGTH",
     "BackendCaptureError",
     "CameraCaptureError",
+    "CameraCoordinator",
     "CameraUnavailableError",
     "CaptureBackend",
     "CaptureResult",

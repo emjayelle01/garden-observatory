@@ -153,6 +153,17 @@ class PreviewConfig:
     ``shutdown_timeout_seconds`` bound process start confirmation and graceful
     shutdown respectively. Preview shares the camera hardware with capture; only
     one may own the camera at a time.
+
+    ``auto_start`` and ``restore_after_capture`` select the *managed preview*
+    policies. Both default to ``False`` -- deliberately and load-bearingly -- so
+    a configuration written before these settings existed behaves exactly as it
+    did without them: preview starts stopped and a capture leaves it stopped.
+
+    ``auto_start`` asks for one preview start attempt during application
+    startup, so the camera pipeline survives a service restart or a reboot
+    without an operator request. ``restore_after_capture`` asks for a preview
+    that was *running* when a capture began to be restarted once that capture
+    attempt finishes. The two are independent: either may be enabled alone.
     """
 
     enabled: bool
@@ -161,6 +172,8 @@ class PreviewConfig:
     fps: int
     startup_timeout_seconds: float
     shutdown_timeout_seconds: float
+    auto_start: bool = False
+    restore_after_capture: bool = False
 
 
 @dataclass(frozen=True)
@@ -280,6 +293,9 @@ def _validate_health_config(health: HealthConfig) -> None:
 
 #: Sensible defaults for preview when the ``[preview]`` section is absent, so
 #: pre-existing configuration files keep loading unchanged.
+#: The managed-preview policies are OFF unless a configuration file asks for
+#: them. Changing either of these silently switches an existing deployment into
+#: managed mode, which is exactly what these defaults exist to prevent.
 _PREVIEW_DEFAULTS = {
     "enabled": False,
     "width": 1280,
@@ -287,6 +303,8 @@ _PREVIEW_DEFAULTS = {
     "fps": 15,
     "startup_timeout_seconds": 5.0,
     "shutdown_timeout_seconds": 5.0,
+    "auto_start": False,
+    "restore_after_capture": False,
 }
 
 
@@ -303,6 +321,38 @@ def _validate_preview_config(preview: PreviewConfig) -> None:
 
     if preview.shutdown_timeout_seconds <= 0:
         raise ValueError("Preview shutdown timeout must be positive")
+
+
+def _validate_managed_preview_policy(
+    camera: CameraConfig, preview: PreviewConfig
+) -> None:
+    """Reject a managed-preview policy that can never run.
+
+    ``auto_start`` and ``restore_after_capture`` both drive the *real* preview
+    start path, so each requires a preview that is allowed to run and a camera
+    that is allowed to be used. Asking for a policy whose subsystem is disabled
+    is a configuration mistake, not a silently ignored preference -- silently
+    ignoring it would leave an operator believing preview would come back after
+    a restart when nothing would ever start it.
+
+    Each message names only the two conflicting settings: no configuration path
+    and no unrelated value.
+    """
+    policies = (
+        ("preview.auto_start", preview.auto_start),
+        ("preview.restore_after_capture", preview.restore_after_capture),
+    )
+    for name, requested in policies:
+        if not requested:
+            continue
+        if not preview.enabled:
+            raise ValueError(
+                f"{name} = true requires preview.enabled = true"
+            )
+        if not camera.enabled:
+            raise ValueError(
+                f"{name} = true requires camera.enabled = true"
+            )
 
 
 #: Sensible defaults for motion when the ``[motion]`` section is absent, so
@@ -571,8 +621,20 @@ def parse_config_text(text: str) -> MGOConfig:
                 _PREVIEW_DEFAULTS["shutdown_timeout_seconds"],
             )
         ),
+        auto_start=bool(
+            preview_data.get("auto_start", _PREVIEW_DEFAULTS["auto_start"])
+        ),
+        restore_after_capture=bool(
+            preview_data.get(
+                "restore_after_capture",
+                _PREVIEW_DEFAULTS["restore_after_capture"],
+            )
+        ),
     )
     _validate_preview_config(preview)
+    # Cross-section: a managed policy needs both the preview and the camera to
+    # be enabled, so this runs once both sections are built and validated.
+    _validate_managed_preview_policy(camera, preview)
 
     # The ``[motion]`` section is optional so pre-Task-4 configuration files
     # continue to load; absent keys fall back to safe (disabled) defaults. Only

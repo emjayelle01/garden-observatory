@@ -54,6 +54,21 @@ capture_directory = "/var/lib/garden-observatory/media/captures"
 # it at a time and capture always takes priority. Enable when a preview
 # consumer is in use.
 enabled = true
+# Managed preview lifecycle — left OFF in this tracked example on purpose, so
+# copying it changes nothing about how an existing deployment behaves.
+#
+# auto_start: one attempt to start preview during application startup (survives
+# `systemctl restart mgo.service` and a reboot without an operator request).
+# restore_after_capture: restart preview after a still capture, but only if it
+# was RUNNING when that capture began.
+#
+# An ACCEPTED production deployment may explicitly set BOTH to true in its own
+# external configuration at /etc/garden-observatory/mgo.toml — that is the
+# configuration the physical camera acceptance run in docs/Camera-Acceptance.md
+# tests. Enabling them here is not how that happens: this file is an example
+# only. To roll back, set both to false and restart mgo.service.
+auto_start = false
+restore_after_capture = false
 width = 1280
 height = 720
 fps = 15

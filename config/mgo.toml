@@ -31,6 +31,23 @@ capture_directory = "data/captures"
 # this is explicitly enabled. Preview shares the camera with capture — only one
 # may own it at a time, and capture always takes priority.
 enabled = false
+# Managed preview lifecycle. Both policies are OFF here and stay off unless a
+# deployment explicitly asks for them in its own configuration file; with both
+# false the behaviour is exactly the manual one described above.
+#
+# auto_start: make ONE attempt to start preview during application startup, so
+# the camera pipeline survives a service restart or a reboot without an operator
+# calling POST /camera/preview/start. There is no retry loop: a failed attempt
+# leaves preview truthfully "failed" and the API keeps serving.
+auto_start = false
+# restore_after_capture: if preview was RUNNING when a still capture began,
+# restart it once that capture attempt finishes. A preview that was stopped
+# stays stopped — a capture never starts a preview nobody asked for. The
+# capture's own result is always the answer: a restoration failure never turns a
+# successful capture into an error (see docs/Camera-Acceptance.md).
+restore_after_capture = false
+# Both policies require preview.enabled = true and camera.enabled = true;
+# asking for one with either disabled is rejected at load time.
 width = 1280
 height = 720
 fps = 15
