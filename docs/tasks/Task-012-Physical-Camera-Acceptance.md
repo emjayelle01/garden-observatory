@@ -2,23 +2,29 @@
 
 ## Status
 
-**Implementation in progress; physical camera acceptance not performed.**
+**Implementation complete and locally validated; physical camera acceptance not
+performed.**
 
 | Gate | Outcome |
 | ---- | ------- |
 | Task definition | Complete (this record, first commit) |
-| Managed preview lifecycle implementation | In progress |
-| Camera coordinator | In progress |
-| Local static and automated validation | Pending |
-| Mutation / negative verification | Pending |
-| Local runtime validation (simulator) | Pending |
+| Managed preview lifecycle implementation | Complete |
+| Camera coordinator | Complete |
+| Local static and automated validation | Passed |
+| Mutation / negative verification | Passed — all 18 defects detected |
+| Local runtime validation (simulator) | Passed |
+| Auto-start failure runtime validation | Passed |
 | Repository review | Not started |
-| Raspberry Pi validation of this branch | **Not performed** — the Pi is not accessed |
+| Raspberry Pi validation of this branch | **Not performed** — the Pi was not accessed |
 | Physical camera acceptance run | **Not performed** — requires separate authorisation |
 | Matthew's visual sign-off | **Not given** |
 
 Nothing in this task claims that the physical camera has been accepted. Task 12
 builds the *gate*; passing the gate is a separate, authorised hardware activity.
+
+The software rows above were written as `In progress` / `Pending` in the first
+commit and updated at closeout. The three physical rows have never changed and
+must not be changed by anything other than an authorised hardware run.
 
 ## Purpose
 
@@ -481,6 +487,42 @@ the external production configuration and restart `mgo.service`.
 
 No automatic production rollback script is written. No database rollback, no
 migration rollback and no media deletion are required.
+
+## Deviations
+
+Recorded for the reviewer. None changes production behaviour.
+
+1. **A second new test file exists.** The plan expected one new test file
+   (`tests/test_camera_coordinator.py`). `tests/test_camera_acceptance_docs.py`
+   was added because two of the required mutations — marking the pending
+   acceptance record as passed, and claiming the 48-hour gate from a 24-hour
+   result — are defects in a *document*, and no test existed that could detect
+   them. It also carries the evidence-handling checks (no image bytes, no
+   credentials, no production filesystem paths in the committed record).
+2. **`tests/test_camera_capture.py` was modified.** It is not on the expected
+   list, but it is where the still-capture command lives, and the physical
+   command-preservation requirement needs an *exact* argument-array assertion for
+   `rpicam-still` and `libcamera-still`. The existing tests only checked
+   membership, so an added autofocus flag would have passed them.
+3. **The managed-preview keys landed in the second commit, not the fourth.**
+   `config/mgo.toml` and `config/mgo.production.example.toml` are part of the
+   configuration *contract*, so they are committed with the contract rather than
+   with the prose documentation.
+4. **The two new `PreviewConfig` fields carry dataclass defaults of `False`.**
+   Every other field in that dataclass is required. Defaults were chosen here
+   because "off unless explicitly asked for" is the load-bearing guarantee, and a
+   default keeps every existing construction — including eight in the test suite
+   — valid and unchanged. Both default sites (the dataclass and the parser's
+   `_PREVIEW_DEFAULTS`) are pinned by tests, so neither can drift alone.
+5. **Mutations 8 and 9 share one mutation site.** "Restoration failure replaces
+   a successful capture" and "…replaces the original capture error" are both
+   prevented by the same guard in `_restore_preview_if_requested`. The mutation
+   was applied twice, once verified against the successful-capture tests and once
+   against the failed-capture tests, and each run was reverted byte-for-byte.
+6. **This record's status table was updated in the fifth commit.** The first
+   commit defined the task with the software gates marked in progress; leaving
+   them that way after the work was finished would have made the record untrue.
+   The physical gates were not touched.
 
 ## Known limitations
 

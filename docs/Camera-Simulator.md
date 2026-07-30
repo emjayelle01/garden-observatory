@@ -657,12 +657,42 @@ needed unless an operator deliberately ran a simulator capture with a
 non-temporary capture directory — in which case delete those files, which are
 identifiable by their `simulator` backend in the capture archive.
 
+## Validation status
+
+Task 11 is **merged, deployed and hardware-validated**. Its Raspberry Pi
+validation passed at `fc66e5193c272f9f7d8d3c101ee3d99cd193d0e4`:
+
+| Check | Result |
+| ----- | ------ |
+| Pi full test suite | 1543 passed, 0 failed, 0 skipped |
+| Task 11 focused suite | 204 passed |
+| Warning-escalated suite | 204 passed |
+| Architecture | aarch64 |
+| Simulator runtime | Passed |
+| Physical-camera production state | Preserved |
+| Merged and deployed | Complete |
+
+Earlier revisions of this document and of
+[`docs/tasks/Task-011-Camera-Simulator.md`](tasks/Task-011-Camera-Simulator.md)
+said Pi validation had not been performed, which was true when they were written
+and is no longer true. Those records are corrected rather than rewritten: the
+review corrections that produced the final implementation stand as documented.
+
+**Simulator validation is not camera acceptance.** Everything above proves the
+software path on real hardware. It proves nothing about focus, exposure, window
+reflections, feeder coverage, subject scale or framing — see below.
+
 ## Relationship to Task 12
 
 Task 12 is **physical camera acceptance on the Raspberry Pi**, and the simulator
 does not substitute for any part of it. What the simulator can do is remove the
 software-only failure modes *before* the Pi is involved, so a physical
 acceptance run is testing the camera rather than the plumbing.
+
+Task 12 is a separate gate with its own evidence: the procedure is
+[`docs/Camera-Acceptance.md`](Camera-Acceptance.md) and the record is
+[`docs/acceptance/Initial-Camera-Acceptance.md`](acceptance/Initial-Camera-Acceptance.md).
+At the time of writing, that physical acceptance run has **not** been performed.
 
 ## Future use
 

@@ -2,8 +2,7 @@
 
 ## Status
 
-**Implementation corrected and locally revalidated after repository re-review;
-Raspberry Pi validation not performed. Awaiting final repository review.**
+**Complete. Reviewed, validated on the Raspberry Pi, merged and deployed.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -14,8 +13,15 @@ Raspberry Pi validation not performed. Awaiting final repository review.**
 | Local runtime validation | Passed |
 | Repository review | **Round 1 complete** — one blocking defect found and corrected |
 | Repository re-review | **Round 2 complete** — two blocking issues found and corrected |
-| Final repository review | Not started |
-| Raspberry Pi validation | **Not performed** — the Pi was not accessed |
+| Final repository review | Complete |
+| Raspberry Pi validation | **Passed** at `fc66e5193c272f9f7d8d3c101ee3d99cd193d0e4` |
+| Merge and deployment | Complete |
+
+This status was corrected during Task 12 closeout. The sections below are the
+original Task 11 record and are **not** rewritten — including its two documented
+review corrections. Only the validation status, which was accurate when written
+and has since been overtaken by the actual Pi run, is brought up to date; see
+[Raspberry Pi validation status](#raspberry-pi-validation-status).
 
 ### Repository-review correction 1 — truthful producer failure handling
 
@@ -619,15 +625,42 @@ for any of it.
 
 ## Raspberry Pi validation status
 
-**Not performed.** The Raspberry Pi is not accessed during Task 11
-implementation: no SSH, no checkout update, no approval-file change, no service
-restart, no production configuration edit, no simulator run on the Pi, no
-capture, no preview start or stop, and no change to Task 10 operations
-components.
+**Passed.** Recorded during Task 12 closeout; the paragraph that follows this
+result describes the position *during Task 11 implementation*, which is why the
+original text said "not performed".
 
-After repository review, a separate narrow Pi authorisation may validate
-simulator mode using isolated temporary configuration without replacing the
-production camera configuration. That decision belongs to Matt.
+Raspberry Pi validation passed at:
+
+```text
+fc66e5193c272f9f7d8d3c101ee3d99cd193d0e4
+```
+
+| Check | Result |
+| ----- | ------ |
+| Pi full test suite | 1543 passed, 0 failed, 0 skipped |
+| Task 11 focused suite | 204 passed |
+| Warning-escalated suite | 204 passed |
+| Architecture | aarch64 |
+| Simulator runtime | Passed |
+| Physical-camera production state | Preserved |
+| Merged and deployed | Complete |
+
+**What this does and does not establish.** Task 11 simulator validation is
+complete: the software path — readiness, capture, preview lifecycle, streaming,
+motion consumption and the API contracts — runs correctly on the production
+hardware, and the physical camera configuration was left untouched. It says
+nothing about focus, exposure, window reflections, feeder coverage, subject
+scale or framing. **Task 12 physical camera acceptance is a separate gate and
+remains outstanding** — see [`docs/Camera-Acceptance.md`](../Camera-Acceptance.md)
+and [`docs/acceptance/Initial-Camera-Acceptance.md`](../acceptance/Initial-Camera-Acceptance.md).
+
+### Position during Task 11 implementation (unchanged, for the record)
+
+The Raspberry Pi was not accessed during Task 11 implementation: no SSH, no
+checkout update, no approval-file change, no service restart, no production
+configuration edit, no simulator run on the Pi, no capture, no preview start or
+stop, and no change to Task 10 operations components. Validation followed later,
+under separate authorisation, and its result is recorded above.
 
 ## Rollback
 
