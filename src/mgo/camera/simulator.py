@@ -142,8 +142,10 @@ _OBJECT_ORIGINS = {
 _MARKER_SCALE_DIVISOR = 320
 _MARKER_PAD_DIVISOR = 36
 
-#: How long to wait for the producer thread to finish after it has been asked to
-#: stop. It only ever sleeps for one frame interval, so this is generous.
+#: How long the cleanup path waits for the producer thread to finish after it has
+#: been asked to stop. It only ever sleeps for one frame interval, so this is
+#: generous. This is deliberately *not* used by :meth:`wait`, whose contract is to
+#: honour the caller's own timeout.
 _PRODUCER_JOIN_SECONDS = 2.0
 
 #: Exit codes reported by the simulated process handle, mirroring the meaning of
@@ -155,16 +157,22 @@ _EXIT_TERMINATED = 0
 _EXIT_KILLED = -9
 _EXIT_PRODUCER_FAILED = 1
 
-#: The bounded diagnostics :meth:`SimulatorPreviewProcess.read_error` reports for
-#: an unexpected producer exit. They are built only from the exception's type and
-#: message, never from a traceback, so no private path, environment value,
-#: hostname or thread identity can reach the API-visible status; the full
-#: traceback goes to the application log instead.
+#: The diagnostics :meth:`SimulatorPreviewProcess.read_error` reports for an
+#: unexpected producer exit. They are safe *by construction*: the only variable
+#: part is the exception's class name. An exception message is arbitrary
+#: application data -- it can carry a filesystem path, an environment value, a
+#: secret, a memory address or control characters -- so it is never placed in a
+#: status response. The complete message and traceback go to the application log,
+#: which has a different, deliberately wider privacy boundary.
 _PRODUCER_FAILURE_PREFIX = "Simulator frame producer failed: "
 _PRODUCER_LOST_DETAIL = (
     "Simulator frame producer stopped without reporting an exit state."
 )
-_MAX_PRODUCER_ERROR_LENGTH = 200
+
+#: A defensive ceiling on the rendered exception class name. An ordinary Python
+#: class name is a short identifier, but the name is read from a hostile object's
+#: type, so it is bounded rather than trusted.
+_MAX_EXCEPTION_NAME_LENGTH = 80
 
 
 # -- frame generation ---------------------------------------------------------
@@ -516,11 +524,18 @@ class SimulatorPreviewProcess:
 
     It is equally truthful about failing. If the producer stops for any reason
     other than a requested :meth:`terminate`, :meth:`kill` or :meth:`close`, the
-    handle settles exit code :data:`_EXIT_PRODUCER_FAILED`, publishes a bounded
+    handle settles exit code :data:`_EXIT_PRODUCER_FAILED`, publishes a safe
     diagnostic through :meth:`read_error` and ends the frame stream, so the owning
     :class:`~mgo.camera.preview.PreviewService` reconciles to ``FAILED`` and every
     blocked reader sees ordinary end-of-file instead of hanging. The first settled
     exit state always wins, so later cleanup can never overwrite a failure.
+
+    **Producer-thread liveness, not the stop request, is the authority.** A
+    requested stop may report a requested exit code only if the producer is still
+    alive at the instant the request is accepted, so cleanup arriving after a
+    silent producer death cannot relabel that death as a normal or forced stop.
+    :meth:`wait` waits on the producer thread itself, so it cannot block on a stop
+    event that a dead producer never set.
     """
 
     def __init__(
@@ -576,27 +591,32 @@ class SimulatorPreviewProcess:
 
     def terminate(self) -> None:
         """Ask the producer to stop, settling a normal exit code. Idempotent."""
-        self._settle(_EXIT_TERMINATED)
+        self._settle_requested(_EXIT_TERMINATED)
 
     def kill(self) -> None:
         """Stop the producer, settling a forced-kill exit code. Idempotent."""
-        self._settle(_EXIT_KILLED)
+        self._settle_requested(_EXIT_KILLED)
 
     def wait(self, timeout: float | None = None) -> int | None:
-        """Wait up to ``timeout`` for exit; return the code or ``None``."""
-        self._stop.wait(timeout)
-        code = self.poll()
-        if code is None:
-            return None
-        self._join_producer()
-        return code
+        """Wait up to ``timeout`` for the producer to exit; return the code.
+
+        The wait is on the producer **thread**, never on the stop event: a
+        producer that died without setting that event would otherwise make
+        ``wait(None)`` block for ever. Returns ``None`` only when the producer is
+        still running when the timeout expires, and honours the caller's timeout
+        exactly -- no further fixed join is performed afterwards.
+        """
+        if threading.current_thread() is not self._producer:
+            self._producer.join(timeout)
+        return self.poll()
 
     def read_error(self) -> str:
-        """Return the bounded producer diagnostic, empty when healthy.
+        """Return the producer diagnostic, empty when healthy.
 
         A healthy or normally-stopped producer has no child stderr to report, so
-        this is empty. After an unexpected failure it carries a concise, bounded
-        summary -- never a traceback.
+        this is empty. After an unexpected failure it names the exception's *type*
+        and nothing else -- never a traceback, and never the exception's message,
+        which is arbitrary application data.
         """
         self.poll()  # reconcile a vanished producer before reporting.
         with self._lock:
@@ -618,7 +638,7 @@ class SimulatorPreviewProcess:
         settled state wins, so closing a handle whose producer already failed
         leaves the failure code and its diagnostic intact.
         """
-        self._settle(_EXIT_TERMINATED)
+        self._settle_requested(_EXIT_TERMINATED)
         self._join_producer()
         self._stream.close()
 
@@ -646,49 +666,106 @@ class SimulatorPreviewProcess:
             if self._exit_code is None:
                 self._exit_code = code
                 self._error = error
+        self._release()
+
+    def _settle_requested(self, code: int) -> None:
+        """Settle a *requested* stop, unless the producer already stopped itself.
+
+        The liveness check and the state decision happen together under the lock,
+        so a producer that died silently cannot be relabelled as a normal or forced
+        stop by cleanup that merely arrived afterwards. A request is honoured only
+        while the producer is genuinely alive.
+        """
+        with self._lock:
+            if self._exit_code is None:
+                if self._producer.is_alive():
+                    self._exit_code = code
+                    self._error = ""
+                else:
+                    self._exit_code = _EXIT_PRODUCER_FAILED
+                    self._error = _PRODUCER_LOST_DETAIL
+        self._release()
+
+    def _release(self) -> None:
+        """Stop the producer and release every blocked reader at end-of-file.
+
+        Always called with the state lock *released*: ending the mailbox wakes
+        other threads, which must never happen while holding it.
+        """
         self._stop.set()
         self._mailbox.end()
 
     def _join_producer(self) -> None:
-        """Wait briefly for the producer to finish, never joining this thread."""
+        """Wait briefly for the producer to finish, never joining this thread.
+
+        This is the cleanup path's bounded defensive join. :meth:`wait` does not
+        use it, because that would silently extend a caller's finite timeout.
+        """
         if threading.current_thread() is not self._producer:
             self._producer.join(_PRODUCER_JOIN_SECONDS)
 
     def _produce(self) -> None:
-        """Publish the deterministic sequence at the configured cadence.
+        """Run the producer body, settling truthful state however it exits.
 
         Any unexpected fault is contained here: a real camera process that dies
-        must be observable rather than silently absent, so the fault is logged
-        with its traceback, settled as :data:`_EXIT_PRODUCER_FAILED` with a
-        bounded diagnostic, and the stream ended. ``KeyboardInterrupt``,
-        ``SystemExit`` and ``GeneratorExit`` are deliberately not caught.
+        must be observable rather than silently absent. The safe diagnostic is
+        built and the state settled **before** logging, so a logging failure
+        cannot leave the process unsettled or a reader blocked.
+
+        ``KeyboardInterrupt``, ``SystemExit`` and ``GeneratorExit`` are
+        deliberately not caught -- they may propagate out of the thread -- but the
+        ``finally`` path has already made the process state truthful, and it also
+        catches an accidental early return from :meth:`_produce_frames`.
         """
         try:
-            index = 0
-            while not self._stop.is_set():
-                self._mailbox.offer(self._sequence.frame(index))
-                index += 1
-                # Waiting on the stop event both paces the producer and makes
-                # shutdown immediate; a bare sleep would delay it by a frame.
-                self._stop.wait(self._interval)
+            self._produce_frames()
         except Exception as exc:
+            # Order matters: a safe detail that cannot render `exc`, then the
+            # settlement, then the detailed log.
+            self._settle(_EXIT_PRODUCER_FAILED, _producer_failure_detail(exc))
             LOGGER.exception(
                 "Simulator frame producer failed; ending the preview stream"
             )
-            self._settle(_EXIT_PRODUCER_FAILED, _producer_failure_detail(exc))
+        finally:
+            # A requested stop, or a failure above, has already settled; first
+            # settled state wins, so this only catches a producer leaving without
+            # having recorded anything at all.
+            self._settle(_EXIT_PRODUCER_FAILED, _PRODUCER_LOST_DETAIL)
+
+    def _produce_frames(self) -> None:
+        """Publish the deterministic sequence at the configured cadence."""
+        index = 0
+        while not self._stop.is_set():
+            self._mailbox.offer(self._sequence.frame(index))
+            index += 1
+            # Waiting on the stop event both paces the producer and makes
+            # shutdown immediate; a bare sleep would delay it by a frame.
+            self._stop.wait(self._interval)
 
 
-def _producer_failure_detail(exc: Exception) -> str:
-    """Summarise ``exc`` as a bounded, single-line diagnostic.
+def _producer_failure_detail(exc: BaseException) -> str:
+    """Describe ``exc`` by *type only*, for a status response.
 
-    Only the exception's class name and message are used, whitespace is
-    collapsed and the result is truncated, so the text stays short and carries no
-    traceback for a status response to leak.
+    The exception is never rendered: neither ``str(exc)`` nor ``repr(exc)`` is
+    called, so an arbitrary message cannot leak a path, an environment value, a
+    secret, a memory address or control text into the API, and an exception whose
+    string conversion itself raises cannot break failure settlement.
+
+    The class name is read defensively -- a hostile type could supply anything --
+    and reduced to identifier characters, which excludes every control, format and
+    whitespace character.
     """
-    summary = " ".join(f"{_PRODUCER_FAILURE_PREFIX}{type(exc).__name__}: {exc}".split())
-    if len(summary) <= _MAX_PRODUCER_ERROR_LENGTH:
-        return summary
-    return summary[: _MAX_PRODUCER_ERROR_LENGTH - 1].rstrip() + "…"
+    try:
+        name = type(exc).__name__
+    except Exception:  # pragma: no cover - a hostile metaclass property
+        name = ""
+    if not isinstance(name, str):
+        name = ""
+    safe = "".join(
+        character for character in name if character.isalnum() or character == "_"
+    )
+    bounded = safe[:_MAX_EXCEPTION_NAME_LENGTH] or "Exception"
+    return f"{_PRODUCER_FAILURE_PREFIX}{bounded}."
 
 
 class SimulatorPreviewBackend:

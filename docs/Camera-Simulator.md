@@ -239,10 +239,10 @@ The handle is truthful about being simulated:
 | ------ | --------- |
 | `pid` | `None` — there is no operating-system process |
 | `poll()` | `None` while active, `0` after a normal termination, `-9` after a forced kill, `1` after an unexpected producer failure |
-| `terminate()` | Asks the producer to stop; settles exit code `0` |
-| `kill()` | Stops the producer; settles exit code `-9` |
-| `wait(timeout)` | Waits up to `timeout`; returns the code, or `None` if still running |
-| `read_error()` | Empty while healthy or normally stopped; a bounded diagnostic after an unexpected failure |
+| `terminate()` | Asks the producer to stop; settles exit code `0` **if the producer is alive when the request is accepted** |
+| `kill()` | Stops the producer; settles exit code `-9` on the same condition |
+| `wait(timeout)` | Waits on the **producer thread** up to `timeout`; returns the code, or `None` if still running |
+| `read_error()` | Empty while healthy or normally stopped; a type-only diagnostic after an unexpected failure |
 | `frame_stream()` | The raw MJPEG stream |
 | `close()` | Stops the producer and releases the stream |
 
@@ -260,42 +260,89 @@ If the producer stops for any reason other than a requested stop, the handle:
 
 - settles exit code **`1`** — never `0` or `-9`, and never leaves `poll()`
   returning `None` for a thread that is no longer alive;
-- publishes a bounded single-line diagnostic through `read_error()`, built from
-  the exception's class and message only:
+- publishes a diagnostic through `read_error()` that names the exception's
+  **type and nothing else**:
 
   ```text
-  Simulator frame producer failed: RuntimeError: controlled test failure
+  Simulator frame producer failed: RuntimeError.
   ```
 
-- logs the **full traceback** to the application log — the traceback never
-  reaches `read_error()` or any API response;
+- logs the **full exception message and traceback** to the application log;
 - ends and clears the frame mailbox, so `frame_stream().read(...)` returns `b""`
   (ordinary end-of-file) once any already-delivered bytes are consumed, and every
   **blocked** reader is released promptly instead of hanging;
 - lets the producer thread exit, leaving no orphan.
 
-`poll()` additionally reconciles defensively: a producer thread that is no longer
-alive while no exit state has been recorded is settled to the same failure state.
-Liveness truthfulness therefore does not depend on the exception handler alone —
-a future accidental early return in the producer loop is caught too. The
-reconciliation is thread-safe and idempotent.
+#### Why the diagnostic carries no exception message
 
-`PreviewService` needed no change to benefit from this. Its existing unexpected-exit
-reconciliation observes the failure on the next `status()` (or `frame_stream()`,
-or `start()`) and settles the service into the existing `FAILED` state:
+An exception message is **arbitrary application data**. It can contain an absolute
+filesystem path, a UNC path, a file URI, a username, an environment value, a
+secret, a memory address, or control characters such as ANSI escapes and Unicode
+direction overrides. `read_error()` is surfaced through `PreviewStatus.last_error`
+and `PreviewStartError`, both of which reach API responses — so the message is
+never placed there. The diagnostic is safe **by construction**, not by filtering:
+the only variable part is the exception class name, read defensively and reduced
+to identifier characters.
+
+**Logs and status responses deliberately have different privacy boundaries.** The
+log is the authority for detailed internal failure data and carries the complete
+message and traceback for an operator; the status response is bounded and
+non-sensitive. If you are diagnosing a producer failure, read the log.
+
+Nothing in the failure path renders the exception — neither `str(exc)` nor
+`repr(exc)` is called — so an exception whose own string conversion raises cannot
+break failure settlement. Inside the handler the order is deliberate:
+
+1. build the safe type-only diagnostic;
+2. settle the failure state and end the mailbox;
+3. log the exception and traceback.
+
+State is therefore already truthful before logging is attempted, so a logging
+failure cannot leave the process unsettled or a reader blocked.
+
+#### Liveness is the authority
+
+`poll()` reconciles defensively: a producer thread that is no longer alive while no
+exit state has been recorded is settled to the failure state. The producer body
+also runs inside a `try/finally`, so **every** exit settles something — including
+an accidental early return. `KeyboardInterrupt`, `SystemExit` and `GeneratorExit`
+are deliberately **not** caught and may propagate out of the thread, but the
+`finally` path has already made the process state truthful before they do.
+
+Two consequences matter:
+
+- **`wait()` follows the producer thread, never the stop-request event.** A
+  producer that died without setting that event would otherwise make `wait(None)`
+  block for ever. `wait(timeout)` joins the thread for at most `timeout` and then
+  reports `poll()`, so it honours its own timeout exactly — no further fixed join
+  is added afterwards. The cleanup path keeps a separate bounded defensive join.
+- **A requested stop may claim a requested exit code only if the producer is alive
+  at the instant the request is atomically accepted.** `terminate()`, `kill()` and
+  `close()` arriving *after* a silent producer death therefore report `1` with the
+  generic diagnostic, not `0` or `-9`. Cleanup cannot relabel a death it did not
+  cause.
+
+  ```text
+  Simulator frame producer stopped without reporting an exit state.
+  ```
+
+`PreviewService` needed no change to benefit from any of this. Its existing
+unexpected-exit reconciliation observes the failure on the next `status()` (or
+`frame_stream()`, or `start()`) and settles the service into the existing `FAILED`
+state:
 
 ```json
 {
   "state": "failed",
   "owner": null,
   "uptime_seconds": null,
-  "last_error": "Preview process terminated unexpectedly with code 1: Simulator frame producer failed: RuntimeError: controlled test failure"
+  "last_error": "Preview process terminated unexpectedly with code 1: Simulator frame producer failed: RuntimeError."
 }
 ```
 
 When the sequence fails *before* its first frame, startup fails instead: the
 existing first-frame validation sees end-of-file, `PreviewStartError` is raised
-carrying code `1` and the bounded diagnostic, and the state is `FAILED` — never
+carrying code `1` and the safe diagnostic, and the state is `FAILED` — never
 `RUNNING`. No new state, status value or response field was introduced for any of
 this.
 
@@ -395,17 +442,20 @@ per preview process. It:
   never memory;
 - releases any blocked reader promptly on `terminate`, `kill` or `close`, so a
   waiting read ends at clean end-of-file instead of hanging;
-- contains any unexpected fault: it is logged with its traceback and settled as
-  the failure state described above, rather than killing the thread silently.
-  `KeyboardInterrupt`, `SystemExit` and `GeneratorExit` are deliberately **not**
-  caught;
+- contains any unexpected fault: it is settled as the failure state described
+  above and then logged with its traceback, rather than killing the thread
+  silently. `KeyboardInterrupt`, `SystemExit` and `GeneratorExit` are deliberately
+  **not** caught, but a `try/finally` around the producer body means the process
+  state is truthful before they propagate;
 - exits on stop *or* on failure, leaving no orphan behind a preview stop, a
   capture, repeated start/stop cycles, a producer failure or application shutdown;
 - is a daemon, so it can never keep the interpreter alive.
 
 Shutdown never joins the calling thread against itself, and the exit-state lock is
 never held while the mailbox is ended, so no combination of `poll`, `terminate`,
-`kill`, `wait`, `close` and a failing producer can deadlock.
+`kill`, `wait`, `close` and a failing producer can deadlock. The liveness check and
+the exit-state decision for a requested stop happen together under that lock, so
+the classification cannot race a producer that is exiting on its own.
 
 No `subprocess`, `multiprocessing`, shell, local HTTP server or temporary video
 file is involved. The module imports none of them.
@@ -509,10 +559,17 @@ Delete the temporary database, captures and configuration afterwards.
 
 Producer failure is validated separately, because it cannot be provoked through
 the API: a controlled in-process run injects a fault into frame generation and
-confirms that `poll()` reports `1`, `read_error()` carries the bounded diagnostic,
-a blocked reader is released at end-of-file, `PreviewService.status()` reconciles
-to `failed`, and no producer thread survives. See
-`tests/test_camera_simulator.py` — the *unexpected producer failure* section.
+confirms that `poll()` reports `1`, `read_error()` carries the type-only
+diagnostic, a blocked reader is released at end-of-file,
+`PreviewService.status()` reconciles to `failed`, and no producer thread survives.
+The same run also plants a hostile exception message (Windows, POSIX and UNC
+paths, a file URI, an environment assignment, a secret, a memory address, ANSI
+escapes and Unicode direction overrides) and proves none of it reaches
+`read_error()`, `last_error` or `PreviewStartError` while all of it reaches the
+log; that a producer which vanished without settling still returns promptly from
+`wait(None)`; and that `close()`/`terminate()`/`kill()` arriving after such a death
+report `1` rather than `0`/`-9`. See `tests/test_camera_simulator.py` — the
+*unexpected producer failure*, *diagnostic privacy* and *liveness* sections.
 
 ## API behaviour
 
@@ -536,6 +593,12 @@ Generated images carry no private data:
 
 Nothing is fetched from the network, and no external asset or binary media
 fixture is committed to the repository.
+
+Failure diagnostics observe the same boundary: the API-visible producer diagnostic
+names the exception **type only** and never its message, so no path, environment
+value, secret, address or control sequence can travel from an internal fault into
+a status response. The full message and traceback are logged instead — see
+[Why the diagnostic carries no exception message](#why-the-diagnostic-carries-no-exception-message).
 
 ## Production safety
 
@@ -575,9 +638,10 @@ evidence.
   approximate under heavy load — as it would be for a real encoder.
 - Nothing here exercises camera ownership contention with a *real* process,
   because there is no real process.
-- A producer failure is reported through one failure code (`1`) and a bounded
-  message; the simulator does not classify *kinds* of internal fault, because a
-  real preview process does not either.
+- A producer failure is reported through one failure code (`1`) and the exception
+  type; the simulator does not classify *kinds* of internal fault, because a real
+  preview process does not either. Diagnosing *why* a producer failed requires the
+  application log — the status response deliberately does not carry enough detail.
 
 ## Rollback
 
