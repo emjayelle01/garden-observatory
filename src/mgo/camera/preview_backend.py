@@ -18,6 +18,10 @@ Implementations provided here:
 * :class:`NullPreviewBackend` -- always reports preview as unavailable;
 * :class:`MockPreviewBackend` / :class:`MockPreviewProcess` -- hardware-free
   doubles that make the full lifecycle testable without a camera.
+
+``simulator`` is also a supported backend; its in-process producer lives in
+:mod:`mgo.camera.simulator` and is selected here by
+:func:`build_preview_backend`.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from pathlib import Path
 from typing import IO, Protocol
 
 from mgo.camera.exceptions import PreviewStartError, PreviewUnavailableError
+from mgo.camera.simulator import SimulatorPreviewBackend
 from mgo.core.config import PreviewConfig
 
 LOGGER = logging.getLogger(__name__)
@@ -404,7 +409,9 @@ def build_preview_backend(backend: str) -> PreviewBackend:
 
     Mirrors :func:`mgo.camera.backend.build_capture_backend` so preview and
     capture agree on backend vocabulary. ``rpicam``/``libcamera`` select the
-    matching ``*-vid`` command; ``null``/``none`` select :class:`NullPreviewBackend`.
+    matching ``*-vid`` command; ``simulator`` selects the in-process
+    deterministic frame producer; ``null``/``none`` select
+    :class:`NullPreviewBackend`.
     """
     normalized = backend.strip().lower()
 
@@ -412,6 +419,8 @@ def build_preview_backend(backend: str) -> PreviewBackend:
         return RPiCamPreviewBackend("rpicam-vid")
     if normalized == "libcamera":
         return RPiCamPreviewBackend("libcamera-vid")
+    if normalized == "simulator":
+        return SimulatorPreviewBackend()
     if normalized in {"null", "none"}:
         return NullPreviewBackend()
 

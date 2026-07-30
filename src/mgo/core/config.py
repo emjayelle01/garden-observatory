@@ -116,7 +116,15 @@ class StorageConfig:
     database_path: Path
 
 
-SUPPORTED_CAMERA_BACKENDS = frozenset({"rpicam", "libcamera", "null", "none"})
+#: The camera backend vocabulary shared by detection, capture and preview.
+#:
+#: * ``rpicam`` -- physical Raspberry Pi camera through the ``rpicam-*`` tools;
+#: * ``libcamera`` -- physical camera through the legacy ``libcamera-*`` tools;
+#: * ``simulator`` -- deterministic generated imagery; **no physical camera**;
+#: * ``null``/``none`` -- deliberately unavailable.
+SUPPORTED_CAMERA_BACKENDS = frozenset(
+    {"rpicam", "libcamera", "simulator", "null", "none"}
+)
 
 
 @dataclass(frozen=True)

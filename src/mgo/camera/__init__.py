@@ -13,7 +13,9 @@ Responsibilities are split across:
 * :mod:`mgo.camera.backend` -- the :class:`CaptureBackend` interface and its
   implementations (``RPiCamBackend``, ``MockBackend``, ``NullBackend``);
 * :mod:`mgo.camera.capture` -- the :class:`CaptureService` that orchestrates a
-  capture and depends only on the backend interface.
+  capture and depends only on the backend interface;
+* :mod:`mgo.camera.simulator` -- the deterministic, hardware-free ``simulator``
+  backend (capture, preview and MJPEG stream) selected through configuration.
 """
 
 from __future__ import annotations
@@ -48,6 +50,20 @@ from mgo.camera.preview_backend import (
     RPiCamPreviewBackend,
     build_preview_backend,
 )
+from mgo.camera.simulator import (
+    SIMULATOR_BACKEND_NAME,
+    SIMULATOR_CAPTURE_HEIGHT,
+    SIMULATOR_CAPTURE_WIDTH,
+    SIMULATOR_MARKER_TEXT,
+    SIMULATOR_SEQUENCE_LENGTH,
+    SimulatorCaptureBackend,
+    SimulatorFrameSequence,
+    SimulatorMjpegStream,
+    SimulatorPreviewBackend,
+    SimulatorPreviewProcess,
+    encode_simulator_frame,
+    render_simulator_frame,
+)
 from mgo.camera.streaming import (
     MJPEG_CONTENT_TYPE,
     FrameSource,
@@ -60,6 +76,11 @@ from mgo.camera.streaming import (
 
 __all__ = [
     "MJPEG_CONTENT_TYPE",
+    "SIMULATOR_BACKEND_NAME",
+    "SIMULATOR_CAPTURE_HEIGHT",
+    "SIMULATOR_CAPTURE_WIDTH",
+    "SIMULATOR_MARKER_TEXT",
+    "SIMULATOR_SEQUENCE_LENGTH",
     "BackendCaptureError",
     "CameraCaptureError",
     "CameraUnavailableError",
@@ -89,9 +110,16 @@ __all__ = [
     "PreviewUnavailableError",
     "RPiCamBackend",
     "RPiCamPreviewBackend",
+    "SimulatorCaptureBackend",
+    "SimulatorFrameSequence",
+    "SimulatorMjpegStream",
+    "SimulatorPreviewBackend",
+    "SimulatorPreviewProcess",
     "build_capture_backend",
     "build_capture_filename",
     "build_preview_backend",
     "encode_multipart_frame",
+    "encode_simulator_frame",
     "parse_mjpeg_frames",
+    "render_simulator_frame",
 ]

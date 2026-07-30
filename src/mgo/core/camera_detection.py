@@ -1,9 +1,13 @@
-"""Operating-system camera detection adapters for MGO.
+"""Camera detection adapters for MGO.
 
 This module contains the only code that knows how to probe real hardware. It
 runs bounded, non-shell subprocess commands (``rpicam``/``libcamera`` tools)
 and translates their results into hardware-agnostic
-:class:`~mgo.core.camera.DetectionEvidence`.
+:class:`~mgo.core.camera.DetectionEvidence`. Alongside the probing adapters it
+holds the two adapters that deliberately probe *nothing*:
+:class:`NullCameraDetector` (never available) and
+:class:`SimulatorCameraDetector` (always available, and truthful about being
+simulated).
 
 Design rules enforced here:
 
@@ -240,6 +244,35 @@ class NullCameraDetector:
         )
 
 
+#: The single, stable readiness detail for the ``simulator`` backend, shared by
+#: the implementation, the tests and the documentation. It states plainly that
+#: the source is simulated so no reader can mistake it for hardware evidence.
+SIMULATOR_READINESS_DETAIL = (
+    "Deterministic camera simulator is active; no physical camera is in use."
+)
+
+
+class SimulatorCameraDetector:
+    """Reports the deterministic camera simulator as available.
+
+    The simulator generates its own imagery, so it *is* genuinely ready whenever
+    it is selected -- but it is never a physical camera. This detector therefore
+    reports availability while naming the source as simulated, and deliberately
+    reports no device index, sensor model, enumerated device, video device,
+    serial number or command output that would imply hardware was discovered.
+
+    It runs no subprocess, touches no filesystem, makes no network call, returns
+    the same evidence every time, and never raises.
+    """
+
+    def detect(self, config: CameraConfig) -> DetectionEvidence:
+        """Always report the simulator as available, and say that it is one."""
+        return DetectionEvidence(
+            DetectionOutcome.DETECTED,
+            SIMULATOR_READINESS_DETAIL,
+        )
+
+
 def build_detector(backend: str) -> CameraDetector:
     """Construct the detector adapter for a configured backend name."""
     normalized = backend.strip().lower()
@@ -248,6 +281,8 @@ def build_detector(backend: str) -> CameraDetector:
         return CommandCameraDetector(("rpicam-hello", "--list-cameras"))
     if normalized == "libcamera":
         return CommandCameraDetector(("libcamera-hello", "--list-cameras"))
+    if normalized == "simulator":
+        return SimulatorCameraDetector()
     if normalized in {"null", "none"}:
         return NullCameraDetector()
 

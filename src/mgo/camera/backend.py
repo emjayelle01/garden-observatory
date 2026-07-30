@@ -16,6 +16,10 @@ Implementations provided here:
 * :class:`MockBackend` -- writes deterministic bytes with no hardware, for
   development and tests;
 * :class:`NullBackend` -- always reports the camera as unavailable.
+
+``simulator`` is also a supported backend; its implementation lives in
+:mod:`mgo.camera.simulator` and is selected here by
+:func:`build_capture_backend`.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from mgo.camera.exceptions import (
     CaptureWriteError,
 )
 from mgo.camera.models import ImageDimensions
+from mgo.camera.simulator import SimulatorCaptureBackend
 from mgo.core.camera_detection import (
     CommandOutcome,
     CommandResult,
@@ -253,8 +258,8 @@ def build_capture_backend(config: CameraConfig) -> CaptureBackend:
 
     Mirrors ``mgo.core.camera_detection.build_detector`` so the detection and
     capture layers agree on backend vocabulary. ``rpicam``/``libcamera`` select
-    the matching ``*-still`` command; ``null``/``none`` select
-    :class:`NullBackend`.
+    the matching ``*-still`` command; ``simulator`` selects the deterministic
+    generated-image backend; ``null``/``none`` select :class:`NullBackend`.
     """
     normalized = config.backend.strip().lower()
 
@@ -262,6 +267,8 @@ def build_capture_backend(config: CameraConfig) -> CaptureBackend:
         return RPiCamBackend("rpicam-still")
     if normalized == "libcamera":
         return RPiCamBackend("libcamera-still")
+    if normalized == "simulator":
+        return SimulatorCaptureBackend()
     if normalized in {"null", "none"}:
         return NullBackend()
 
