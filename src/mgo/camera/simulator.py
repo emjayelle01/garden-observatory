@@ -147,9 +147,24 @@ _MARKER_PAD_DIVISOR = 36
 _PRODUCER_JOIN_SECONDS = 2.0
 
 #: Exit codes reported by the simulated process handle, mirroring the meaning of
-#: a real process exiting normally versus being force-killed.
+#: a real process exiting normally versus being force-killed. A real preview
+#: process can also die on its own; ``_EXIT_PRODUCER_FAILED`` is the simulator's
+#: equivalent, so an unexpected producer fault is never mistaken for a requested
+#: stop and is never reported as continued health.
 _EXIT_TERMINATED = 0
 _EXIT_KILLED = -9
+_EXIT_PRODUCER_FAILED = 1
+
+#: The bounded diagnostics :meth:`SimulatorPreviewProcess.read_error` reports for
+#: an unexpected producer exit. They are built only from the exception's type and
+#: message, never from a traceback, so no private path, environment value,
+#: hostname or thread identity can reach the API-visible status; the full
+#: traceback goes to the application log instead.
+_PRODUCER_FAILURE_PREFIX = "Simulator frame producer failed: "
+_PRODUCER_LOST_DETAIL = (
+    "Simulator frame producer stopped without reporting an exit state."
+)
+_MAX_PRODUCER_ERROR_LENGTH = 200
 
 
 # -- frame generation ---------------------------------------------------------
@@ -496,8 +511,16 @@ class SimulatorPreviewProcess:
     exits promptly on :meth:`terminate`, :meth:`kill` or :meth:`close`.
 
     The handle is truthful about being simulated: :attr:`pid` is ``None`` because
-    there is no operating-system process, and :meth:`read_error` is empty because
-    there is no child stderr.
+    there is no operating-system process, and :meth:`read_error` is empty while
+    the producer is healthy because there is no child stderr.
+
+    It is equally truthful about failing. If the producer stops for any reason
+    other than a requested :meth:`terminate`, :meth:`kill` or :meth:`close`, the
+    handle settles exit code :data:`_EXIT_PRODUCER_FAILED`, publishes a bounded
+    diagnostic through :meth:`read_error` and ends the frame stream, so the owning
+    :class:`~mgo.camera.preview.PreviewService` reconciles to ``FAILED`` and every
+    blocked reader sees ordinary end-of-file instead of hanging. The first settled
+    exit state always wins, so later cleanup can never overwrite a failure.
     """
 
     def __init__(
@@ -516,6 +539,7 @@ class SimulatorPreviewProcess:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._exit_code: int | None = None
+        self._error = ""
         self._producer = threading.Thread(
             target=self._produce,
             name="mgo-simulator-preview",
@@ -531,6 +555,22 @@ class SimulatorPreviewProcess:
         return None
 
     def poll(self) -> int | None:
+        """Return the exit code, or ``None`` while the producer is running.
+
+        This never reports ``None`` for a producer that is no longer alive. A
+        thread that vanished without settling an exit state -- an exception the
+        handler somehow missed, or a future accidental early return -- is
+        reconciled here to the unexpected-failure state, so liveness truthfulness
+        does not rest on the exception handler alone.
+        """
+        with self._lock:
+            if self._exit_code is not None:
+                return self._exit_code
+            if self._producer.is_alive():
+                return None
+        # Settled outside the lock: _settle re-acquires it, and ending the
+        # mailbox must never happen with this lock held.
+        self._settle(_EXIT_PRODUCER_FAILED, _PRODUCER_LOST_DETAIL)
         with self._lock:
             return self._exit_code
 
@@ -548,12 +588,19 @@ class SimulatorPreviewProcess:
         code = self.poll()
         if code is None:
             return None
-        self._producer.join(_PRODUCER_JOIN_SECONDS)
+        self._join_producer()
         return code
 
     def read_error(self) -> str:
-        """Always empty: a simulated producer has no child stderr to report."""
-        return ""
+        """Return the bounded producer diagnostic, empty when healthy.
+
+        A healthy or normally-stopped producer has no child stderr to report, so
+        this is empty. After an unexpected failure it carries a concise, bounded
+        summary -- never a traceback.
+        """
+        self.poll()  # reconcile a vanished producer before reporting.
+        with self._lock:
+            return self._error
 
     def frame_stream(self) -> IO[bytes] | None:
         """Return the simulator's raw MJPEG stream.
@@ -565,9 +612,14 @@ class SimulatorPreviewProcess:
         return cast("IO[bytes]", self._stream)
 
     def close(self) -> None:
-        """Stop the producer and release the stream. Idempotent."""
+        """Stop the producer and release the stream. Idempotent.
+
+        Settling a normal exit here cannot mask an earlier failure: the first
+        settled state wins, so closing a handle whose producer already failed
+        leaves the failure code and its diagnostic intact.
+        """
         self._settle(_EXIT_TERMINATED)
-        self._producer.join(_PRODUCER_JOIN_SECONDS)
+        self._join_producer()
         self._stream.close()
 
     # -- internals ---------------------------------------------------------
@@ -582,23 +634,61 @@ class SimulatorPreviewProcess:
         """Frames currently waiting for the consumer (bounded by design)."""
         return self._mailbox.depth
 
-    def _settle(self, code: int) -> None:
-        """Record an exit code (first one wins) and release everything."""
+    def _settle(self, code: int, error: str = "") -> None:
+        """Record an exit code and diagnostic (first wins) and release everything.
+
+        Thread-safe and idempotent: an unexpected failure recorded by the producer
+        survives any later ``terminate``/``kill``/``close``, and a requested stop
+        is never retrospectively relabelled a failure. Ending the mailbox releases
+        every blocked reader with ordinary end-of-file.
+        """
         with self._lock:
             if self._exit_code is None:
                 self._exit_code = code
+                self._error = error
         self._stop.set()
         self._mailbox.end()
 
+    def _join_producer(self) -> None:
+        """Wait briefly for the producer to finish, never joining this thread."""
+        if threading.current_thread() is not self._producer:
+            self._producer.join(_PRODUCER_JOIN_SECONDS)
+
     def _produce(self) -> None:
-        """Publish the deterministic sequence at the configured cadence."""
-        index = 0
-        while not self._stop.is_set():
-            self._mailbox.offer(self._sequence.frame(index))
-            index += 1
-            # Waiting on the stop event both paces the producer and makes
-            # shutdown immediate; a bare sleep would delay it by a frame.
-            self._stop.wait(self._interval)
+        """Publish the deterministic sequence at the configured cadence.
+
+        Any unexpected fault is contained here: a real camera process that dies
+        must be observable rather than silently absent, so the fault is logged
+        with its traceback, settled as :data:`_EXIT_PRODUCER_FAILED` with a
+        bounded diagnostic, and the stream ended. ``KeyboardInterrupt``,
+        ``SystemExit`` and ``GeneratorExit`` are deliberately not caught.
+        """
+        try:
+            index = 0
+            while not self._stop.is_set():
+                self._mailbox.offer(self._sequence.frame(index))
+                index += 1
+                # Waiting on the stop event both paces the producer and makes
+                # shutdown immediate; a bare sleep would delay it by a frame.
+                self._stop.wait(self._interval)
+        except Exception as exc:
+            LOGGER.exception(
+                "Simulator frame producer failed; ending the preview stream"
+            )
+            self._settle(_EXIT_PRODUCER_FAILED, _producer_failure_detail(exc))
+
+
+def _producer_failure_detail(exc: Exception) -> str:
+    """Summarise ``exc`` as a bounded, single-line diagnostic.
+
+    Only the exception's class name and message are used, whitespace is
+    collapsed and the result is truncated, so the text stays short and carries no
+    traceback for a status response to leak.
+    """
+    summary = " ".join(f"{_PRODUCER_FAILURE_PREFIX}{type(exc).__name__}: {exc}".split())
+    if len(summary) <= _MAX_PRODUCER_ERROR_LENGTH:
+        return summary
+    return summary[: _MAX_PRODUCER_ERROR_LENGTH - 1].rstrip() + "…"
 
 
 class SimulatorPreviewBackend:

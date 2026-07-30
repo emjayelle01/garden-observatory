@@ -2,18 +2,58 @@
 
 ## Status
 
-**Implementation complete and locally validated; Raspberry Pi validation not
-performed. Awaiting repository review.**
+**Implementation corrected and locally revalidated; Raspberry Pi validation not
+performed. Awaiting repository re-review.**
 
 | Gate | Outcome |
 | ---- | ------- |
 | Task definition | Complete (this record, first commit) |
 | Implementation | Complete |
 | Local static and automated validation | Passed |
-| Mutation / negative verification | Passed — all 18 defects detected |
+| Mutation / negative verification | Passed — all 18 defects detected, plus 1 correction mutation |
 | Local runtime validation | Passed |
-| Repository review | Not started |
+| Repository review | **Round 1 complete** — one blocking defect found and corrected (see below) |
+| Repository re-review | Not started |
 | Raspberry Pi validation | **Not performed** — the Pi was not accessed |
+
+### Repository-review correction — truthful producer failure handling
+
+Review round 1 found one blocking defect. The producer thread could die from an
+unexpected frame-generation exception without updating the simulated process
+state, so `poll()` kept returning `None`, `read_error()` stayed empty, the frame
+mailbox was never ended, a blocked reader stayed blocked for ever, and
+`PreviewService` went on reporting `RUNNING`. The failure was never reconciled to
+`FAILED`, and no test exercised it.
+
+This was reproduced first, against the unmodified branch, with a frame sequence
+that returns one valid frame and then raises: the producer died, `producer_alive`
+became false, `poll()` returned `None`, `read_error()` returned `""`, the blocked
+reader was never released and `status()` still reported `running` with
+`owner: preview` and `last_error: null`.
+
+The correction (fifth commit, `src/mgo/camera/simulator.py`) makes an unexpected
+producer exit observable, bounded and truthful. See *Preview-process design*
+below and `docs/Camera-Simulator.md` for the full contract. In summary:
+
+- an unexpected exit settles exit code **`1`** — distinct from a requested
+  `terminate` (`0`) and `kill` (`-9`);
+- `read_error()` publishes a bounded single-line diagnostic built only from the
+  exception's class and message; the traceback goes to the application log;
+- the mailbox is ended and cleared, so blocked readers see ordinary end-of-file;
+- `poll()` reconciles a producer thread that is no longer alive even if it left no
+  exit state, so truthfulness does not depend on the exception handler alone;
+- the **first** settled exit state always wins, so later cleanup cannot mask a
+  failure and a requested stop is never relabelled a failure;
+- `PreviewService` needed no change: its existing unexpected-exit reconciliation
+  settles the service into the existing `FAILED` state.
+
+The misleading test `test_unexpected_exit_reconciliation_stays_truthful` — which
+killed an *unrelated* simulator process and then confirmed the service's own
+process was healthy — was renamed to
+`test_an_unrelated_simulator_process_does_not_affect_the_service` with an accurate
+docstring, and the explicit-kill test was renamed
+`test_a_killed_process_is_reported_as_failed` so neither is presented as proof of
+unexpected producer failure.
 
 ### Delivered
 
@@ -25,7 +65,7 @@ performed. Awaiting repository review.**
 | `src/mgo/camera/backend.py` | one `build_capture_backend` branch |
 | `src/mgo/camera/preview_backend.py` | one `build_preview_backend` branch |
 | `src/mgo/camera/__init__.py` | re-exports |
-| `tests/test_camera_simulator.py` | **new** — 170 tests |
+| `tests/test_camera_simulator.py` | **new** — 187 tests (170, plus 17 for the review correction) |
 | `docs/Camera-Simulator.md` | **new** — full reference |
 | `README.md`, `config/mgo.toml`, `config/mgo.production.example.toml` | documentation and comments only |
 
@@ -38,7 +78,7 @@ Validation on the Windows development workstation:
 ```text
 Ruff:   passed
 mypy:   passed — 49 source files (48 baseline + simulator.py)
-pytest: 1497 passed, 12 skipped  (baseline 1327 + 170 added; same 12 skips)
+pytest: 1514 passed, 12 skipped  (baseline 1327 + 187 added; same 12 skips)
 ```
 
 No dependency was added; `pyproject.toml` and `uv.lock` are unchanged. No API
@@ -262,11 +302,13 @@ equivalents:
 
 ```text
 pid:        None            (there is no operating-system process)
-poll:       None while active, 0 after normal termination, -9 after a forced kill
-read_error: empty during normal operation
+poll:       None while active, 0 after normal termination, -9 after a forced kill,
+            1 after an unexpected producer failure
+read_error: empty during normal operation; a bounded diagnostic after a failure
 ```
 
-`terminate`, `kill`, `wait` and `close` are idempotent.
+`terminate`, `kill`, `wait` and `close` are idempotent, and the **first** settled
+exit state wins.
 
 A single bounded producer thread per preview process generates frames at the
 configured preview frame rate into a bounded mailbox (at most two frames). When
@@ -275,6 +317,30 @@ stays bounded. The producer does not busy-spin, exits promptly on terminate,
 kill or close, is a daemon so it can never keep the interpreter alive, and is
 started **only** by the normal preview start path — never merely because the
 application started.
+
+An **unexpected** producer exit is a distinct, truthful case (added by the
+repository-review correction). An explicit `terminate()`/`kill()` and an
+unexpected failure are never conflated:
+
+```text
+producer raises  -> log the traceback; settle exit code 1 with a bounded
+                    read_error diagnostic; set the stop event; end and clear the
+                    mailbox; release every blocked reader at end-of-file; the
+                    thread exits
+poll()           -> never reports None for a producer thread that is not alive:
+                    a thread that vanished without settling is reconciled to the
+                    same failure state (thread-safe and idempotent)
+first exit wins  -> failure then close stays 1; terminate then kill stays 0;
+                    kill then close stays -9; a normal stop acquires no message
+```
+
+`KeyboardInterrupt`, `SystemExit` and `GeneratorExit` are deliberately not caught.
+The exit-state lock is never held while the mailbox is ended and the calling
+thread is never joined against itself, so no lifecycle combination can deadlock.
+`PreviewService` then reconciles to the existing `FAILED` state with
+`owner: null`, `uptime_seconds: null` and a `last_error` naming code `1` and the
+bounded diagnostic; when the failure precedes the first frame, `start()` raises
+`PreviewStartError` instead and the state is never `RUNNING`.
 
 No `subprocess`, `multiprocessing`, shell, local HTTP server or temporary video
 file is used.
@@ -361,12 +427,22 @@ boundary proving no subprocess or `rpicam`/`libcamera` command is ever invoked.
 
 Independent mutations are applied and reverted to prove the new tests actually
 fail when the corresponding defect is introduced — **all 18 were detected**, and
-every mutated file was verified byte-identical afterwards by SHA-256 digest.
+every mutated file was verified byte-identical afterwards by SHA-256 digest. The
+repository-review correction adds a nineteenth: **removing the unexpected-producer-failure
+settlement** (both the producer's exception handler and the `poll()`
+reconciliation) fails 13 of the new tests and raises 12 unhandled-thread-exception
+teardown errors; the file was verified byte-identical after reverting.
 `tests/test_camera_simulator.py`
-holds **170** tests, and no existing test file needed a change: the shared
+holds **187** tests, and no existing test file needed a change: the shared
 contracts they cover (backend vocabulary, detector selection, the physical and
 null branches) are asserted from the new file, so nothing existing was weakened
 or rewritten.
+
+Every read in the producer-failure tests is **bounded** — performed on a helper
+thread with a timeout — so a stream that fails to reach end-of-file makes a test
+fail rather than hang it. The failure tests also carry
+`filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")`, so an
+exception escaping the producer thread is a test failure rather than a warning.
 
 ### Delivered coverage
 
@@ -376,7 +452,8 @@ or rewritten.
 | Readiness | `available` + `backend: simulator` + the exact sentence; the disabled gate still wins; no command runner, no subprocess, no filesystem probe; repeated checks materially identical |
 | Frame generation | every frame a decodable JPEG at the exact size; no EXIF; the marker present before *and* after encoding; deterministic; clock-independent; the four identical pairs identical at pixel level; the three transitions meaningfully different at pixel level; only three distinct images ever; out-of-bounds geometry refused |
 | Capture | factory selection; `name == "simulator"`; truthful dimensions and file size; deterministic; write failure mapped to `CaptureWriteError` (not an `OSError`); no subprocess; the real `CaptureService`; the disabled gate; archive insertion in a temporary database; capture confined to the temporary directory |
-| Preview | factory selection; nothing starts until preview starts; truthful `pid`/`poll`/`read_error`; first frame prompt; `RUNNING` via the real service; idempotent start; unsafe width/height/fps refused and never clamped; message leaks no environment detail; terminate, kill, wait codes; blocked reads unblocked by both close and terminate; full idempotence; truthful reconciliation of an unexpected exit; no thread survives stop or repeated cycles; producer is a daemon |
+| Preview | factory selection; nothing starts until preview starts; truthful `pid`/`poll`/`read_error`; first frame prompt; `RUNNING` via the real service; idempotent start; unsafe width/height/fps refused and never clamped; message leaks no environment detail; terminate, kill, wait codes; blocked reads unblocked by both close and terminate; full idempotence; an unrelated process's death does not disturb the service; an explicit kill surfaces as `FAILED` with `-9`; no thread survives stop or repeated cycles; producer is a daemon |
+| Producer failure | a fault inside frame generation settles exit code `1`, never `0`/`-9`/`None`; `read_error()` is the bounded one-line diagnostic, is empty while healthy, after a normal terminate and after an explicit kill, and is bounded to 200 characters for a pathological 5 000-character message; the traceback reaches the log but never the diagnostic; the diagnostic contains no path, environment fragment or `Traceback`; a failure survives later terminate/kill/close; a kill *before* a failing frame stays a kill; repeated `poll`/`wait`/`close` stay safe; a blocked reader is released at end-of-file; the stream reaches EOF; `poll()` reconciles a producer that returned without settling; startup failure raises `PreviewStartError` with code `1` and the diagnostic and never reports `RUNNING`; post-start failure reconciles the real service to `FAILED` with `owner: null`, `uptime_seconds: null` and a truthful `last_error`; shutdown stays idempotent; no producer thread survives |
 | Streaming | the existing parser consumes the generated MJPEG; broker delivery; three viewers share one producer and one pump; a slow viewer's mailbox holds one frame; last-viewer disconnect leaves preview running; stop ends the stream; a new generation is not ended by the old one; the existing multipart encoder |
 | Motion | quiet pair scores exactly `0.0`; each transition clears the threshold; all scores finite and in `[0, 1]`; the threshold is untouched; hand-written frames behave exactly as before; the real monitor + `BrokerFrameSource` + `MjpegBroker` + `FrameDifferenceDetector` produce `establishing_baseline` → `no_motion` → `motion_detected` with no `error` |
 | API | real in-process ASGI dispatch of `/camera/status`, the whole preview lifecycle including a real multipart frame, `/camera/capture`, `/captures`, `/captures/{id}`, `/health`, `/dashboard`, `/preview`; the 409 stream gate; capture releases preview with no auto-restart; neither page starts a producer; the documented route set is intact |
@@ -453,6 +530,15 @@ The temporary configuration, database, captures and logs were deleted afterwards
 and none were committed. `git status --porcelain` showed no unexpected change to
 any tracked file.
 
+This runtime validation was **re-run unchanged after the repository-review
+correction** and passed identically (24 of 24), confirming the correction did not
+disturb the normal runtime path. Producer failure cannot be provoked through the
+API, so it is validated by a separate controlled in-process run that injects a
+fault into frame generation and confirms the failure code, bounded diagnostic,
+released reader, `FAILED` reconciliation and absence of any surviving producer
+thread. The temporary configuration and the production application API were not
+modified for it.
+
 ## Raspberry Pi validation status
 
 **Not performed.** The Raspberry Pi is not accessed during Task 11
@@ -471,7 +557,7 @@ Before merge: switch back to `main`. The simulator branch has no production
 effect — no migration, no schema change, no dependency change, no configuration
 value change and no deployment change.
 
-After a future merge: revert the four Task 11 commits, re-run the test suite,
+After a future merge: revert the five Task 11 commits, re-run the test suite,
 and redeploy `main` if required.
 
 No database rollback and no migration rollback are required. No media cleanup is
@@ -480,9 +566,15 @@ non-temporary capture directory. No automatic rollback script is written.
 
 ## Deviations
 
-One deviation from the prescribed plan, recorded for the reviewer.
+Two deviations from the prescribed plans, recorded for the reviewer.
 
-**Test-robustness hardening landed in the fourth commit rather than the third.**
+**1. A fifth commit exists, adding the repository-review correction.** The
+original Task 11 plan specified exactly four commits. The review correction was
+separately authorised as exactly one additional commit
+(`Handle simulator producer failures truthfully`), so the branch now carries five.
+No existing commit was amended, rebased, squashed or force-pushed.
+
+**2. Test-robustness hardening landed in the fourth commit rather than the third.**
 Mutation verification (removing the producer's first-frame output) exposed a
 latent weakness in two of the new tests: they read from the frame stream on the
 calling thread, so against a simulator that produces *nothing* they would block
@@ -498,6 +590,11 @@ alongside the documentation. No assertion was weakened; the bounded reads made
 the suite *faster* (the simulator file's targeted run dropped from ~23 s to
 ~8 s) because a satisfied read no longer waits for a frame it does not need.
 
+The same lesson recurred in the correction: the first draft of the
+producer-failure tests read from the stream on the calling thread, and the
+correction's own mutation run *hung* instead of failing. Those reads now go
+through a bounded `_read_bounded` helper, so the mutation run fails cleanly.
+
 ## Known limitations
 
 - Simulator readiness proves the *software* path only; it says nothing about a
@@ -512,6 +609,9 @@ the suite *faster* (the simulator file's targeted run dropped from ~23 s to
   byte-determinism is guaranteed within one environment.
 - Task 12 physical camera acceptance remains required and is not replaced by
   this task.
+- An unexpected producer failure is reported through one failure code (`1`) and
+  one bounded message; the simulator does not classify *kinds* of internal fault,
+  because a real preview process does not either.
 
 ## Explicit non-goals
 

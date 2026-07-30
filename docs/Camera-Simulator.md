@@ -238,17 +238,66 @@ The handle is truthful about being simulated:
 | Member | Behaviour |
 | ------ | --------- |
 | `pid` | `None` — there is no operating-system process |
-| `poll()` | `None` while active, `0` after a normal termination, `-9` after a forced kill |
+| `poll()` | `None` while active, `0` after a normal termination, `-9` after a forced kill, `1` after an unexpected producer failure |
 | `terminate()` | Asks the producer to stop; settles exit code `0` |
 | `kill()` | Stops the producer; settles exit code `-9` |
 | `wait(timeout)` | Waits up to `timeout`; returns the code, or `None` if still running |
-| `read_error()` | Always empty — there is no child stderr |
+| `read_error()` | Empty while healthy or normally stopped; a bounded diagnostic after an unexpected failure |
 | `frame_stream()` | The raw MJPEG stream |
 | `close()` | Stops the producer and releases the stream |
 
 `terminate`, `kill`, `wait` and `close` are all idempotent, and the **first**
-exit code wins, so a later `terminate` cannot rewrite a forced kill as a clean
-exit.
+settled exit state wins, so a later `terminate` cannot rewrite a forced kill as a
+clean exit, and cleanup cannot mask a failure.
+
+### Unexpected producer failure
+
+A real preview process can die on its own, and the simulator is as truthful about
+that as it is about a requested stop. **An explicit `terminate()`/`kill()` and an
+unexpected failure are different cases and are reported differently.**
+
+If the producer stops for any reason other than a requested stop, the handle:
+
+- settles exit code **`1`** — never `0` or `-9`, and never leaves `poll()`
+  returning `None` for a thread that is no longer alive;
+- publishes a bounded single-line diagnostic through `read_error()`, built from
+  the exception's class and message only:
+
+  ```text
+  Simulator frame producer failed: RuntimeError: controlled test failure
+  ```
+
+- logs the **full traceback** to the application log — the traceback never
+  reaches `read_error()` or any API response;
+- ends and clears the frame mailbox, so `frame_stream().read(...)` returns `b""`
+  (ordinary end-of-file) once any already-delivered bytes are consumed, and every
+  **blocked** reader is released promptly instead of hanging;
+- lets the producer thread exit, leaving no orphan.
+
+`poll()` additionally reconciles defensively: a producer thread that is no longer
+alive while no exit state has been recorded is settled to the same failure state.
+Liveness truthfulness therefore does not depend on the exception handler alone —
+a future accidental early return in the producer loop is caught too. The
+reconciliation is thread-safe and idempotent.
+
+`PreviewService` needed no change to benefit from this. Its existing unexpected-exit
+reconciliation observes the failure on the next `status()` (or `frame_stream()`,
+or `start()`) and settles the service into the existing `FAILED` state:
+
+```json
+{
+  "state": "failed",
+  "owner": null,
+  "uptime_seconds": null,
+  "last_error": "Preview process terminated unexpectedly with code 1: Simulator frame producer failed: RuntimeError: controlled test failure"
+}
+```
+
+When the sequence fails *before* its first frame, startup fails instead: the
+existing first-frame validation sees end-of-file, `PreviewStartError` is raised
+carrying code `1` and the bounded diagnostic, and the state is `FAILED` — never
+`RUNNING`. No new state, status value or response field was introduced for any of
+this.
 
 Through the API the lifecycle is unchanged:
 
@@ -346,9 +395,17 @@ per preview process. It:
   never memory;
 - releases any blocked reader promptly on `terminate`, `kill` or `close`, so a
   waiting read ends at clean end-of-file instead of hanging;
-- exits on stop, leaving no orphan behind a preview stop, a capture, repeated
-  start/stop cycles or application shutdown;
+- contains any unexpected fault: it is logged with its traceback and settled as
+  the failure state described above, rather than killing the thread silently.
+  `KeyboardInterrupt`, `SystemExit` and `GeneratorExit` are deliberately **not**
+  caught;
+- exits on stop *or* on failure, leaving no orphan behind a preview stop, a
+  capture, repeated start/stop cycles, a producer failure or application shutdown;
 - is a daemon, so it can never keep the interpreter alive.
+
+Shutdown never joins the calling thread against itself, and the exit-state lock is
+never held while the mailbox is ended, so no combination of `poll`, `terminate`,
+`kill`, `wait`, `close` and a failing producer can deadlock.
 
 No `subprocess`, `multiprocessing`, shell, local HTTP server or temporary video
 file is involved. The module imports none of them.
@@ -450,6 +507,13 @@ A useful sequence against a running local simulator instance:
 
 Delete the temporary database, captures and configuration afterwards.
 
+Producer failure is validated separately, because it cannot be provoked through
+the API: a controlled in-process run injects a fault into frame generation and
+confirms that `poll()` reports `1`, `read_error()` carries the bounded diagnostic,
+a blocked reader is released at end-of-file, `PreviewService.status()` reconciles
+to `failed`, and no producer thread survives. See
+`tests/test_camera_simulator.py` — the *unexpected producer failure* section.
+
 ## API behaviour
 
 No endpoint was added, removed or renamed, and no response field was removed or
@@ -511,6 +575,9 @@ evidence.
   approximate under heavy load — as it would be for a real encoder.
 - Nothing here exercises camera ownership contention with a *real* process,
   because there is no real process.
+- A producer failure is reported through one failure code (`1`) and a bounded
+  message; the simulator does not classify *kinds* of internal fault, because a
+  real preview process does not either.
 
 ## Rollback
 

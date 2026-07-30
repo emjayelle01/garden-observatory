@@ -20,6 +20,7 @@ import asyncio
 import functools
 import io
 import json
+import logging
 import queue
 import subprocess
 import threading
@@ -1469,25 +1470,27 @@ def test_terminate_kill_and_close_are_idempotent() -> None:
     assert stream.read(16) == b""
 
 
-def test_unexpected_exit_reconciliation_stays_truthful(
+def test_an_unrelated_simulator_process_does_not_affect_the_service(
     simulator_preview: PreviewService,
 ) -> None:
-    """A producer that dies while running is reconciled to a truthful failure."""
+    """Reconciliation observes only the service's own process.
+
+    A second, unrelated simulator process dying must not disturb a healthy
+    preview. This is an isolation check, *not* a test of unexpected producer
+    failure -- that is covered by the producer-failure section below.
+    """
     status = simulator_preview.start()
     assert status.state is PreviewState.RUNNING
 
-    # Simulate the producer dying without the service asking it to.
-    stream = simulator_preview.frame_stream()
-    assert stream is not None
-    process = SimulatorPreviewBackend().start(_preview_config())
-    process.kill()
-    process.close()
+    unrelated = SimulatorPreviewBackend().start(_preview_config())
+    unrelated.kill()
+    unrelated.close()
 
     # The service's own process is still healthy; reconciliation says running.
     assert simulator_preview.status().state is PreviewState.RUNNING
 
 
-def test_a_dead_producer_is_reported_as_failed() -> None:
+def test_a_killed_process_is_reported_as_failed() -> None:
     """Killing the service's own process surfaces as FAILED with its code."""
     backend = SimulatorPreviewBackend()
     started: list[SimulatorPreviewProcess] = []
@@ -1514,6 +1517,437 @@ def test_a_dead_producer_is_reported_as_failed() -> None:
         assert "-9" in status.last_error
     finally:
         service.shutdown()
+
+
+# -- unexpected producer failure ----------------------------------------------
+#
+# A real preview process can die on its own. These prove the simulator is as
+# truthful about that as it is about a requested stop: the failure is settled as
+# exit code 1 with a bounded diagnostic, the stream ends, every blocked reader is
+# released, and PreviewService reconciles to FAILED. The fault is injected into
+# frame *generation* only -- the process, the service and the stream under test
+# are all the production implementations.
+
+
+#: The controlled fault used throughout this section.
+_CONTROLLED_FAILURE = "controlled test failure"
+
+#: The bounded diagnostic the corrected simulator must publish for it.
+_EXPECTED_PRODUCER_DETAIL = (
+    f"Simulator frame producer failed: RuntimeError: {_CONTROLLED_FAILURE}"
+)
+
+#: Applied to every test whose producer raises. Were the exception to escape the
+#: producer thread, pytest would warn about an unhandled thread exception and this
+#: turns that warning into a failure.
+_no_unhandled_thread_exception = pytest.mark.filterwarnings(
+    "error::pytest.PytestUnhandledThreadExceptionWarning"
+)
+
+
+class _FailingFrameSequence(SimulatorFrameSequence):
+    """A real frame sequence whose frames start raising on demand.
+
+    Everything except the fault is production behaviour: the first
+    ``healthy_frames`` indices render genuine simulator frames, after which
+    ``frame`` raises. When ``gate_open`` is false the raising call first waits for
+    :attr:`gate`, which lets a test hold the producer at a known point and then
+    release it deterministically. The wait is bounded and the call raises either
+    way, so no test can hang on it.
+    """
+
+    def __init__(
+        self,
+        *,
+        healthy_frames: int,
+        gate_open: bool = True,
+        message: str = _CONTROLLED_FAILURE,
+    ) -> None:
+        super().__init__(_TEST_WIDTH, _TEST_HEIGHT)
+        self._healthy_frames = healthy_frames
+        self._message = message
+        self.gate = threading.Event()
+        if gate_open:
+            self.gate.set()
+
+    def frame(self, sequence_index: int) -> bytes:
+        if sequence_index < self._healthy_frames:
+            return super().frame(sequence_index)
+        self.gate.wait(_FRAME_WAIT_SECONDS)
+        raise RuntimeError(self._message)
+
+
+class _FailingSequenceBackend:
+    """A preview backend building real processes over a failing sequence."""
+
+    def __init__(self, sequence: _FailingFrameSequence) -> None:
+        self._sequence = sequence
+        self.processes: list[SimulatorPreviewProcess] = []
+
+    @property
+    def name(self) -> str:
+        return SIMULATOR_BACKEND_NAME
+
+    def start(self, config: PreviewConfig) -> SimulatorPreviewProcess:
+        process = SimulatorPreviewProcess(self._sequence, fps=config.fps)
+        self.processes.append(process)
+        return process
+
+
+def _failing_process(
+    *, healthy_frames: int, gate_open: bool = True, message: str = _CONTROLLED_FAILURE
+) -> tuple[SimulatorPreviewProcess, _FailingFrameSequence]:
+    """Start a real simulator process whose sequence fails as configured."""
+    sequence = _FailingFrameSequence(
+        healthy_frames=healthy_frames, gate_open=gate_open, message=message
+    )
+    return SimulatorPreviewProcess(sequence, fps=15), sequence
+
+
+def _read_bounded(
+    stream: IO[bytes],
+    size: int = 65536,
+    *,
+    timeout: float = _FRAME_WAIT_SECONDS,
+) -> bytes | None:
+    """Read once from ``stream``, returning ``None`` if the read never returned.
+
+    Every read in this section goes through here: a stream that fails to reach
+    end-of-file must make a test *fail*, never hang it.
+    """
+    outcome: list[bytes] = []
+
+    def _read() -> None:
+        outcome.append(stream.read(size))
+
+    reader = threading.Thread(target=_read, name="mgo-test-reader", daemon=True)
+    reader.start()
+    reader.join(timeout)
+    return outcome[0] if outcome else None
+
+
+def _await_producer_failure(process: SimulatorPreviewProcess) -> None:
+    """Wait for the producer to die, bounded, then assert it settled a failure."""
+    assert _wait_until(lambda: not process.producer_alive, _FRAME_WAIT_SECONDS)
+    assert process.poll() == 1
+
+
+@_no_unhandled_thread_exception
+def test_no_producer_thread_survives_an_unexpected_failure() -> None:
+    """An unexpected fault ends the producer instead of leaving it spinning."""
+    process, _ = _failing_process(healthy_frames=0)
+    try:
+        _await_producer_failure(process)
+
+        assert not process.producer_alive
+        assert _wait_until(
+            lambda: not any(
+                thread.name == "mgo-simulator-preview"
+                for thread in threading.enumerate()
+            ),
+            _FRAME_WAIT_SECONDS,
+        )
+    finally:
+        process.close()
+
+
+@_no_unhandled_thread_exception
+def test_an_unexpected_failure_settles_exit_code_one() -> None:
+    """A producer fault is a failure code, never a clean or killed exit."""
+    process, _ = _failing_process(healthy_frames=0)
+    try:
+        _await_producer_failure(process)
+
+        assert process.poll() == 1
+        assert process.poll() not in (0, -9, None)
+    finally:
+        process.close()
+
+
+@_no_unhandled_thread_exception
+def test_read_error_reports_the_bounded_producer_diagnostic() -> None:
+    """The failure is described concisely, from the exception alone."""
+    process, _ = _failing_process(healthy_frames=0)
+    try:
+        _await_producer_failure(process)
+
+        assert process.read_error() == _EXPECTED_PRODUCER_DETAIL
+    finally:
+        process.close()
+
+
+@_no_unhandled_thread_exception
+def test_the_producer_diagnostic_is_bounded_and_single_line() -> None:
+    """A pathological exception message cannot bloat the visible status."""
+    process, _ = _failing_process(
+        healthy_frames=0, message="x" * 5_000 + "\n\tsecond line"
+    )
+    try:
+        _await_producer_failure(process)
+        detail = process.read_error()
+
+        assert 0 < len(detail) <= 200
+        assert "\n" not in detail
+        assert "\t" not in detail
+    finally:
+        process.close()
+
+
+@_no_unhandled_thread_exception
+def test_the_producer_diagnostic_leaks_no_environment_detail() -> None:
+    """The visible diagnostic carries no traceback, path or environment value."""
+    process, _ = _failing_process(healthy_frames=0)
+    try:
+        _await_producer_failure(process)
+        detail = process.read_error()
+
+        assert "Traceback" not in detail
+        assert "simulator.py" not in detail
+        for fragment in ("\\", "/", "C:", "AppData", "Users", "line "):
+            assert fragment not in detail
+    finally:
+        process.close()
+
+
+@_no_unhandled_thread_exception
+def test_the_traceback_reaches_the_log_not_the_status(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Operators get the traceback in the log; the API sees only the summary."""
+    with caplog.at_level(logging.ERROR, logger="mgo.camera.simulator"):
+        process, _ = _failing_process(healthy_frames=0)
+        try:
+            _await_producer_failure(process)
+        finally:
+            process.close()
+
+    assert "Traceback (most recent call last)" in caplog.text
+    assert _CONTROLLED_FAILURE in caplog.text
+
+
+def test_read_error_is_empty_during_normal_operation(
+    simulator_process: SimulatorPreviewProcess,
+) -> None:
+    """A healthy producer reports no error."""
+    assert simulator_process.poll() is None
+    assert simulator_process.read_error() == ""
+
+
+def test_read_error_stays_empty_after_normal_termination() -> None:
+    """A requested stop is not a failure and acquires no error text."""
+    process = SimulatorPreviewBackend().start(_preview_config())
+    try:
+        process.terminate()
+        assert process.wait(_FRAME_WAIT_SECONDS) == 0
+
+        assert process.read_error() == ""
+        assert process.poll() == 0
+    finally:
+        process.close()
+
+
+def test_read_error_stays_empty_after_an_explicit_kill() -> None:
+    """A forced kill is a requested stop too: no diagnostic is invented."""
+    process = SimulatorPreviewBackend().start(_preview_config())
+    try:
+        process.kill()
+        assert process.wait(_FRAME_WAIT_SECONDS) == -9
+
+        assert process.read_error() == ""
+    finally:
+        process.close()
+
+
+@_no_unhandled_thread_exception
+def test_an_unexpected_failure_survives_later_cleanup() -> None:
+    """The first settled exit state wins: cleanup cannot mask a failure."""
+    process, _ = _failing_process(healthy_frames=0)
+    _await_producer_failure(process)
+
+    process.terminate()
+    process.kill()
+    process.close()
+
+    assert process.poll() == 1
+    assert process.read_error() == _EXPECTED_PRODUCER_DETAIL
+
+
+@_no_unhandled_thread_exception
+def test_a_kill_before_a_failing_frame_stays_a_kill() -> None:
+    """A requested kill is never relabelled as an unexpected failure."""
+    process, sequence = _failing_process(healthy_frames=1, gate_open=False)
+    try:
+        process.kill()
+        sequence.gate.set()
+        assert _wait_until(lambda: not process.producer_alive, _FRAME_WAIT_SECONDS)
+
+        assert process.poll() == -9
+        assert process.read_error() == ""
+    finally:
+        process.close()
+
+
+@_no_unhandled_thread_exception
+def test_repeated_lifecycle_calls_are_safe_after_a_failure() -> None:
+    """poll, wait and close remain safe and stable however often they are called."""
+    process, _ = _failing_process(healthy_frames=0)
+    _await_producer_failure(process)
+
+    for _ in range(3):
+        assert process.poll() == 1
+        assert process.wait(0.01) == 1
+        process.close()
+
+    assert process.read_error() == _EXPECTED_PRODUCER_DETAIL
+
+
+@_no_unhandled_thread_exception
+def test_a_blocked_reader_is_released_by_a_producer_failure() -> None:
+    """A reader waiting for the next frame sees EOF, never an endless block."""
+    process, sequence = _failing_process(healthy_frames=1, gate_open=False)
+    stream = process.frame_stream()
+    assert stream is not None
+    outcome: list[bytes] = []
+
+    def _read_until_eof() -> None:
+        stream.read(65536)  # the one healthy frame
+        outcome.append(stream.read(65536))  # blocks: frame 1 never arrives
+
+    reader = threading.Thread(target=_read_until_eof, daemon=True)
+    reader.start()
+    assert _wait_until(lambda: reader.is_alive(), 1.0)
+
+    sequence.gate.set()
+    reader.join(_FRAME_WAIT_SECONDS)
+
+    assert not reader.is_alive()
+    assert outcome == [b""], "a producer failure must end the stream, not hang it"
+    process.close()
+
+
+@_no_unhandled_thread_exception
+def test_the_stream_reaches_eof_after_a_producer_failure() -> None:
+    """Once the producer has failed the stream is simply at end-of-file."""
+    process, _ = _failing_process(healthy_frames=0)
+    try:
+        _await_producer_failure(process)
+        stream = process.frame_stream()
+        assert stream is not None
+
+        assert _read_bounded(stream) == b""
+        assert _read_bounded(stream) == b""
+    finally:
+        process.close()
+
+
+class _VanishingProducerProcess(SimulatorPreviewProcess):
+    """A process whose producer returns without settling any exit state.
+
+    This is the defensive case: a future accidental early return in the producer
+    loop would otherwise leave ``poll()`` claiming health for ever.
+    """
+
+    def _produce(self) -> None:
+        return
+
+
+def test_poll_reconciles_a_producer_that_vanished_silently() -> None:
+    """A dead producer is never reported as still running."""
+    process = _VanishingProducerProcess(
+        SimulatorFrameSequence(_TEST_WIDTH, _TEST_HEIGHT), fps=15
+    )
+    try:
+        assert _wait_until(lambda: not process.producer_alive, _FRAME_WAIT_SECONDS)
+
+        assert process.poll() == 1
+        assert process.read_error()
+        stream = process.frame_stream()
+        assert stream is not None
+        assert _read_bounded(stream) == b"", (
+            "reconciliation must also end the stream"
+        )
+    finally:
+        process.close()
+
+
+@_no_unhandled_thread_exception
+def test_startup_producer_failure_fails_the_start() -> None:
+    """A sequence failing before its first frame fails startup truthfully."""
+    backend = _FailingSequenceBackend(_FailingFrameSequence(healthy_frames=0))
+    service = PreviewService(_preview_config(), backend)
+    try:
+        with pytest.raises(PreviewStartError) as excinfo:
+            service.start()
+
+        message = str(excinfo.value)
+        assert "code 1" in message
+        assert _EXPECTED_PRODUCER_DETAIL in message
+
+        status = service.status()
+        assert status.state is not PreviewState.RUNNING
+        assert status.state is PreviewState.FAILED
+
+        process = backend.processes[0]
+        assert process.poll() == 1
+        assert not process.producer_alive
+        stream = process.frame_stream()
+        assert stream is not None
+        assert _read_bounded(stream) == b""
+    finally:
+        service.shutdown()
+
+    assert _wait_until(
+        lambda: not any(
+            thread.name == "mgo-simulator-preview"
+            for thread in threading.enumerate()
+        ),
+        _FRAME_WAIT_SECONDS,
+    )
+
+
+@_no_unhandled_thread_exception
+def test_post_start_producer_failure_reconciles_the_service_to_failed() -> None:
+    """A producer dying after startup turns RUNNING into a truthful FAILED."""
+    sequence = _FailingFrameSequence(healthy_frames=1, gate_open=False)
+    backend = _FailingSequenceBackend(sequence)
+    service = PreviewService(_preview_config(), backend)
+    try:
+        assert service.start().state is PreviewState.RUNNING
+        process = backend.processes[0]
+        stream = process.frame_stream()
+        assert stream is not None
+
+        # The failure originates inside the producer: nothing here terminates,
+        # kills or closes the process.
+        sequence.gate.set()
+        assert _wait_until(lambda: not process.producer_alive, _FRAME_WAIT_SECONDS)
+        assert _read_bounded(stream) == b""
+
+        status = service.status()
+
+        assert status.state is PreviewState.FAILED
+        assert status.owner is None
+        assert status.uptime_seconds is None
+        assert status.backend == SIMULATOR_BACKEND_NAME
+        assert status.last_error is not None
+        assert "terminated unexpectedly" in status.last_error
+        assert "code 1" in status.last_error
+        assert _EXPECTED_PRODUCER_DETAIL in status.last_error
+
+        # Shutdown after a failure stays idempotent.
+        service.shutdown()
+        assert service.status().state is PreviewState.STOPPED
+        service.shutdown()
+    finally:
+        service.shutdown()
+
+    assert _wait_until(
+        lambda: not any(
+            thread.name == "mgo-simulator-preview"
+            for thread in threading.enumerate()
+        ),
+        _FRAME_WAIT_SECONDS,
+    )
 
 
 def test_no_producer_thread_survives_preview_stop(
