@@ -13,7 +13,13 @@ database_path = "data/mgo.db"
 # Camera functionality is disabled by default. No hardware is assumed to
 # exist and no capture is attempted until this is explicitly enabled.
 enabled = false
-# Detection backend: "rpicam", "libcamera", "null"/"none".
+# Camera backend, shared by detection, capture and preview:
+#   "rpicam"    — physical Raspberry Pi camera through the rpicam-* tools
+#   "libcamera" — physical camera through the legacy libcamera-* tools
+#   "simulator" — deterministic generated imagery; NO physical camera. Opt-in,
+#                 for development without hardware. Simulated captures are not
+#                 wildlife evidence. See docs/Camera-Simulator.md.
+#   "null"/"none" — deliberately unavailable; never produces an image
 backend = "rpicam"
 # Optional preferred device index; leave unset for no preference.
 # device_index = 0

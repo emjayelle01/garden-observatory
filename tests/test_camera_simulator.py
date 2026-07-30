@@ -28,7 +28,7 @@ import tomllib
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import IO, Any
 
 import pytest
 from PIL import Image
@@ -265,14 +265,49 @@ def _wait_until(predicate: Callable[[], bool], timeout: float) -> bool:
     return predicate()
 
 
-def _read_frames(source: PreviewProcessFrameSource, count: int) -> list[bytes]:
-    """Read exactly ``count`` frames from a frame source."""
+def _read_frames(
+    source: PreviewProcessFrameSource,
+    count: int,
+    *,
+    timeout: float = _FRAME_WAIT_SECONDS,
+) -> list[bytes]:
+    """Read up to ``count`` frames from a frame source, bounded by ``timeout``.
+
+    The read happens on a helper thread so a source that stops producing makes
+    the calling test *fail* rather than hang it. Nothing here waits longer than
+    it has to: a healthy simulator delivers every frame well inside the bound.
+    """
     collected: list[bytes] = []
-    for frame in source.frames():
-        collected.append(frame)
-        if len(collected) >= count:
-            break
-    return collected
+
+    def _pump() -> None:
+        for frame in source.frames():
+            collected.append(frame)
+            if len(collected) >= count:
+                return
+
+    reader = threading.Thread(target=_pump, name="mgo-test-reader", daemon=True)
+    reader.start()
+    reader.join(timeout)
+    return list(collected)
+
+
+def _first_frame(stream: IO[bytes], timeout: float) -> bytes | None:
+    """Return the first complete JPEG on ``stream``, or ``None`` on timeout.
+
+    Bounded for the same reason as :func:`_read_frames`: a stream that never
+    produces must fail a test, never block it for ever.
+    """
+    collected: list[bytes] = []
+
+    def _read() -> None:
+        for frame in parse_mjpeg_frames(stream):
+            collected.append(frame)
+            return
+
+    reader = threading.Thread(target=_read, name="mgo-test-reader", daemon=True)
+    reader.start()
+    reader.join(timeout)
+    return collected[0] if collected else None
 
 
 _SIMULATOR_SOURCE_PATH = _REPOSITORY_ROOT / "src" / "mgo" / "camera" / "simulator.py"
@@ -1123,9 +1158,10 @@ def test_the_first_complete_frame_arrives_promptly(
     assert stream is not None
 
     started = time.monotonic()
-    frame = next(parse_mjpeg_frames(stream))
+    frame = _first_frame(stream, _FRAME_WAIT_SECONDS)
     elapsed = time.monotonic() - started
 
+    assert frame is not None, "no complete frame arrived within the bound"
     assert elapsed < _FRAME_WAIT_SECONDS
     with Image.open(io.BytesIO(frame)) as image:
         assert image.size == (_TEST_WIDTH, _TEST_HEIGHT)
@@ -1672,11 +1708,13 @@ def test_preview_stop_ends_the_stream_cleanly(
         simulator_preview.stop()
 
         deadline = time.monotonic() + _FRAME_WAIT_SECONDS
-        while time.monotonic() < deadline:
-            if subscriber.get(_FRAME_WAIT_SECONDS) is None:
+        ended = False
+        while not ended and time.monotonic() < deadline:
+            try:
+                ended = subscriber.get(_FRAME_WAIT_SECONDS) is None
+            except queue.Empty:  # pragma: no cover - defensive
                 break
-        else:  # pragma: no cover - defensive
-            pytest.fail("the stream never signalled end-of-stream")
+        assert ended, "the stream never signalled end-of-stream"
     finally:
         broker.unsubscribe(subscriber)
 

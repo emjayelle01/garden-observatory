@@ -331,11 +331,18 @@ startup with a clear error.
 ```toml
 [camera]
 enabled = false            # camera functionality is off unless enabled
-backend = "rpicam"         # "rpicam", "libcamera", or "null"/"none"
+backend = "rpicam"         # see the backend table below
 # device_index = 0         # optional preferred device; unset = no preference
 detection_interval_seconds = 60
 capture_directory = "data/captures"
 ```
+
+| `backend` | Meaning |
+| --------- | ------- |
+| `rpicam` | Physical Raspberry Pi camera through the `rpicam-*` tools. |
+| `libcamera` | Physical camera through the legacy `libcamera-*` tools. |
+| `simulator` | Deterministic generated imagery; **no physical camera**. See [Camera simulator](#camera-simulator). |
+| `null` / `none` | Deliberately unavailable; never produces an image. |
 
 Defaults are deliberately safe: the camera is **disabled**, no hardware is
 assumed to exist, and no image capture is ever attempted.
@@ -451,6 +458,57 @@ Either way the application starts and serves normally. A `camera_status`
 observation is persisted only when the readiness **materially changes**
 (a change of `status` or `available`); repeated identical checks do not create
 duplicate observations.
+
+## Camera simulator
+
+`backend = "simulator"` is a supported runtime backend that generates
+deterministic imagery, so the **real** pipeline — readiness, still capture, the
+preview lifecycle, MJPEG streaming, browser delivery, motion analysis and
+status/health reporting — runs with no Raspberry Pi, no camera, no `rpicam-*` or
+`libcamera-*` tooling, no subprocess and no network access:
+
+```toml
+[camera]
+enabled = true
+backend = "simulator"
+```
+
+It is not a test double. It is selected through normal configuration and
+satisfies the same `CaptureBackend`, `PreviewBackend` and `PreviewProcess`
+protocols the physical backends do, so `CaptureService`, `PreviewService`, the
+MJPEG broker and the motion detector drive it unchanged. The existing
+`MockBackend` / `MockPreviewBackend` / `MockFrameSource` test doubles are
+untouched and still used by the suite.
+
+Each frame is a real JPEG of a simple drawn feeder scene carrying the static
+marker `MGO CAMERA SIMULATOR`, generated with Pillow at runtime — no image
+fixture is committed and nothing is downloaded. An eight-frame sequence repeats
+with deliberately identical pairs, so motion analysis settles to `no_motion` and
+each scene transition produces a deterministic `motion_detected`.
+
+Readiness is truthful about what it is:
+
+```json
+{
+  "backend": "simulator",
+  "status": "available",
+  "available": true,
+  "detail": "Deterministic camera simulator is active; no physical camera is in use."
+}
+```
+
+> **Simulated imagery is not evidence.** Simulator captures are drawings: they
+> are not wildlife records, must never be entered into Matt's Viewings, and are
+> unsuitable as a bird-identification dataset. Simulator readiness proves the
+> software path only — it says nothing about a physical camera, its focus, its
+> exposure or its field of view, and physical camera acceptance on the Pi is
+> still required.
+
+The simulator is **opt-in**: the default configuration and the production example
+both stay on a physical backend, and an operator must deliberately select
+`simulator`. Full details — architecture, scene design, safety bounds, threading,
+local validation and rollback — are in
+[`docs/Camera-Simulator.md`](docs/Camera-Simulator.md).
 
 ## Motion detection
 

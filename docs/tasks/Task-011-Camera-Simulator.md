@@ -2,16 +2,48 @@
 
 ## Status
 
-**Implementation in progress; Raspberry Pi validation not performed.**
+**Implementation complete and locally validated; Raspberry Pi validation not
+performed. Awaiting repository review.**
 
 | Gate | Outcome |
 | ---- | ------- |
 | Task definition | Complete (this record, first commit) |
-| Implementation | In progress |
-| Local static and automated validation | Not yet run |
-| Local runtime validation | Not yet run |
+| Implementation | Complete |
+| Local static and automated validation | Passed |
+| Mutation / negative verification | Passed — all 18 defects detected |
+| Local runtime validation | Passed |
 | Repository review | Not started |
-| Raspberry Pi validation | **Not performed** |
+| Raspberry Pi validation | **Not performed** — the Pi was not accessed |
+
+### Delivered
+
+| File | Change |
+| ---- | ------ |
+| `src/mgo/camera/simulator.py` | **new** — frame generation, `SimulatorCaptureBackend`, `SimulatorPreviewBackend`, `SimulatorPreviewProcess`, `SimulatorMjpegStream` |
+| `src/mgo/core/camera_detection.py` | `SimulatorCameraDetector`, `SIMULATOR_READINESS_DETAIL`, one `build_detector` branch |
+| `src/mgo/core/config.py` | `simulator` added to `SUPPORTED_CAMERA_BACKENDS` |
+| `src/mgo/camera/backend.py` | one `build_capture_backend` branch |
+| `src/mgo/camera/preview_backend.py` | one `build_preview_backend` branch |
+| `src/mgo/camera/__init__.py` | re-exports |
+| `tests/test_camera_simulator.py` | **new** — 170 tests |
+| `docs/Camera-Simulator.md` | **new** — full reference |
+| `README.md`, `config/mgo.toml`, `config/mgo.production.example.toml` | documentation and comments only |
+
+`src/mgo/api/app.py` needed **no change**: the existing wiring already calls
+`build_capture_backend`, `build_preview_backend` and `build_detector`, so the
+simulator is selected purely by configuration.
+
+Validation on the Windows development workstation:
+
+```text
+Ruff:   passed
+mypy:   passed — 49 source files (48 baseline + simulator.py)
+pytest: 1497 passed, 12 skipped  (baseline 1327 + 170 added; same 12 skips)
+```
+
+No dependency was added; `pyproject.toml` and `uv.lock` are unchanged. No API
+route, response-field meaning, status vocabulary, migration, schema, systemd
+unit, deployment script or production configuration *value* was touched.
 
 ## Purpose
 
@@ -328,7 +360,42 @@ integration through real in-process ASGI dispatch; and a negative hardware
 boundary proving no subprocess or `rpicam`/`libcamera` command is ever invoked.
 
 Independent mutations are applied and reverted to prove the new tests actually
-fail when the corresponding defect is introduced.
+fail when the corresponding defect is introduced — **all 18 were detected**, and
+every mutated file was verified byte-identical afterwards by SHA-256 digest.
+`tests/test_camera_simulator.py`
+holds **170** tests, and no existing test file needed a change: the shared
+contracts they cover (backend vocabulary, detector selection, the physical and
+null branches) are asserted from the new file, so nothing existing was weakened
+or rewritten.
+
+### Delivered coverage
+
+| Area | What is proven |
+| ---- | -------------- |
+| Configuration | `simulator` accepted; every pre-existing value still accepted; unsupported values still rejected; trimming and case-folding preserved; the default is still `rpicam`; no tracked file selects the simulator |
+| Readiness | `available` + `backend: simulator` + the exact sentence; the disabled gate still wins; no command runner, no subprocess, no filesystem probe; repeated checks materially identical |
+| Frame generation | every frame a decodable JPEG at the exact size; no EXIF; the marker present before *and* after encoding; deterministic; clock-independent; the four identical pairs identical at pixel level; the three transitions meaningfully different at pixel level; only three distinct images ever; out-of-bounds geometry refused |
+| Capture | factory selection; `name == "simulator"`; truthful dimensions and file size; deterministic; write failure mapped to `CaptureWriteError` (not an `OSError`); no subprocess; the real `CaptureService`; the disabled gate; archive insertion in a temporary database; capture confined to the temporary directory |
+| Preview | factory selection; nothing starts until preview starts; truthful `pid`/`poll`/`read_error`; first frame prompt; `RUNNING` via the real service; idempotent start; unsafe width/height/fps refused and never clamped; message leaks no environment detail; terminate, kill, wait codes; blocked reads unblocked by both close and terminate; full idempotence; truthful reconciliation of an unexpected exit; no thread survives stop or repeated cycles; producer is a daemon |
+| Streaming | the existing parser consumes the generated MJPEG; broker delivery; three viewers share one producer and one pump; a slow viewer's mailbox holds one frame; last-viewer disconnect leaves preview running; stop ends the stream; a new generation is not ended by the old one; the existing multipart encoder |
+| Motion | quiet pair scores exactly `0.0`; each transition clears the threshold; all scores finite and in `[0, 1]`; the threshold is untouched; hand-written frames behave exactly as before; the real monitor + `BrokerFrameSource` + `MjpegBroker` + `FrameDifferenceDetector` produce `establishing_baseline` → `no_motion` → `motion_detected` with no `error` |
+| API | real in-process ASGI dispatch of `/camera/status`, the whole preview lifecycle including a real multipart frame, `/camera/capture`, `/captures`, `/captures/{id}`, `/health`, `/dashboard`, `/preview`; the 409 stream gate; capture releases preview with no auto-restart; neither page starts a producer; the documented route set is intact |
+| Hardware boundary | behavioural spies make `subprocess.run`, `subprocess.Popen`, `run_subprocess` and `launch_preview_subprocess` fatal across the whole pipeline; AST checks prove the module imports no process/network facility and names no camera command in executable code |
+
+## Measured motion behaviour
+
+Measured through the real `FrameDifferenceDetector` with the production defaults
+(analysis 160 × 90, per-pixel threshold 20, changed-pixel ratio threshold 0.08):
+
+| Transition | Changed-pixel ratio | Result |
+| ---------- | ------------------- | ------ |
+| identical pair (`0→1`, `2→3`, `4→5`, `6→7`) | `0.000` | `no_motion` |
+| object appears (`1→2`) | ≈ `0.117` | `motion_detected` |
+| object moves (`3→4`) | ≈ `0.236` | `motion_detected` |
+| object leaves (`5→6`) | ≈ `0.119` | `motion_detected` |
+
+Every identical pair scores exactly zero and every transition clears the
+threshold with margin, so the demonstration is not marginal.
 
 ## Local validation procedure
 
@@ -351,6 +418,40 @@ preview stop and clean shutdown. It is never run against `config/mgo.toml`, the
 repository development database, `/etc/garden-observatory/mgo.toml`,
 `/var/lib/garden-observatory`, or the Raspberry Pi. No temporary configuration,
 capture, database or log is committed.
+
+### Local runtime validation result
+
+**Passed — 24 of 24 checks.** The real application was served by `uvicorn` from
+the production `mgo.api.app:app` object against a temporary configuration and
+temporary storage in the system temp directory, bound to `127.0.0.1:8125`, with
+`camera.enabled = true`, `camera.backend = "simulator"`, `preview.enabled = true`,
+`motion.enabled = true` and `notifications.enabled = false`. Every request went
+over real HTTP.
+
+Confirmed: startup with no camera tooling; `/camera/status` reporting `available`,
+`simulator` and the exact truthful detail; preview initially `stopped`; start
+succeeding; `running` with `backend: simulator`; the stream delivering complete
+decodable 1280 × 720 JPEGs as `multipart/x-mixed-replace`; the marker visibly
+present (corner luminance 19–247); several distinct frames; motion reporting
+**both** `no_motion` and `motion_detected` with no `error`, every score in
+`[0, 1]` and the threshold still `0.08`; capture succeeding with
+`backend: simulator` at 1280 × 720; the file decoding; the capture landing only
+under the temporary directory; the archive listing it; preview stopping; a clean
+shutdown with every monitor stopped and `Application shutdown complete`; the
+`application_stop` observation recorded in the temporary database; no producer
+process surviving; and no `rpicam-*` or `libcamera-*` command named anywhere in
+the application log, which instead carried the simulator's own
+"no physical camera is in use" lines.
+
+Two harness details are worth recording so a future reader does not mistake them
+for defects. A Ctrl+Break-initiated stop on Windows exits with the control-event
+code (3), so the *log* is the evidence of graceful shutdown, not the exit status.
+And `uvicorn`'s default logging configures only its own loggers, so the harness
+configures root logging itself in order to capture the application's INFO output.
+
+The temporary configuration, database, captures and logs were deleted afterwards
+and none were committed. `git status --porcelain` showed no unexpected change to
+any tracked file.
 
 ## Raspberry Pi validation status
 
@@ -376,6 +477,26 @@ and redeploy `main` if required.
 No database rollback and no migration rollback are required. No media cleanup is
 required unless an operator deliberately ran a simulator capture with a
 non-temporary capture directory. No automatic rollback script is written.
+
+## Deviations
+
+One deviation from the prescribed plan, recorded for the reviewer.
+
+**Test-robustness hardening landed in the fourth commit rather than the third.**
+Mutation verification (removing the producer's first-frame output) exposed a
+latent weakness in two of the new tests: they read from the frame stream on the
+calling thread, so against a simulator that produces *nothing* they would block
+for ever rather than fail. That is a real defect in the tests — a broken
+implementation must make a test fail, never hang a suite.
+
+The fix adds two bounded helpers (`_read_frames` and `_first_frame`) that read on
+a helper thread with a join timeout, plus a `queue.Empty` guard in the
+end-of-stream test. It belongs logically in the third commit ("Integrate and test
+camera simulator"), but that commit was already made and the commit plan forbids
+amending it and forbids a fifth commit — so it is carried in the fourth commit
+alongside the documentation. No assertion was weakened; the bounded reads made
+the suite *faster* (the simulator file's targeted run dropped from ~23 s to
+~8 s) because a satisfied read no longer waits for a frame it does not need.
 
 ## Known limitations
 

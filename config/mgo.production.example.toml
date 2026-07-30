@@ -37,6 +37,14 @@ database_path = "/var/lib/garden-observatory/db/mgo.db"
 
 [camera]
 enabled = true
+# Camera backend, shared by detection, capture and preview:
+#   "rpicam"    — physical Raspberry Pi camera through the rpicam-* tools
+#   "libcamera" — physical camera through the legacy libcamera-* tools
+#   "simulator" — deterministic generated imagery; NO physical camera
+#   "null"/"none" — deliberately unavailable; never produces an image
+# Production must stay on a physical backend. "simulator" is a development aid
+# only: its output is drawn in memory, is not wildlife evidence, must never be
+# entered into Matt's Viewings, and proves nothing about the real camera.
 backend = "rpicam"
 detection_interval_seconds = 60
 capture_directory = "/var/lib/garden-observatory/media/captures"
