@@ -59,8 +59,29 @@ Consequences:
 - stopping the monitor does not stop the frames a browser needs;
 - when preview is not running, the monitor simply reports `waiting_for_frames`.
 
-Motion detection **does not** start preview automatically. To feed the monitor,
-enable and start the preview (`[preview]` enabled; `POST /camera/preview/start`).
+Motion detection **does not** start preview automatically, and nothing in the
+motion subsystem ever will: it is a frame *consumer*. How preview gets started is
+a preview-configuration decision:
+
+| `preview.auto_start` | How the monitor gets frames |
+| -------------------- | --------------------------- |
+| `false` (default) | Manual: enable `[preview]` and call `POST /camera/preview/start`. Until then the monitor truthfully reports `waiting_for_frames`. |
+| `true` | Automatic: the application makes one preview start attempt during startup, so the monitor has frames after a service restart or a reboot with no operator action. |
+
+When `auto_start` is enabled, motion monitoring is started only **after** that
+attempt has resolved, so motion does not open in a misleading
+`waiting_for_frames` state while frames are already on their way. If the
+auto-start attempt fails, preview is `failed` and the monitor reports
+`waiting_for_frames` — which is the truth.
+
+`preview.restore_after_capture` matters to the monitor too: with it enabled, a
+still capture interrupts the frame supply only for the duration of the capture
+rather than until someone restarts preview. See
+[`docs/Camera-Acceptance.md`](Camera-Acceptance.md).
+
+**Task 12 changed no part of the motion algorithm**, its analysis interval, its
+analysis resolution or its `changed_pixel_ratio_threshold`. Only where the frames
+come from — and when — is affected.
 
 ## Detection algorithm
 

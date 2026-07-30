@@ -273,6 +273,95 @@ value.
 
 See [`docs/Dashboard.md`](Dashboard.md) for the page itself.
 
+## Camera endpoints and the managed preview lifecycle
+
+Task 12 added two opt-in preview policies (`preview.auto_start` and
+`preview.restore_after_capture`) and routed every camera *mutation* through one
+coordinator. **No endpoint path, response field, status value or error mapping
+changed.** This section documents the behaviour a client can now observe.
+
+### Which operations are coordinated
+
+| Endpoint | Kind | Coordinated |
+| -------- | ---- | ----------- |
+| `POST /camera/preview/start` | mutation | Yes |
+| `POST /camera/preview/stop` | mutation | Yes |
+| `POST /camera/capture` | mutation | Yes |
+| `GET /camera/preview/status` | read | No |
+| `GET /camera/preview/stream` | read | No |
+| `GET /health` | read | No |
+
+Coordinated operations are serialised: a start, stop, capture or shutdown
+requested while a capture transaction is open waits for it rather than racing
+it. Reads are deliberately *not* serialised, so preview status and `/health`
+keep answering during a capture.
+
+### Auto-start
+
+`preview.auto_start = true` makes exactly one preview start attempt during
+application startup, through the same `PreviewService.start()` path an API
+request uses — the same first-frame validation, the same idempotence, no
+duplicate process. It happens **only in the application lifespan**: no request,
+and no page load of `/preview` or `/dashboard`, ever starts preview.
+
+An expected failure (camera absent, camera busy, tool missing, encoder failure,
+no first frame, permission denied, process exit during startup) does not stop the
+application from serving. `GET /health`, `GET /camera/status` and
+`GET /camera/preview/status` all keep returning 200, with preview truthfully:
+
+```json
+{
+  "state": "failed",
+  "owner": null,
+  "started_at": null,
+  "uptime_seconds": null,
+  "last_error": "Preview process exited during startup with code 1: ..."
+}
+```
+
+Nothing retries in a loop; an operator restarts preview explicitly with
+`POST /camera/preview/start`.
+
+### Capture and restoration
+
+`POST /camera/capture` releases an active preview so the capture owns the camera
+exclusively — unchanged from before. With
+`preview.restore_after_capture = true`, a preview that was **running** when the
+capture began is restarted once the capture attempt finishes. A preview that was
+stopped stays stopped: a capture never starts a preview nobody asked for.
+
+The capture response is **unchanged** and carries no restoration field:
+
+```text
+success  filename  absolute_path  timestamp  width  height
+filesize_bytes  backend  capture_id
+```
+
+Error mappings are unchanged: 503 camera unavailable, 504 capture timeout, 502
+backend failure, 500 write failure, 500 other camera-domain failure, 500 archive
+failure.
+
+### When restoration fails
+
+The capture's own outcome is always the response:
+
+| Capture | Restoration | Response | Preview status afterwards |
+| ------- | ----------- | -------- | ------------------------- |
+| succeeded | succeeded | 200 with metadata | `running` |
+| succeeded | **failed** | **200 with metadata** | `failed`, with `last_error` |
+| failed | succeeded | the capture's own error code | `running` |
+| failed | **failed** | **the capture's own error code** | `failed`, with `last_error` |
+
+A successful capture is never reported as a failure because preview did not come
+back — a client told "capture failed" would retry, and the archive would gain a
+second record for an image captured once. Conversely a preview failure never
+replaces a capture failure.
+
+**Preview restoration failure is visible only through
+`GET /camera/preview/status`** (and the application log). A client that reads
+only the capture response will not learn that preview did not return; poll
+preview status if that matters to it.
+
 ## Compatibility promise
 
 - `/` keeps its exact three keys and their values. Only the *source* of

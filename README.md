@@ -510,6 +510,68 @@ both stay on a physical backend, and an operator must deliberately select
 local validation and rollback — are in
 [`docs/Camera-Simulator.md`](docs/Camera-Simulator.md).
 
+## Camera acceptance
+
+A detected camera is not an accepted camera. Software can prove that a camera
+responds, that a full-resolution still is written, that preview runs and that the
+pipeline survives a restart. It cannot prove that the feeders are in frame, that
+a bird is sharp at the feeder plane, that the exposure is usable, that window
+reflections are tolerable, or that the framing respects the neighbours. Those are
+decided by a person looking at the picture.
+
+The full procedure — hardware identification, cable and mounting safety, the
+privacy gate, feeder coverage, subject pixel scale, autofocus, exposure,
+reflections, mechanical stability, preview, capture, restart and reboot recovery,
+and the two time gates — is
+[`docs/Camera-Acceptance.md`](docs/Camera-Acceptance.md). Results are recorded in
+[`docs/acceptance/Initial-Camera-Acceptance.md`](docs/acceptance/Initial-Camera-Acceptance.md).
+
+**24 hours is not 48 hours.** At least 24 continuous hours is the *camera
+bring-up* minimum and may be recorded as `CAMERA BRING-UP PASSED`. Only at least
+48 continuous hours, with no unexplained restart, capture failure or restoration
+failure, may be recorded as `CAMERA PIPELINE STABLE`. **Matthew signs off** the
+visual gates; a green test suite never substitutes for that, and no gate may be
+inferred from another.
+
+### Managed preview lifecycle
+
+An unattended acceptance run needs a camera pipeline that comes back by itself.
+Two opt-in policies provide that:
+
+```toml
+[preview]
+enabled = true
+auto_start = false             # one preview start attempt during startup
+restore_after_capture = false  # restart preview after a capture that interrupted it
+```
+
+| Setting | `false` (default) | `true` |
+| ------- | ----------------- | ------ |
+| `auto_start` | The application starts with preview stopped; an operator calls `POST /camera/preview/start`. | One start attempt during startup, through the normal start path (same first-frame validation, no duplicate process, no retry loop). Motion monitoring begins only after that attempt resolves. |
+| `restore_after_capture` | A capture releases preview and leaves it stopped. | A preview that was *running* when a capture began is restarted afterwards. A preview that was stopped stays stopped. |
+
+Both default to `false`, in the code and in both tracked configuration files, so
+**a configuration written before these settings existed behaves exactly as it did
+before**. They are independent: either may be enabled alone. Both require
+`preview.enabled = true` and `camera.enabled = true`; asking for one with either
+disabled is rejected at load time.
+
+An accepted production deployment may set both to `true` in its **external**
+configuration at `/etc/garden-observatory/mgo.toml` — that is the configuration
+the restart and reboot gates test. To roll back, set both to `false` and restart
+`mgo.service`; nothing else changes.
+
+Camera *mutations* — preview start, preview stop, still capture and shutdown —
+are serialised by one coordinator, so they can never interleave and no second
+camera process can appear. Status reads, `/health` and the MJPEG stream are not
+serialised behind them, so an operator can always see what the camera is doing.
+Opening `/preview` or `/dashboard` never starts preview.
+
+A preview restoration that fails never changes a capture's outcome: a successful
+capture is still reported as a success (so a caller does not retry and duplicate
+the evidence), a failed capture still reports its own error, and preview reports
+`failed` with its own `last_error` through `GET /camera/preview/status`.
+
 ## Motion detection
 
 MGO includes a lightweight **motion-detection foundation**. It answers one
