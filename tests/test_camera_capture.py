@@ -464,6 +464,52 @@ def test_rpicam_backend_builds_expected_args(tmp_path: Path) -> None:
     assert str(DEFAULT_CAPTURE_HEIGHT) in args
 
 
+@pytest.mark.parametrize("command", ["rpicam-still", "libcamera-still"])
+def test_the_capture_command_array_is_exactly_preserved(
+    command: str, tmp_path: Path
+) -> None:
+    """Task 12 adds no argument to the production still-capture command.
+
+    Pinned as an *exact* array rather than a membership check: the physical
+    camera acceptance procedure assesses the current default autofocus and
+    exposure behaviour first, so no tuning flag may appear before then.
+    """
+    captured: dict[str, Sequence[str]] = {}
+
+    def runner(args: Sequence[str], *, timeout: float) -> CommandResult:
+        captured["args"] = tuple(args)
+        Path(args[-1]).write_bytes(b"\xff\xd8\xff\xd9")
+        return CommandResult(CommandOutcome.COMPLETED, 0, "", "")
+
+    destination = tmp_path / "x.jpg"
+    RPiCamBackend(command, runner=runner).capture(destination)
+
+    assert captured["args"] == (
+        command,
+        "--nopreview",
+        "--timeout",
+        "2000",
+        "--width",
+        str(DEFAULT_CAPTURE_WIDTH),
+        "--height",
+        str(DEFAULT_CAPTURE_HEIGHT),
+        "--output",
+        str(destination),
+    )
+    for forbidden in (
+        "--autofocus-mode",
+        "--autofocus-range",
+        "--autofocus-speed",
+        "--autofocus-window",
+        "--autofocus-on-capture",
+        "--lens-position",
+        "--exposure",
+        "--awb",
+        "--roi",
+    ):
+        assert forbidden not in captured["args"]
+
+
 # --- backend factory ------------------------------------------------------
 
 

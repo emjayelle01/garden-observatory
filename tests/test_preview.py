@@ -413,6 +413,81 @@ def test_null_preview_backend_is_unavailable() -> None:
         NullPreviewBackend().start(_config())
 
 
+@pytest.mark.parametrize("command", ["rpicam-vid", "libcamera-vid"])
+def test_the_preview_command_array_is_exactly_preserved(command: str) -> None:
+    """Task 12 adds no argument to the production preview command.
+
+    Pinned as an *exact* array rather than a membership check: the physical
+    camera acceptance procedure evaluates the current default autofocus,
+    exposure and white-balance behaviour first, so no tuning flag may be
+    smuggled into the command before that assessment has happened.
+    """
+    captured: dict[str, Sequence[str]] = {}
+
+    def launcher(args: Sequence[str]) -> PreviewProcess:
+        captured["args"] = tuple(args)
+        return MockPreviewProcess()
+
+    backend = RPiCamPreviewBackend(command, launcher=launcher)
+    backend.start(_config(width=1280, height=720, fps=15))
+
+    assert captured["args"] == (
+        command,
+        "--nopreview",
+        "--codec",
+        "mjpeg",
+        "--width",
+        "1280",
+        "--height",
+        "720",
+        "--framerate",
+        "15",
+        "--flush",
+        "--timeout",
+        "0",
+        "--output",
+        "-",
+    )
+    # No autofocus, exposure, white-balance, ROI or lens-position tuning.
+    for forbidden in (
+        "--autofocus-mode",
+        "--autofocus-range",
+        "--autofocus-speed",
+        "--autofocus-window",
+        "--autofocus-on-capture",
+        "--lens-position",
+        "--exposure",
+        "--awb",
+        "--roi",
+    ):
+        assert forbidden not in captured["args"]
+
+
+def test_managed_preview_settings_do_not_reach_the_command() -> None:
+    """The managed policies are application behaviour, not camera arguments."""
+    captured: dict[str, Sequence[str]] = {}
+
+    def launcher(args: Sequence[str]) -> PreviewProcess:
+        captured["args"] = tuple(args)
+        return MockPreviewProcess()
+
+    managed = PreviewConfig(
+        enabled=True,
+        width=1280,
+        height=720,
+        fps=15,
+        startup_timeout_seconds=5.0,
+        shutdown_timeout_seconds=5.0,
+        auto_start=True,
+        restore_after_capture=True,
+    )
+    RPiCamPreviewBackend("rpicam-vid", launcher=launcher).start(managed)
+
+    assert not any(
+        "auto_start" in arg or "restore" in arg for arg in captured["args"]
+    )
+
+
 def test_rpicam_preview_backend_builds_expected_args() -> None:
     """The preview command is a shell-free argument array with resolution/fps."""
     captured: dict[str, Sequence[str]] = {}

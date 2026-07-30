@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
 import uuid
 from collections.abc import AsyncIterator
@@ -17,6 +18,7 @@ from mgo.api.dashboard_page import render_dashboard_page
 from mgo.api.preview_page import render_preview_page
 from mgo.camera import (
     MJPEG_CONTENT_TYPE,
+    CameraCoordinator,
     CameraUnavailableError,
     CaptureService,
     CaptureTimeoutError,
@@ -31,6 +33,7 @@ from mgo.camera import (
 from mgo.camera.exceptions import (
     BackendCaptureError,
     CameraCaptureError,
+    PreviewError,
     PreviewStartError,
     PreviewUnavailableError,
 )
@@ -76,6 +79,8 @@ from mgo.notifications import (
 )
 
 config = load_config()
+
+LOGGER = logging.getLogger(__name__)
 
 #: The one release version this module reports, resolved once from package
 #: metadata. Every place that used to carry a hard-coded literal -- the OpenAPI
@@ -314,6 +319,57 @@ def _preview_broker(app: FastAPI) -> MjpegBroker:
     return broker
 
 
+def _camera_coordinator(app: FastAPI) -> CameraCoordinator:
+    """Return the camera coordinator, building one if none was attached.
+
+    The lifespan attaches a coordinator to ``app.state``; a lazily built
+    fallback keeps the mutating endpoints usable in contexts (such as direct
+    unit tests) that never ran startup, mirroring :func:`_capture_service`.
+
+    The fallback deliberately composes :func:`_capture_service` and
+    :func:`_preview_service`, so a test that attached its own mock-backed
+    services gets a coordinator over *those* services and never a production
+    backend built behind its back.
+    """
+    coordinator: CameraCoordinator | None = getattr(
+        app.state, "camera_coordinator", None
+    )
+    if coordinator is not None:
+        return coordinator
+    coordinator = CameraCoordinator(
+        _capture_service(app),
+        _preview_service(app),
+        restore_after_capture=config.preview.restore_after_capture,
+    )
+    app.state.camera_coordinator = coordinator
+    return coordinator
+
+
+def _attempt_preview_auto_start(coordinator: CameraCoordinator) -> None:
+    """Make the single configured preview start attempt during startup.
+
+    An *expected* preview failure -- camera absent, camera busy, tool missing,
+    encoder failure, no first frame, permission denied, process exit during
+    startup -- must not stop the application from serving: an operator needs the
+    API precisely when the camera is broken. The failure is logged, preview is
+    left truthfully in ``FAILED`` with its own ``last_error``, and nothing
+    retries in a loop. Unexpected faults are deliberately *not* caught here;
+    they are programming errors, not hardware absence.
+    """
+    try:
+        status = coordinator.start_preview()
+    except PreviewError as exc:
+        LOGGER.error(
+            "Preview auto-start failed; the API continues to serve without a "
+            "live preview: %s",
+            exc,
+        )
+        return
+    LOGGER.info(
+        "Preview auto-started during startup (state=%s)", status.state.value
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Initialise persistent MGO services during application startup.
@@ -393,13 +449,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     camera_state = CameraState()
     app.state.camera_state = camera_state
-    app.state.capture_service = CaptureService(
+    capture_service = CaptureService(
         config.camera,
         build_capture_backend(config.camera),
     )
-    # Preview shares the camera with capture; it starts STOPPED and is only ever
-    # started explicitly via the API. It is attached here so the endpoints and
-    # /health reflect a single, canonical preview service.
+    app.state.capture_service = capture_service
+    # Preview shares the camera with capture. It starts STOPPED and is started
+    # either explicitly via the API or -- when preview.auto_start is enabled --
+    # once below, after camera readiness has been established. It is attached
+    # here so the endpoints and /health reflect a single, canonical service.
     preview_service = PreviewService(
         config.preview,
         build_preview_backend(config.camera.backend),
@@ -411,6 +469,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.preview_broker = MjpegBroker(
         lambda: PreviewProcessFrameSource(preview_service)
     )
+    # Every camera-*mutating* operation (preview start/stop, still capture,
+    # shutdown) goes through this one coordinator, so they can never interleave.
+    # Status and frame-stream reads deliberately bypass it.
+    camera_coordinator = CameraCoordinator(
+        capture_service,
+        preview_service,
+        restore_after_capture=config.preview.restore_after_capture,
+    )
+    app.state.camera_coordinator = camera_coordinator
     camera_detector = build_detector(config.camera.backend)
 
     # Material camera readiness changes become notification events. The monitor
@@ -441,6 +508,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
         name="mgo-camera-monitor",
     )
+
+    # Managed preview: one start attempt, made here so it resolves BEFORE motion
+    # monitoring begins -- otherwise motion would open in "waiting_for_frames"
+    # even though frames were on their way. Off by default; the process
+    # management runs in a worker thread so it never blocks the event loop.
+    if config.preview.auto_start:
+        await asyncio.to_thread(_attempt_preview_auto_start, camera_coordinator)
 
     # Motion detection shares the preview stream via the broker (single camera
     # owner); it never starts preview or a second camera process. The state is
@@ -481,7 +555,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             monitor_tasks.append(motion_task)
         await asyncio.gather(*monitor_tasks)
         # Ensure no preview process is left running (no orphans) on shutdown.
-        await asyncio.to_thread(app.state.preview_service.shutdown)
+        # Routed through the coordinator so shutdown waits for an in-flight
+        # capture transaction -- including any preview restoration -- to finish
+        # rather than racing a preview back into existence behind it.
+        await asyncio.to_thread(camera_coordinator.shutdown)
         notification_manager.publish(
             _system_event(EventType.SYSTEM_STOP, "MGO API stopped")
         )
@@ -664,14 +741,17 @@ async def camera_capture(request: Request) -> dict[str, Any]:
     are mapped to meaningful status codes: an unavailable camera to 503, a
     capture timeout to 504, and backend/write failures to 502/500. Detection
     runs in a worker thread so the capture subprocess never blocks the loop.
+
+    Camera ownership is exclusive and capture is authoritative. The coordinator
+    releases any active preview so the capture never contends for the camera and
+    -- only when ``preview.restore_after_capture`` is enabled and preview was
+    genuinely running beforehand -- restarts it afterwards. A restoration
+    failure never changes this response: the capture's own outcome is the
+    answer, and preview truth stays on the preview status endpoint.
     """
-    service = _capture_service(request.app)
-    # Camera ownership is exclusive and capture is authoritative: release any
-    # active preview first so the capture never contends for the camera. Preview
-    # is left stopped; the caller may restart it explicitly afterwards.
-    await asyncio.to_thread(_preview_service(request.app).release_for_capture)
+    coordinator = _camera_coordinator(request.app)
     try:
-        result = await asyncio.to_thread(service.capture_image)
+        result = await asyncio.to_thread(coordinator.capture_image)
     except CameraUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except CaptureTimeoutError as exc:
@@ -683,10 +763,11 @@ async def camera_capture(request: Request) -> dict[str, Any]:
     except CameraCaptureError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    # The capture is complete and verified on disk. Persist its metadata as the
-    # authoritative catalogue record. A persistence failure must NOT delete the
-    # JPEG: the capture itself remains valid, so we surface an error and leave
-    # the file in place for a later reconciliation.
+    # The capture is complete and verified on disk, and the camera-operation
+    # lock has already been released -- database work never holds the camera.
+    # Persist its metadata as the authoritative catalogue record. A persistence
+    # failure must NOT delete the JPEG: the capture itself remains valid, so we
+    # surface an error and leave the file in place for a later reconciliation.
     archive = _capture_archive(request.app)
     try:
         record = archive.record_capture(result)
@@ -716,10 +797,13 @@ async def camera_preview_start(request: Request) -> dict[str, Any]:
     current status and never launches a duplicate process. A disabled preview
     maps to 503; a process that cannot start maps to 502. Runs in a worker
     thread so process management never blocks the event loop.
+
+    Routed through the coordinator, so a start requested while a capture holds
+    the camera waits for that capture rather than racing it.
     """
-    service = _preview_service(request.app)
+    coordinator = _camera_coordinator(request.app)
     try:
-        status = await asyncio.to_thread(service.start)
+        status = await asyncio.to_thread(coordinator.start_preview)
     except PreviewUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except PreviewStartError as exc:
@@ -729,9 +813,14 @@ async def camera_preview_start(request: Request) -> dict[str, Any]:
 
 @app.post("/camera/preview/stop")
 async def camera_preview_stop(request: Request) -> dict[str, Any]:
-    """Stop the live preview and return the final status. Idempotent."""
-    service = _preview_service(request.app)
-    status = await asyncio.to_thread(service.stop)
+    """Stop the live preview and return the final status. Idempotent.
+
+    Routed through the coordinator, so a stop requested during a capture is
+    applied after that transaction (including any preview restoration) rather
+    than being lost or interleaved with it.
+    """
+    coordinator = _camera_coordinator(request.app)
+    status = await asyncio.to_thread(coordinator.stop_preview)
     return status.as_dict()
 
 
