@@ -351,6 +351,19 @@ traceback go to the application log instead. The same applies to a stream-read
 failure, which publishes the fixed operational reason
 `stream read failed during startup` rather than the underlying error text.
 
+Which side of the line a failure falls on is decided by the failure itself, not
+by its wording. A read failure is operational when the stream reports itself
+closed — the ordinary "read from a closed file" case — and a programming fault
+when it does not. An unhelpfully worded defect therefore cannot present itself
+as a camera problem.
+
+When application startup fails, shutdown still runs in full: monitors are
+stopped, the camera is released, the stop event is published and the stop
+observation is recorded. Each is attempted even if an earlier one fails, and a
+failure during shutdown never replaces the original startup failure — the
+exception the caller receives is always the one that actually caused the
+shutdown. Shutdown failures are logged with their tracebacks.
+
 ### Capture and restoration
 
 `POST /camera/capture` releases an active preview so the capture owns the camera

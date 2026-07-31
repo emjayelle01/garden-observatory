@@ -6,8 +6,9 @@ import asyncio
 import logging
 import queue
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from types import TracebackType
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -370,6 +371,72 @@ def _attempt_preview_auto_start(coordinator: CameraCoordinator) -> None:
     )
 
 
+async def _shutdown_lifespan(
+    *,
+    stop_events: Sequence[asyncio.Event],
+    monitor_tasks: Sequence[asyncio.Task[None]],
+    coordinator: CameraCoordinator,
+    notification_manager: NotificationManager,
+) -> BaseException | None:
+    """Run every shutdown stage and return the first failure, if any.
+
+    Each stage is attempted even when an earlier one failed. That is the whole
+    point: the stages are independent obligations -- stop the monitors, release
+    the camera, announce the stop, record it -- and a failure in one is never a
+    reason to skip the rest. In particular, a monitor that raises on the way out
+    must not be able to strand a camera process.
+
+    No failure is swallowed: every one is logged with its traceback, and the
+    *first* is returned so the caller can decide whether it is the failure worth
+    raising or whether an earlier, more informative one already exists.
+    """
+    for event in stop_events:
+        event.set()
+
+    first_error: BaseException | None = None
+
+    def _record(stage: str, exc: BaseException) -> None:
+        nonlocal first_error
+        LOGGER.error("Lifespan cleanup stage %r failed", stage, exc_info=exc)
+        if first_error is None:
+            first_error = exc
+
+    try:
+        await asyncio.gather(*monitor_tasks)
+    except BaseException as exc:
+        _record("monitor-tasks", exc)
+
+    try:
+        # Ensure no preview process is left running (no orphans) on shutdown.
+        # Routed through the coordinator so shutdown waits for an in-flight
+        # capture transaction -- including any preview restoration -- to finish
+        # rather than racing a preview back into existence behind it.
+        await asyncio.to_thread(coordinator.shutdown)
+    except BaseException as exc:
+        _record("camera-shutdown", exc)
+
+    try:
+        notification_manager.publish(
+            _system_event(EventType.SYSTEM_STOP, "MGO API stopped")
+        )
+    except BaseException as exc:
+        _record("stop-notification", exc)
+
+    try:
+        record_observation(
+            config.storage.database_path,
+            kind="application_stop",
+            source="mgo-api",
+            status="success",
+            summary="MGO API stopped",
+            payload={"version": APPLICATION_VERSION},
+        )
+    except BaseException as exc:
+        _record("stop-observation", exc)
+
+    return first_error
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Initialise persistent MGO services during application startup.
@@ -520,6 +587,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Declared before the cleanup scope opens so the ``finally`` below can always
     # reason about it, whether or not the monitor was ever created.
     motion_task: asyncio.Task[None] | None = None
+    # The *primary* failure -- whatever went wrong in startup or serving -- is
+    # tracked explicitly rather than left to ``finally`` semantics, because an
+    # exception raised inside a ``finally`` silently replaces the one already in
+    # flight. Here that would mean a monitor failing on the way out could hide
+    # the programming defect that caused the shutdown in the first place.
+    primary_error: BaseException | None = None
+    primary_traceback: TracebackType | None = None
+    cleanup_error: BaseException | None = None
 
     # The cleanup scope deliberately opens BEFORE preview auto-start and before
     # the motion monitor is created, not just around ``yield``. An unexpected
@@ -557,40 +632,44 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
 
         yield
+    except BaseException as exc:
+        # Held rather than propagated immediately so cleanup runs first and,
+        # crucially, so a *cleanup* failure cannot take this exception's place.
+        # It is re-raised below, as the same object.
+        primary_error = exc
+        primary_traceback = exc.__traceback__
     finally:
-        stop_event.set()
-        database_stop_event.set()
-        camera_stop_event.set()
-        motion_stop_event.set()
         monitor_tasks = [health_task, database_task, camera_task]
         if motion_task is not None:
             monitor_tasks.append(motion_task)
-        # Each step is nested so a failure in one cannot skip the next. A
-        # monitor that raises on its way out is a real problem and is never
-        # swallowed -- it propagates -- but it must not be able to strand a
-        # camera process, which is what a flat sequence here would allow.
-        try:
-            await asyncio.gather(*monitor_tasks)
-        finally:
-            try:
-                # Ensure no preview process is left running (no orphans) on
-                # shutdown. Routed through the coordinator so shutdown waits for
-                # an in-flight capture transaction -- including any preview
-                # restoration -- to finish rather than racing a preview back
-                # into existence behind it.
-                await asyncio.to_thread(camera_coordinator.shutdown)
-            finally:
-                notification_manager.publish(
-                    _system_event(EventType.SYSTEM_STOP, "MGO API stopped")
-                )
-                record_observation(
-                    config.storage.database_path,
-                    kind="application_stop",
-                    source="mgo-api",
-                    status="success",
-                    summary="MGO API stopped",
-                    payload={"version": APPLICATION_VERSION},
-                )
+        cleanup_error = await _shutdown_lifespan(
+            stop_events=(
+                stop_event,
+                database_stop_event,
+                camera_stop_event,
+                motion_stop_event,
+            ),
+            monitor_tasks=monitor_tasks,
+            coordinator=camera_coordinator,
+            notification_manager=notification_manager,
+        )
+
+    if primary_error is not None:
+        if cleanup_error is not None:
+            # Both failed. The startup/serving failure is what an operator has
+            # to diagnose; the cleanup failure would otherwise silently take its
+            # place, so it is logged here and the original is raised.
+            LOGGER.error(
+                "Lifespan cleanup also failed while an earlier failure was "
+                "propagating; the earlier failure is the one raised",
+                exc_info=cleanup_error,
+            )
+        raise primary_error.with_traceback(primary_traceback)
+
+    if cleanup_error is not None:
+        # Nothing else failed, so the first cleanup failure is the result --
+        # raised only after every remaining stage was attempted.
+        raise cleanup_error
 
 
 app = FastAPI(

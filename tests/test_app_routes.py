@@ -26,8 +26,10 @@ Task 11 simulator backend -- still no Raspberry Pi, camera or camera tooling.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
+import logging
 import subprocess
 import threading
 import time
@@ -53,7 +55,7 @@ from mgo.camera.preview import (
 from mgo.camera.preview_backend import MockPreviewBackend
 from mgo.camera.simulator import SimulatorCaptureBackend
 from mgo.core.config import MGOConfig, parse_config_text
-from mgo.notifications import NotificationManager, NullProvider
+from mgo.notifications import EventType, NotificationManager, NullProvider
 
 _EXPECTED_FIELDS = {
     "enabled",
@@ -1130,11 +1132,19 @@ def test_an_expected_backend_failure_is_not_fatal_to_startup(
 
 
 class _FailingStream(io.RawIOBase):
-    """A byte stream whose reads always raise the configured exception."""
+    """A byte stream whose reads always raise the configured exception.
+
+    It reports itself **open**, which is what makes a ``ValueError`` from it a
+    programming fault rather than the ordinary closed-file case.
+    """
 
     def __init__(self, error: BaseException) -> None:
         super().__init__()
         self._error = error
+
+    @property
+    def closed(self) -> bool:
+        return False
 
     def readable(self) -> bool:
         return True
@@ -1333,3 +1343,266 @@ def test_a_monitor_failure_cannot_strand_the_camera(
     assert spies["health"].exited
     assert spies["database"].exited
     _await_no_camera_threads()
+
+
+def test_a_value_error_from_an_open_stream_is_fatal_to_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An open stream raising ValueError is a defect, and auto-start says so.
+
+    Classifying every ``ValueError`` as operational let a bug in the read path
+    be caught by auto-start, so the application served on with a camera that
+    could never work.
+    """
+    spies = _install_monitor_spies(monkeypatch)
+    injected = ValueError("frame index -1 is not valid")
+    backend = _StreamBackend(injected)
+    monkeypatch.setattr(
+        app_module, "build_preview_backend", lambda _backend: backend
+    )
+    shutdowns, captured = _capture_preview_at_shutdown(monkeypatch)
+
+    observed = _run_lifespan_expecting(
+        monkeypatch,
+        _lifespan_config(tmp_path, auto_start=True, motion=True),
+        ValueError,
+    )
+
+    assert observed["reached_yield"] is False
+    assert observed["error"] is injected
+    assert not isinstance(observed["error"], PreviewError)
+    assert shutdowns == ["shutdown"]
+    assert captured["preview"]["state"] == "failed"
+    assert captured["preview"]["last_error"] == UNEXPECTED_START_ERROR
+    assert backend.process is not None
+    assert backend.process.closed is True
+    assert spies["health"].exited
+    assert spies["database"].exited
+    assert spies["camera"].exited
+    assert spies["motion"].entered is False
+    assert observed["live_tasks"] == []
+    assert observed["producers"] == 0
+    _await_no_camera_threads()
+    assert _readiness_readers() == 0
+
+
+# --- primary-exception preservation -----------------------------------------
+#
+# An exception raised inside a ``finally`` silently replaces the one already in
+# flight. During lifespan shutdown that would mean a monitor failing on the way
+# out hides the programming defect that caused the shutdown -- the operator
+# would be handed the symptom instead of the cause.
+
+
+@contextlib.contextmanager
+def caplog_at_error() -> Iterator[list[str]]:
+    """Capture formatted ERROR records (with tracebacks) from the mgo loggers.
+
+    A plain handler rather than the ``caplog`` fixture, because these runs
+    happen inside ``asyncio.run`` within a helper and the captured text is
+    inspected after it returns.
+    """
+    records: list[str] = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(self.format(record))
+
+    handler = _Handler()
+    handler.setFormatter(logging.Formatter("%(name)s %(message)s"))
+    logger = logging.getLogger("mgo")
+    previous_level = logger.level
+    logger.setLevel(logging.ERROR)
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+
+class _CleanupSpy:
+    """Records which lifespan cleanup stages were attempted."""
+
+    def __init__(self) -> None:
+        self.stages: list[str] = []
+
+
+def _install_cleanup_spies(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fail_notification: BaseException | None = None,
+    fail_observation: BaseException | None = None,
+    fail_shutdown: BaseException | None = None,
+) -> _CleanupSpy:
+    """Instrument the stop-notification, stop-observation and shutdown stages."""
+    spy = _CleanupSpy()
+    real_build = app_module.build_notification_manager
+    real_record = app_module.record_observation
+
+    class _ManagerProxy:
+        """Delegates to a real manager, recording the stop publication."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def publish(self, event: Any) -> Any:
+            if event.event_type is EventType.SYSTEM_STOP:
+                spy.stages.append("stop-notification")
+                if fail_notification is not None:
+                    raise fail_notification
+            return self._inner.publish(event)
+
+        def status(self) -> Any:
+            return self._inner.status()
+
+    def _manager(*args: Any, **kwargs: Any) -> Any:
+        return _ManagerProxy(real_build(*args, **kwargs))
+
+    def _record(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("kind") == "application_stop":
+            spy.stages.append("stop-observation")
+            if fail_observation is not None:
+                raise fail_observation
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "build_notification_manager", _manager)
+    monkeypatch.setattr(app_module, "record_observation", _record)
+
+    class _Coordinator(CameraCoordinator):
+        def shutdown(self) -> None:
+            spy.stages.append("camera-shutdown")
+            super().shutdown()
+            if fail_shutdown is not None:
+                raise fail_shutdown
+
+    monkeypatch.setattr(app_module, "CameraCoordinator", _Coordinator)
+    return spy
+
+
+def _failing_camera_monitor(error: BaseException) -> Any:
+    """Build a camera-monitor stub that raises ``error`` during shutdown."""
+
+    async def _monitor(*args: Any, **kwargs: Any) -> None:
+        stop_event: asyncio.Event = args[2]
+        await stop_event.wait()
+        raise error
+
+    return _monitor
+
+
+def test_a_cleanup_failure_never_replaces_a_startup_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The caller is handed the cause, not a symptom of the shutdown."""
+    _install_monitor_spies(monkeypatch)
+    startup_error = RuntimeError("programming error inside startup validation")
+    monitor_error = RuntimeError("camera monitor failed during shutdown")
+    launched: dict[str, int] = {}
+
+    def _explode(self: PreviewService, process: object) -> str | None:
+        launched["producers_at_fault"] = _producer_count()
+        raise startup_error
+
+    monkeypatch.setattr(PreviewService, "_validate_startup", _explode)
+    monkeypatch.setattr(
+        app_module, "run_camera_monitor", _failing_camera_monitor(monitor_error)
+    )
+    spy = _install_cleanup_spies(monkeypatch)
+
+    with caplog_at_error() as records:
+        observed = _run_lifespan_expecting(
+            monkeypatch,
+            _lifespan_config(tmp_path, auto_start=True),
+            RuntimeError,
+        )
+
+    # The preview process really was launched, so cleanup had work to do.
+    assert launched["producers_at_fault"] == 1
+    # Object identity: the exact startup exception, not the monitor's.
+    assert observed["error"] is startup_error
+    assert observed["error"] is not monitor_error
+    # Every remaining cleanup stage still ran.
+    assert spy.stages == [
+        "camera-shutdown",
+        "stop-notification",
+        "stop-observation",
+    ]
+    assert observed["producers"] == 0
+    assert observed["live_tasks"] == []
+    _await_no_camera_threads()
+    assert _readiness_readers() == 0
+    # The cleanup failure is not swallowed: it is logged.
+    logged = "\n".join(records)
+    assert "camera monitor failed during shutdown" in logged
+    assert "monitor-tasks" in logged
+
+
+def test_a_coordinator_shutdown_failure_propagates_after_every_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A shutdown failure is the result -- but only after the rest is attempted."""
+    _install_monitor_spies(monkeypatch)
+    shutdown_error = RuntimeError("camera shutdown failed")
+    spy = _install_cleanup_spies(monkeypatch, fail_shutdown=shutdown_error)
+
+    observed = _run_lifespan_expecting(
+        monkeypatch,
+        _lifespan_config(tmp_path, auto_start=True),
+        RuntimeError,
+    )
+
+    assert observed["reached_yield"] is True
+    assert observed["error"] is shutdown_error
+    assert spy.stages == [
+        "camera-shutdown",
+        "stop-notification",
+        "stop-observation",
+    ]
+    assert observed["producers"] == 0
+
+
+def test_a_notification_failure_does_not_prevent_observation_persistence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The stop observation is a separate obligation and is still recorded."""
+    _install_monitor_spies(monkeypatch)
+    notification_error = RuntimeError("stop notification failed")
+    spy = _install_cleanup_spies(
+        monkeypatch, fail_notification=notification_error
+    )
+
+    observed = _run_lifespan_expecting(
+        monkeypatch,
+        _lifespan_config(tmp_path, auto_start=True),
+        RuntimeError,
+    )
+
+    assert observed["error"] is notification_error
+    assert "stop-observation" in spy.stages
+    assert observed["producers"] == 0
+
+
+def test_an_observation_failure_remains_observable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The last cleanup stage's failure is not quietly dropped either."""
+    _install_monitor_spies(monkeypatch)
+    observation_error = RuntimeError("stop observation failed")
+    spy = _install_cleanup_spies(monkeypatch, fail_observation=observation_error)
+
+    with caplog_at_error() as records:
+        observed = _run_lifespan_expecting(
+            monkeypatch,
+            _lifespan_config(tmp_path, auto_start=True),
+            RuntimeError,
+        )
+
+    assert observed["error"] is observation_error
+    assert spy.stages == [
+        "camera-shutdown",
+        "stop-notification",
+        "stop-observation",
+    ]
+    assert "stop-observation" in "\n".join(records)
+    assert observed["producers"] == 0

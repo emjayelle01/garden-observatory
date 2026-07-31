@@ -2,9 +2,9 @@
 
 ## Status
 
-**Implementation corrected and locally revalidated after repository re-review;
-Raspberry Pi validation and physical camera acceptance not performed. Awaiting
-final repository review.**
+**Implementation corrected and locally revalidated after final repository
+review; Raspberry Pi validation and physical camera acceptance not performed.
+Awaiting Raspberry Pi validation authorisation.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -17,7 +17,7 @@ final repository review.**
 | Auto-start failure runtime validation | Passed |
 | Repository review | **Round 1 complete** — two blocking defects found and corrected |
 | Repository re-review | **Round 2 complete** — one blocking classification defect found and corrected |
-| Final repository review | Not started |
+| Final repository review | **Round 3 complete** — two edge cases found and corrected |
 | Raspberry Pi validation of this branch | **Not performed** — the Pi was not accessed |
 | Physical camera acceptance run | **Not performed** — requires separate authorisation |
 | Matthew's visual sign-off | **Not given** |
@@ -799,6 +799,126 @@ mapping, physical command array, simulator contract, motion behaviour, migration
 or dependency changed. The Raspberry Pi was not accessed, and the physical
 camera acceptance record remains entirely pending.
 
+## Final review correction — precise stream classification and primary-exception preservation
+
+Correction 2 established one classification for the whole startup transaction.
+Final review found two edge cases where it still gave the wrong answer.
+
+### Defect 5 — every `ValueError` was treated as an operational stream failure
+
+`_await_first_frame` classified `(OSError, ValueError)` together. That is right
+for the standard "read from a closed file" case, but a `ValueError` raised by a
+**demonstrably open** stream is a defect in the read path, and it was being
+handed to auto-start as an ordinary camera problem.
+
+Reproduced against the unmodified branch with a stream that reports
+`closed == False` and raises one specific `ValueError`:
+
+```text
+stream reported closed at raise : False
+raised type                     : PreviewStartError   <- wrong
+original ValueError propagated  : False               <- wrong
+raised is a PreviewError        : True                <- wrong
+last_error                      : Preview process stream read failed during startup.
+```
+
+and through the real lifespan with `auto_start = true`, `lifespan reached
+yield: True` — the application started and served with a bug in the read path
+presented as a camera failure.
+
+### Defect 6 — a cleanup failure replaced the primary startup failure
+
+The lifespan's nested `try/finally` guaranteed that every cleanup step ran, but
+an exception raised *inside* a `finally` silently replaces the one already in
+flight. With a startup programming defect active and a monitor failing on the
+way out, the caller was handed the monitor's exception:
+
+```text
+lifespan reached yield  : False
+escaped exception       : camera monitor failed during shutdown
+is the STARTUP exception: False   <- wrong
+is the MONITOR exception: True    <- wrong
+```
+
+An operator would have been given the symptom of the shutdown instead of the
+cause of it.
+
+### Root causes
+
+**Defect 5** classified by exception *type* alone, when the type is genuinely
+ambiguous: Python raises `ValueError` both for reading a closed file and for
+ordinary programming mistakes. The disambiguator had to be the stream's own
+state, and there was none.
+
+**Defect 6** relied on `finally` for ordering and, implicitly, for exception
+precedence. `finally` guarantees the first and silently inverts the second.
+
+### Corrections
+
+**The stream's state is the authority.** `_stream_is_closed(stream)` returns
+`True` only when the stream can be *proven* closed. An `OSError` stays
+operational; a `ValueError` is operational only when that helper says the stream
+is closed; every other `ValueError` is an unexpected programming fault, carried
+back and re-raised unchanged. The classification never inspects the exception's
+message — a defect can produce text that reads exactly like the closed-file
+error, and a real closed-file error is not obliged to contain it. A stream that
+cannot answer (no attribute, or a property that raises) has not proven itself
+closed, so the stricter classification stands; the exception raised while asking
+is logged at debug level and never replaces the read's own error.
+
+**Primary and cleanup exceptions are tracked explicitly.** The lifespan records
+the startup/serving failure, runs every cleanup stage through
+`_shutdown_lifespan`, and then decides: with a primary failure present the
+cleanup failure is logged and the **original object** is re-raised
+(`raise primary_error.with_traceback(primary_traceback)`, so identity and
+traceback survive); with no primary failure the first cleanup failure is raised
+after every stage has been attempted. No `ExceptionGroup` is introduced — the
+caller always receives the exact original exception object.
+
+**Every cleanup stage is an independent obligation.** `_shutdown_lifespan` runs
+monitor gathering, camera shutdown, stop notification and stop-observation
+persistence in sequence, each guarded. A failure in one is logged with its
+traceback and never prevents the rest — a monitor that fails must not be able to
+strand a camera process, and a failed notification must not lose the stop
+record. The first failure is returned for the caller to weigh.
+
+### New tests
+
+- **Stream classification** (`tests/test_preview.py`): an `OSError` from an open
+  stream is operational; a genuinely closed `io.BytesIO` produces Python's own
+  `ValueError` and stays operational; a `ValueError` from an open stream
+  propagates as the exact original object with the constant diagnostic; a
+  `ValueError` whose message reads `I/O operation on closed file` but whose
+  stream is open is still a defect (message is not the test); a stream whose
+  `closed` property raises keeps the stricter classification and the read's own
+  error; and the reader thread exits cleanly for all five cases.
+- **Lifespan** (`tests/test_app_routes.py`): an open-stream `ValueError` is
+  fatal to startup with full cleanup;
+  `test_a_cleanup_failure_never_replaces_a_startup_failure` asserts object
+  identity between the raised exception and the startup error while the monitor
+  error appears only in the logs and every remaining stage still ran; a
+  coordinator-shutdown failure propagates only after the notification and
+  observation stages were attempted; a notification failure does not prevent
+  observation persistence; an observation failure remains observable.
+
+### Validation
+
+Ruff passed; mypy passed for 50 source files; the full suite passed with no new
+skip and no thread or unraisable warning under escalation. Mutations A–D (broad
+`ValueError`, message-based closed detection, cleanup replacing the primary
+exception, cleanup short-circuiting) were each applied independently, each
+detected, and each reverted byte-for-byte. Runtime revalidation re-ran the
+simulator managed-preview run (14 checks, including motion recovery) and eight
+in-process lifespan scenarios, adding the closed-stream `ValueError`, the
+open-stream `ValueError` and the simultaneous startup-and-cleanup failure.
+
+### Unchanged by this correction
+
+No endpoint, response field, preview state, capture result, capture error
+mapping, physical command array, simulator contract, motion behaviour, migration
+or dependency changed. The Raspberry Pi was not accessed, and the physical
+camera acceptance record remains entirely pending.
+
 ## Deviations
 
 Recorded for the reviewer. None changes production behaviour.
@@ -847,12 +967,9 @@ Recorded for the reviewer. None changes production behaviour.
 9. **A seventh commit exists.** Re-review round 2 separately authorised one
    further correction commit, `Preserve preview startup fault boundaries`. No
    existing commit was amended, rebased, squashed or force-pushed.
-10. **A closed-stream `ValueError` is classified as operational.** The brief
-    names it as an expected failure, so `_await_first_frame` treats
-    `(OSError, ValueError)` as ordinary stream I/O. A `ValueError` raised by a
-    defect in the parsing path would therefore be classified operational rather
-    than unexpected. Separating them would mean changing
-    `mgo.camera.streaming`, which is outside this correction's scope.
+10. **An eighth commit exists.** Final review round 3 separately authorised one
+    further correction commit, `Complete Task 12 startup failure handling`. No
+    existing commit was amended, rebased, squashed or force-pushed.
 
 ## Known limitations
 
@@ -881,6 +998,15 @@ Recorded for the reviewer. None changes production behaviour.
   check — would still escape with the health and database monitors running.
   Widening the scope further would mean restructuring startup beyond this
   correction, and no such fault is known.
+- Stream-failure classification uses the stream's closed state, which is the
+  only evidence available at that point. A `ValueError` raised while the stream
+  genuinely *is* closed is therefore recorded as operational even in the
+  unlikely case that a defect produced it — the observable facts are identical,
+  and the alternative (guessing from the message) is what this correction
+  removed.
+- `PreviewService.shutdown()` normalises a failed preview to `STOPPED`, so after
+  application shutdown the last failure is visible only in the log. That is the
+  pre-existing shutdown contract and was not changed here.
 - No numerical subject-scale threshold is asserted. Measurements are recorded so
   a later model-selection task can set thresholds from evidence rather than
   guesswork.

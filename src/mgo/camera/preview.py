@@ -142,6 +142,33 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _stream_is_closed(stream: IO[bytes]) -> bool:
+    """Return ``True`` only when ``stream`` can be *proven* closed.
+
+    This is the authority for classifying a :class:`ValueError` raised while
+    reading: Python raises one for an ordinary read against an already-closed
+    file or pipe, which is an operational failure, but it also raises one for
+    genuine programming mistakes against a perfectly healthy stream.
+
+    The stream's own state decides, never the exception's message -- a message
+    is arbitrary text that a defect can imitate ("...closed...") and that a real
+    closed-file error is not obliged to contain.
+
+    An object that cannot answer the question at all (no attribute, or a
+    property that raises) has not proven itself closed, so the caller keeps the
+    stricter classification. The check never raises: it runs on the reader
+    thread, where an escaping exception would be reported nowhere useful.
+    """
+    try:
+        return stream.closed is True
+    except Exception:
+        LOGGER.debug(
+            "Preview startup stream could not report its closed state",
+            exc_info=True,
+        )
+        return False
+
+
 def _bounded_error(text: str) -> str:
     """Trim error text to a safe, log-friendly length."""
     collapsed = " ".join(text.split())
@@ -336,16 +363,28 @@ class PreviewService:
                     break
                 else:
                     outcome.eof = True
-            except (OSError, ValueError):
-                # Ordinary stream-operation failure: a torn-down pipe, a closed
-                # stream, a device read error. Nothing about the exception is
-                # recorded -- its message is arbitrary data and the operational
-                # fact ("the stream could not be read") is what a status
-                # consumer needs. The detail goes to the log below.
+            except OSError:
+                # Ordinary stream-operation failure: a torn-down pipe, a device
+                # read error. Nothing about the exception is recorded -- its
+                # message is arbitrary data and the operational fact ("the
+                # stream could not be read") is what a status consumer needs.
+                # The detail goes to the log.
                 LOGGER.warning(
                     "Preview startup stream read failed", exc_info=True
                 )
                 outcome.stream_error = True
+            except ValueError as exc:
+                # Operational *only* against a stream that is demonstrably
+                # closed -- the standard "read from a closed file" case. A
+                # ValueError from an open stream is a defect in the read path
+                # and is classified as one; see :func:`_stream_is_closed`.
+                if _stream_is_closed(stream):
+                    LOGGER.warning(
+                        "Preview startup stream read failed", exc_info=True
+                    )
+                    outcome.stream_error = True
+                else:
+                    outcome.unexpected = exc
             except Exception as exc:
                 # A defect in the reader path itself. Carried back untouched so
                 # the caller can re-raise the original object.

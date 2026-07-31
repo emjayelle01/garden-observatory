@@ -817,11 +817,25 @@ def test_the_null_backend_remains_an_expected_unavailable_failure() -> None:
 
 
 class _FailingStream(io.RawIOBase):
-    """A byte stream whose reads always raise the configured exception."""
+    """A byte stream whose reads always raise the configured exception.
 
-    def __init__(self, error: BaseException) -> None:
+    ``closed_state`` controls what the stream says about itself when the reader
+    asks -- and that answer, not the exception's message, is what decides
+    whether a ``ValueError`` is operational.
+    """
+
+    def __init__(
+        self, error: BaseException, *, closed_state: str = "open"
+    ) -> None:
         super().__init__()
         self._error = error
+        self._closed_state = closed_state
+
+    @property
+    def closed(self) -> bool:
+        if self._closed_state == "raises":
+            raise RuntimeError("this stream cannot report whether it is closed")
+        return self._closed_state == "closed"
 
     def readable(self) -> bool:
         return True
@@ -867,9 +881,11 @@ class _StreamProcess:
         self._stream.close()
 
 
-def _stream_service(error: BaseException) -> tuple[PreviewService, _StreamProcess]:
-    """Build a service whose process stream fails with ``error`` on read."""
-    process = _StreamProcess(_FailingStream(error))  # type: ignore[arg-type]
+def _service_over_stream(
+    stream: IO[bytes],
+) -> tuple[PreviewService, _StreamProcess]:
+    """Build a service whose preview process hands out ``stream``."""
+    process = _StreamProcess(stream)
 
     class _Backend:
         @property
@@ -884,6 +900,15 @@ def _stream_service(error: BaseException) -> tuple[PreviewService, _StreamProces
         _Backend(),  # type: ignore[arg-type]
     )
     return service, process
+
+
+def _stream_service(
+    error: BaseException, *, closed_state: str = "open"
+) -> tuple[PreviewService, _StreamProcess]:
+    """Build a service whose process stream fails with ``error`` on read."""
+    return _service_over_stream(
+        _FailingStream(error, closed_state=closed_state)  # type: ignore[arg-type]
+    )
 
 
 def test_an_expected_stream_io_failure_is_an_operational_start_error() -> None:
@@ -905,16 +930,90 @@ def test_an_expected_stream_io_failure_is_an_operational_start_error() -> None:
     _await_no_readiness_readers()
 
 
-def test_a_closed_stream_value_error_is_also_operational() -> None:
-    """A read against a torn-down stream stays an expected failure."""
-    service, _process = _stream_service(
-        ValueError("I/O operation on closed file")
-    )
+def test_a_genuinely_closed_stream_value_error_is_operational() -> None:
+    """The real "read from a closed file" case stays an expected failure.
+
+    A genuinely closed :class:`io.BytesIO` is used rather than a double, so the
+    ``ValueError`` is Python's own and the stream's closed state is real.
+    """
+    closed = io.BytesIO(b"")
+    closed.close()
+    service, process = _service_over_stream(closed)
 
     with pytest.raises(PreviewStartError, match="stream read failed"):
         service.start()
 
+    assert closed.closed is True
     assert service.status().state is PreviewState.FAILED
+    assert service.status().last_error != UNEXPECTED_START_ERROR
+    assert process.closed is True
+    _await_no_readiness_readers()
+
+
+def test_a_value_error_from_an_open_stream_is_a_programming_fault() -> None:
+    """An open stream that raises ValueError is a defect, not a camera problem.
+
+    Treating every ``ValueError`` as operational made auto-start swallow a bug
+    in the read path and keep serving. The stream's own state is the authority:
+    this one reports itself open at the instant it raises.
+    """
+    injected = ValueError("frame index -1 is not valid")
+    stream = _FailingStream(injected)
+    service, process = _service_over_stream(stream)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError) as excinfo:
+        service.start()
+
+    assert stream.closed is False
+    assert excinfo.value is injected
+    assert not isinstance(excinfo.value, PreviewError)
+    status = service.status()
+    assert status.state is PreviewState.FAILED
+    assert status.owner is None
+    assert status.started_at is None
+    assert status.uptime_seconds is None
+    assert status.last_error == UNEXPECTED_START_ERROR
+    assert process.closed is True
+    _await_no_readiness_readers()
+
+
+def test_a_misleading_value_error_message_does_not_make_it_operational() -> None:
+    """Classification is by stream state, never by matching the message.
+
+    A defect can produce any text it likes, including text that reads exactly
+    like the closed-file error -- so the message must not be the test.
+    """
+    injected = ValueError("I/O operation on closed file")
+    stream = _FailingStream(injected)
+    service, _process = _service_over_stream(stream)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError) as excinfo:
+        service.start()
+
+    assert stream.closed is False
+    assert excinfo.value is injected
+    assert service.status().last_error == UNEXPECTED_START_ERROR
+    _await_no_readiness_readers()
+
+
+def test_an_unprovable_closed_state_keeps_the_stricter_classification() -> None:
+    """A stream that cannot answer has not proven itself closed.
+
+    The exception raised while asking must not replace the read's own
+    ``ValueError`` either -- the caller has to see what actually went wrong.
+    """
+    injected = ValueError("frame index -1 is not valid")
+    service, process = _stream_service(injected, closed_state="raises")
+
+    with pytest.raises(ValueError) as excinfo:
+        service.start()
+
+    assert excinfo.value is injected
+    assert "cannot report whether it is closed" not in str(excinfo.value)
+    status = service.status()
+    assert status.state is PreviewState.FAILED
+    assert status.last_error == UNEXPECTED_START_ERROR
+    assert process.closed is True
     _await_no_readiness_readers()
 
 
@@ -945,13 +1044,16 @@ def test_the_readiness_reader_never_raises_into_its_own_thread() -> None:
     An exception escaping a thread would surface as an unhandled-thread warning
     and, worse, would be reported nowhere the caller can classify it.
     """
-    for error in (
-        OSError(_HOSTILE_MESSAGE),
-        ValueError("I/O operation on closed file"),
-        RuntimeError(_HOSTILE_MESSAGE),
-    ):
-        service, _process = _stream_service(error)
-        with contextlib.suppress(PreviewError, RuntimeError):
+    cases: list[tuple[BaseException, str]] = [
+        (OSError(_HOSTILE_MESSAGE), "open"),
+        (ValueError("I/O operation on closed file"), "closed"),
+        (ValueError("frame index -1 is not valid"), "open"),
+        (ValueError("frame index -1 is not valid"), "raises"),
+        (RuntimeError(_HOSTILE_MESSAGE), "open"),
+    ]
+    for error, closed_state in cases:
+        service, _process = _stream_service(error, closed_state=closed_state)
+        with contextlib.suppress(PreviewError, RuntimeError, ValueError):
             service.start()
         _await_no_readiness_readers()
         assert _readiness_readers() == 0
