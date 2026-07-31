@@ -87,6 +87,94 @@ def test_the_guide_adds_no_camera_tuning_flag_to_production() -> None:
     )
 
 
+# --- evidence commands must fail closed -------------------------------------
+#
+# An acceptance gate is only as trustworthy as the command that evidences it.
+# ``curl -s localhost:8080/...`` prints a 404 body and exits 0, and honours a
+# proxy variable that could send the check to another host entirely -- so it can
+# report a pass for an endpoint that answered nothing useful, or for a machine
+# that is not the Pi.
+
+
+def _shell_lines() -> list[str]:
+    """Return every line inside a ```bash fence in the guide.
+
+    Prose that merely *mentions* a command (including the warning against a
+    bare ``curl -s localhost``) is deliberately excluded: these checks are about
+    what an operator would actually run.
+    """
+    lines: list[str] = []
+    in_shell = False
+    for raw in _text(_GUIDE).splitlines():
+        if raw.startswith("```"):
+            in_shell = raw.startswith("```bash")
+            continue
+        if in_shell and raw.strip():
+            lines.append(raw.strip())
+    return lines
+
+
+def _curl_commands() -> list[str]:
+    """Return every runnable line of the guide that invokes curl."""
+    return [line for line in _shell_lines() if "curl" in line]
+
+
+def test_the_guide_contains_curl_evidence_commands() -> None:
+    """Guard the guard: the checks below must have something to check."""
+    assert _curl_commands()
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    ["--noproxy '*'", "-fsS", "http://127.0.0.1:"],
+)
+def test_every_curl_command_fails_closed(requirement: str) -> None:
+    """Proxy-disabled, HTTP-failing, literal-loopback -- on every invocation."""
+    for command in _curl_commands():
+        assert requirement in command, command
+
+
+def test_no_curl_command_uses_a_resolvable_hostname() -> None:
+    """`localhost` needs a lookup; the loopback address does not."""
+    for command in _curl_commands():
+        assert "localhost" not in command, command
+
+
+def test_the_guide_explains_why_a_bare_curl_is_unsafe() -> None:
+    """The reasoning is written down, so a later edit cannot lose it."""
+    flat = _flat(_GUIDE)
+
+    assert "A response body is not a passing endpoint check" in flat
+    assert "never a bare `curl -s localhost:...`" in flat
+
+
+def test_the_preview_process_count_gate_requires_exactly_one() -> None:
+    """"At least one" is not the gate: zero and two are both failures."""
+    flat = _flat(_GUIDE)
+
+    assert "mgo_preview_count()" in flat
+    assert 'pgrep -c -x rpicam-vid' in flat
+    assert 'if [ "$n" -eq 1 ]' in flat
+    assert "FAIL expected exactly 1 rpicam-vid" in flat
+    assert (
+        '"at least one" is not the gate' in flat.lower()
+        or "at least one\" is not the gate" in flat
+    )
+
+
+def test_the_guide_keeps_its_checks_read_only_by_default() -> None:
+    """The only authorised write is the capture the gate deliberately performs."""
+    writes = [
+        command
+        for command in _curl_commands()
+        if "-X POST" in command or "--request POST" in command
+    ]
+
+    assert writes, "the capture gate must actually issue a capture"
+    for command in writes:
+        assert "/camera/capture" in command, command
+
+
 # --- the pending record -----------------------------------------------------
 
 
@@ -162,6 +250,40 @@ def test_the_record_pre_populates_only_supported_facts() -> None:
         "Protective lens film removed",
     ):
         assert f"| {field} | NOT RECORDED |" in flat
+
+
+def test_the_pre_population_note_matches_what_is_pre_populated() -> None:
+    """The explanation must describe the actual rows, not an idealised set.
+
+    A note that undercounts what was filled in is the same defect as filling in
+    a result: the reader is told less has been assumed than actually has been.
+    """
+    flat = _flat(_RECORD)
+
+    assert (
+        "Exactly two values in this section are pre-populated — "
+        "**architecture** and **detected sensor**" in flat
+    )
+    # The expected field of view is an expectation to confirm, not a result.
+    assert (
+        "| Field of view variant | NOT RECORDED (expected: Standard, not Wide) |"
+        in flat
+    )
+    assert "| Architecture | aarch64 (recorded after the Task 11 deployment) |" in flat
+
+    # Every other row of the hardware-identity section is genuinely unrecorded.
+    section = flat.split("## 5. Hardware identity", 1)[1].split("## 6.", 1)[0]
+    rows = re.findall(r"\| ([^|]+?) \| ([^|]+?) \|", section)
+    pre_populated = [
+        name.strip()
+        for name, value in rows
+        if "NOT RECORDED" not in value
+        and name.strip() != "Field"
+        and set(name.strip()) != {"-"}
+    ]
+    assert sorted(pre_populated) == ["Architecture", "Detected sensor"], (
+        pre_populated
+    )
 
 
 # --- evidence handling ------------------------------------------------------

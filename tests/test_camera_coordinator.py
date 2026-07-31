@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -38,8 +39,13 @@ from mgo.camera.exceptions import (
     PreviewStartError,
 )
 from mgo.camera.models import CaptureResult
-from mgo.camera.preview import PreviewService, PreviewState
-from mgo.camera.preview_backend import MockPreviewBackend
+from mgo.camera.preview import (
+    UNEXPECTED_START_ERROR,
+    PreviewService,
+    PreviewState,
+)
+from mgo.camera.preview_backend import MockPreviewBackend, build_preview_backend
+from mgo.camera.simulator import SIMULATOR_BACKEND_NAME
 from mgo.core.config import CameraConfig, PreviewConfig
 
 #: Generous upper bound for an operation that *must* complete. Never used as a
@@ -441,35 +447,149 @@ def test_restoration_failure_does_not_replace_a_failed_capture() -> None:
     assert preview.status().state is PreviewState.FAILED
 
 
-def test_an_unexpected_restoration_fault_is_caught_and_logged(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """An unexpected restoration fault is logged with its traceback, not raised.
+class _RestorationValidationExplodes(PreviewService):
+    """A real preview service whose *restoration* startup fails unexpectedly.
 
-    A programming error in the restoration path is not ordinary hardware
-    absence, so it is logged in full -- but it still must not rewrite the
-    capture's own outcome.
+    The first start (the operator's) validates normally; the restoration start
+    launches its process and then hits an unexpected fault inside the production
+    startup-validation boundary -- the situation that used to leave preview
+    reporting ``STARTING`` with a live camera process and no error.
     """
 
-    class _StartExplodes(PreviewService):
-        def start(self) -> object:  # type: ignore[override]
-            raise RuntimeError("programming error")
+    def __init__(self, *args: object, error: BaseException, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.error = error
+        self.validations = 0
 
-    preview = _StartExplodes(_preview_config(), MockPreviewBackend())
-    # Reach RUNNING through the real implementation, so the transaction sees a
-    # genuinely running preview before the overridden start is reached.
-    PreviewService.start(preview)
+    def _validate_startup(self, process: object) -> str | None:
+        self.validations += 1
+        if self.validations > 1:
+            raise self.error
+        return super()._validate_startup(process)  # type: ignore[arg-type]
+
+
+def _simulator_producers() -> int:
+    """Count live simulator preview producer threads."""
+    return sum(
+        1
+        for thread in threading.enumerate()
+        if thread.name == "mgo-simulator-preview"
+    )
+
+
+def _readiness_readers() -> int:
+    """Count live preview startup-readiness reader threads."""
+    return sum(
+        1
+        for thread in threading.enumerate()
+        if thread.name == "mgo-preview-readiness"
+    )
+
+
+def _await_no_camera_threads() -> None:
+    """Wait, bounded, for every producer and readiness thread to exit."""
+    deadline = time.monotonic() + _TIMEOUT
+    while time.monotonic() < deadline and (
+        _simulator_producers() or _readiness_readers()
+    ):
+        time.sleep(0.02)
+
+
+def test_an_unexpected_restoration_fault_leaves_preview_truthfully_failed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The capture still succeeds, and preview reports the truth about itself.
+
+    Logging the fault is not enough: an operator reading preview status has to
+    see ``failed`` with an error, not a preview that claims to be starting while
+    holding a camera nothing will ever release.
+    """
+    injected = RuntimeError("programming error inside startup validation")
+    preview = _RestorationValidationExplodes(
+        _preview_config(),
+        build_preview_backend(SIMULATOR_BACKEND_NAME),
+        error=injected,
+    )
     expected = _capture_result()
     coordinator = _coordinator(
         _GatedCapture(result=expected), preview, restore_after_capture=True
     )
+    coordinator.start_preview()
+    assert _simulator_producers() == 1
 
     with caplog.at_level("ERROR"):
         result = coordinator.capture_image()
 
+    # The capture outcome is untouched.
     assert result is expected
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("unexpectedly" in message for message in messages), messages
+
+    status = preview.status()
+    assert status.state is PreviewState.FAILED
+    assert status.owner is None
+    assert status.started_at is None
+    assert status.uptime_seconds is None
+    assert status.last_error == UNEXPECTED_START_ERROR
+
+    # The restoration process was reaped: nothing holds the camera.
+    _await_no_camera_threads()
+    assert _simulator_producers() == 0
+    assert _readiness_readers() == 0
+
+    # The full original exception is still available for diagnosis.
+    assert "programming error inside startup validation" in caplog.text
+    coordinator.shutdown()
+
+
+def test_an_unexpected_restoration_fault_after_a_failed_capture() -> None:
+    """The original capture exception survives, and preview is still truthful."""
+    failure = BackendCaptureError("rpicam-still exited 1")
+    preview = _RestorationValidationExplodes(
+        _preview_config(),
+        build_preview_backend(SIMULATOR_BACKEND_NAME),
+        error=RuntimeError("programming error"),
+    )
+    coordinator = _coordinator(
+        _GatedCapture(error=failure), preview, restore_after_capture=True
+    )
+    coordinator.start_preview()
+
+    with pytest.raises(BackendCaptureError) as excinfo:
+        coordinator.capture_image()
+
+    assert excinfo.value is failure
+
+    status = preview.status()
+    assert status.state is PreviewState.FAILED
+    assert status.owner is None
+    assert status.started_at is None
+    assert status.uptime_seconds is None
+    assert status.last_error == UNEXPECTED_START_ERROR
+
+    _await_no_camera_threads()
+    assert _simulator_producers() == 0
+    assert _readiness_readers() == 0
+    coordinator.shutdown()
+
+
+def test_an_unexpected_restoration_fault_never_reaches_the_caller() -> None:
+    """The restoration exception is not what the capture caller sees."""
+    preview = _RestorationValidationExplodes(
+        _preview_config(),
+        build_preview_backend(SIMULATOR_BACKEND_NAME),
+        error=RuntimeError("programming error"),
+    )
+    coordinator = _coordinator(
+        _GatedCapture(), preview, restore_after_capture=True
+    )
+    coordinator.start_preview()
+
+    # No RuntimeError escapes; the capture simply returns.
+    result = coordinator.capture_image()
+
+    assert result.success is True
+    assert preview.status().state is PreviewState.FAILED
+    _await_no_camera_threads()
+    coordinator.shutdown()
 
 
 # --- serialisation ----------------------------------------------------------

@@ -141,6 +141,13 @@ class CameraCoordinator:
         reach the caller, because the caller asked for a *capture* and a caller
         told "capture failed" would retry a capture that actually succeeded,
         duplicating evidence in the archive.
+
+        Both failure kinds are truthful because
+        :meth:`PreviewService.start` settles its own state before raising --
+        expected failures keep the preview service's own error, unexpected ones
+        settle ``FAILED`` with a stable safe diagnostic and reap the process
+        they launched. Swallowing the exception here therefore hides nothing:
+        the outcome stays visible through preview status.
         """
         if not (self._restore_after_capture and was_running):
             # Either the policy is off, or preview was not running when the

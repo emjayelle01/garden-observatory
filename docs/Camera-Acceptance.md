@@ -30,6 +30,36 @@ dated record for a re-acceptance). Anything not actually performed stays
 `NOT PERFORMED`; anything not actually measured stays `NOT RECORDED`. Do not
 pre-fill a pass, and do not infer a value you did not read.
 
+## 0. Evidence commands must fail closed
+
+Every command in this procedure is read-only unless the gate it belongs to
+explicitly performs an authorised start, stop, capture, restart or reboot.
+
+Two shell helpers are used throughout. Define them once in the acceptance shell
+on the Pi; they exist so a broken check cannot be mistaken for a passing one.
+
+```bash
+mgo_get() { curl --noproxy '*' -fsS "http://127.0.0.1:8080$1"; }
+mgo_preview_count() { n=$(pgrep -c -x rpicam-vid || true); n=${n:-0}; if [ "$n" -eq 1 ]; then echo "PASS exactly one rpicam-vid"; else echo "FAIL expected exactly 1 rpicam-vid, found $n"; return 1; fi; }
+```
+
+Why each part matters:
+
+- `--noproxy '*'` — a proxy variable in the environment would otherwise send a
+  "local" check somewhere else entirely, and the reply would look like the Pi's.
+- `-f` — without it curl prints an HTTP 404 or 500 body and exits **0**. A
+  response body is not a passing endpoint check; the HTTP status is. With `-f`
+  a non-2xx status is a non-zero exit.
+- `-sS` — quiet, but errors are still shown.
+- literal `127.0.0.1` rather than `localhost` — no DNS or `/etc/hosts` lookup
+  stands between the check and the loopback interface.
+- `pgrep -c -x` with an explicit `-eq 1` — "at least one" is not the gate. Zero
+  processes and two processes are both failures, and both must be reported as
+  such rather than summarised as "preview is running".
+
+If a helper is not available, write the full form inline — never a bare
+`curl -s localhost:...`.
+
 ---
 
 ## 1. Hardware identification
@@ -305,7 +335,7 @@ Prove and record:
 - preview status remains truthful throughout.
 
 ```bash
-pgrep -a rpicam-vid; curl -s localhost:8080/camera/preview/status
+pgrep -a -x rpicam-vid; mgo_preview_count; mgo_get /camera/preview/status
 ```
 
 Do not claim frame-rate precision without measuring it. `15` is what MGO
@@ -329,6 +359,17 @@ Prove and record:
 - with `restore_after_capture = true`, preview returns to `running`;
 - the restored preview has exactly one physical process;
 - a capture begun while preview is stopped does **not** start preview.
+
+This is the only authorised write in the software checks — a capture is a
+deliberate act of the gate, not an incidental side effect of a status probe:
+
+```bash
+capture=$(curl --noproxy '*' -fsS -X POST http://127.0.0.1:8080/camera/capture) && echo "$capture" && mgo_get "/captures/$(echo "$capture" | python3 -c 'import json,sys; print(json.load(sys.stdin)["capture_id"])')" && mgo_preview_count
+```
+
+`-f` matters here more than anywhere else: without it a 503 (camera
+unavailable) or 504 (capture timeout) would print an error body and exit 0,
+and the gate would record a capture that never happened.
 
 Acceptance captures are real evidence and may remain in the production archive.
 **Do not commit them to Git.**
@@ -365,8 +406,11 @@ After `systemctl restart mgo.service`, verify:
 - no human preview-start action was required.
 
 ```bash
-systemctl is-active mgo.service; pgrep -c rpicam-vid; curl -s localhost:8080/camera/preview/status
+systemctl is-active mgo.service; mgo_preview_count; mgo_get /camera/preview/status; mgo_get /motion/status
 ```
+
+Each of those exits non-zero if its check fails, so the sequence stops being
+"output appeared" and starts being "the gate passed".
 
 ---
 
@@ -387,6 +431,14 @@ After an authorised reboot, verify:
 - the existing database and prior captures are still present;
 - the backup timer is still active;
 - no production configuration was replaced.
+
+```bash
+systemctl is-active mgo.service; mgo_preview_count; mgo_get /health; mgo_get /camera/status; mgo_get /database/status; systemctl is-active mgo-backup.timer
+```
+
+`mgo_preview_count` is what proves "exactly one preview process and no stale
+one" — a stale process from before the reboot would make the count two, which
+it reports as a failure rather than as "preview is running".
 
 ---
 
@@ -425,21 +477,21 @@ At each checkpoint record:
 | Service state | `systemctl is-active mgo.service` |
 | `MainPID` | `systemctl show -p MainPID mgo.service` |
 | `NRestarts` | `systemctl show -p NRestarts mgo.service` |
-| Camera readiness | `GET /camera/status` |
-| Preview state | `GET /camera/preview/status` |
-| Preview `started_at` | `GET /camera/preview/status` |
-| Preview uptime | `GET /camera/preview/status` |
-| Physical preview PID | `pgrep rpicam-vid` |
-| Database health | `GET /database/status` |
-| Pi temperature | `GET /health` |
-| Memory use | `GET /health` |
-| Disk use | `GET /health` |
+| Camera readiness | `mgo_get /camera/status` |
+| Preview state | `mgo_get /camera/preview/status` |
+| Preview `started_at` | `mgo_get /camera/preview/status` |
+| Preview uptime | `mgo_get /camera/preview/status` |
+| Physical preview PID | `pgrep -x rpicam-vid` (count checked with `mgo_preview_count`) |
+| Database health | `mgo_get /database/status` |
+| Pi temperature | `mgo_get /health` |
+| Memory use | `mgo_get /health` |
+| Disk use | `mgo_get /health` |
 | Journal errors | `journalctl -u mgo.service -p err --since ...` |
 | Malformed-frame or stream errors | journal |
 | Unexpected preview restarts | preview `started_at` + journal |
-| Capture count | `GET /captures` |
-| One controlled still where scheduled | `POST /camera/capture` |
-| Whether preview restored after that capture | `GET /camera/preview/status` |
+| Capture count | `mgo_get /captures` |
+| One controlled still where scheduled | `curl --noproxy '*' -fsS -X POST http://127.0.0.1:8080/camera/capture` |
+| Whether preview restored after that capture | `mgo_get /camera/preview/status` |
 
 **Do not claim continuous monitoring from a handful of snapshots.** Continuity is
 supported by service uptime, preview process uptime, `NRestarts` and journal

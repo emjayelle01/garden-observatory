@@ -509,41 +509,53 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         name="mgo-camera-monitor",
     )
 
-    # Managed preview: one start attempt, made here so it resolves BEFORE motion
-    # monitoring begins -- otherwise motion would open in "waiting_for_frames"
-    # even though frames were on their way. Off by default; the process
-    # management runs in a worker thread so it never blocks the event loop.
-    if config.preview.auto_start:
-        await asyncio.to_thread(_attempt_preview_auto_start, camera_coordinator)
-
     # Motion detection shares the preview stream via the broker (single camera
     # owner); it never starts preview or a second camera process. The state is
     # always attached so /motion/status is truthful even when disabled; the
-    # background monitor is only started when motion is enabled.
+    # background monitor is only started when motion is enabled, below.
     motion_state = MotionState()
     motion_state.set(default_motion_result(config.motion))
     app.state.motion_state = motion_state
     motion_stop_event = asyncio.Event()
+    # Declared before the cleanup scope opens so the ``finally`` below can always
+    # reason about it, whether or not the monitor was ever created.
     motion_task: asyncio.Task[None] | None = None
-    if config.motion.enabled:
-        # Material motion transitions become notification events, mirroring
-        # the camera wiring above.
-        def _publish_motion_transition(result: MotionResult) -> None:
-            notification_manager.publish(_motion_event(result))
 
-        motion_task = asyncio.create_task(
-            run_motion_monitor(
-                config,
-                motion_state,
-                BrokerFrameSource(app.state.preview_broker),
-                FrameDifferenceDetector(config.motion),
-                motion_stop_event,
-                transition_listener=_publish_motion_transition,
-            ),
-            name="mgo-motion-monitor",
-        )
-
+    # The cleanup scope deliberately opens BEFORE preview auto-start and before
+    # the motion monitor is created, not just around ``yield``. An unexpected
+    # exception during either would otherwise escape with the monitor tasks
+    # already running and a preview process already launched, leaving orphans
+    # that nothing would ever stop. Everything below therefore gets the same
+    # shutdown as a normal run, and the original exception is re-raised.
     try:
+        # Managed preview: one start attempt, made here so it resolves BEFORE
+        # motion monitoring begins -- otherwise motion would open in
+        # "waiting_for_frames" even though frames were on their way. Off by
+        # default; the process management runs in a worker thread so it never
+        # blocks the event loop.
+        if config.preview.auto_start:
+            await asyncio.to_thread(
+                _attempt_preview_auto_start, camera_coordinator
+            )
+
+        if config.motion.enabled:
+            # Material motion transitions become notification events, mirroring
+            # the camera wiring above.
+            def _publish_motion_transition(result: MotionResult) -> None:
+                notification_manager.publish(_motion_event(result))
+
+            motion_task = asyncio.create_task(
+                run_motion_monitor(
+                    config,
+                    motion_state,
+                    BrokerFrameSource(app.state.preview_broker),
+                    FrameDifferenceDetector(config.motion),
+                    motion_stop_event,
+                    transition_listener=_publish_motion_transition,
+                ),
+                name="mgo-motion-monitor",
+            )
+
         yield
     finally:
         stop_event.set()

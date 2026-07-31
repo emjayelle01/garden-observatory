@@ -44,6 +44,16 @@ Clock = Callable[[], datetime]
 _FORCE_KILL_REAP_SECONDS = 2.0
 _MAX_ERROR_LENGTH = 500
 
+#: The single, stable diagnostic published when a start fails for an
+#: *unexpected* reason (a programming defect rather than a camera problem).
+#:
+#: It is safe by construction: it is a constant. An unexpected exception's
+#: message is arbitrary application data and may carry a path, a username, an
+#: environment value, a secret, a memory address or control characters, so it is
+#: never rendered into a status response. The exception and its traceback go to
+#: the application log instead, which is where diagnosis belongs.
+UNEXPECTED_START_ERROR = "Preview startup failed unexpectedly."
+
 
 class PreviewState(StrEnum):
     """The lifecycle states of the preview subsystem.
@@ -178,17 +188,74 @@ class PreviewService:
         progress) never launches a duplicate process. Raises
         :class:`PreviewUnavailableError` when preview is disabled and
         :class:`PreviewStartError` when the process fails to start or stay up.
-        """
-        result = self._begin_start()
-        if isinstance(result, PreviewStatus):
-            # Already running, or a start is already in progress: return status.
-            return result
 
-        # Validate startup OUTSIDE the lock so status()/stop()/capture calls are
-        # never blocked during the (bounded) window.
-        process = result
-        failure = self._validate_startup(process)
-        return self._finish_start(process, failure)
+        Every invocation resolves the service into a truthful state. An
+        *unexpected* exception -- a programming defect anywhere in the startup
+        transaction -- is re-raised unchanged so callers can still tell it apart
+        from ordinary hardware absence, but only after the process this start
+        launched has been reaped and the service has settled into ``FAILED``
+        (see :meth:`_settle_unexpected_start`). A start can therefore never leave
+        preview reporting ``STARTING`` with a live process and no error.
+        """
+        process: PreviewProcess | None = None
+        try:
+            result = self._begin_start()
+            if isinstance(result, PreviewStatus):
+                # Already running, or a start is already in progress: return
+                # status.
+                return result
+
+            # Validate startup OUTSIDE the lock so status()/stop()/capture calls
+            # are never blocked during the (bounded) window.
+            process = result
+            failure = self._validate_startup(process)
+            return self._finish_start(process, failure)
+        except PreviewError:
+            # Expected preview failures already settled their own truthful
+            # state and error; that contract is unchanged.
+            raise
+        except BaseException:
+            # Cleanup and state settlement come FIRST: a failure while logging
+            # must never be what leaves a camera process running.
+            self._settle_unexpected_start(process)
+            LOGGER.exception("Preview startup failed unexpectedly")
+            # Re-raised unchanged, and deliberately NOT wrapped in a
+            # PreviewError: lifespan auto-start distinguishes a programming
+            # defect from an expected hardware failure by exception type.
+            raise
+
+    def _settle_unexpected_start(self, process: PreviewProcess | None) -> None:
+        """Reap ``process`` and settle ``FAILED`` after an unexpected fault.
+
+        Ownership is proven before the state is rewritten: if a concurrent stop
+        or capture already superseded this start, its process is still fully
+        reaped -- the camera must never be left held -- but the later, valid
+        state is not overwritten with this start's failure.
+
+        Never raises: it runs on the way out of an already-failing call, and an
+        exception here would replace the original fault with a less informative
+        one.
+        """
+        try:
+            with self._lock:
+                owns_process = process is not None and self._process is process
+                if process is not None:
+                    # Idempotent with a concurrent stop that already terminated
+                    # it. Closing the process also releases its stdout pipe,
+                    # which unblocks and ends the startup-readiness reader.
+                    self._discard_process(process)
+                if owns_process or (
+                    process is None and self._state is PreviewState.STARTING
+                ):
+                    self._process = None
+                    self._started_at = None
+                    self._last_error = UNEXPECTED_START_ERROR
+                    self._state = PreviewState.FAILED
+        except Exception:
+            LOGGER.exception(
+                "Preview cleanup after an unexpected startup failure did not "
+                "complete"
+            )
 
     def _validate_startup(self, process: PreviewProcess) -> str | None:
         """Confirm the process reached a healthy running state, or say why not.

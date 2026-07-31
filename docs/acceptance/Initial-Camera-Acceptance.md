@@ -92,7 +92,7 @@ filled only by the authorised acceptance run.
 | Detected camera index | NOT RECORDED |
 | Detected sensor | Sony IMX708 / Camera Module 3 Standard (recorded after Task 11) |
 | Supported sensor modes | NOT RECORDED |
-| Field of view variant | Standard (not wide) |
+| Field of view variant | NOT RECORDED (expected: Standard, not Wide) |
 | Ribbon-cable type | NOT RECORDED |
 | Ribbon-cable length | NOT RECORDED |
 | Camera mounting method | NOT RECORDED |
@@ -104,8 +104,16 @@ filled only by the authorised acceptance run.
 | Camera orientation | NOT RECORDED |
 | Protective lens film removed | NOT RECORDED |
 
-The two pre-populated values come from the completed Task 11 deployment. They are
-software-side observations (what MGO detects), not physical measurements.
+Exactly two values in this section are pre-populated — **architecture** and
+**detected sensor** — and both come from the completed Task 11 deployment. They
+are software-side observations (what MGO detected on the production host), not
+physical measurements. Everything else here, including the field-of-view
+variant, is `NOT RECORDED`: the brief's *expected* installation is written
+alongside it as an expectation to confirm, never as a result.
+
+Section 3 likewise pre-populates only what the project itself defines — the
+host name, that there is one camera and that there are four feeders — and
+nothing that has to be observed at the window.
 
 ## 6. Cable and connector
 

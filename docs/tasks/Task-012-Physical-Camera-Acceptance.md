@@ -2,8 +2,9 @@
 
 ## Status
 
-**Implementation complete and locally validated; physical camera acceptance not
-performed.**
+**Implementation corrected and locally revalidated after repository review;
+Raspberry Pi validation and physical camera acceptance not performed. Awaiting
+repository re-review.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -14,7 +15,8 @@ performed.**
 | Mutation / negative verification | Passed — all 18 defects detected |
 | Local runtime validation (simulator) | Passed |
 | Auto-start failure runtime validation | Passed |
-| Repository review | Not started |
+| Repository review | **Round 1 complete** — two blocking defects found and corrected |
+| Repository re-review | Not started |
 | Raspberry Pi validation of this branch | **Not performed** — the Pi was not accessed |
 | Physical camera acceptance run | **Not performed** — requires separate authorisation |
 | Matthew's visual sign-off | **Not given** |
@@ -488,6 +490,172 @@ the external production configuration and restart `mgo.service`.
 No automatic production rollback script is written. No database rollback, no
 migration rollback and no media deletion are required.
 
+## Repository-review correction — unexpected failure cleanup
+
+Review round 1 found two blocking defects. Both were reproduced against the
+unmodified branch before anything was changed. Neither affects the expected
+failure paths, and neither changes an endpoint, a response field, a preview
+state, a physical command or a production default.
+
+### Defect 1 — an unexpected restoration fault left preview lying about itself
+
+`CameraCoordinator._restore_preview_if_requested` caught an unexpected exception
+and logged it, which correctly protected the capture's outcome. But
+`PreviewService.start()` had no unexpected-exception handling of its own: if a
+fault occurred *after* the process was launched and before startup validation
+finished, the service was left in `STARTING`, still reporting
+`owner: preview`, with `started_at: null`, `last_error: null` — and a live camera
+process nothing would ever release.
+
+Reproduced by injecting a `RuntimeError` at the production
+`PreviewService._validate_startup` boundary during restoration, with the real
+`PreviewService`, the real `CameraCoordinator` and the Task 11 simulator backend:
+
+```text
+capture result returned (success=True)   <- correct
+preview state       : starting           <- wrong
+preview owner       : preview            <- wrong
+preview last_error  : None               <- wrong
+simulator producers : 1                  <- leaked
+```
+
+The same result appeared with a failed capture: the original
+`BackendCaptureError` still propagated correctly, while preview truth was wrong
+in exactly the same way.
+
+**Root cause.** The transaction protected the *capture's* truth and forgot the
+*preview's*. `start()` settled a truthful state for every expected failure and
+for success, but an unexpected exception simply escaped the middle of the
+transaction, leaving the intermediate `STARTING` state and the launched process
+as the observable result.
+
+### Defect 2 — an unexpected auto-start fault escaped before cleanup existed
+
+Lifespan preview auto-start ran *before* the `try/finally` that stops the
+monitors and the camera. An unexpected exception therefore left the application
+with no cleanup at all.
+
+Reproduced with the real lifespan and the simulator backend:
+
+```text
+reached yield              : False
+exception escaped lifespan : RuntimeError: ...
+live monitor tasks         : ['mgo-camera-monitor(done=False)',
+                              'mgo-database-monitor(done=False)']
+simulator producers        : 1
+preview state              : starting
+```
+
+**Root cause.** The cleanup scope was drawn around `yield` — around *serving* —
+rather than around everything the lifespan had already created. Auto-start was
+the first startup step placed after resource creation and before that scope, so
+it was the first step whose failure could orphan them.
+
+### Correction
+
+**`PreviewService.start()` now resolves every invocation.** The whole startup
+transaction (`_begin_start`, `_validate_startup`, `_finish_start`) is wrapped.
+`PreviewError` is re-raised untouched, so the expected failure contract is
+unchanged. An unexpected exception goes through `_settle_unexpected_start()`
+first: the process this start launched is fully terminated, reaped and closed —
+which also releases the startup-readiness reader thread by closing its pipe —
+`_process` and `_started_at` are cleared, the state settles `FAILED`, and a
+stable diagnostic is recorded. Only then is the exception logged, and only then
+re-raised **unchanged**.
+
+Ownership is proven before the state is rewritten: if a concurrent stop or
+capture already superseded this start, the losing start still reaps its own
+process (the camera must never stay held) but does not overwrite the later,
+valid state.
+
+**The diagnostic is safe by construction.** `last_error` becomes the constant
+`Preview startup failed unexpectedly.` — never `str(exc)`, `repr(exc)`, the
+exception's arguments or a traceback. An exception message is arbitrary
+application data and may carry a path, a username, an environment value, a
+secret, an address or control characters; none of that belongs in an API
+response. The full exception and traceback go to `LOGGER.exception`, which is
+where diagnosis belongs. This is the same boundary Task 11 established for
+simulator producer failures.
+
+The exception is deliberately **not** converted into a `PreviewError`: lifespan
+auto-start distinguishes a programming defect from an expected hardware failure
+by exception type, and collapsing the two would make a bug look like an absent
+camera.
+
+**The lifespan cleanup scope now opens before auto-start**, before motion-monitor
+creation and before `yield`. `motion_task` is declared ahead of it so the
+`finally` can always reason about it. An unexpected exception during either step
+now gets the same shutdown a normal run gets — every monitor stop event is
+signalled, every monitor task is awaited, `CameraCoordinator.shutdown()` runs
+(so it also waits for any in-flight capture transaction) — and the original
+exception is then re-raised.
+
+### New tests
+
+- **`tests/test_preview.py`** — unexpected startup faults settle `FAILED` and
+  reap the process; the exception is re-raised unchanged (identity-checked, and
+  asserted *not* to be a `PreviewError`); a hostile exception message reaches
+  neither `last_error` nor any status field; the original exception and its
+  traceback reach the log; a superseded start does not overwrite the winner's
+  state but still releases the camera; the startup-readiness reader thread is
+  released (the fault is injected *after* the real readiness wait, with a
+  process whose pipe never produces a frame, so a reader is genuinely blocked at
+  the moment of the fault); expected failures keep their own error.
+- **`tests/test_camera_coordinator.py`** — the previous unexpected-restoration
+  test overrode the whole `start()` method and asserted only capture preservation
+  and logging, so it exercised none of the production startup transaction and
+  proved nothing about preview truth. It is replaced by three tests that inject
+  at `_validate_startup` and assert the full invariant — state, owner,
+  `started_at`, `uptime_seconds`, the exact diagnostic, zero producer and reader
+  threads, the original exception in the log — for a successful capture, for a
+  failed capture, and for the rule that the restoration exception never reaches
+  the caller.
+- **`tests/test_app_routes.py`** — an unexpected auto-start fault propagates
+  unchanged while every monitor is signalled and awaited, the coordinator
+  shutdown runs, the motion monitor is never created, and no task, producer or
+  reader survives (all inspected *inside* the running loop, before `asyncio.run`
+  can hide a leak); the same for an unexpected fault during motion-monitor
+  creation; expected auto-start failure still reaches `yield` and keeps serving;
+  and motion loses frames while a capture owns the camera and gets them back from
+  the restored preview generation.
+
+### Acceptance-command hardening
+
+Operator evidence commands in `docs/Camera-Acceptance.md` now fail closed. Two
+helpers replace ad-hoc invocations:
+
+```bash
+mgo_get() { curl --noproxy '*' -fsS "http://127.0.0.1:8080$1"; }
+mgo_preview_count() { n=$(pgrep -c -x rpicam-vid || true); n=${n:-0}; if [ "$n" -eq 1 ]; then echo "PASS exactly one rpicam-vid"; else echo "FAIL expected exactly 1 rpicam-vid, found $n"; return 1; fi; }
+```
+
+`curl -s localhost:8080/...` printed a 404 or 500 body and exited **0** — a
+response body is not a passing endpoint check — and honoured a proxy variable
+that could send a "local" check to another host. `pgrep -c` without an explicit
+`-eq 1` treated two preview processes as a pass. Both are now errors. A test
+asserts every runnable `curl` line in the guide carries `--noproxy '*'`, `-fsS`
+and a literal `127.0.0.1`, that none names `localhost`, that the exactly-one
+process gate exists, and that the only write is the capture the gate performs
+deliberately.
+
+### Validation
+
+Ruff passed; mypy passed for 50 source files; the full suite passed with no new
+skip and no thread or unraisable warning under escalation. Mutations A–E (state
+settlement removed, process cleanup removed, cleanup scope moved back out,
+`str(exc)` inserted into the diagnostic, bare `curl -s localhost` restored) were
+each applied independently, each detected, and each reverted byte-for-byte.
+Local runtime revalidation re-ran the simulator run on `127.0.0.1:8126` and added
+motion recovery after capture restoration, plus in-process runs of unexpected
+restoration (successful and failed capture) and unexpected auto-start cleanup.
+
+### Unchanged by this correction
+
+The Raspberry Pi was not accessed. The physical camera acceptance run has not
+been performed. Every gate in `docs/acceptance/Initial-Camera-Acceptance.md`
+remains `PENDING` / `NOT PERFORMED` / `NOT RECORDED`, and Matthew's sign-off
+remains `NOT GIVEN`.
+
 ## Deviations
 
 Recorded for the reviewer. None changes production behaviour.
@@ -523,6 +691,16 @@ Recorded for the reviewer. None changes production behaviour.
    commit defined the task with the software gates marked in progress; leaving
    them that way after the work was finished would have made the record untrue.
    The physical gates were not touched.
+7. **A sixth commit exists.** The original plan specified exactly five. Review
+   round 1 separately authorised one correction commit,
+   `Harden managed preview failure cleanup`, so the branch carries six. No
+   existing commit was amended, rebased, squashed or force-pushed.
+8. **The motion-recovery test slows the simulator capture.** It patches
+   `SimulatorCaptureBackend.capture` (at test level; the Task 11 source is
+   untouched) to take ~0.8 s, so the window in which no preview producer exists
+   is longer than a motion analysis interval. Without it the test would be
+   racing the sampler rather than proving recovery, and a real `rpicam-still`
+   capture takes far longer than 0.8 s anyway.
 
 ## Known limitations
 
@@ -543,6 +721,14 @@ Recorded for the reviewer. None changes production behaviour.
 - Preview restoration failure is visible through preview status and the
   application log, not in the capture response. A client that only reads the
   capture response will not learn that preview did not come back.
+- An *unexpected* preview startup failure publishes one constant diagnostic.
+  Distinguishing *kinds* of programming defect requires the application log; the
+  status response deliberately carries no exception detail at all.
+- The lifespan cleanup scope opens immediately before auto-start. An unexpected
+  fault in an earlier startup step — for example the initial camera readiness
+  check — would still escape with the health and database monitors running.
+  Widening the scope further would mean restructuring startup beyond this
+  correction, and no such fault is known.
 - No numerical subject-scale threshold is asserted. Measurements are recorded so
   a later model-selection task can set thresholds from evidence rather than
   guesswork.
