@@ -54,6 +54,29 @@ _MAX_ERROR_LENGTH = 500
 #: the application log instead, which is where diagnosis belongs.
 UNEXPECTED_START_ERROR = "Preview startup failed unexpectedly."
 
+#: The stable operational reason published when the startup readiness reader
+#: cannot read the preview process's stream. Like every other expected startup
+#: failure it is a bounded, non-sensitive phrase: the exception's own message
+#: could name a path or a device and adds nothing an operator can act on, so it
+#: goes to the log instead.
+_STREAM_READ_FAILURE = "stream read failed during startup"
+
+
+@dataclass
+class _ReadinessOutcome:
+    """What the startup-readiness reader thread observed.
+
+    A typed carrier rather than a loose dict: the distinction between "the
+    stream could not be read" (expected, operational) and "the reader itself is
+    broken" (unexpected, a defect) is the whole point, and it must not depend on
+    which string key happened to be set.
+    """
+
+    frame: bool = False
+    eof: bool = False
+    stream_error: bool = False
+    unexpected: Exception | None = None
+
 
 class PreviewState(StrEnum):
     """The lifecycle states of the preview subsystem.
@@ -291,20 +314,42 @@ class PreviewService:
         broker only reads once the state is ``RUNNING`` (its stream endpoint
         returns 409 while starting), so this never competes with it. Reading
         here keeps the pipe from filling during the window. Returns ``None`` on
-        the first frame, or a failure reason on EOF/early-exit, error or timeout.
+        the first frame, or a failure reason on EOF/early-exit, stream I/O
+        failure or timeout.
+
+        The reader runs on another thread, so a failure there has to be carried
+        back deliberately. It is classified, not merely reported: an ordinary
+        stream-operation failure becomes the stable operational reason
+        :data:`_STREAM_READ_FAILURE` (and so an expected ``PreviewStartError``),
+        while anything else is a programming defect whose original exception is
+        re-raised **in this thread** for the transaction handler in
+        :meth:`start` to settle. Either way the reader thread exits normally, so
+        it can never surface as an unhandled-thread warning.
         """
-        outcome: dict[str, object] = {}
+        outcome = _ReadinessOutcome()
         done = threading.Event()
 
         def _drain() -> None:
             try:
                 for _frame in parse_mjpeg_frames(stream):
-                    outcome["frame"] = True
+                    outcome.frame = True
                     break
                 else:
-                    outcome["eof"] = True
-            except Exception as exc:  # reading a torn-down pipe, etc.
-                outcome["error"] = repr(exc)
+                    outcome.eof = True
+            except (OSError, ValueError):
+                # Ordinary stream-operation failure: a torn-down pipe, a closed
+                # stream, a device read error. Nothing about the exception is
+                # recorded -- its message is arbitrary data and the operational
+                # fact ("the stream could not be read") is what a status
+                # consumer needs. The detail goes to the log below.
+                LOGGER.warning(
+                    "Preview startup stream read failed", exc_info=True
+                )
+                outcome.stream_error = True
+            except Exception as exc:
+                # A defect in the reader path itself. Carried back untouched so
+                # the caller can re-raise the original object.
+                outcome.unexpected = exc
             finally:
                 done.set()
 
@@ -316,16 +361,21 @@ class PreviewService:
             # Alive but silent: the caller reaps the process, which closes the
             # pipe and lets this daemon reader unblock and exit.
             return "did not produce a frame within the startup window"
-        if outcome.get("frame"):
+        if outcome.unexpected is not None:
+            # Re-raised on the calling thread, unchanged, so start() applies the
+            # unexpected-start contract to it exactly as it would to a defect
+            # raised here directly.
+            raise outcome.unexpected
+        if outcome.frame:
             return None
-        if outcome.get("eof"):
+        if outcome.eof:
             exit_code = process.poll()
             detail = process.read_error()
             code_text = "unknown" if exit_code is None else str(exit_code)
             return f"exited during startup with code {code_text}" + (
                 f": {detail}" if detail else ""
             )
-        return f"stream error during startup: {outcome.get('error')}"
+        return _STREAM_READ_FAILURE
 
     def _begin_start(self) -> PreviewProcess | PreviewStatus:
         """Launch phase (locked). Return the process, or a status to short-circuit."""
@@ -357,15 +407,21 @@ class PreviewService:
             try:
                 process = self._backend.start(self._config)
             except PreviewError as exc:
+                # An *expected* launch failure. The backend adapter is
+                # responsible for mapping operating-system and camera failures
+                # (missing tool, permission denial, launch OSError, refused
+                # configuration) into the preview domain before they get here,
+                # so this message is a bounded operational one.
                 self._fail_locked(str(exc))
                 LOGGER.error("Preview failed to start: %s", exc)
                 raise
-            except Exception as exc:  # unexpected backend fault
-                self._fail_locked(str(exc))
-                LOGGER.exception("Preview backend raised an unexpected error")
-                raise PreviewStartError(
-                    f"Preview backend failed unexpectedly: {exc}"
-                ) from exc
+            # Anything that is *not* a PreviewError is a violation of the
+            # backend contract -- a programming defect, not a camera problem.
+            # It is deliberately NOT caught here: it escapes to the transaction
+            # handler in start(), which settles FAILED with the constant safe
+            # diagnostic and re-raises the original object. Rendering it into a
+            # PreviewStartError here would have made a bug indistinguishable
+            # from an absent camera *and* published arbitrary exception text.
 
             self._process = process
             LOGGER.info(

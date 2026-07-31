@@ -8,6 +8,8 @@ command that does not exist.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
 import os
 import threading
@@ -18,6 +20,7 @@ from typing import IO
 
 import pytest
 
+import mgo.camera.preview_backend as preview_backend_module
 from mgo.camera.exceptions import (
     PreviewError,
     PreviewStartError,
@@ -41,6 +44,42 @@ from mgo.camera.preview_backend import (
 from mgo.core.config import PreviewConfig
 
 _T0 = datetime(2026, 7, 24, 9, 0, 0, tzinfo=UTC)
+
+#: A deliberately hostile exception message. An exception's text is arbitrary
+#: application data, so the one used to prove diagnostics are safe carries every
+#: category worth worrying about: Windows, POSIX and UNC paths, environment- and
+#: secret-looking values, a memory address, newlines and tabs, an ANSI control
+#: sequence, and Unicode direction overrides.
+_HOSTILE_MESSAGE = (
+    "C:\\Users\\MatthewLewis\\private.toml "
+    "\\\\fileserver\\share\\camera.log "
+    "/etc/garden-observatory/mgo.toml "
+    "MGO_SECRET=hunter2 token=sk-live-abcdef 0xDEADBEEF"
+    "\n\tsecond line\x1b[31m\u202e\u200f"
+)
+
+_HOSTILE_FRAGMENTS = (
+    "MatthewLewis",
+    "private.toml",
+    "\\\\fileserver\\share",
+    "/etc/garden-observatory",
+    "MGO_SECRET",
+    "hunter2",
+    "sk-live-abcdef",
+    "0xDEADBEEF",
+    "\x1b",
+    "\u202e",
+    "\u200f",
+    "\n",
+    "\t",
+)
+
+
+def _assert_no_hostile_fragment(text: str | None) -> None:
+    """Assert no part of :data:`_HOSTILE_MESSAGE` survived into ``text``."""
+    assert text is not None
+    for fragment in _HOSTILE_FRAGMENTS:
+        assert fragment not in text, repr(fragment)
 
 
 class _FakeClock:
@@ -199,15 +238,49 @@ def test_failed_launch_transitions_to_failed() -> None:
     assert "no encoder" in status.last_error
 
 
-def test_unexpected_backend_error_is_wrapped_as_start_error() -> None:
-    """A non-preview backend exception is wrapped and marks the service FAILED."""
-    backend = MockPreviewBackend(error=RuntimeError("boom"))
+def test_unexpected_backend_error_propagates_unchanged() -> None:
+    """A non-PreviewError from a backend is a defect, not a camera failure.
+
+    Rendering it into a ``PreviewStartError`` would make a programming bug
+    indistinguishable from an absent camera -- lifespan auto-start would catch
+    it and serve on -- *and* would publish the exception's arbitrary text.
+    """
+    injected = RuntimeError(_HOSTILE_MESSAGE)
+    backend = MockPreviewBackend(error=injected)
     service = _service(backend)
 
-    with pytest.raises(PreviewStartError):
+    with pytest.raises(RuntimeError) as excinfo:
         service.start()
 
-    assert service.status().state is PreviewState.FAILED
+    assert excinfo.value is injected
+    assert not isinstance(excinfo.value, PreviewError)
+
+    status = service.status()
+    assert status.state is PreviewState.FAILED
+    assert status.owner is None
+    assert status.started_at is None
+    assert status.uptime_seconds is None
+    assert status.last_error == UNEXPECTED_START_ERROR
+    _assert_no_hostile_fragment(status.last_error)
+    # No process was ever launched, so nothing can be left behind.
+    assert backend.last_process is None
+    assert _readiness_readers() == 0
+
+
+def test_the_backend_fault_traceback_reaches_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The detail an operator actually needs is preserved -- in the log."""
+    service = _service(MockPreviewBackend(error=RuntimeError(_HOSTILE_MESSAGE)))
+
+    with caplog.at_level("ERROR"), pytest.raises(RuntimeError):
+        service.start()
+
+    assert "Preview startup failed unexpectedly" in caplog.text
+    # The full exception -- the part deliberately kept out of the API -- is
+    # still there for whoever has to diagnose it.
+    for fragment in ("MatthewLewis", "MGO_SECRET", "0xDEADBEEF", "RuntimeError"):
+        assert fragment in caplog.text, fragment
 
 
 def test_process_exit_during_startup_is_start_failure() -> None:
@@ -442,6 +515,13 @@ def _readiness_readers() -> int:
     )
 
 
+def _await_no_readiness_readers() -> None:
+    """Wait, bounded, for every readiness reader thread to exit."""
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and _readiness_readers():
+        time.sleep(0.02)
+
+
 class _ValidationExplodes(PreviewService):
     """A real preview service whose startup validation fails unexpectedly.
 
@@ -504,10 +584,7 @@ def test_the_unexpected_start_diagnostic_leaks_nothing() -> None:
     username, an environment value, a secret, an address or control characters.
     None of it may reach a status response.
     """
-    hostile = RuntimeError(
-        "C:\\Users\\MatthewLewis\\secret.toml MGO_SECRET=hunter2 "
-        "0xDEADBEEF \x1b[31m\x00 /etc/garden-observatory/mgo.toml"
-    )
+    hostile = RuntimeError(_HOSTILE_MESSAGE)
     service = _ValidationExplodes(_config(), MockPreviewBackend(), error=hostile)
 
     with pytest.raises(RuntimeError):
@@ -515,18 +592,7 @@ def test_the_unexpected_start_diagnostic_leaks_nothing() -> None:
 
     last_error = service.status().last_error
     assert last_error == UNEXPECTED_START_ERROR
-    for fragment in (
-        "MatthewLewis",
-        "secret.toml",
-        "MGO_SECRET",
-        "hunter2",
-        "0xDEADBEEF",
-        "\x1b",
-        "\x00",
-        "/etc/",
-        "C:\\",
-    ):
-        assert fragment not in last_error
+    _assert_no_hostile_fragment(last_error)
 
 
 def test_the_original_unexpected_exception_reaches_the_log(
@@ -672,6 +738,223 @@ def test_an_unexpected_start_releases_the_readiness_reader() -> None:
     assert process.closed is True
     assert service.status().state is PreviewState.FAILED
     assert service.status().last_error == UNEXPECTED_START_ERROR
+
+
+# --- the two sides of the classification ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PreviewUnavailableError("Preview tool 'rpicam-vid' is not installed."),
+        PreviewStartError("Failed to launch preview tool 'rpicam-vid': denied"),
+    ],
+)
+def test_expected_backend_errors_pass_through_unchanged(
+    error: PreviewError,
+) -> None:
+    """An operational failure keeps its own type, object and message.
+
+    These are the failures a deployment legitimately hits -- absent tooling, a
+    refused launch -- and lifespan auto-start is entitled to catch them and keep
+    serving. Collapsing them into the unexpected diagnostic would throw away the
+    only actionable information an operator has.
+    """
+    service = _service(MockPreviewBackend(error=error))
+
+    with pytest.raises(PreviewError) as excinfo:
+        service.start()
+
+    assert excinfo.value is error
+    status = service.status()
+    assert status.state is PreviewState.FAILED
+    assert status.last_error is not None
+    assert str(error) in status.last_error
+    assert status.last_error != UNEXPECTED_START_ERROR
+
+
+def test_the_real_launcher_maps_a_missing_command_to_unavailable() -> None:
+    """The adapter -- not the service -- classifies an absent camera tool."""
+    with pytest.raises(PreviewUnavailableError):
+        launch_preview_subprocess(["mgo-no-such-preview-command"])
+
+
+def test_the_real_launcher_maps_an_os_error_to_a_start_error() -> None:
+    """An ordinary launch OSError is expected, and is mapped by the adapter."""
+
+    def _refuse(*args: object, **kwargs: object) -> None:
+        raise OSError("permission denied")
+
+    original = preview_backend_module.subprocess.Popen
+    preview_backend_module.subprocess.Popen = _refuse  # type: ignore[assignment]
+    try:
+        with pytest.raises(PreviewStartError):
+            launch_preview_subprocess(["rpicam-vid"])
+    finally:
+        preview_backend_module.subprocess.Popen = original  # type: ignore[assignment]
+
+
+def test_the_null_backend_remains_an_expected_unavailable_failure() -> None:
+    """The null backend is a deliberate absence, never a programming defect."""
+    service = PreviewService(_config(), NullPreviewBackend())
+
+    with pytest.raises(PreviewUnavailableError):
+        service.start()
+
+    status = service.status()
+    assert status.state is PreviewState.FAILED
+    assert status.last_error is not None
+    assert status.last_error != UNEXPECTED_START_ERROR
+    assert "never starts" in status.last_error
+
+
+# --- startup stream classification ------------------------------------------
+#
+# The readiness reader runs on another thread, so what it observed has to be
+# carried back deliberately. An ordinary stream-operation failure is an expected
+# camera problem; a defect in the reader path is not, and the two must not share
+# a diagnostic.
+
+
+class _FailingStream(io.RawIOBase):
+    """A byte stream whose reads always raise the configured exception."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self._error = error
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: object) -> int:
+        raise self._error
+
+
+class _StreamProcess:
+    """A preview process handing out a caller-supplied frame stream."""
+
+    def __init__(self, stream: IO[bytes]) -> None:
+        self._stream = stream
+        self.terminated = False
+        self.closed = False
+        self._alive = True
+
+    @property
+    def pid(self) -> int | None:
+        return 4321
+
+    def poll(self) -> int | None:
+        return None if self._alive else 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self._alive = False
+
+    def kill(self) -> None:
+        self._alive = False
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        return None if self._alive else 0
+
+    def read_error(self) -> str:
+        return ""
+
+    def frame_stream(self) -> IO[bytes]:
+        return self._stream
+
+    def close(self) -> None:
+        self.closed = True
+        self._stream.close()
+
+
+def _stream_service(error: BaseException) -> tuple[PreviewService, _StreamProcess]:
+    """Build a service whose process stream fails with ``error`` on read."""
+    process = _StreamProcess(_FailingStream(error))  # type: ignore[arg-type]
+
+    class _Backend:
+        @property
+        def name(self) -> str:
+            return "stream"
+
+        def start(self, config: PreviewConfig) -> PreviewProcess:
+            return process  # type: ignore[return-value]
+
+    service = PreviewService(
+        _config(startup=1.0, shutdown=0.5),
+        _Backend(),  # type: ignore[arg-type]
+    )
+    return service, process
+
+
+def test_an_expected_stream_io_failure_is_an_operational_start_error() -> None:
+    """A stream that cannot be read is a camera problem, not a defect."""
+    service, process = _stream_service(OSError(_HOSTILE_MESSAGE))
+
+    with pytest.raises(PreviewStartError) as excinfo:
+        service.start()
+
+    assert isinstance(excinfo.value, PreviewError)
+    status = service.status()
+    assert status.state is PreviewState.FAILED
+    assert status.last_error is not None
+    assert "stream read failed during startup" in status.last_error
+    # The exception's own text names a device or a path and helps nobody here.
+    _assert_no_hostile_fragment(status.last_error)
+    _assert_no_hostile_fragment(str(excinfo.value))
+    assert process.closed is True
+    _await_no_readiness_readers()
+
+
+def test_a_closed_stream_value_error_is_also_operational() -> None:
+    """A read against a torn-down stream stays an expected failure."""
+    service, _process = _stream_service(
+        ValueError("I/O operation on closed file")
+    )
+
+    with pytest.raises(PreviewStartError, match="stream read failed"):
+        service.start()
+
+    assert service.status().state is PreviewState.FAILED
+    _await_no_readiness_readers()
+
+
+def test_an_unexpected_stream_fault_propagates_unchanged() -> None:
+    """A defect in the reader path keeps its own exception object."""
+    injected = RuntimeError(_HOSTILE_MESSAGE)
+    service, process = _stream_service(injected)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        service.start()
+
+    assert excinfo.value is injected
+    assert not isinstance(excinfo.value, PreviewError)
+    status = service.status()
+    assert status.state is PreviewState.FAILED
+    assert status.owner is None
+    assert status.started_at is None
+    assert status.uptime_seconds is None
+    assert status.last_error == UNEXPECTED_START_ERROR
+    _assert_no_hostile_fragment(status.last_error)
+    assert process.closed is True
+    _await_no_readiness_readers()
+
+
+def test_the_readiness_reader_never_raises_into_its_own_thread() -> None:
+    """Whatever the reader hits, the thread ends normally.
+
+    An exception escaping a thread would surface as an unhandled-thread warning
+    and, worse, would be reported nowhere the caller can classify it.
+    """
+    for error in (
+        OSError(_HOSTILE_MESSAGE),
+        ValueError("I/O operation on closed file"),
+        RuntimeError(_HOSTILE_MESSAGE),
+    ):
+        service, _process = _stream_service(error)
+        with contextlib.suppress(PreviewError, RuntimeError):
+            service.start()
+        _await_no_readiness_readers()
+        assert _readiness_readers() == 0
 
 
 def test_expected_start_failures_keep_their_own_error() -> None:

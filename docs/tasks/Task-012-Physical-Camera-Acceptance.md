@@ -2,9 +2,9 @@
 
 ## Status
 
-**Implementation corrected and locally revalidated after repository review;
+**Implementation corrected and locally revalidated after repository re-review;
 Raspberry Pi validation and physical camera acceptance not performed. Awaiting
-repository re-review.**
+final repository review.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -16,7 +16,8 @@ repository re-review.**
 | Local runtime validation (simulator) | Passed |
 | Auto-start failure runtime validation | Passed |
 | Repository review | **Round 1 complete** — two blocking defects found and corrected |
-| Repository re-review | Not started |
+| Repository re-review | **Round 2 complete** — one blocking classification defect found and corrected |
+| Final repository review | Not started |
 | Raspberry Pi validation of this branch | **Not performed** — the Pi was not accessed |
 | Physical camera acceptance run | **Not performed** — requires separate authorisation |
 | Matthew's visual sign-off | **Not given** |
@@ -656,6 +657,148 @@ been performed. Every gate in `docs/acceptance/Initial-Camera-Acceptance.md`
 remains `PENDING` / `NOT PERFORMED` / `NOT RECORDED`, and Matthew's sign-off
 remains `NOT GIVEN`.
 
+## Repository re-review correction 2 — complete startup fault classification
+
+Round 1 established the unexpected-start contract for faults raised inside
+`_validate_startup` and `_finish_start`. Re-review found the contract was not
+applied consistently: one part of the same transaction still classified faults
+the old way, and the readiness reader still rendered exception text.
+
+### Defect 3 — a backend programming defect was classified as a camera failure
+
+`_begin_start` caught *every* non-`PreviewError` from `PreviewBackend.start()`,
+rendered `str(exc)` into `last_error`, and re-raised it as a `PreviewStartError`.
+A programming defect in a backend was therefore indistinguishable from an absent
+camera: lifespan auto-start caught it, the application served on, and the
+arbitrary exception text was published through preview status.
+
+Reproduced against the unmodified branch with a backend raising a hostile
+`RuntimeError` through the real `PreviewService.start()` path:
+
+```text
+raised type                   : PreviewStartError   <- wrong
+raised object is injected     : False               <- wrong
+raised is a PreviewError      : True                <- wrong
+state                         : failed
+last_error contains 'MGO_SECRET' : True             <- leak
+last_error contains 'hunter2'    : True             <- leak
+last_error contains '0xDEADBEEF' : True             <- leak
+```
+
+and through the real lifespan with `auto_start = true`:
+
+```text
+lifespan reached yield      : True                  <- wrong
+exception escaped lifespan  : None                  <- wrong
+GET /health status          : 200
+preview state               : failed
+status leaks 'MatthewLewis' : True                  <- leak
+status leaks 'MGO_SECRET'   : True                  <- leak
+```
+
+### Defect 4 — the readiness reader rendered exception text
+
+`_await_first_frame` stored `repr(exc)` for *any* reader exception and turned it
+into `stream error during startup: <repr>`. That both published arbitrary text
+and collapsed two different things into one: an ordinary stream-read failure
+(operational) and a defect in the reader path (a bug) produced the same expected
+`PreviewStartError`.
+
+### Root cause
+
+The classification lived at the wrong altitude. Round 1 put the
+expected/unexpected decision in `start()`, but two inner steps had already made
+their own decision *before* the transaction handler could see the exception:
+`_begin_start` decided every backend fault was operational, and the reader
+decided every reader fault was operational. A boundary that a caller can bypass
+is not a boundary.
+
+### Correction
+
+**One contract for the whole transaction.** `_begin_start` now catches
+`PreviewError` only. Anything else is a violation of the backend contract and is
+allowed to escape to `start()`, which settles `FAILED`, publishes
+`UNEXPECTED_START_ERROR`, logs the traceback and re-raises the original object.
+There is no second settlement in `_begin_start`.
+
+**The backend adapter keeps its mapping responsibility**, unchanged:
+`launch_preview_subprocess` maps `FileNotFoundError` to
+`PreviewUnavailableError` and a launch `OSError` to `PreviewStartError`;
+`NullPreviewBackend` raises `PreviewUnavailableError`; the simulator refuses an
+unsafe configuration with a `PreviewError`. `PreviewService` deliberately does
+*not* guess which arbitrary backend exceptions might be operational — that guess
+is what produced the defect.
+
+**The readiness reader now classifies rather than reports.** A typed
+`_ReadinessOutcome` carries what the reader thread saw. An `OSError` or
+`ValueError` becomes the stable operational reason
+`stream read failed during startup` — no `str(exc)`, no `repr(exc)` — which
+becomes the existing expected `PreviewStartError` and stays non-fatal during
+auto-start; its detail goes to the log. Any other exception is carried back
+untouched and re-raised **on the calling thread**, where `start()` applies the
+unexpected-start contract. Either way the reader thread returns normally, so it
+can never surface as an unhandled-thread warning.
+
+**Lifespan cleanup is now resilient.** `await asyncio.gather(*monitor_tasks)`
+and the coordinator shutdown were a flat sequence, so a monitor that raised on
+its way out skipped the shutdown and stranded a live camera process behind an
+unrelated-looking error. They are now nested `try/finally` steps: the monitor
+exception still propagates — it is never swallowed — but only after the camera
+has been released and the lifecycle records written.
+
+### New and corrected tests
+
+- `test_unexpected_backend_error_is_wrapped_as_start_error` locked in the
+  defect and is replaced by `test_unexpected_backend_error_propagates_unchanged`,
+  which asserts object identity, that the result is not a `PreviewError`, the
+  full settled state, the exact constant diagnostic, and that no hostile
+  fragment survives; a companion test proves the full exception still reaches
+  the log.
+- Expected-failure preservation: parametrised pass-through for
+  `PreviewUnavailableError` and `PreviewStartError`; the real launcher mapping a
+  missing command to `PreviewUnavailableError` and a launch `OSError` to
+  `PreviewStartError`; the null backend staying an expected failure with its own
+  message.
+- Stream classification: an expected `OSError` and a closed-stream `ValueError`
+  each produce the stable operational reason with no hostile fragment and a
+  closed process; an unexpected `RuntimeError` propagates unchanged with the
+  constant diagnostic; and the reader thread exits cleanly for all three.
+- Lifespan: an unexpected backend fault and an unexpected stream fault are each
+  fatal, propagate the original object, settle `FAILED` with the constant
+  diagnostic (captured as cleanup begins, since shutdown normalises preview to
+  `stopped`), leak nothing into `/camera/preview/status` or the `/health`
+  preview projection, run every monitor to exit, never start the motion monitor,
+  run coordinator shutdown and leave no task, producer or reader; an expected
+  backend failure and an expected stream-I/O failure each keep the API serving
+  with their own operational message and exactly one attempt.
+- Cleanup resilience: `test_a_monitor_failure_cannot_strand_the_camera` proves
+  preview was genuinely running, the monitor exception still propagates, the
+  coordinator shutdown still ran and the producer count returned to zero.
+
+The hostile message used throughout carries Windows, POSIX and UNC paths,
+environment- and secret-looking values, a memory address, newlines, tabs, an
+ANSI sequence and Unicode direction overrides.
+
+### Validation
+
+Ruff passed; mypy passed for 50 source files; the full suite passed with no new
+skip and no thread or unraisable warning under escalation. Mutations A–E
+(backend wrapping restored, `str(exc)` leaked into the backend diagnostic,
+`repr(exc)` restored in the reader, an unexpected stream fault swallowed as an
+ordinary failure, a monitor failure allowed to skip coordinator shutdown) were
+each applied independently, each detected, and each reverted byte-for-byte.
+Runtime revalidation re-ran the simulator managed-preview run (14 checks) and
+added five in-process lifespan scenarios: expected stream-I/O failure, unexpected
+stream-processing failure, unexpected backend fault, expected backend failure and
+monitor failure during cleanup.
+
+### Unchanged by this correction
+
+No endpoint, response field, preview state, capture result, capture error
+mapping, physical command array, simulator contract, motion behaviour, migration
+or dependency changed. The Raspberry Pi was not accessed, and the physical
+camera acceptance record remains entirely pending.
+
 ## Deviations
 
 Recorded for the reviewer. None changes production behaviour.
@@ -701,6 +844,15 @@ Recorded for the reviewer. None changes production behaviour.
    is longer than a motion analysis interval. Without it the test would be
    racing the sampler rather than proving recovery, and a real `rpicam-still`
    capture takes far longer than 0.8 s anyway.
+9. **A seventh commit exists.** Re-review round 2 separately authorised one
+   further correction commit, `Preserve preview startup fault boundaries`. No
+   existing commit was amended, rebased, squashed or force-pushed.
+10. **A closed-stream `ValueError` is classified as operational.** The brief
+    names it as an expected failure, so `_await_first_frame` treats
+    `(OSError, ValueError)` as ordinary stream I/O. A `ValueError` raised by a
+    defect in the parsing path would therefore be classified operational rather
+    than unexpected. Separating them would mean changing
+    `mgo.camera.streaming`, which is outside this correction's scope.
 
 ## Known limitations
 

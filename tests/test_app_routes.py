@@ -26,6 +26,7 @@ Task 11 simulator backend -- still no Raspberry Pi, camera or camera tooling.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import subprocess
 import threading
@@ -43,8 +44,12 @@ import mgo.api.app as app_module
 # sub-app) would not prove production routing.
 from mgo.api.app import app, lifespan
 from mgo.camera import CameraCoordinator
-from mgo.camera.exceptions import PreviewStartError
-from mgo.camera.preview import PreviewService, PreviewState
+from mgo.camera.exceptions import PreviewError, PreviewStartError
+from mgo.camera.preview import (
+    UNEXPECTED_START_ERROR,
+    PreviewService,
+    PreviewState,
+)
 from mgo.camera.preview_backend import MockPreviewBackend
 from mgo.camera.simulator import SimulatorCaptureBackend
 from mgo.core.config import MGOConfig, parse_config_text
@@ -762,6 +767,10 @@ def _run_lifespan_expecting(
             if (task.get_name() or "").startswith("mgo-") and not task.done()
         )
         observed["producers"] = _producer_count()
+        preview = getattr(app.state, "preview_service", None)
+        observed["preview_status"] = (
+            preview.status().as_dict() if preview is not None else None
+        )
 
     try:
         asyncio.run(_main())
@@ -956,3 +965,371 @@ def test_motion_recovers_after_a_capture_restores_preview(
     assert observed["motion"]["status"] != "waiting_for_frames"
     _await_no_camera_threads()
     assert _producer_count() == 0
+
+
+# --- preview startup fault classification (re-review correction 2) ----------
+#
+# A preview start fails in exactly two ways, and auto-start treats them
+# differently: an *operational* failure is non-fatal (an operator needs the API
+# most when the camera is broken), while a *programming defect* is fatal, so it
+# cannot hide behind a plausible-looking camera error. These tests pin both
+# sides, and that neither leaks arbitrary exception text.
+
+#: A deliberately hostile exception message: Windows, POSIX and UNC paths,
+#: environment- and secret-looking values, a memory address, newlines, tabs, an
+#: ANSI sequence and Unicode direction overrides.
+_HOSTILE_MESSAGE = (
+    "C:\\Users\\MatthewLewis\\private.toml "
+    "\\\\fileserver\\share\\camera.log "
+    "/etc/garden-observatory/mgo.toml "
+    "MGO_SECRET=hunter2 token=sk-live-abcdef 0xDEADBEEF"
+    "\n\tsecond line\x1b[31m\u202e\u200f"
+)
+
+_HOSTILE_FRAGMENTS = (
+    "MatthewLewis",
+    "private.toml",
+    "fileserver",
+    "/etc/garden-observatory",
+    "MGO_SECRET",
+    "hunter2",
+    "sk-live-abcdef",
+    "0xDEADBEEF",
+    "\x1b",
+    "\u202e",
+    "\u200f",
+)
+
+
+def _assert_no_hostile_fragment(payload: object) -> None:
+    """Assert no part of the hostile message survived into an API payload."""
+    serialised = json.dumps(payload)
+    for fragment in _HOSTILE_FRAGMENTS:
+        assert fragment not in serialised, repr(fragment)
+
+
+def _capture_preview_at_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[str], dict[str, Any]]:
+    """Record the preview status as lifespan cleanup begins.
+
+    Cleanup stops preview, which normalises the state to ``stopped`` -- the
+    pre-existing shutdown contract. The failure state therefore has to be read
+    at the moment cleanup starts, which is the instant after the fault.
+    """
+    shutdowns: list[str] = []
+    captured: dict[str, Any] = {}
+
+    class _RecordingCoordinator(CameraCoordinator):
+        def shutdown(self) -> None:
+            shutdowns.append("shutdown")
+            captured["preview"] = app.state.preview_service.status().as_dict()
+            super().shutdown()
+
+    monkeypatch.setattr(app_module, "CameraCoordinator", _RecordingCoordinator)
+    return shutdowns, captured
+
+
+class _ExplodingBackend:
+    """A preview backend whose ``start()`` violates the backend contract."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.start_calls = 0
+
+    @property
+    def name(self) -> str:
+        return "exploding"
+
+    def start(self, config: object) -> object:
+        self.start_calls += 1
+        raise self.error
+
+
+def test_an_unexpected_backend_fault_is_fatal_to_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A backend programming defect must not masquerade as an absent camera.
+
+    Before this correction it was rendered into a ``PreviewStartError``, caught
+    by auto-start, and the application served on with the exception's arbitrary
+    text published through preview status.
+    """
+    spies = _install_monitor_spies(monkeypatch)
+    injected = RuntimeError(_HOSTILE_MESSAGE)
+    backend = _ExplodingBackend(injected)
+    monkeypatch.setattr(
+        app_module, "build_preview_backend", lambda _backend: backend
+    )
+
+    shutdowns, captured = _capture_preview_at_shutdown(monkeypatch)
+
+    observed = _run_lifespan_expecting(
+        monkeypatch,
+        _lifespan_config(tmp_path, auto_start=True, motion=True),
+        RuntimeError,
+    )
+
+    # Fatal, and the original object -- not a substitute.
+    assert observed["reached_yield"] is False
+    assert observed["error"] is injected
+    assert not isinstance(observed["error"], PreviewError)
+    assert backend.start_calls == 1
+
+    # Preview settled truthfully, with the constant diagnostic.
+    preview = captured["preview"]
+    assert preview["state"] == "failed"
+    assert preview["owner"] is None
+    assert preview["started_at"] is None
+    assert preview["uptime_seconds"] is None
+    assert preview["last_error"] == UNEXPECTED_START_ERROR
+    _assert_no_hostile_fragment(preview)
+
+    # Cleanup ran exactly as it does on a normal shutdown.
+    assert shutdowns == ["shutdown"]
+    assert spies["health"].exited
+    assert spies["database"].exited
+    assert spies["camera"].exited
+    assert spies["motion"].entered is False
+    assert observed["live_tasks"] == []
+    assert observed["producers"] == 0
+    _await_no_camera_threads()
+    assert _readiness_readers() == 0
+
+
+def test_an_expected_backend_failure_is_not_fatal_to_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other side of the classification: operational failures serve on."""
+    backend = _ExplodingBackend(
+        PreviewStartError("Failed to launch preview tool 'rpicam-vid': denied")
+    )
+    monkeypatch.setattr(
+        app_module, "build_preview_backend", lambda _backend: backend
+    )
+    observed: dict[str, Any] = {}
+
+    async def _body() -> None:
+        observed["reached_yield"] = True
+        observed["health"] = await _asgi_call("GET", "/health")
+        observed["preview"] = await _asgi_call("GET", "/camera/preview/status")
+
+    _run_lifespan(
+        monkeypatch, _lifespan_config(tmp_path, auto_start=True), _body
+    )
+
+    assert observed["reached_yield"] is True
+    assert observed["health"][0] == 200
+    preview = observed["preview"][1]
+    assert preview["state"] == "failed"
+    # Its own operational message survives -- that is the actionable detail.
+    assert "rpicam-vid" in preview["last_error"]
+    assert preview["last_error"] != UNEXPECTED_START_ERROR
+    # Exactly one attempt; no retry loop.
+    assert backend.start_calls == 1
+
+
+class _FailingStream(io.RawIOBase):
+    """A byte stream whose reads always raise the configured exception."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self._error = error
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: object) -> int:
+        raise self._error
+
+
+class _StreamProcess:
+    """A preview process handing out a failing frame stream."""
+
+    def __init__(self, stream: io.RawIOBase) -> None:
+        self._stream = stream
+        self.closed = False
+        self._alive = True
+
+    @property
+    def pid(self) -> int | None:
+        return 4321
+
+    def poll(self) -> int | None:
+        return None if self._alive else 0
+
+    def terminate(self) -> None:
+        self._alive = False
+
+    def kill(self) -> None:
+        self._alive = False
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        return None if self._alive else 0
+
+    def read_error(self) -> str:
+        return ""
+
+    def frame_stream(self) -> io.RawIOBase:
+        return self._stream
+
+    def close(self) -> None:
+        self.closed = True
+        self._stream.close()
+
+
+class _StreamBackend:
+    """A backend whose process always fails to deliver a first frame."""
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+        self.process: _StreamProcess | None = None
+
+    @property
+    def name(self) -> str:
+        return "stream"
+
+    def start(self, config: object) -> object:
+        self.process = _StreamProcess(_FailingStream(self._error))
+        return self.process
+
+
+def test_an_expected_stream_io_failure_keeps_the_api_serving(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stream that cannot be read is a camera problem: non-fatal, no leak."""
+    backend = _StreamBackend(OSError(_HOSTILE_MESSAGE))
+    monkeypatch.setattr(
+        app_module, "build_preview_backend", lambda _backend: backend
+    )
+    observed: dict[str, Any] = {}
+
+    async def _body() -> None:
+        observed["reached_yield"] = True
+        observed["health"] = await _asgi_call("GET", "/health")
+        observed["preview"] = await _asgi_call("GET", "/camera/preview/status")
+
+    _run_lifespan(
+        monkeypatch, _lifespan_config(tmp_path, auto_start=True), _body
+    )
+
+    assert observed["reached_yield"] is True
+    assert observed["health"][0] == 200
+    preview = observed["preview"][1]
+    assert preview["state"] == "failed"
+    assert "stream read failed during startup" in preview["last_error"]
+    _assert_no_hostile_fragment(preview)
+    _assert_no_hostile_fragment(observed["health"][1]["preview"])
+    assert backend.process is not None
+    assert backend.process.closed is True
+    _await_no_camera_threads()
+    assert _readiness_readers() == 0
+
+
+def test_an_unexpected_stream_fault_is_fatal_to_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A defect in the reader path is fatal, and leaves nothing behind."""
+    spies = _install_monitor_spies(monkeypatch)
+    injected = RuntimeError(_HOSTILE_MESSAGE)
+    backend = _StreamBackend(injected)
+    monkeypatch.setattr(
+        app_module, "build_preview_backend", lambda _backend: backend
+    )
+    shutdowns, captured = _capture_preview_at_shutdown(monkeypatch)
+
+    observed = _run_lifespan_expecting(
+        monkeypatch,
+        _lifespan_config(tmp_path, auto_start=True, motion=True),
+        RuntimeError,
+    )
+
+    assert observed["reached_yield"] is False
+    assert observed["error"] is injected
+    assert shutdowns == ["shutdown"]
+    preview = captured["preview"]
+    assert preview["state"] == "failed"
+    assert preview["last_error"] == UNEXPECTED_START_ERROR
+    _assert_no_hostile_fragment(preview)
+    assert backend.process is not None
+    assert backend.process.closed is True
+    assert spies["health"].exited
+    assert spies["database"].exited
+    assert spies["camera"].exited
+    assert spies["motion"].entered is False
+    assert observed["live_tasks"] == []
+    _await_no_camera_threads()
+    assert _readiness_readers() == 0
+
+
+# --- cleanup resilience -----------------------------------------------------
+
+
+def test_a_monitor_failure_cannot_strand_the_camera(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A monitor that raises on the way out is reported -- after the camera stops.
+
+    A flat cleanup sequence would have let the raising ``gather`` skip the
+    coordinator shutdown entirely, leaving a live preview process behind an
+    error that looked unrelated to it.
+    """
+    spies = _install_monitor_spies(monkeypatch)
+
+    class _FailsOnShutdown:
+        def __init__(self) -> None:
+            self.entered = False
+
+        async def __call__(self, *args: Any, **kwargs: Any) -> None:
+            self.entered = True
+            stop_event: asyncio.Event = args[2]
+            await stop_event.wait()
+            raise RuntimeError("camera monitor failed during shutdown")
+
+    failing = _FailsOnShutdown()
+    monkeypatch.setattr(app_module, "run_camera_monitor", failing)
+
+    shutdowns: list[str] = []
+
+    class _RecordingCoordinator(CameraCoordinator):
+        def shutdown(self) -> None:
+            shutdowns.append("shutdown")
+            super().shutdown()
+
+    monkeypatch.setattr(app_module, "CameraCoordinator", _RecordingCoordinator)
+    monkeypatch.setattr(
+        app_module, "config", _lifespan_config(tmp_path, auto_start=True)
+    )
+    observed: dict[str, Any] = {}
+    previous = dict(app.state._state)
+
+    async def _main() -> None:
+        with pytest.raises(RuntimeError, match="monitor failed during shutdown"):
+            async with lifespan(app):
+                observed["preview"] = app.state.preview_service.status().state
+                observed["producers_while_serving"] = _producer_count()
+        observed["live_tasks"] = sorted(
+            task.get_name()
+            for task in asyncio.all_tasks()
+            if (task.get_name() or "").startswith("mgo-") and not task.done()
+        )
+        observed["producers"] = _producer_count()
+
+    try:
+        asyncio.run(_main())
+    finally:
+        app.state._state.clear()
+        app.state._state.update(previous)
+
+    # Preview really was running, so there was something to strand.
+    assert observed["preview"] is PreviewState.RUNNING
+    assert observed["producers_while_serving"] == 1
+    # The monitor exception is not swallowed...
+    assert failing.entered is True
+    # ...and the camera was released anyway.
+    assert shutdowns == ["shutdown"]
+    assert observed["producers"] == 0
+    assert observed["live_tasks"] == []
+    assert spies["health"].exited
+    assert spies["database"].exited
+    _await_no_camera_threads()

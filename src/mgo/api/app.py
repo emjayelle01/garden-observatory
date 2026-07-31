@@ -565,23 +565,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         monitor_tasks = [health_task, database_task, camera_task]
         if motion_task is not None:
             monitor_tasks.append(motion_task)
-        await asyncio.gather(*monitor_tasks)
-        # Ensure no preview process is left running (no orphans) on shutdown.
-        # Routed through the coordinator so shutdown waits for an in-flight
-        # capture transaction -- including any preview restoration -- to finish
-        # rather than racing a preview back into existence behind it.
-        await asyncio.to_thread(camera_coordinator.shutdown)
-        notification_manager.publish(
-            _system_event(EventType.SYSTEM_STOP, "MGO API stopped")
-        )
-        record_observation(
-            config.storage.database_path,
-            kind="application_stop",
-            source="mgo-api",
-            status="success",
-            summary="MGO API stopped",
-            payload={"version": APPLICATION_VERSION},
-        )
+        # Each step is nested so a failure in one cannot skip the next. A
+        # monitor that raises on its way out is a real problem and is never
+        # swallowed -- it propagates -- but it must not be able to strand a
+        # camera process, which is what a flat sequence here would allow.
+        try:
+            await asyncio.gather(*monitor_tasks)
+        finally:
+            try:
+                # Ensure no preview process is left running (no orphans) on
+                # shutdown. Routed through the coordinator so shutdown waits for
+                # an in-flight capture transaction -- including any preview
+                # restoration -- to finish rather than racing a preview back
+                # into existence behind it.
+                await asyncio.to_thread(camera_coordinator.shutdown)
+            finally:
+                notification_manager.publish(
+                    _system_event(EventType.SYSTEM_STOP, "MGO API stopped")
+                )
+                record_observation(
+                    config.storage.database_path,
+                    kind="application_stop",
+                    source="mgo-api",
+                    status="success",
+                    summary="MGO API stopped",
+                    payload={"version": APPLICATION_VERSION},
+                )
 
 
 app = FastAPI(

@@ -304,10 +304,14 @@ request uses — the same first-frame validation, the same idempotence, no
 duplicate process. It happens **only in the application lifespan**: no request,
 and no page load of `/preview` or `/dashboard`, ever starts preview.
 
-An expected failure (camera absent, camera busy, tool missing, encoder failure,
-no first frame, permission denied, process exit during startup) does not stop the
-application from serving. `GET /health`, `GET /camera/status` and
-`GET /camera/preview/status` all keep returning 200, with preview truthfully:
+#### Two kinds of startup failure, treated differently
+
+An **expected operational failure** — camera absent, camera busy, tool missing,
+permission denied, encoder failure, process exit during startup, no first frame,
+or a stream that cannot be read — does not stop the application from serving. An
+operator needs the API most when the camera is broken. `GET /health`,
+`GET /camera/status` and `GET /camera/preview/status` all keep returning 200,
+with preview truthfully:
 
 ```json
 {
@@ -319,8 +323,33 @@ application from serving. `GET /health`, `GET /camera/status` and
 }
 ```
 
-Nothing retries in a loop; an operator restarts preview explicitly with
-`POST /camera/preview/start`.
+`last_error` carries the subsystem's own bounded operational message, which is
+the actionable detail. Nothing retries in a loop; an operator restarts preview
+explicitly with `POST /camera/preview/start`.
+
+An **unexpected programming failure** — any exception that is not a
+preview-domain error, from a backend, from startup validation or from the
+startup stream reader — is **fatal to application startup**. It propagates out
+of the lifespan unchanged, after the same cleanup a normal shutdown performs
+(monitors stopped, camera released, no orphan process). It is deliberately not
+caught: a defect that presented itself as an absent camera would be diagnosed as
+a hardware problem and could persist unnoticed for as long as the camera stayed
+plausible.
+
+Whenever such a fault does settle preview state, `last_error` is a single
+constant:
+
+```text
+Preview startup failed unexpectedly.
+```
+
+It never contains the exception's message, arguments, `repr` or traceback. An
+exception message is arbitrary application data and may carry a filesystem path,
+a username, an environment value, a secret, a memory address or control
+characters, none of which belongs in an API response. The full exception and
+traceback go to the application log instead. The same applies to a stream-read
+failure, which publishes the fixed operational reason
+`stream read failed during startup` rather than the underlying error text.
 
 ### Capture and restoration
 
