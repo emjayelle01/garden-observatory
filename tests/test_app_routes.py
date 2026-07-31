@@ -44,7 +44,7 @@ import mgo.api.app as app_module
 # The exact production application object: the systemd/uvicorn entry point
 # serves ``mgo.api.app:app``. Importing anything narrower (a handler, a
 # sub-app) would not prove production routing.
-from mgo.api.app import app, lifespan
+from mgo.api.app import _shutdown_lifespan, app, lifespan
 from mgo.camera import CameraCoordinator
 from mgo.camera.exceptions import PreviewError, PreviewStartError
 from mgo.camera.preview import (
@@ -1581,6 +1581,355 @@ def test_a_notification_failure_does_not_prevent_observation_persistence(
     assert observed["error"] is notification_error
     assert "stop-observation" in spy.stages
     assert observed["producers"] == 0
+
+
+# --- complete monitor drain -------------------------------------------------
+#
+# ``asyncio.gather(*tasks)`` propagates the first exception the instant it
+# happens and stops awaiting the rest. During shutdown that let cleanup advance
+# to camera shutdown -- and the lifespan return -- while another monitor was
+# still running. These tests drive the real ``_shutdown_lifespan`` directly, so
+# the ordering they pin is the production one.
+
+#: Bounded window used only for the direction that must NOT happen. With the
+#: drain in place camera shutdown cannot begin while a monitor is pending,
+#: whatever the timing; without it the executor hop is far shorter than this.
+_DRAIN_WINDOW = 0.25
+_DRAIN_TIMEOUT = 10.0
+
+
+class _StageCoordinator:
+    """A coordinator double that records when camera shutdown begins."""
+
+    def __init__(
+        self, stages: list[str], probe: Callable[[], None] | None = None
+    ) -> None:
+        self._stages = stages
+        self._probe = probe
+
+    def shutdown(self) -> None:
+        if self._probe is not None:
+            self._probe()
+        self._stages.append("camera-shutdown")
+
+
+class _StageManager:
+    """A notification-manager double that records the stop publication."""
+
+    def __init__(self, stages: list[str]) -> None:
+        self._stages = stages
+
+    def publish(self, event: Any) -> None:
+        if event.event_type is EventType.SYSTEM_STOP:
+            self._stages.append("stop-notification")
+
+
+def _install_stage_recorder(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the stop-observation stage without touching a database."""
+    stages: list[str] = []
+
+    def _record(*args: Any, **kwargs: Any) -> None:
+        if kwargs.get("kind") == "application_stop":
+            stages.append("stop-observation")
+
+    monkeypatch.setattr(app_module, "record_observation", _record)
+    return stages
+
+
+def test_every_monitor_reaches_a_terminal_state_before_camera_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing monitor must not let cleanup run past a monitor still draining.
+
+    Monitor A fails immediately; monitor B has observed the stop event and is
+    still finishing. Camera shutdown may not begin until B is terminal.
+    """
+    stages = _install_stage_recorder(monkeypatch)
+    observed: dict[str, Any] = {}
+    failure = RuntimeError("monitor A failed during shutdown")
+
+    async def _main() -> None:
+        stop_event = asyncio.Event()
+        release_b = asyncio.Event()
+
+        async def _monitor_a() -> None:
+            await stop_event.wait()
+            raise failure
+
+        async def _monitor_b() -> None:
+            await stop_event.wait()
+            observed["b_observed_stop"] = True
+            await release_b.wait()
+            observed["b_exited"] = True
+
+        task_a = asyncio.create_task(_monitor_a(), name="mgo-monitor-a")
+        task_b = asyncio.create_task(_monitor_b(), name="mgo-monitor-b")
+
+        def _probe() -> None:
+            observed["b_done_at_shutdown"] = task_b.done()
+            observed["b_exited_at_shutdown"] = observed.get("b_exited", False)
+
+        async def _release_after_window() -> None:
+            await asyncio.sleep(_DRAIN_WINDOW)
+            observed["shutdown_before_release"] = "camera-shutdown" in stages
+            release_b.set()
+
+        releaser = asyncio.create_task(_release_after_window())
+        observed["error"] = await asyncio.wait_for(
+            _shutdown_lifespan(
+                stop_events=(stop_event,),
+                monitor_tasks=[task_a, task_b],
+                coordinator=_StageCoordinator(stages, probe=_probe),
+                notification_manager=_StageManager(stages),
+            ),
+            timeout=_DRAIN_TIMEOUT,
+        )
+        await releaser
+        observed["a_done"] = task_a.done()
+        observed["b_done"] = task_b.done()
+        observed["b_cancelled"] = task_b.cancelled()
+
+    asyncio.run(_main())
+
+    assert observed["b_observed_stop"] is True
+    # The decisive ordering proof: cleanup had not advanced while B was pending.
+    assert observed["shutdown_before_release"] is False
+    assert observed["b_done_at_shutdown"] is True
+    assert observed["b_exited_at_shutdown"] is True
+    # B was allowed to finish cooperatively; a failing peer never cancels it.
+    assert observed["b_cancelled"] is False
+    assert observed["b_exited"] is True
+    # No monitor survives the drain.
+    assert observed["a_done"] is True
+    assert observed["b_done"] is True
+    assert observed["error"] is failure
+    assert stages == [
+        "camera-shutdown",
+        "stop-notification",
+        "stop-observation",
+    ]
+
+
+def test_the_first_monitor_failure_in_list_order_is_the_stage_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every monitor failure is logged; the retained one is deterministic.
+
+    The *second* monitor fails first in wall-clock terms, so a rule based on
+    "whichever failed first" would pick the wrong one. Order is by
+    ``monitor_tasks``.
+    """
+    stages = _install_stage_recorder(monkeypatch)
+    observed: dict[str, Any] = {}
+    first = RuntimeError("first monitor failed")
+    second = RuntimeError("second monitor failed")
+
+    async def _main() -> None:
+        stop_event = asyncio.Event()
+
+        async def _slow_failure() -> None:
+            await stop_event.wait()
+            await asyncio.sleep(_DRAIN_WINDOW)
+            raise first
+
+        async def _fast_failure() -> None:
+            await stop_event.wait()
+            raise second
+
+        task_first = asyncio.create_task(
+            _slow_failure(), name="mgo-monitor-first"
+        )
+        task_second = asyncio.create_task(
+            _fast_failure(), name="mgo-monitor-second"
+        )
+
+        observed["error"] = await asyncio.wait_for(
+            _shutdown_lifespan(
+                stop_events=(stop_event,),
+                monitor_tasks=[task_first, task_second],
+                coordinator=_StageCoordinator(stages),
+                notification_manager=_StageManager(stages),
+            ),
+            timeout=_DRAIN_TIMEOUT,
+        )
+        observed["first_done"] = task_first.done()
+        observed["second_done"] = task_second.done()
+
+    with caplog_at_error() as records:
+        asyncio.run(_main())
+
+    assert observed["error"] is first
+    assert observed["first_done"] is True
+    assert observed["second_done"] is True
+
+    logged = "\n".join(records)
+    # Every failure is logged, named by its task, not just the retained one.
+    assert "first monitor failed" in logged
+    assert "second monitor failed" in logged
+    assert "mgo-monitor-first" in logged
+    assert "mgo-monitor-second" in logged
+    assert stages == [
+        "camera-shutdown",
+        "stop-notification",
+        "stop-observation",
+    ]
+
+
+def test_a_cancelled_monitor_is_terminal_and_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation is terminal, and is a cleanup failure -- never hidden."""
+    stages = _install_stage_recorder(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    async def _main() -> None:
+        stop_event = asyncio.Event()
+
+        async def _never_returns() -> None:
+            await asyncio.Event().wait()
+
+        async def _cooperative() -> None:
+            await stop_event.wait()
+            observed["cooperative_exited"] = True
+
+        task_cancelled = asyncio.create_task(
+            _never_returns(), name="mgo-monitor-cancelled"
+        )
+        task_ok = asyncio.create_task(_cooperative(), name="mgo-monitor-ok")
+        await asyncio.sleep(0)
+        task_cancelled.cancel()
+
+        observed["error"] = await asyncio.wait_for(
+            _shutdown_lifespan(
+                stop_events=(stop_event,),
+                monitor_tasks=[task_cancelled, task_ok],
+                coordinator=_StageCoordinator(stages),
+                notification_manager=_StageManager(stages),
+            ),
+            timeout=_DRAIN_TIMEOUT,
+        )
+        observed["cancelled_done"] = task_cancelled.done()
+        observed["ok_done"] = task_ok.done()
+        observed["ok_cancelled"] = task_ok.cancelled()
+
+    with caplog_at_error() as records:
+        asyncio.run(_main())
+
+    assert isinstance(observed["error"], asyncio.CancelledError)
+    assert observed["cancelled_done"] is True
+    # The healthy monitor finished on its own and was never cancelled by us.
+    assert observed["cooperative_exited"] is True
+    assert observed["ok_done"] is True
+    assert observed["ok_cancelled"] is False
+    assert "mgo-monitor-cancelled" in "\n".join(records)
+    assert stages == [
+        "camera-shutdown",
+        "stop-notification",
+        "stop-observation",
+    ]
+
+
+def _slow_monitor(observed: dict[str, Any]) -> Any:
+    """Build a monitor stub that finishes cooperatively, but not instantly."""
+
+    async def _monitor(*args: Any, **kwargs: Any) -> None:
+        stop_event: asyncio.Event = args[1]
+        await stop_event.wait()
+        await asyncio.sleep(_DRAIN_WINDOW)
+        observed["slow_exited"] = True
+
+    return _monitor
+
+
+def _install_drain_lifespan_spies(
+    monkeypatch: pytest.MonkeyPatch,
+    observed: dict[str, Any],
+    monitor_error: BaseException,
+) -> list[str]:
+    """Wire a slow health monitor, a failing camera monitor and stage capture."""
+    monkeypatch.setattr(
+        app_module, "run_health_monitor", _slow_monitor(observed)
+    )
+    monkeypatch.setattr(app_module, "run_database_monitor", _MonitorSpy(2))
+    monkeypatch.setattr(app_module, "run_motion_monitor", _MonitorSpy(4))
+    monkeypatch.setattr(
+        app_module, "run_camera_monitor", _failing_camera_monitor(monitor_error)
+    )
+
+    stages: list[str] = []
+
+    class _RecordingCoordinator(CameraCoordinator):
+        def shutdown(self) -> None:
+            observed["slow_exited_at_shutdown"] = observed.get(
+                "slow_exited", False
+            )
+            stages.append("camera-shutdown")
+            super().shutdown()
+
+    monkeypatch.setattr(app_module, "CameraCoordinator", _RecordingCoordinator)
+    return stages
+
+
+def test_a_slow_monitor_is_drained_before_a_startup_failure_is_raised(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The drain holds even when a startup failure is already propagating.
+
+    The eighth commit's guarantee -- the original startup exception is the one
+    raised -- must survive the drain, and the drain must survive it.
+    """
+    observed: dict[str, Any] = {}
+    startup_error = RuntimeError("programming error inside startup validation")
+    monitor_error = RuntimeError("camera monitor failed during shutdown")
+    stages = _install_drain_lifespan_spies(monkeypatch, observed, monitor_error)
+
+    def _explode(self: PreviewService, process: object) -> str | None:
+        raise startup_error
+
+    monkeypatch.setattr(PreviewService, "_validate_startup", _explode)
+
+    with caplog_at_error() as records:
+        result = _run_lifespan_expecting(
+            monkeypatch,
+            _lifespan_config(tmp_path, auto_start=True),
+            RuntimeError,
+        )
+
+    # The slow monitor reached terminal completion before the camera stopped.
+    assert observed["slow_exited"] is True
+    assert observed["slow_exited_at_shutdown"] is True
+    assert stages == ["camera-shutdown"]
+    # The primary exception is still the startup one, by identity.
+    assert result["error"] is startup_error
+    assert result["error"] is not monitor_error
+    assert result["live_tasks"] == []
+    assert result["producers"] == 0
+    assert "camera monitor failed during shutdown" in "\n".join(records)
+    _await_no_camera_threads()
+
+
+def test_a_slow_monitor_is_drained_before_a_monitor_failure_is_raised(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no startup failure, the monitor failure is the result -- by identity."""
+    observed: dict[str, Any] = {}
+    monitor_error = RuntimeError("camera monitor failed during shutdown")
+    stages = _install_drain_lifespan_spies(monkeypatch, observed, monitor_error)
+
+    result = _run_lifespan_expecting(
+        monkeypatch,
+        _lifespan_config(tmp_path, auto_start=True),
+        RuntimeError,
+    )
+
+    assert result["reached_yield"] is True
+    assert observed["slow_exited"] is True
+    assert observed["slow_exited_at_shutdown"] is True
+    assert stages == ["camera-shutdown"]
+    assert result["error"] is monitor_error
+    assert result["live_tasks"] == []
+    assert result["producers"] == 0
+    _await_no_camera_threads()
 
 
 def test_an_observation_failure_remains_observable(

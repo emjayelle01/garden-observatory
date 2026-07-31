@@ -386,9 +386,14 @@ async def _shutdown_lifespan(
     reason to skip the rest. In particular, a monitor that raises on the way out
     must not be able to strand a camera process.
 
+    Every supplied monitor task is driven to a terminal state before camera
+    shutdown begins, so the application can never return from its lifespan with
+    a monitor it created still running.
+
     No failure is swallowed: every one is logged with its traceback, and the
-    *first* is returned so the caller can decide whether it is the failure worth
-    raising or whether an earlier, more informative one already exists.
+    *first* in ``monitor_tasks`` order is returned so the caller can decide
+    whether it is the failure worth raising or whether an earlier, more
+    informative one already exists.
     """
     for event in stop_events:
         event.set()
@@ -401,10 +406,24 @@ async def _shutdown_lifespan(
         if first_error is None:
             first_error = exc
 
-    try:
-        await asyncio.gather(*monitor_tasks)
-    except BaseException as exc:
-        _record("monitor-tasks", exc)
+    # ``return_exceptions=True`` is load-bearing, not a style choice. The
+    # default propagates the first monitor exception the instant it happens and
+    # stops awaiting the rest, so cleanup would advance to camera shutdown --
+    # and the lifespan would return -- while another monitor was still running.
+    # Collecting results instead means every task is terminal (returned, raised
+    # or already cancelled) before the next stage begins.
+    #
+    # A monitor that fails is never a reason to cancel the others: the stop
+    # events above are their cooperative shutdown mechanism, and cutting a
+    # healthy monitor short would lose whatever it was still finishing.
+    results = await asyncio.gather(*monitor_tasks, return_exceptions=True)
+    for task, result in zip(monitor_tasks, results, strict=True):
+        if isinstance(result, BaseException):
+            # Ordered by ``monitor_tasks``, not by which failed first in
+            # wall-clock terms, so the retained failure is deterministic.
+            # ``CancelledError`` counts: a cancelled monitor is terminal, but it
+            # is not a clean shutdown either.
+            _record(f"monitor-tasks[{task.get_name()}]", result)
 
     try:
         # Ensure no preview process is left running (no orphans) on shutdown.

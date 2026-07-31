@@ -2,9 +2,9 @@
 
 ## Status
 
-**Implementation corrected and locally revalidated after final repository
-review; Raspberry Pi validation and physical camera acceptance not performed.
-Awaiting Raspberry Pi validation authorisation.**
+**Implementation corrected and locally revalidated after final shutdown review;
+Raspberry Pi validation and physical camera acceptance not performed. Awaiting
+Raspberry Pi validation authorisation.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -18,6 +18,7 @@ Awaiting Raspberry Pi validation authorisation.**
 | Repository review | **Round 1 complete** — two blocking defects found and corrected |
 | Repository re-review | **Round 2 complete** — one blocking classification defect found and corrected |
 | Final repository review | **Round 3 complete** — two edge cases found and corrected |
+| Final shutdown review | **Round 4 complete** — one monitor-drain defect found and corrected |
 | Raspberry Pi validation of this branch | **Not performed** — the Pi was not accessed |
 | Physical camera acceptance run | **Not performed** — requires separate authorisation |
 | Matthew's visual sign-off | **Not given** |
@@ -919,6 +920,114 @@ mapping, physical command array, simulator contract, motion behaviour, migration
 or dependency changed. The Raspberry Pi was not accessed, and the physical
 camera acceptance record remains entirely pending.
 
+## Final shutdown correction — drain every monitor task
+
+The previous correction made every cleanup *stage* run. Final shutdown review
+found that the first stage did not finish what it started.
+
+### Defect 7 — cleanup advanced while a monitor was still running
+
+`_shutdown_lifespan` awaited `asyncio.gather(*monitor_tasks)` with the default
+`return_exceptions=False`. That propagates the first exception the instant it
+happens and **stops awaiting the remaining tasks**. The tasks keep running — the
+await is simply over. Cleanup therefore proceeded to camera shutdown, published
+the stop event, recorded the stop observation and returned from the lifespan
+while another application-created monitor was still alive.
+
+Reproduced against `c94b46a` with a bounded two-monitor harness driving the real
+`_shutdown_lifespan`. Monitor A raises on its stop event; monitor B observes the
+stop event and then waits on a controlled release:
+
+```text
+monitor A failed                      : True
+monitor B observed stop               : True
+monitor B exited at camera shutdown   : False
+cleanup advanced to camera shutdown   : True
+monitor B task done at camera shutdown: False
+_shutdown_lifespan returned           : True
+cleanup error returned                : RuntimeError('monitor A failed during shutdown')
+```
+
+`monitor B task done at camera shutdown: False` is the decisive evidence. The
+harness releases monitor B in its own `finally`, so the reproduction leaks
+nothing of its own.
+
+### Root cause
+
+`asyncio.gather`'s default is *fail fast*, which is the right default for
+concurrent work whose results you need and whose peers you would abandon. It is
+the wrong default for a shutdown drain, where the point of the await is not the
+results but the guarantee that nothing is left running. The code read as though
+it waited for every monitor; it waited only for the first failure.
+
+### Correction
+
+The monitor stage now collects results instead of failing fast:
+
+```python
+results = await asyncio.gather(*monitor_tasks, return_exceptions=True)
+for task, result in zip(monitor_tasks, results, strict=True):
+    if isinstance(result, BaseException):
+        _record(f"monitor-tasks[{task.get_name()}]", result)
+```
+
+Consequences, each deliberate:
+
+- **Every task is terminal** — returned, raised, or already cancelled — before
+  camera shutdown begins, so the lifespan cannot return with a monitor it
+  created still running.
+- **A failing monitor never cancels its peers.** The stop events are their
+  cooperative shutdown mechanism; cutting a healthy monitor short would discard
+  whatever it was still finishing. Cancellation is not a substitute for asking.
+- **Every failure is logged**, named by its task, not just the one retained.
+- **The retained failure is deterministic** — first in `monitor_tasks` order,
+  not whichever happened to fail first in wall-clock terms.
+- **A cancelled monitor is terminal but is not a clean shutdown**, so its
+  `CancelledError` is recorded as a monitor-stage failure. `Task.uncancel()` is
+  not called and cancellation is never hidden.
+
+The primary-exception guarantee from the eighth commit is unchanged: when a
+startup or serving failure is already active it remains the object raised, and
+the monitor failure is logged beside it.
+
+### New tests
+
+Four drive the real `_shutdown_lifespan` directly, so the ordering they pin is
+the production one:
+
+- **terminal-before-shutdown** — a failing monitor plus one still draining;
+  asserts camera shutdown had not begun while the second was pending, that the
+  second was neither cancelled nor abandoned, that both tasks are done, and that
+  the stage order is `camera-shutdown → stop-notification → stop-observation`;
+- **deterministic selection** — two failing monitors where the *second* fails
+  first in wall-clock terms; asserts the returned failure is the first in list
+  order, and that both failures and both task names appear in the log;
+- **cancellation** — a cancelled monitor is terminal and recorded, while the
+  cooperative peer completes normally and is not cancelled;
+- **slow-monitor lifespan tests** — one with an active startup failure (the
+  startup exception is still the object raised, by identity) and one without
+  (the monitor failure is the object raised, by identity); both assert the slow
+  monitor reached terminal completion *before* camera shutdown and that no task,
+  producer or readiness reader survives.
+
+### Validation
+
+Ruff passed; mypy passed for 50 source files; the full suite passed with no new
+skip and no thread or unraisable warning under escalation. Mutations A–D
+(default `gather`, cancelling the remaining monitors, inspecting only the first
+failing result, starting camera shutdown before the drain completes) were each
+applied independently, each detected, and each reverted byte-for-byte. Runtime
+revalidation re-ran the simulator managed-preview run (14 checks), the eight
+in-process classification and cleanup scenarios, and the restoration scenarios.
+
+### Unchanged by this correction
+
+No endpoint, response field, preview state, capture result, capture error
+mapping, physical command array, simulator contract, motion behaviour, migration
+or dependency changed. `src/mgo/camera/` was not touched. The Raspberry Pi was
+not accessed, and the physical camera acceptance record remains entirely
+pending.
+
 ## Deviations
 
 Recorded for the reviewer. None changes production behaviour.
@@ -970,6 +1079,17 @@ Recorded for the reviewer. None changes production behaviour.
 10. **An eighth commit exists.** Final review round 3 separately authorised one
     further correction commit, `Complete Task 12 startup failure handling`. No
     existing commit was amended, rebased, squashed or force-pushed.
+11. **A ninth commit exists.** Final shutdown review round 4 separately
+    authorised one further correction commit,
+    `Drain all monitor tasks during shutdown`. No existing commit was amended,
+    rebased, squashed or force-pushed.
+12. **The drain ordering tests use one bounded window.** The direction that
+    *must not* happen — camera shutdown beginning while a monitor is pending —
+    is checked after a 0.25 s window. With the drain in place that ordering is
+    structurally impossible whatever the timing; without it the executor hop is
+    orders of magnitude shorter than the window, so the mutation is caught
+    reliably. The direction that must happen is always driven by an explicit
+    event, never a sleep.
 
 ## Known limitations
 
@@ -1007,6 +1127,12 @@ Recorded for the reviewer. None changes production behaviour.
 - `PreviewService.shutdown()` normalises a failed preview to `STOPPED`, so after
   application shutdown the last failure is visible only in the log. That is the
   pre-existing shutdown contract and was not changed here.
+- The monitor drain waits for every monitor task without a timeout. A monitor
+  that never honoured its stop event would hold shutdown open indefinitely.
+  That is deliberate for now: every monitor in the application is a bounded
+  cooperative loop, and a bounded wait here would reintroduce exactly the defect
+  this correction removed — returning while a task is still running — only with
+  the truth hidden behind a timeout instead of an exception.
 - No numerical subject-scale threshold is asserted. Measurements are recorded so
   a later model-selection task can set thresholds from evidence rather than
   guesswork.
