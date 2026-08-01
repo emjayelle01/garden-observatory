@@ -786,21 +786,20 @@ def test_recovery_succeeds_once_both_conditions_hold() -> None:
     assert result.stdout.strip() == "0"
 
 
-def test_recovery_is_bounded_and_does_not_wait_for_ever() -> None:
-    """The bound is a real limit, not a comment."""
+def test_recovery_is_bounded_and_does_not_wait_for_ever(tmp_path: Path) -> None:
+    """The bound is a real limit, not a comment: it probes exactly N times."""
     result = call_gateway_function(
-        'await_recovery "mgo.service" "http://127.0.0.1:8080/health" 3\n'
-        'printf "attempts=%s\\n" "$(cat attempts)"',
+        'await_recovery "mgo.service" "http://127.0.0.1:8080/health" 3',
         preamble=(
-            "printf '0' > attempts\n"
             "service_is_active() { return 0; }\n"
             'endpoint_is_ok() { printf "x" >> attempts; return 1; }\n'
             "sleep() { :; }\n"
         ),
-        cwd=None,
+        cwd=tmp_path,
     )
 
     assert result.returncode != 0
+    assert (tmp_path / "attempts").read_text(encoding="utf-8") == "xxx"
 
 
 def test_no_endpoint_probe_uses_a_proxy() -> None:
@@ -954,24 +953,26 @@ def test_the_environment_sync_is_always_frozen() -> None:
 def test_a_missing_uv_is_a_hard_failure() -> None:
     """Deploying code against a stale environment is not a degraded success."""
     result = call_gateway_function(
-        'sync_environment "claude" "/tmp/repo"',
-        preamble='run_as_admin() { return 127; }\n',
+        'require_uv_available "claude"',
+        preamble="run_as_admin() { return 127; }\n",
     )
 
     assert result.returncode == EX_PRECONDITION
     assert "uv is not available" in result.stderr
 
 
+def test_uv_availability_is_proven_before_the_checkout_moves() -> None:
+    """Discovering it afterwards would mean rolling back a known problem."""
+    check, merge = _ordered_indices("require_uv_available", "merge --ff-only")
+
+    assert check < merge
+
+
 def test_a_failed_sync_is_reported_to_the_caller() -> None:
     """The forward deployment stops; it does not carry on to the restart."""
-    preamble = (
-        "run_as_admin() {\n"
-        '    if [[ "$2" == "uv" && "$3" == "--version" ]]; then return 0; fi\n'
-        "    return 1\n"
-        "}\n"
-    )
     result = call_gateway_function(
-        'sync_environment "claude" "/tmp/repo"', preamble=preamble
+        'sync_environment "claude" "/tmp/repo"',
+        preamble="run_as_admin() { return 1; }\n",
     )
 
     assert result.returncode != 0
@@ -1201,6 +1202,235 @@ def test_the_gateway_accepts_no_caller_supplied_production_value() -> None:
     assert "eval" not in source
     assert "${MGO_REPOSITORY:-" not in source
     assert "${MGO_APPROVAL_FILE:-" not in source
+
+
+# --------------------------------------------------------------------------
+# transaction rollback
+# --------------------------------------------------------------------------
+
+
+EX_ROLLBACK = 78
+
+
+def _function_body(name: str, next_name: str) -> str:
+    """Slice one shipped function out of the gateway, exactly."""
+    source = _read(GATEWAY)
+    start = source.index(name)
+    return source[start : source.index(next_name, start)]
+
+
+def _rollback_repository(
+    checkout: Path, previous_sha: str, *, extra: str = ""
+) -> subprocess.CompletedProcess[str]:
+    preamble = PASSTHROUGH_RUNNER + "sync_environment() { return 0; }\n" + extra
+    call = (
+        f'rollback_repository "claude" "{_posix(checkout)}" '
+        f'"{previous_sha}" "main" || true\n'
+        'printf "stage=%s\\n" "$ROLLBACK_STAGE"\n'
+    )
+    return call_gateway_function(call, preamble=preamble)
+
+
+def test_a_rollback_restores_the_exact_captured_commit(
+    production: dict[str, object],
+) -> None:
+    """The checkout goes back to the commit recorded before the mutation."""
+    upstream = production["upstream"]
+    checkout = production["checkout"]
+    assert isinstance(upstream, Path)
+    assert isinstance(checkout, Path)
+    previous = str(production["first"])
+    _commit(upstream, "second")
+    _git(checkout, "fetch", "--quiet", "origin", "main")
+    _git(checkout, "merge", "--ff-only", "--quiet", "origin/main")
+    assert _git(checkout, "rev-parse", "HEAD") != previous
+
+    result = _rollback_repository(checkout, previous)
+
+    assert result.returncode == 0, result.stderr
+    assert "stage=" in result.stdout
+    assert _git(checkout, "rev-parse", "HEAD") == previous
+    assert _git(checkout, "branch", "--show-current") == "main"
+    assert _git(checkout, "status", "--porcelain") == ""
+
+
+def test_a_rollback_names_the_stage_that_failed(
+    production: dict[str, object],
+) -> None:
+    """"It failed" is not an operator report; where it failed is."""
+    checkout = production["checkout"]
+    assert isinstance(checkout, Path)
+
+    result = _rollback_repository(
+        checkout,
+        str(production["first"]),
+        extra="sync_environment() { return 1; }\n",
+    )
+
+    assert "stage=environment" in result.stdout
+
+
+def test_a_rollback_that_cannot_move_the_checkout_reports_that_stage(
+    tmp_path: Path,
+) -> None:
+    """A failure to restore the commit is reported as the checkout stage."""
+    result = _rollback_repository(tmp_path / "absent", "0" * 40)
+
+    assert "stage=checkout" in result.stdout
+
+
+def test_a_rollback_verifies_rather_than_assumes(
+    production: dict[str, object],
+) -> None:
+    """Restoration is proven against HEAD, branch and cleanliness."""
+    source = _read(GATEWAY)
+    body = source[source.index("rollback_repository()") :]
+    body = body[: body.index("fail_before_restart()")]
+
+    assert 'ROLLBACK_STAGE="verification"' in body
+    assert "rev-parse HEAD" in body
+    assert "branch --show-current" in body
+    assert "status --porcelain" in body
+
+
+def test_only_the_rollback_path_uses_reset() -> None:
+    """The forward deployment is a fast-forward; reset exists for going back."""
+    source = _read(GATEWAY)
+    occurrences = [
+        line
+        for line in source.splitlines()
+        if "reset --hard" in line and not line.strip().startswith("#")
+    ]
+
+    assert len(occurrences) == 1
+    assert "reset --hard" in _function_body(
+        "restore_checkout()", "rollback_repository()"
+    )
+
+
+def test_a_pre_restart_failure_does_not_restart_the_service() -> None:
+    """Nothing disturbed the service, so recovering it would cause the outage."""
+    source = _read(GATEWAY)
+    body = source[
+        source.index("fail_before_restart()") : source.index("fail_after_restart()")
+    ]
+
+    assert "restart_service" not in body
+    assert "restore_preview_state" not in body
+    assert "service_main_pid" in body
+    assert "service_active_enter_timestamp" in body
+
+
+def test_a_pre_restart_rollback_still_reports_failure() -> None:
+    """A recovered deployment is still a failed deployment."""
+    source = _read(GATEWAY)
+    body = source[
+        source.index("fail_before_restart()") : source.index("fail_after_restart()")
+    ]
+
+    assert 'die "$EX_DEPLOY"' in body
+    assert "rollback succeeded" in body
+    assert "return 0" not in body
+
+
+def test_a_post_restart_rollback_restarts_once_and_restores_preview() -> None:
+    """The service is already on the new code, so it has to come back."""
+    source = _read(GATEWAY)
+    body = source[source.index("fail_after_restart()") :]
+    body = body[: body.index("# --- actions")]
+
+    assert body.count("restart_service") == 1
+    assert "await_recovery" in body
+    assert "restore_preview_state" in body
+    assert 'die "$EX_DEPLOY" "deployment failed; rollback succeeded"' in body
+
+
+def test_a_failed_rollback_uses_a_distinct_high_severity_code() -> None:
+    """Not restored is a different outcome from restored, and says so."""
+    source = _read(GATEWAY)
+
+    assert "readonly EX_ROLLBACK=78" in source
+    for body_name in ("fail_before_restart()", "fail_after_restart()"):
+        index = source.index(body_name)
+        body = source[index : index + 2000]
+        assert 'die "$EX_ROLLBACK"' in body
+        assert "was NOT" in body
+
+
+def test_a_failed_rollback_never_claims_production_was_restored() -> None:
+    """Every rollback-failure message says the opposite, explicitly."""
+    source = _read(GATEWAY)
+
+    for line in source.splitlines():
+        if "$EX_ROLLBACK" in line and "readonly" not in line:
+            continue
+    messages = [
+        line
+        for line in source.splitlines()
+        if "production was NOT" in line or "production was NOT fully" in line
+    ]
+
+    assert len(messages) >= 5
+
+
+def test_the_rollback_does_not_loop() -> None:
+    """One attempt. A retrying rollback turns one failure into a flap."""
+    for name, following in (
+        ("fail_before_restart()", "fail_after_restart()"),
+        ("fail_after_restart()", "# --- actions"),
+    ):
+        body = _function_body(name, following)
+        assert "while" not in body
+        assert "until" not in body
+        # Neither handler calls the other, or itself, a second time.
+        assert body.count("rollback_repository ") == 1
+
+
+def test_no_rollback_target_is_accepted_from_a_caller() -> None:
+    """The only SHA a rollback moves to is the one this run recorded."""
+    source = _read(GATEWAY)
+    body = source[source.index("action_deploy_main()") :]
+
+    for call in ("fail_before_restart ", "fail_after_restart "):
+        for fragment in body.split(call)[1:]:
+            arguments = fragment[: fragment.index("\n    fi")]
+            assert '"$head"' in arguments, arguments
+            assert "$1" not in arguments
+
+
+@pytest.mark.parametrize(
+    ("reason", "handler"),
+    [
+        ("the frozen dependency sync failed", "fail_before_restart"),
+        ("the sync changed a tracked file", "fail_before_restart"),
+        (
+            "the runtime account cannot execute the deployed environment",
+            "fail_before_restart",
+        ),
+        ("the service restart failed", "fail_after_restart"),
+        ("the service did not recover within the bound", "fail_after_restart"),
+        ("the preview state could not be restored", "fail_after_restart"),
+    ],
+)
+def test_every_post_mutation_failure_is_routed_to_a_rollback(
+    reason: str, handler: str
+) -> None:
+    """No failure after the fast-forward exits without restoring."""
+    source = _read(GATEWAY)
+    body = source[source.index("action_deploy_main()") :]
+    index = body.index(reason)
+
+    assert handler in body[max(0, index - 200) : index + 200]
+
+
+def test_no_post_mutation_failure_exits_without_rolling_back() -> None:
+    """The mutation boundary is where bare ``die`` stops being acceptable."""
+    source = _read(GATEWAY)
+    body = source[source.index("action_deploy_main()") :]
+    after_mutation = body[body.index("merge --ff-only") :]
+    after_mutation = after_mutation[: after_mutation.index('log "deployed')]
+
+    assert 'die "$EX_DEPLOY"' not in after_mutation
 
 
 # --------------------------------------------------------------------------

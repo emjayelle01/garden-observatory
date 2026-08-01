@@ -62,7 +62,11 @@ readonly MGO_PREVIEW_TIMEOUT_SECONDS=20
 
 readonly EX_REQUEST=64      # bad action, or unusable approval state
 readonly EX_PRECONDITION=65 # the host or repository is not fit to deploy
-readonly EX_DEPLOY=70       # deployment failed
+readonly EX_DEPLOY=70       # deployment failed; production was restored
+readonly EX_ROLLBACK=78     # deployment failed AND restoration failed
+
+# The stage a failed rollback stopped at, for the operator-facing message.
+ROLLBACK_STAGE=""
 
 # --- output ----------------------------------------------------------------
 # Messages are constructed from constants and validated values only. Command
@@ -427,16 +431,24 @@ sync_environment() {
     local admin_account="$1"
     local repository="$2"
 
-    # A real invocation rather than a PATH lookup: what matters is that the
-    # administrative account can actually run uv, not that a file exists.
-    run_as_admin "$admin_account" uv --version >/dev/null 2>&1 \
-        || die "$EX_PRECONDITION" \
-            "uv is not available to the $admin_account account"
-
     # runuser preserves the working directory, so the change of directory
     # happens here in a subshell rather than through a nested shell command.
     (cd "$repository" && run_as_admin "$admin_account" uv sync --frozen) \
         || return 1
+}
+
+# Proven before the checkout is touched, not discovered after it.
+#
+# A real invocation rather than a PATH lookup: what matters is that the
+# administrative account can actually run uv. Finding this out after the
+# fast-forward would mean rolling back over a problem that was visible from
+# the start.
+require_uv_available() {
+    local admin_account="$1"
+
+    run_as_admin "$admin_account" uv --version >/dev/null 2>&1 \
+        || die "$EX_PRECONDITION" \
+            "uv is not available to the $admin_account account"
 }
 
 require_clean_after_sync() {
@@ -547,6 +559,141 @@ restore_preview_state() {
     return 0
 }
 
+# --- transaction rollback --------------------------------------------------
+#
+# A deployment that advanced the checkout and then failed must not leave
+# production half-deployed: new code against an old environment, or new code
+# the service could not start. Everything below restores the commit and preview
+# state captured *before* the first mutation, and nothing else. A rollback
+# target is never accepted from a caller — the only SHA these functions will
+# move to is the one this run recorded for itself.
+
+# Move the branch back to the captured commit.
+#
+# reset --hard is used here and nowhere else. The forward deployment is a
+# strict fast-forward by contract; going backwards is not a fast-forward and
+# cannot be expressed as one.
+restore_checkout() {
+    local admin_account="$1"
+    local repository="$2"
+    local previous_sha="$3"
+
+    git_admin "$admin_account" "$repository" \
+        reset --hard "$previous_sha" >/dev/null
+}
+
+# Restore the checkout and environment, then prove both.
+#
+# Sets ROLLBACK_STAGE to the stage that failed so the operator is told where
+# restoration stopped rather than merely that it did.
+rollback_repository() {
+    local admin_account="$1"
+    local repository="$2"
+    local previous_sha="$3"
+    local branch="$4"
+    local head
+    local current_branch
+    local porcelain
+
+    ROLLBACK_STAGE=""
+
+    if ! restore_checkout "$admin_account" "$repository" "$previous_sha"; then
+        ROLLBACK_STAGE="checkout"
+        return 1
+    fi
+
+    if ! sync_environment "$admin_account" "$repository"; then
+        ROLLBACK_STAGE="environment"
+        return 1
+    fi
+
+    head="$(git_admin "$admin_account" "$repository" rev-parse HEAD)" || true
+    current_branch="$(git_admin "$admin_account" "$repository" \
+        branch --show-current)" || true
+    porcelain="$(git_admin "$admin_account" "$repository" \
+        status --porcelain --untracked-files=no)" || true
+
+    if [[ "$head" != "$previous_sha" || "$current_branch" != "$branch" \
+        || -n "$porcelain" ]]; then
+        ROLLBACK_STAGE="verification"
+        return 1
+    fi
+    return 0
+}
+
+# §16.1 — a failure after the fast-forward but before the restart.
+#
+# The service is still running the old code from the old environment, so it is
+# deliberately *not* restarted and the preview is deliberately *not* touched:
+# nothing disturbed them, and restarting to "recover" would create the outage
+# this branch exists to avoid. Its identity is verified instead.
+fail_before_restart() {
+    local reason="$1"
+    local previous_sha="$2"
+    local expected_pid="$3"
+    local expected_timestamp="$4"
+
+    warn "deployment failed before the restart: $reason"
+    warn "restoring $previous_sha"
+
+    if ! rollback_repository "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        "$previous_sha" "$MGO_BRANCH"; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and rollback failed at the $ROLLBACK_STAGE stage; production was NOT restored"
+    fi
+
+    if [[ "$(service_main_pid "$MGO_SERVICE")" != "$expected_pid" \
+        || "$(service_active_enter_timestamp "$MGO_SERVICE")" \
+            != "$expected_timestamp" ]]; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and the running service changed unexpectedly; production was NOT restored"
+    fi
+
+    die "$EX_DEPLOY" \
+        "deployment failed; rollback succeeded; the service was never restarted"
+}
+
+# §16.2 — a failure at or after the restart.
+#
+# The service is already running the new code, so restoring the commit is not
+# enough: it has to be restarted once onto the restored environment, proven
+# healthy, and given back the preview state the deployment found.
+fail_after_restart() {
+    local reason="$1"
+    local previous_sha="$2"
+    local previous_preview="$3"
+
+    warn "deployment failed after the restart: $reason"
+    warn "restoring $previous_sha"
+
+    if ! rollback_repository "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        "$previous_sha" "$MGO_BRANCH"; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and rollback failed at the $ROLLBACK_STAGE stage; production was NOT restored"
+    fi
+
+    # Exactly one restart, and no retry if it does not take. A rollback that
+    # restarts in a loop turns one failed deployment into a flapping service.
+    if ! restart_service "$MGO_SERVICE"; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and the rollback restart failed; production was NOT restored"
+    fi
+
+    if ! await_recovery "$MGO_SERVICE" "$MGO_HEALTH_URL" \
+        "$MGO_RECOVERY_TIMEOUT_SECONDS" >/dev/null; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and the restored service did not recover; production was NOT restored"
+    fi
+
+    if ! restore_preview_state "$previous_preview" "$MGO_PREVIEW_STATUS_URL" \
+        "$MGO_PREVIEW_START_URL" "$MGO_PREVIEW_TIMEOUT_SECONDS"; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and the preview state was not restored; production was NOT fully restored"
+    fi
+
+    die "$EX_DEPLOY" "deployment failed; rollback succeeded"
+}
+
 # --- actions ---------------------------------------------------------------
 
 action_show_approval() {
@@ -595,6 +742,8 @@ action_deploy_main() {
     local remote_sha
     local tracking
     local previous_preview
+    local previous_pid
+    local previous_timestamp
     local recovered
 
     # 1. approval
@@ -613,9 +762,15 @@ action_deploy_main() {
         || die "$EX_PRECONDITION" \
             "the preview status endpoint is not answering"
 
+    require_uv_available "$MGO_ADMIN_ACCOUNT"
+
+    # Captured before anything moves. These are the only values a rollback
+    # will ever restore to; none of them can be supplied by a caller.
     head="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" rev-parse HEAD)"
     previous_preview="$(read_preview_state "$MGO_PREVIEW_STATUS_URL")" \
         || die "$EX_PRECONDITION" "the preview state could not be read"
+    previous_pid="$(service_main_pid "$MGO_SERVICE")"
+    previous_timestamp="$(service_active_enter_timestamp "$MGO_SERVICE")"
     log "currently at commit $head"
     log "preview state before deployment: $previous_preview"
 
@@ -650,32 +805,47 @@ action_deploy_main() {
     require_fast_forward_target "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
         "$head" "$approved"
 
-    # 8. mutate
+    # 8. mutate — every failure from here restores what was captured above.
     log "fast-forwarding $head -> $approved"
+    # A refused fast-forward changes nothing, so there is nothing to restore.
     git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
         merge --ff-only "$MGO_REMOTE/$MGO_BRANCH" \
-        || die "$EX_DEPLOY" "the fast-forward failed"
+        || die "$EX_PRECONDITION" "the fast-forward was refused"
 
-    sync_environment "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
-        || die "$EX_DEPLOY" "the frozen dependency sync failed"
-    require_clean_after_sync "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
-        || die "$EX_DEPLOY" "the sync changed a tracked file"
-    require_runtime_can_execute "$MGO_RUNTIME_ACCOUNT" "$MGO_REPOSITORY" \
-        || die "$EX_DEPLOY" \
-            "the runtime account cannot execute the deployed environment"
+    if ! sync_environment "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY"; then
+        fail_before_restart "the frozen dependency sync failed" \
+            "$head" "$previous_pid" "$previous_timestamp"
+    fi
+    if ! require_clean_after_sync "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY"; then
+        fail_before_restart "the sync changed a tracked file" \
+            "$head" "$previous_pid" "$previous_timestamp"
+    fi
+    if ! require_runtime_can_execute "$MGO_RUNTIME_ACCOUNT" \
+        "$MGO_REPOSITORY"; then
+        fail_before_restart \
+            "the runtime account cannot execute the deployed environment" \
+            "$head" "$previous_pid" "$previous_timestamp"
+    fi
 
     log "restarting $MGO_SERVICE"
-    restart_service "$MGO_SERVICE" \
-        || die "$EX_DEPLOY" "the service restart failed"
+    if ! restart_service "$MGO_SERVICE"; then
+        fail_after_restart "the service restart failed" \
+            "$head" "$previous_preview"
+    fi
 
-    recovered="$(await_recovery "$MGO_SERVICE" "$MGO_HEALTH_URL" \
-        "$MGO_RECOVERY_TIMEOUT_SECONDS")" \
-        || die "$EX_DEPLOY" "the service did not recover within the bound"
+    if ! recovered="$(await_recovery "$MGO_SERVICE" "$MGO_HEALTH_URL" \
+        "$MGO_RECOVERY_TIMEOUT_SECONDS")"; then
+        fail_after_restart "the service did not recover within the bound" \
+            "$head" "$previous_preview"
+    fi
     log "recovered in ${recovered}s"
 
-    restore_preview_state "$previous_preview" "$MGO_PREVIEW_STATUS_URL" \
-        "$MGO_PREVIEW_START_URL" "$MGO_PREVIEW_TIMEOUT_SECONDS" \
-        || die "$EX_DEPLOY" "the preview state could not be restored"
+    if ! restore_preview_state "$previous_preview" \
+        "$MGO_PREVIEW_STATUS_URL" "$MGO_PREVIEW_START_URL" \
+        "$MGO_PREVIEW_TIMEOUT_SECONDS"; then
+        fail_after_restart "the preview state could not be restored" \
+            "$head" "$previous_preview"
+    fi
 
     log "deployed $approved"
     log "MainPID $(service_main_pid "$MGO_SERVICE")"
