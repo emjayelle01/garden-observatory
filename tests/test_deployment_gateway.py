@@ -700,6 +700,23 @@ def test_a_downgrade_is_rejected(production: dict[str, object]) -> None:
     assert "behind" in result.stderr or "descendant" in result.stderr
 
 
+def test_both_fast_forward_proofs_are_stated_explicitly() -> None:
+    """The ancestry proof and the downgrade refusal are both present.
+
+    They are logically equivalent — ``rev-list --count X..Y`` is zero exactly
+    when Y is an ancestor of X — so no input can fail one without failing the
+    other, and neither can be detected by removing it and watching a behaviour
+    test. Both are kept because they fail with different messages, and this
+    asserts that removing either one is a change to the shipped contract.
+    """
+    body = _function_body("require_fast_forward_target()", "# --- environment")
+
+    assert "merge-base --is-ancestor" in body
+    assert "is not a descendant of the deployed commit" in body
+    assert 'rev-list --count "$target..$head"' in body
+    assert "is behind the deployed commit" in body
+
+
 def test_divergent_history_is_rejected(
     production: dict[str, object], tmp_path: Path
 ) -> None:
@@ -1384,6 +1401,41 @@ def test_the_rollback_does_not_loop() -> None:
         assert "until" not in body
         # Neither handler calls the other, or itself, a second time.
         assert body.count("rollback_repository ") == 1
+
+
+def test_the_rollback_handlers_take_their_target_only_from_their_caller() -> None:
+    """No environment default may stand behind the captured SHA.
+
+    Checked inside the handlers, not only at their call sites: a
+    ``${SOMETHING:-$2}`` in either body would let an environment variable
+    choose what production is restored to, and the call-site test above would
+    not see it.
+    """
+    for name, following in (
+        ("fail_before_restart()", "fail_after_restart()"),
+        ("fail_after_restart()", "# --- actions"),
+    ):
+        body = _function_body(name, following)
+        assert 'local previous_sha="$2"' in body, name
+        assert ":-$2" not in body, name
+        assert "MGO_ROLLBACK" not in body, name
+
+    for name, following in (
+        ("restore_checkout()", "rollback_repository()"),
+        ("rollback_repository()", "# §16.1"),
+    ):
+        body = _function_body(name, following)
+        assert ":-" not in body, name
+
+
+def test_no_production_value_falls_back_to_the_environment() -> None:
+    """``${VAR:-default}`` is how a fixed constant quietly becomes tunable."""
+    allowed = {"${SUDO_USER:-}", "${1:-}", "${BASH_SOURCE[0]}"}
+    for line in _read(GATEWAY).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or ":-" not in stripped:
+            continue
+        assert any(token in stripped for token in allowed), stripped
 
 
 def test_no_rollback_target_is_accepted_from_a_caller() -> None:

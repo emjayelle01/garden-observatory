@@ -398,9 +398,12 @@ remote_branch_sha() {
 
 # The target must be a strict descendant of what is deployed now.
 #
-# Two separate facts: the current HEAD is an ancestor of the target (so the
-# move is a fast-forward), and the target is not behind HEAD (so this is not a
-# downgrade dressed up as a deployment).
+# Two statements of the same fact, kept deliberately. "HEAD is an ancestor of
+# the target" is the fast-forward proof; "the target is not behind HEAD" is the
+# downgrade refusal. They are logically equivalent — `rev-list --count X..Y` is
+# zero exactly when Y is an ancestor of X — but they fail with different
+# messages, and an operator reading either one learns what the deployment
+# actually refused to do. Neither is dead code standing in for the other.
 require_fast_forward_target() {
     local admin_account="$1"
     local repository="$2"
