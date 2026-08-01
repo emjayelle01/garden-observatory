@@ -2,9 +2,9 @@
 
 ## Status
 
-**Implementation and narrow Raspberry Pi validation complete.
-Physical camera acceptance has not been performed.
-Ready for final merge review.**
+**Implementation and narrow Raspberry Pi validation merged into `main`.
+Production deployment and physical camera acceptance have not been performed.
+Awaiting separately authorised deployment and physical acceptance.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -20,15 +20,21 @@ Ready for final merge review.**
 | Final repository review | **Round 3 complete** — two edge cases found and corrected |
 | Final shutdown review | **Round 4 complete** — one monitor-drain defect found and corrected |
 | Raspberry Pi validation of this branch | **Passed** — narrow ARM64 validation, 2026-07-31 |
+| Merge into `main` | **Passed** — fast-forward merge, 2026-08-01 |
+| Production deployment | **Not performed** — requires separate authorisation |
 | Physical camera acceptance run | **Not performed** — requires separate authorisation |
 | Matthew's visual sign-off | **Not given** |
+| 24-hour gate | **Not started** |
+| 48-hour gate | **Not started** |
 
 Nothing in this task claims that the physical camera has been accepted. Task 12
 builds the *gate*; passing the gate is a separate, authorised hardware activity.
 
 The software rows above were written as `In progress` / `Pending` in the first
-commit and updated at closeout. The three physical rows have never changed and
-must not be changed by anything other than an authorised hardware run.
+commit and updated at closeout; the Raspberry Pi and merge rows were updated by
+their own separately authorised runs. The deployment, physical-acceptance,
+sign-off and gate rows have never changed and must not be changed by anything
+other than an authorised deployment and hardware run.
 
 ## Purpose
 
@@ -1148,7 +1154,38 @@ capture directory — entirely separate from production.
 - Matthew's visual sign-off remains **NOT GIVEN**.
 - The 24-hour gate remains **NOT STARTED**.
 - The 48-hour gate remains **NOT STARTED**.
-- Task 12 has **not** been deployed and **not** been merged.
+- Task 12 has been merged into `main` but has **not** been deployed.
+
+## Merge into main — performed
+
+Task 12 was merged into `main` on **2026-08-01** under separate authorisation.
+
+| Fact | Value |
+| ---- | ----- |
+| Merge date | 2026-08-01 |
+| Previous `main` SHA | `fc66e5193c272f9f7d8d3c101ee3d99cd193d0e4` |
+| Reviewed Task 12 source SHA | `c3507e3d8febedf6a9a8bfd7eccb91f899774c76` |
+| Merge method | Fast-forward only (`git merge --ff-only`) |
+| Merge commit | None created |
+| Squash or rebase | Neither — no commit was amended, squashed, rebased or cherry-picked |
+| Pull request | None created |
+| Windows validation | Passed — Ruff, mypy (50 source files), 1668 passed / 12 skipped |
+| Raspberry Pi ARM64 validation | Passed — 1680 passed / 0 skipped |
+
+History stayed linear: the eleven Task 12 commits sit directly on top of the
+previous `main`, and no merge commit exists between them.
+
+The merge moves code only. It changed nothing on the Raspberry Pi:
+
+- No deployment was performed.
+- No Raspberry Pi was accessed during the merge.
+- Production configuration was not changed; both managed-preview policies remain
+  `false` wherever they are deployed.
+- `mgo.service` was not restarted and the production preview was not touched.
+- Physical acceptance remains pending in full.
+
+Deploying the merged commit, enabling either managed-preview policy, and running
+the physical acceptance checklist each require their own explicit authorisation.
 
 ## Deviations
 
