@@ -490,9 +490,9 @@ Every remaining step in the paragraph above is still outstanding.
 **Before merge.** Switch back to `main`. No production behaviour changes; the
 physical acceptance record remains pending.
 
-**After a future merge, before production enablement.** Revert the five Task 12
-commits and redeploy `main`. No production configuration rollback is needed
-because both managed-preview defaults are `false`.
+**After a future merge, before production enablement.** Revert the complete
+Task 12 change set and redeploy `main`. No production configuration rollback is
+needed because both managed-preview defaults are `false`.
 
 **After production managed mode is enabled.** Set both keys back to `false` in
 the external production configuration and restart `mgo.service`.
