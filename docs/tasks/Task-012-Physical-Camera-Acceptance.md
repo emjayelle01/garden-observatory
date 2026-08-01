@@ -2,9 +2,9 @@
 
 ## Status
 
-**Implementation corrected and locally revalidated after final shutdown review;
-Raspberry Pi validation and physical camera acceptance not performed. Awaiting
-Raspberry Pi validation authorisation.**
+**Implementation and narrow Raspberry Pi validation complete.
+Physical camera acceptance has not been performed.
+Ready for final merge review.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -19,7 +19,7 @@ Raspberry Pi validation authorisation.**
 | Repository re-review | **Round 2 complete** — one blocking classification defect found and corrected |
 | Final repository review | **Round 3 complete** — two edge cases found and corrected |
 | Final shutdown review | **Round 4 complete** — one monitor-drain defect found and corrected |
-| Raspberry Pi validation of this branch | **Not performed** — the Pi was not accessed |
+| Raspberry Pi validation of this branch | **Passed** — narrow ARM64 validation, 2026-07-31 |
 | Physical camera acceptance run | **Not performed** — requires separate authorisation |
 | Matthew's visual sign-off | **Not given** |
 
@@ -476,6 +476,14 @@ configuration in a controlled manner, test auto-start and capture restoration,
 execute the physical acceptance checklist, begin the 24-hour and 48-hour records,
 collect Matthew's decisions, and update the acceptance record with actual
 evidence.
+
+The first of those steps has since happened. A separately authorised **narrow**
+Raspberry Pi validation ran on 2026-07-31 against the reviewed SHA; it covered
+the ARM64 build, the full suite and the managed preview lifecycle on the
+simulator backend, and it deliberately did *not* touch production configuration,
+the physical camera or the acceptance checklist. Its results are recorded under
+[Raspberry Pi narrow validation](#raspberry-pi-narrow-validation--performed).
+Every remaining step in the paragraph above is still outstanding.
 
 ## Rollback
 
@@ -1027,6 +1035,120 @@ mapping, physical command array, simulator contract, motion behaviour, migration
 or dependency changed. `src/mgo/camera/` was not touched. The Raspberry Pi was
 not accessed, and the physical camera acceptance record remains entirely
 pending.
+
+## Raspberry Pi narrow validation — performed
+
+A separately authorised narrow validation ran on the production Raspberry Pi
+between **2026-07-31T16:12:44+02:00** and **2026-07-31T16:27:58+02:00**, against
+SHA `591d4a3ef70c4014ed0d292b05d739f334e2bd41`.
+
+Its purpose was to prove that the reviewed branch builds and behaves correctly in
+the real ARM64 environment, without modifying or interrupting production. It is
+**not** physical camera acceptance and makes no claim about what the camera can
+see.
+
+### Environment
+
+| Fact | Value |
+| ---- | ----- |
+| Validation account | `claude` |
+| Host | `mgo-core` |
+| Architecture | `aarch64` |
+| Operating system | Raspberry Pi OS (Debian), Linux 6.18.34+rpt-rpi-2712 |
+| Approval SHA | Matched the validated SHA exactly |
+
+### Production non-interference
+
+Every production fact below was recorded before the validation began and re-read
+after it finished. All were unchanged.
+
+| Fact | Before and after |
+| ---- | ---------------- |
+| Production branch | `main` |
+| Production SHA | `fc66e5193c272f9f7d8d3c101ee3d99cd193d0e4` |
+| Production working tree | Clean |
+| Service state | Active |
+| `MainPID` | `42147` |
+| `NRestarts` | `0` |
+| Physical preview PID | `42175` |
+| Physical preview `started_at` | Unchanged — the preview was never interrupted |
+| Production configuration checksum | Unchanged |
+| Production capture count | `8` |
+
+The production service was not restarted, its configuration was not edited, the
+physical preview was not stopped, no production capture was taken and no
+production image content was read.
+
+### Static and automated results
+
+| Check | Result |
+| ----- | ------ |
+| Dependency sync | Passed, `uv.lock` unchanged |
+| Ruff | Passed |
+| mypy | Passed — 50 source files |
+| Full Pi suite | **1680 passed, 0 skipped** |
+| Windows-only skips | All 12 executed and passed on the Pi |
+| Configuration suite | 41 passed |
+| Preview suite | 50 passed |
+| Coordinator suite | 26 passed |
+| Lifespan suite | 35 passed |
+| Focused monitor-drain selection | 9 passed |
+| API suites | 28 passed |
+| Camera capture suite | 30 passed |
+| Simulator suite | 204 passed |
+| Acceptance-document suite | 28 passed |
+| Warning-escalated Task 12 suites | 442 passed |
+
+The Windows suite reports 1668 passed with 12 skips, all of them POSIX-only
+environment guards in the operations suites. On the Pi those 12 ran and passed,
+reconciling exactly to 1680.
+
+### Managed preview lifecycle behaviour
+
+Exercised against an isolated runtime bound only to `127.0.0.1:8126`, using the
+simulator backend, its own configuration file, its own database and its own
+capture directory — entirely separate from production.
+
+| Behaviour | Result |
+| --------- | ------ |
+| Preview auto-started before the first request | Passed |
+| MJPEG stream produced balanced, decodable live JPEG frames | Passed |
+| Motion progressed beyond `waiting_for_frames` | Passed |
+| Capture and archive persistence | Passed |
+| Preview restoration after capture, with a new `started_at` | Passed |
+| Motion recovered after restoration | Passed |
+| Capture while stopped did not start preview | Passed |
+| Preview start and stop were idempotent | Passed |
+| Two clients consumed the shared stream | Passed |
+| Isolated runtime shut down cleanly | Passed |
+| Temporary runtime and worktree material removed | Passed |
+| Production non-interference | Passed |
+
+### Validation deviations
+
+1. **The Task 12 remote-tracking ref and objects were fetched into the production
+   repository metadata.** Validating a remote SHA on the Pi requires its objects
+   locally. `main`, `HEAD` and the production working tree were unchanged.
+2. **The full Pi suite was run twice.** The second run existed only to capture
+   explicit post-test working-tree cleanliness evidence, which the first run had
+   not recorded. Both runs gave 1680 passed with the lockfile unchanged.
+3. **The warning-escalated run covered 442 tests**, a superset of the equivalent
+   Windows run.
+4. **Repository-wide `ruff format --check` is not clean.** It is not currently a
+   project gate — the standard is `ruff check .`, `mypy src` and `pytest` — and
+   the condition was not introduced by Task 12.
+
+### Boundaries still standing
+
+- The validation used the **simulator backend only**.
+- Physical `rpicam` / `libcamera` behaviour was not exercised by the validation
+  runtime.
+- Production geometry and physical restoration latency remain unvalidated.
+- Physical acceptance remains **entirely pending**.
+- Matthew's visual sign-off remains **NOT GIVEN**.
+- The 24-hour gate remains **NOT STARTED**.
+- The 48-hour gate remains **NOT STARTED**.
+- Task 12 has **not** been deployed and **not** been merged.
 
 ## Deviations
 
