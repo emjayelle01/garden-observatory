@@ -15,3 +15,14 @@
 # logrotate configuration is installed verbatim into /etc/logrotate.d. A CR
 # would become part of a directive and break rotation for the whole host.
 *.logrotate text eol=lf
+
+# The deployment gateway is an extensionless executable installed to
+# /usr/local/sbin, so it is not covered by *.sh. A CR after its shebang would
+# make the kernel look for an interpreter named "bash\r" and every sudo call
+# would fail with "no such file or directory".
+scripts/deploy/mgo-validate text eol=lf
+
+# sudoers policies are parsed by visudo. A CR would become part of the command
+# path in the rule, so the gateway would never match and deployment would be
+# refused for the one account that is supposed to have it.
+*.sudoers text eol=lf

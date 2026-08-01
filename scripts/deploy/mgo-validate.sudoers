@@ -1,0 +1,23 @@
+# MGO deployment gateway — sudoers policy
+#
+# Installed to /etc/sudoers.d/mgo-validate (root:root, 0440) by
+# scripts/deploy/install-mgo-validate.sh.
+#
+# Grants exactly one account permission to execute exactly one absolute path as
+# root, with no password. Nothing else is granted: no shell, no arbitrary
+# systemctl, no arbitrary git, no arbitrary uv, no installer, no wildcard over
+# a directory of executables, and nothing at all for the mgo runtime account or
+# for any group.
+#
+# The rule deliberately carries no argument pattern. Sudo argument matching is
+# a poor security boundary — it is textual, and a policy that tried to enumerate
+# permitted actions here would have to be kept in step with the script forever.
+# The gateway's own action parser is the command boundary: it accepts one word
+# from a closed set, rejects every other input, and takes no path, ref, remote,
+# branch, command or username from the caller. Read scripts/deploy/mgo-validate
+# to see the whole input surface.
+#
+# The gateway is root-owned and mode 0755, so the caller cannot edit what this
+# rule lets them run.
+
+claude ALL=(root) NOPASSWD: /usr/local/sbin/mgo-validate

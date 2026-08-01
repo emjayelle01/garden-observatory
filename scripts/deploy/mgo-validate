@@ -1,0 +1,728 @@
+#!/usr/bin/env bash
+#
+# mgo-validate — the approved production deployment gateway.
+#
+# Installed to /usr/local/sbin/mgo-validate by
+# scripts/deploy/install-mgo-validate.sh and reachable only through the sudoers
+# rule in scripts/deploy/mgo-validate.sudoers, which permits exactly one caller
+# (claude) to execute exactly this path as root.
+#
+# Public actions:
+#
+#   show-approval   print the approved SHA and nothing else
+#   deploy-main     deploy origin/main at the approved SHA, transactionally
+#   restart-api     restart the service at the already-deployed approved SHA
+#
+# The root-owned approval file is the deployment authority. Only Matthew writes
+# it; this gateway only ever reads it. A deployment that the approval file does
+# not name cannot happen here.
+#
+# Privilege split: root is needed for exactly one thing — restarting the
+# service. Everything touching the repository or the virtual environment is
+# executed back down as the unprivileged administrative account. Git and uv
+# never run as root and never run as the runtime account.
+#
+# Input surface: the action word, and nothing else. No repository path, service
+# name, ref, remote, branch, command or username is accepted from the caller.
+# Every production value below is a fixed constant.
+#
+# This file is a library when sourced and a program when executed, so its real
+# logic can be tested without privilege (see tests/test_deployment_gateway.py).
+# Sourcing grants nothing: the privileged actions still verify root and caller.
+
+set -Eeuo pipefail
+
+# --- fixed production constants -------------------------------------------
+# Never overridable, never taken from the environment, never taken from the
+# caller. Functions receive what they need as parameters so that tests can
+# exercise the shipped logic against temporary directories without any of
+# these becoming configurable in production.
+
+readonly MGO_REPOSITORY="/opt/garden-observatory"
+readonly MGO_APPROVAL_FILE="/etc/garden-observatory/claude-approved-sha"
+readonly MGO_SERVICE="mgo.service"
+readonly MGO_ADMIN_ACCOUNT="claude"
+readonly MGO_RUNTIME_ACCOUNT="mgo"
+readonly MGO_EXPECTED_REPOSITORY="emjayelle01/garden-observatory"
+readonly MGO_REMOTE="origin"
+readonly MGO_BRANCH="main"
+readonly MGO_HEALTH_URL="http://127.0.0.1:8080/health"
+readonly MGO_PREVIEW_STATUS_URL="http://127.0.0.1:8080/camera/preview/status"
+readonly MGO_PREVIEW_START_URL="http://127.0.0.1:8080/camera/preview/start"
+
+# A fixed safe search path, applied only when this file runs as a program.
+readonly MGO_SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+readonly MGO_RECOVERY_TIMEOUT_SECONDS=60
+readonly MGO_PREVIEW_TIMEOUT_SECONDS=20
+
+# --- exit codes ------------------------------------------------------------
+# Distinct codes so an operator (or a wrapper) can tell "you asked for
+# something I will not do" from "production is in a state I could not restore".
+
+readonly EX_REQUEST=64      # bad action, or unusable approval state
+readonly EX_PRECONDITION=65 # the host or repository is not fit to deploy
+readonly EX_DEPLOY=70       # deployment failed
+
+# --- output ----------------------------------------------------------------
+# Messages are constructed from constants and validated values only. Command
+# output, file content and exception text are never interpolated into a
+# message: an operator-facing line is a summary, not a channel for whatever a
+# failing tool happened to print.
+
+log() {
+    printf 'mgo-validate: %s\n' "$*"
+}
+
+warn() {
+    printf 'mgo-validate: %s\n' "$*" >&2
+}
+
+die() {
+    local code="$1"
+    shift
+    printf 'mgo-validate: %s\n' "$*" >&2
+    exit "$code"
+}
+
+# --- caller and privilege --------------------------------------------------
+
+# The effective UID and sudo caller are parameters, not globals.
+#
+# ``EUID`` is readonly in Bash, so a test cannot stand in front of it; taking
+# both as arguments lets the real refusal logic be executed rather than merely
+# described, and the production call site below passes the real values.
+require_root_caller() {
+    local admin_account="$1"
+    local effective_uid="$2"
+    local sudo_caller="$3"
+
+    [[ "$effective_uid" -eq 0 ]] \
+        || die "$EX_REQUEST" "this gateway must be invoked as root through sudo"
+
+    [[ -n "$sudo_caller" ]] \
+        || die "$EX_REQUEST" "no sudo caller recorded; invoke through sudo"
+
+    [[ "$sudo_caller" == "$admin_account" ]] \
+        || die "$EX_REQUEST" \
+            "only the $admin_account account may use this gateway"
+
+    id -u "$admin_account" >/dev/null 2>&1 \
+        || die "$EX_PRECONDITION" \
+            "the $admin_account account does not exist on this host"
+}
+
+# Run a command as the unprivileged administrative account.
+#
+# Every Git and uv invocation goes through here. Running them as root would
+# leave root-owned objects in a checkout the account has to keep managing, and
+# running them as the runtime account would give the service write access to
+# its own code.
+run_as_admin() {
+    local admin_account="$1"
+    shift
+    runuser -u "$admin_account" -- "$@"
+}
+
+# Git, always as the administrative account, always against a named repository.
+git_admin() {
+    local admin_account="$1"
+    local repository="$2"
+    shift 2
+    run_as_admin "$admin_account" git -C "$repository" "$@"
+}
+
+# --- approval file ---------------------------------------------------------
+
+# Validate the approval file and print the approved SHA.
+#
+# The file is the deployment authority, so its *shape* is part of the contract:
+# a stray second line or a trailing space is not tidied up here, it is refused.
+# Silently normalising malformed authority would mean the thing that decides
+# what may be deployed is whatever this function was willing to salvage.
+validate_approval_file() {
+    local path="$1"
+    local owner
+    local mode
+    local line_count
+    local content
+
+    [[ -e "$path" ]] \
+        || die "$EX_REQUEST" "no approval file is installed"
+
+    # -L before -f: a symlink to a valid file passes -f, and would let anyone
+    # who can write the link's parent redirect the deployment authority.
+    [[ ! -L "$path" ]] \
+        || die "$EX_REQUEST" "the approval file must not be a symlink"
+
+    [[ -f "$path" ]] \
+        || die "$EX_REQUEST" "the approval file must be a regular file"
+
+    owner="$(stat -c '%u' "$path")"
+    [[ "$owner" == "0" ]] \
+        || die "$EX_REQUEST" "the approval file must be owned by root"
+
+    # Group or world write would move the authority outside root's control.
+    # Normalise to the trailing three digits first: stat reports a setuid or
+    # sticky bit as a fourth leading digit, and the write bits must be read
+    # from a known position rather than from wherever the string ends up.
+    mode="$(stat -c '%a' "$path")"
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] \
+        || die "$EX_REQUEST" "the approval file mode is unreadable"
+    mode="${mode: -3}"
+    case "${mode:1:1}" in
+        [2367])
+            die "$EX_REQUEST" \
+                "the approval file must not be writable by group"
+            ;;
+    esac
+    case "${mode:2:1}" in
+        [2367])
+            die "$EX_REQUEST" \
+                "the approval file must not be writable by other"
+            ;;
+    esac
+
+    # Count lines from the raw bytes: a trailing newline is the only line
+    # terminator allowed, and a second line is a refusal, not a hint.
+    line_count="$(wc -l <"$path")"
+    [[ "$line_count" -le 1 ]] \
+        || die "$EX_REQUEST" "the approval file must contain exactly one line"
+
+    # Read without stripping so surrounding whitespace is still visible here.
+    IFS= read -r content <"$path" || true
+
+    [[ "$content" =~ ^[0-9a-f]{40}$ ]] \
+        || die "$EX_REQUEST" "approved SHA is missing or malformed"
+
+    printf '%s\n' "$content"
+}
+
+# --- repository preconditions ----------------------------------------------
+
+require_repository_preconditions() {
+    local admin_account="$1"
+    local repository="$2"
+    local expected_repository="$3"
+    local branch="$4"
+    local remote="$5"
+    local canonical
+    local current_branch
+    local head
+    local local_branch
+    local porcelain
+    local stash
+    local worktrees
+    local remote_url
+
+    [[ -d "$repository/.git" ]] \
+        || die "$EX_PRECONDITION" "no repository at the production path"
+
+    # Resolve before trusting: a replaced symlink component would otherwise
+    # point every later check at a different tree than the one deployed.
+    # Physical against logical rather than against the literal argument — the
+    # two differ exactly when a component of the path is a symlink, which is
+    # the condition being refused.
+    canonical="$(cd "$repository" && pwd -P)"
+    [[ "$canonical" == "$(cd "$repository" && pwd -L)" ]] \
+        || die "$EX_PRECONDITION" \
+            "the production path resolves through a symlink"
+
+    current_branch="$(git_admin "$admin_account" "$repository" \
+        branch --show-current)"
+    [[ -n "$current_branch" ]] \
+        || die "$EX_PRECONDITION" "the production checkout is in detached HEAD"
+    [[ "$current_branch" == "$branch" ]] \
+        || die "$EX_PRECONDITION" "the production checkout is not on $branch"
+
+    head="$(git_admin "$admin_account" "$repository" rev-parse HEAD)"
+    local_branch="$(git_admin "$admin_account" "$repository" \
+        rev-parse "$branch")"
+    [[ "$head" == "$local_branch" ]] \
+        || die "$EX_PRECONDITION" "HEAD does not match the $branch branch"
+
+    # --untracked-files=all: an untracked file is not harmless here. It may be
+    # shadowing a tracked path, and a fast-forward that has to overwrite it
+    # would fail halfway.
+    porcelain="$(git_admin "$admin_account" "$repository" \
+        status --porcelain --untracked-files=all)"
+    [[ -z "$porcelain" ]] \
+        || die "$EX_PRECONDITION" "the production working tree is not clean"
+
+    stash="$(git_admin "$admin_account" "$repository" stash list)"
+    [[ -z "$stash" ]] \
+        || die "$EX_PRECONDITION" "the production repository has a stash"
+
+    require_no_operation_in_progress "$repository"
+
+    worktrees="$(git_admin "$admin_account" "$repository" worktree list \
+        | wc -l)"
+    [[ "$worktrees" -eq 1 ]] \
+        || die "$EX_PRECONDITION" \
+            "the production repository has an unexpected worktree"
+
+    remote_url="$(git_admin "$admin_account" "$repository" \
+        remote get-url "$remote")"
+    remote_matches_repository "$remote_url" "$expected_repository" \
+        || die "$EX_PRECONDITION" "$remote is not the expected repository"
+}
+
+# An interrupted merge, rebase, cherry-pick or revert leaves state that a
+# fast-forward would either refuse or silently build on. Neither is a safe
+# starting point for a deployment.
+require_no_operation_in_progress() {
+    local repository="$1"
+    local git_dir="$repository/.git"
+    local marker
+
+    for marker in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD \
+        rebase-merge rebase-apply; do
+        [[ ! -e "$git_dir/$marker" ]] \
+            || die "$EX_PRECONDITION" \
+                "a Git operation is in progress in the production repository"
+    done
+}
+
+# Accept the expected repository over HTTPS or SSH, with or without .git, and
+# nothing else. Matching on the owner/name pair rather than a whole URL keeps a
+# look-alike host from passing on a substring.
+remote_matches_repository() {
+    local url="$1"
+    local expected="$2"
+    local normalised="${url%.git}"
+
+    case "$normalised" in
+        "https://github.com/$expected" | \
+            "ssh://git@github.com/$expected" | \
+            "git@github.com:$expected")
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# --- service and endpoint state -------------------------------------------
+
+service_is_active() {
+    local service="$1"
+    [[ "$(systemctl is-active "$service" || true)" == "active" ]]
+}
+
+service_main_pid() {
+    local service="$1"
+    systemctl show "$service" -p MainPID --value
+}
+
+service_active_enter_timestamp() {
+    local service="$1"
+    systemctl show "$service" -p ActiveEnterTimestamp --value
+}
+
+# Literal loopback, proxies disabled: a deployment health check must describe
+# this host, not whatever a proxy or redirect would answer for.
+endpoint_is_ok() {
+    local url="$1"
+    curl --noproxy '*' -fsS -o /dev/null --max-time 5 "$url"
+}
+
+endpoint_body() {
+    local url="$1"
+    curl --noproxy '*' -fsS --max-time 5 "$url"
+}
+
+# Extract the reported preview state from a status document.
+#
+# A bounded field read rather than a JSON parser: the gateway must not gain a
+# dependency, and it only ever needs this one lowercase token.
+preview_state_from_status() {
+    local body="$1"
+    local state
+
+    # A document without the field is a legitimate outcome, not an error, so
+    # the pipeline's non-zero status is absorbed and reported as "unknown".
+    state="$(printf '%s' "$body" \
+        | grep -o '"state"[[:space:]]*:[[:space:]]*"[a-z_]*"' \
+        | head -n 1 \
+        | grep -o '"[a-z_]*"$' \
+        | tr -d '"' || true)"
+
+    if [[ -z "$state" ]]; then
+        printf 'unknown\n'
+    else
+        printf '%s\n' "$state"
+    fi
+}
+
+read_preview_state() {
+    local url="$1"
+    local body
+
+    body="$(endpoint_body "$url")" || return 1
+    preview_state_from_status "$body"
+}
+
+count_processes() {
+    local name="$1"
+    local count
+
+    # pgrep -c prints a count and exits non-zero when that count is zero, so
+    # the exit status is deliberately ignored and the value is validated.
+    count="$(pgrep -x -c "$name" 2>/dev/null || true)"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    printf '%s\n' "$count"
+}
+
+# --- remote authority ------------------------------------------------------
+
+# Ask the remote what main is, before fetching anything.
+#
+# The order matters: if the fetch came first, a remote that had moved past the
+# approval would already be in the local object store and named by
+# origin/main before anything compared it to the approved SHA.
+remote_branch_sha() {
+    local admin_account="$1"
+    local repository="$2"
+    local remote="$3"
+    local branch="$4"
+
+    git_admin "$admin_account" "$repository" \
+        ls-remote "$remote" "refs/heads/$branch" \
+        | awk 'NR == 1 { print $1 }'
+}
+
+# --- deployment proofs -----------------------------------------------------
+
+# The target must be a strict descendant of what is deployed now.
+#
+# Two separate facts: the current HEAD is an ancestor of the target (so the
+# move is a fast-forward), and the target is not behind HEAD (so this is not a
+# downgrade dressed up as a deployment).
+require_fast_forward_target() {
+    local admin_account="$1"
+    local repository="$2"
+    local head="$3"
+    local target="$4"
+    local behind
+
+    git_admin "$admin_account" "$repository" \
+        merge-base --is-ancestor "$head" "$target" \
+        || die "$EX_PRECONDITION" \
+            "the approved SHA is not a descendant of the deployed commit"
+
+    behind="$(git_admin "$admin_account" "$repository" \
+        rev-list --count "$target..$head")"
+    [[ "$behind" -eq 0 ]] \
+        || die "$EX_PRECONDITION" \
+            "the approved SHA is behind the deployed commit"
+}
+
+# --- environment -----------------------------------------------------------
+
+# Synchronise the virtual environment from the lockfile, never resolving.
+#
+# --frozen is the whole point: a deployment installs the dependency set the
+# repository locked and the test suite ran against. A resolving sync would let
+# production drift to versions nothing verified.
+sync_environment() {
+    local admin_account="$1"
+    local repository="$2"
+
+    # A real invocation rather than a PATH lookup: what matters is that the
+    # administrative account can actually run uv, not that a file exists.
+    run_as_admin "$admin_account" uv --version >/dev/null 2>&1 \
+        || die "$EX_PRECONDITION" \
+            "uv is not available to the $admin_account account"
+
+    # runuser preserves the working directory, so the change of directory
+    # happens here in a subshell rather than through a nested shell command.
+    (cd "$repository" && run_as_admin "$admin_account" uv sync --frozen) \
+        || return 1
+}
+
+require_clean_after_sync() {
+    local admin_account="$1"
+    local repository="$2"
+    local porcelain
+
+    porcelain="$(git_admin "$admin_account" "$repository" \
+        status --porcelain --untracked-files=no)"
+    [[ -z "$porcelain" ]] \
+        || return 1
+}
+
+# The runtime account has to be able to traverse the checkout and execute the
+# interpreter, or the restart fails with 203/EXEC after the code has already
+# moved. Checked before the restart, not diagnosed after it.
+require_runtime_can_execute() {
+    local runtime_account="$1"
+    local repository="$2"
+
+    runuser -u "$runtime_account" -- \
+        test -x "$repository/.venv/bin/uvicorn" \
+        || return 1
+}
+
+# --- restart and recovery --------------------------------------------------
+
+restart_service() {
+    local service="$1"
+    systemctl restart "$service"
+}
+
+# Wait for the service to be active *and* answering, within a bound.
+#
+# Both conditions, every time. "systemctl says active" alone is not recovery:
+# the unit can be active while the application is still failing every request.
+await_recovery() {
+    local service="$1"
+    local health_url="$2"
+    local timeout="$3"
+    local elapsed=0
+
+    while [[ "$elapsed" -lt "$timeout" ]]; do
+        if service_is_active "$service" && endpoint_is_ok "$health_url"; then
+            printf '%s\n' "$elapsed"
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 1
+}
+
+# --- preview preservation --------------------------------------------------
+
+# Restore the preview operating state that was found before deployment.
+#
+# Deliberately conditional. preview.auto_start is false in production, so a
+# restart leaves preview stopped; if it was running before, the deployment put
+# it out and owes an operator the state it borrowed. If it was stopped or
+# failed before, completing a deployment is not a reason to start a camera
+# nobody asked for.
+# Issue exactly one preview start request.
+#
+# The only write this gateway ever makes to the application. There is no
+# capture call and no stream call anywhere in this file: a deployment restores
+# an operating state, it does not exercise the camera.
+start_preview() {
+    local start_url="$1"
+    curl --noproxy '*' -fsS -o /dev/null --max-time 20 -X POST "$start_url"
+}
+
+restore_preview_state() {
+    local previous_state="$1"
+    local status_url="$2"
+    local start_url="$3"
+    local timeout="$4"
+    local current
+    local elapsed=0
+    local producers
+
+    if [[ "$previous_state" != "running" ]]; then
+        log "preview was $previous_state before deployment; leaving it alone"
+        return 0
+    fi
+
+    current="$(read_preview_state "$status_url")" || return 1
+
+    if [[ "$current" == "running" ]]; then
+        # Nothing to restore. A second start would be a duplicate request
+        # against a camera that already has an owner.
+        log "preview is already running; no start request issued"
+    else
+        start_preview "$start_url" || return 1
+
+        while [[ "$elapsed" -lt "$timeout" ]]; do
+            current="$(read_preview_state "$status_url")" || return 1
+            [[ "$current" == "running" ]] && break
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        [[ "$current" == "running" ]] || return 1
+    fi
+
+    producers="$(count_processes rpicam-vid)"
+    [[ "$producers" -eq 1 ]] || return 1
+    [[ "$(count_processes libcamera-vid)" -eq 0 ]] || return 1
+    return 0
+}
+
+# --- actions ---------------------------------------------------------------
+
+action_show_approval() {
+    validate_approval_file "$MGO_APPROVAL_FILE"
+}
+
+action_restart_api() {
+    local approved
+    local head
+    local tracking
+    local recovered
+
+    approved="$(validate_approval_file "$MGO_APPROVAL_FILE")"
+    require_repository_preconditions "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        "$MGO_EXPECTED_REPOSITORY" "$MGO_BRANCH" "$MGO_REMOTE"
+
+    head="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" rev-parse HEAD)"
+    [[ "$head" == "$approved" ]] \
+        || die "$EX_PRECONDITION" \
+            "the deployed commit is not the approved SHA"
+
+    tracking="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        rev-parse "$MGO_REMOTE/$MGO_BRANCH")"
+    [[ "$tracking" == "$approved" ]] \
+        || die "$EX_PRECONDITION" \
+            "$MGO_REMOTE/$MGO_BRANCH is not the approved SHA"
+
+    systemctl cat "$MGO_SERVICE" >/dev/null 2>&1 \
+        || die "$EX_PRECONDITION" "the service unit is not installed"
+
+    log "restarting $MGO_SERVICE at $approved"
+    restart_service "$MGO_SERVICE"
+
+    recovered="$(await_recovery "$MGO_SERVICE" "$MGO_HEALTH_URL" \
+        "$MGO_RECOVERY_TIMEOUT_SECONDS")" \
+        || die "$EX_DEPLOY" "the service did not recover within the bound"
+
+    log "recovered in ${recovered}s"
+    log "MainPID $(service_main_pid "$MGO_SERVICE")"
+    log "activated $(service_active_enter_timestamp "$MGO_SERVICE")"
+}
+
+action_deploy_main() {
+    local approved
+    local head
+    local remote_sha
+    local tracking
+    local previous_preview
+    local recovered
+
+    # 1. approval
+    approved="$(validate_approval_file "$MGO_APPROVAL_FILE")"
+    log "approved SHA $approved"
+
+    # 2. local preconditions
+    require_repository_preconditions "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        "$MGO_EXPECTED_REPOSITORY" "$MGO_BRANCH" "$MGO_REMOTE"
+
+    service_is_active "$MGO_SERVICE" \
+        || die "$EX_PRECONDITION" "$MGO_SERVICE is not active"
+    endpoint_is_ok "$MGO_HEALTH_URL" \
+        || die "$EX_PRECONDITION" "the health endpoint is not answering"
+    endpoint_is_ok "$MGO_PREVIEW_STATUS_URL" \
+        || die "$EX_PRECONDITION" \
+            "the preview status endpoint is not answering"
+
+    head="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" rev-parse HEAD)"
+    previous_preview="$(read_preview_state "$MGO_PREVIEW_STATUS_URL")" \
+        || die "$EX_PRECONDITION" "the preview state could not be read"
+    log "currently at commit $head"
+    log "preview state before deployment: $previous_preview"
+
+    # 3-4. remote authority, proven before the fetch
+    remote_sha="$(remote_branch_sha "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        "$MGO_REMOTE" "$MGO_BRANCH")"
+    [[ "$remote_sha" =~ ^[0-9a-f]{40}$ ]] \
+        || die "$EX_PRECONDITION" "the remote branch could not be resolved"
+    [[ "$remote_sha" == "$approved" ]] \
+        || die "$EX_PRECONDITION" \
+            "$MGO_REMOTE/$MGO_BRANCH does not match the approved SHA"
+
+    # 5. fetch
+    git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        fetch --no-tags "$MGO_REMOTE" "$MGO_BRANCH" \
+        || die "$EX_PRECONDITION" "the fetch failed"
+
+    # 6. local remote-tracking ref
+    tracking="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        rev-parse "$MGO_REMOTE/$MGO_BRANCH")"
+    [[ "$tracking" == "$approved" ]] \
+        || die "$EX_PRECONDITION" \
+            "$MGO_REMOTE/$MGO_BRANCH is not the approved SHA after fetching"
+
+    # Already current: nothing to do, and nothing may be done.
+    if [[ "$head" == "$approved" ]]; then
+        log "production is already at the approved target; nothing to do"
+        return 0
+    fi
+
+    # 7. ancestry
+    require_fast_forward_target "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        "$head" "$approved"
+
+    # 8. mutate
+    log "fast-forwarding $head -> $approved"
+    git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        merge --ff-only "$MGO_REMOTE/$MGO_BRANCH" \
+        || die "$EX_DEPLOY" "the fast-forward failed"
+
+    sync_environment "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        || die "$EX_DEPLOY" "the frozen dependency sync failed"
+    require_clean_after_sync "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        || die "$EX_DEPLOY" "the sync changed a tracked file"
+    require_runtime_can_execute "$MGO_RUNTIME_ACCOUNT" "$MGO_REPOSITORY" \
+        || die "$EX_DEPLOY" \
+            "the runtime account cannot execute the deployed environment"
+
+    log "restarting $MGO_SERVICE"
+    restart_service "$MGO_SERVICE" \
+        || die "$EX_DEPLOY" "the service restart failed"
+
+    recovered="$(await_recovery "$MGO_SERVICE" "$MGO_HEALTH_URL" \
+        "$MGO_RECOVERY_TIMEOUT_SECONDS")" \
+        || die "$EX_DEPLOY" "the service did not recover within the bound"
+    log "recovered in ${recovered}s"
+
+    restore_preview_state "$previous_preview" "$MGO_PREVIEW_STATUS_URL" \
+        "$MGO_PREVIEW_START_URL" "$MGO_PREVIEW_TIMEOUT_SECONDS" \
+        || die "$EX_DEPLOY" "the preview state could not be restored"
+
+    log "deployed $approved"
+    log "MainPID $(service_main_pid "$MGO_SERVICE")"
+    log "activated $(service_active_enter_timestamp "$MGO_SERVICE")"
+}
+
+# --- entry point -----------------------------------------------------------
+
+main() {
+    local action="${1:-}"
+
+    PATH="$MGO_SAFE_PATH"
+    export PATH
+
+    [[ -n "$action" ]] || die "$EX_REQUEST" "no action supplied"
+    shift
+    [[ "$#" -eq 0 ]] \
+        || die "$EX_REQUEST" "this gateway takes no arguments beyond an action"
+
+    case "$action" in
+        show-approval)
+            require_root_caller "$MGO_ADMIN_ACCOUNT" "$EUID" "${SUDO_USER:-}"
+            action_show_approval
+            ;;
+        deploy-main)
+            require_root_caller "$MGO_ADMIN_ACCOUNT" "$EUID" "${SUDO_USER:-}"
+            action_deploy_main
+            ;;
+        restart-api)
+            require_root_caller "$MGO_ADMIN_ACCOUNT" "$EUID" "${SUDO_USER:-}"
+            action_restart_api
+            ;;
+        install)
+            # Removed deliberately. The old action provisioned service identity
+            # while its name promised code deployment, and it could not deploy
+            # code at all. Both meanings now have their own entry point.
+            die "$EX_REQUEST" \
+                "the install action has been removed; use deploy-main to deploy application code, or scripts/deploy/install-service-identity.sh to provision service identity"
+            ;;
+        *)
+            die "$EX_REQUEST" \
+                "unsupported action; expected show-approval, deploy-main or restart-api"
+            ;;
+    esac
+}
+
+# Program when executed, library when sourced.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
