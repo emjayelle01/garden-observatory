@@ -2,9 +2,12 @@
 
 ## Status
 
-**Implementation and narrow Raspberry Pi validation merged into `main`.
-Production deployment and physical camera acceptance have not been performed.
-Awaiting separately authorised deployment and physical acceptance.**
+**Implementation, narrow Raspberry Pi validation, merge and production
+deployment complete.
+Managed preview remains disabled in production.
+Physical camera acceptance has not been performed.
+Awaiting deployment-gateway remediation and separately authorised physical
+acceptance.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -21,7 +24,8 @@ Awaiting separately authorised deployment and physical acceptance.**
 | Final shutdown review | **Round 4 complete** — one monitor-drain defect found and corrected |
 | Raspberry Pi validation of this branch | **Passed** — narrow ARM64 validation, 2026-07-31 |
 | Merge into `main` | **Passed** — fast-forward merge, 2026-08-01 |
-| Production deployment | **Not performed** — requires separate authorisation |
+| Production deployment | **Passed** — controlled direct fast-forward, 2026-08-01 |
+| Managed preview production policies | **Disabled** — `auto_start` and `restore_after_capture` remain `false` |
 | Physical camera acceptance run | **Not performed** — requires separate authorisation |
 | Matthew's visual sign-off | **Not given** |
 | 24-hour gate | **Not started** |
@@ -1079,7 +1083,21 @@ after it finished. All were unchanged.
 | Physical preview PID | `42175` |
 | Physical preview `started_at` | Unchanged — the preview was never interrupted |
 | Production configuration checksum | Unchanged |
-| Production capture count | `8` |
+| Production archive/database capture records | `8` |
+| Production physical capture files | `5` |
+
+**Note on the capture counts.** This table originally carried a single ambiguous
+row, `Production capture count | 8`. That `8` was always the *archive/database
+record* count read from `GET /captures`; it was later described incorrectly as a
+physical file count, which nearly caused a false stop during deployment. The
+truth is that the production capture directory holds **five** physical files
+while the archive holds **eight** records — four `rpicam-still` captures have
+both a record and a file, four small `mock` records from an early setting-up run
+have no file in that directory, and one file predates the archive and has no
+record. Both values were unchanged throughout the Raspberry Pi validation and
+throughout the production deployment. No capture file was added, removed, listed
+by name or opened at any point; the file figure comes from a count, and the
+record figure from the API's own count.
 
 The production service was not restarted, its configuration was not edited, the
 physical preview was not stopped, no production capture was taken and no
@@ -1154,7 +1172,9 @@ capture directory — entirely separate from production.
 - Matthew's visual sign-off remains **NOT GIVEN**.
 - The 24-hour gate remains **NOT STARTED**.
 - The 48-hour gate remains **NOT STARTED**.
-- Task 12 has been merged into `main` but has **not** been deployed.
+- Task 12 has since been merged into `main` and deployed to production with
+  managed preview left disabled; see
+  [Production deployment](#production-deployment--performed).
 
 ## Merge into main — performed
 
@@ -1186,6 +1206,130 @@ The merge moves code only. It changed nothing on the Raspberry Pi:
 
 Deploying the merged commit, enabling either managed-preview policy, and running
 the physical acceptance checklist each require their own explicit authorisation.
+
+## Production deployment — performed
+
+Task 12 was deployed to the production Raspberry Pi on **2026-08-01** under
+separate authorisation. Managed preview was left disabled, so the deployment
+changes what the service *can* do, not what it *does*.
+
+| Fact | Value |
+| ---- | ----- |
+| Deployment date | 2026-08-01 |
+| Deployment target SHA | `1aec2245010a1bd971d028be235c1864af6b46b3` |
+| Previous production SHA | `fc66e5193c272f9f7d8d3c101ee3d99cd193d0e4` |
+| Deployment account | `claude` |
+| Host | `mgo-core` |
+| Architecture | `aarch64` |
+
+### Method
+
+- Unprivileged `git fetch --prune origin main` as `claude`.
+- Strict ancestry proof before any change: `merge-base --is-ancestor` returned 0
+  and the divergence was `0 12`.
+- `git merge --ff-only origin/main`.
+- `uv sync --frozen`.
+- One authorised `sudo -n /usr/local/sbin/mgo-validate restart-api` call.
+
+No `sudo git`; no `sudo uv`; no Git or `uv` as `pi` or `mgo`; no reset, rebase,
+squash, cherry-pick or force of anything; no repository commit or push from the
+Pi; no merge commit.
+
+### Gateway limitation discovered
+
+The deployment was first attempted through the gateway's `install` action, as
+originally planned. It is not capable of deploying application code:
+
+- `/usr/local/sbin/mgo-validate` hardcodes `FEATURE_BRANCH="task-010-operations"`.
+- `install` execs Task 10's service-identity and systemd provisioner,
+  `scripts/deploy/install-service-identity.sh`.
+- It neither fetches nor advances the checkout, so it cannot move production to a
+  new SHA.
+- The attempt therefore stopped safely with exit 128, failing on
+  `rev-parse origin/task-010-operations` inside its own precondition check.
+- Production remained completely untouched by the failed attempt.
+- A separately authorised direct fast-forward deployment was used instead.
+
+**The deployment gateway needs a durable generalisation before routine
+deployments.** It should take the approved SHA as its single source of truth
+rather than a hardcoded feature branch, and it needs an action that actually
+fetches and fast-forwards. Until then, every deployment requires a bespoke
+authorisation like this one.
+
+### Evidence
+
+| Check | Result |
+| ----- | ------ |
+| Production checkout moved to the target SHA | Passed |
+| Working tree | Remained clean |
+| `uv sync --frozen` | Passed |
+| Dependencies | None changed — Task 12 adds no dependency |
+| Service restart | Succeeded |
+| Recovery time | 2 seconds |
+| Old `MainPID` | `42147` |
+| New `MainPID` | `70709` |
+| `NRestarts` | Remained `0` |
+| Database | Remained healthy and schema-current |
+| Camera | Remained available — IMX708 through `rpicam` |
+| Preview immediately after restart | Correctly **stopped**, because `auto_start` remains `false` |
+| Old preview process `42175` | Fully reaped — no orphan |
+| Manual preview start | One request, succeeded |
+| Restored preview PID | `71087` |
+| Restored geometry | 1280x720 at 15 fps, unchanged |
+| Producers | Exactly one `rpicam-vid`; no `libcamera-vid` |
+| Ten-minute smoke observation | Passed |
+| Deployment-window error match | None found |
+| Configuration checksum | `8346e732c2545ff369f6c4f0e3fc2e415d10993d8fe6b4b1b2c67600555183da`, unchanged |
+| `preview.auto_start` | Remained `false` |
+| `preview.restore_after_capture` | Remained `false` |
+| Archive/database capture records | Remained `8` |
+| Physical capture files | Remained `5` |
+
+The correctly stopped preview is the deployment's central behavioural proof: the
+managed lifecycle is present and deliberately inert.
+
+No capture was taken. No preview stream was accessed. No image was opened, saved,
+decoded or inspected. No production configuration was changed. Physical
+acceptance was not begun.
+
+### Shutdown observation
+
+During the authorised restart, the **outgoing** pre-Task-12 process at
+`fc66e519` logged that its preview process terminated unexpectedly with code
+`-15`.
+
+- Code `-15` is `SIGTERM` — the signal the application's own shutdown sends.
+- The message came from the outgoing old process during authorised shutdown, not
+  from the deployed code.
+- Shutdown completed.
+- No preview process survived.
+- The new service started healthy.
+- No operational failure resulted.
+- **This is not evidence that the deployed shutdown correction failed.** The
+  deployed code did not produce the message and was not exercised on this path.
+- The next authorised restart should observe whether the message recurs under the
+  deployed code.
+
+### Physical-acceptance boundaries after deployment
+
+Deployment proves the code is installed and inert. It proves nothing about the
+camera. All of the following remain true:
+
+- Managed preview remains disabled.
+- Auto-start has not run on physical hardware.
+- Capture restoration has not run on physical hardware.
+- No physical still capture was taken.
+- No feeder image was reviewed.
+- Privacy was not assessed.
+- Feeder coverage was not assessed.
+- Autofocus was not assessed.
+- Exposure and reflections were not assessed.
+- Reboot recovery was not tested.
+- Matthew's sign-off remains **NOT GIVEN**.
+- The 24-hour gate remains **NOT STARTED**.
+- The 48-hour gate remains **NOT STARTED**.
+- `docs/acceptance/Initial-Camera-Acceptance.md` remains unchanged and entirely
+  pending, as its tests require until the actual hardware run.
 
 ## Deviations
 
