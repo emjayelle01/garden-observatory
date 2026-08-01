@@ -1671,6 +1671,171 @@ def test_the_installer_is_separate_from_service_identity_provisioning() -> None:
 
 
 # --------------------------------------------------------------------------
+# the update-main wrapper
+# --------------------------------------------------------------------------
+
+
+def _wrapper_body() -> str:
+    """The wrapper's executable lines, without its explanatory comments."""
+    return "\n".join(
+        line
+        for line in _read(UPDATE_MAIN).splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    )
+
+
+def test_the_wrapper_delegates_to_the_gateway() -> None:
+    """One job: hand off to the gateway and get out of the way."""
+    body = _wrapper_body()
+
+    assert 'readonly GATEWAY="/usr/local/sbin/mgo-validate"' in body
+    assert 'exec sudo -n "$GATEWAY" deploy-main' in body
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    ["git ", "uv ", "chgrp", "chmod", "find ", "systemctl", "curl", "pull"],
+)
+def test_the_wrapper_retains_no_deployment_logic(forbidden: str) -> None:
+    """A second, weaker deployment path is the defect this replaced."""
+    assert forbidden not in _wrapper_body()
+
+
+def test_the_wrapper_has_no_fallback_around_the_gateway() -> None:
+    """If the gateway is missing, install it — do not deploy around it."""
+    body = _wrapper_body()
+
+    assert "is not installed at" in _read(UPDATE_MAIN)
+    assert "install-mgo-validate.sh" in _read(UPDATE_MAIN)
+    assert body.count("exec sudo") == 1
+
+
+def test_the_wrapper_refuses_to_run_as_root() -> None:
+    """The gateway raises its own privilege; the caller should not."""
+    body = _wrapper_body()
+
+    assert '[[ "${EUID}" -eq 0 ]]' in body
+    assert "exit 1" in body
+
+
+def test_the_wrapper_reports_a_missing_gateway_and_stops(tmp_path: Path) -> None:
+    """Executed, not described: the real script on a host with no gateway."""
+    result = subprocess.run(
+        [_bash(), str(UPDATE_MAIN)],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "not installed" in result.stderr
+    assert "install-mgo-validate.sh" in result.stderr
+
+
+def test_the_wrapper_preserves_the_gateway_exit_code_by_execing() -> None:
+    """A wrapper that summarised the result could report a false success."""
+    assert "exec sudo" in _wrapper_body()
+
+
+# --------------------------------------------------------------------------
+# documentation
+# --------------------------------------------------------------------------
+
+
+DEPLOYMENT_DOC = PROJECT_ROOT / "docs" / "Deployment-Gateway.md"
+
+
+def test_the_deployment_document_exists_and_is_linked() -> None:
+    """The gateway is not discoverable unless the docs point at it."""
+    assert DEPLOYMENT_DOC.exists()
+
+    for source in (
+        PROJECT_ROOT / "README.md",
+        PROJECT_ROOT / "scripts" / "README.md",
+        PROJECT_ROOT / "docs" / "Remote-Access.md",
+    ):
+        assert "Deployment-Gateway.md" in _read(source), source.name
+
+
+@pytest.mark.parametrize(
+    "topic",
+    [
+        "approval file",
+        "show-approval",
+        "deploy-main",
+        "restart-api",
+        "fast-forward",
+        "--frozen",
+        "rollback",
+        "sudoers",
+        "install-service-identity.sh",
+        "capture",
+    ],
+)
+def test_the_deployment_document_covers_the_contract(topic: str) -> None:
+    """Each promise the gateway makes is written down where operators look."""
+    assert topic in _read(DEPLOYMENT_DOC)
+
+
+def test_the_deployment_document_records_the_incident() -> None:
+    """The reason the gateway exists is part of the gateway's documentation."""
+    text = _read(DEPLOYMENT_DOC)
+
+    assert "task-010-operations" in text
+    assert "128" in text
+    assert "Production was untouched" in text
+
+
+def _shell_blocks(markdown: str) -> list[str]:
+    """Extract fenced ``bash`` blocks — the runnable part of a document.
+
+    Prose that *names* an obsolete command in order to explain why it is gone
+    is not a bypass; a copy-pasteable block still teaching it would be.
+    """
+    blocks: list[str] = []
+    current: list[str] | None = None
+    for line in markdown.splitlines():
+        if line.strip() == "```bash":
+            current = []
+        elif line.strip() == "```" and current is not None:
+            blocks.append("\n".join(current))
+            current = None
+        elif current is not None:
+            current.append(line)
+    return blocks
+
+
+def test_the_remote_access_document_no_longer_teaches_the_old_path() -> None:
+    """A documented bypass is a bypass — checked against runnable blocks."""
+    text = _read(PROJECT_ROOT / "docs" / "Remote-Access.md")
+    deployment = text[text.index("## 8. Deployment") : text.index("## 9.")]
+    commands = "\n".join(_shell_blocks(deployment))
+
+    assert "git pull" not in commands
+    assert "chgrp" not in commands
+    assert "chmod" not in commands
+    assert "systemctl restart" not in commands
+    assert "uv sync" not in commands
+    assert "mgo-validate deploy-main" in commands
+    assert "mgo-validate show-approval" in commands
+
+
+def test_the_task_record_does_not_claim_the_production_gateway_changed() -> None:
+    """Implemented is not installed, and the record must not blur them."""
+    record = (
+        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Physical-Camera-Acceptance.md"
+    )
+    text = _read(record)
+    index = text.index("Remediation status")
+    section = text[index : index + 900]
+
+    assert "not** been reviewed" in section
+    assert "not** been installed" in section
+    assert "still the\nTask 10 one" in section or "still the" in section
+
+
+# --------------------------------------------------------------------------
 # environment safety
 # --------------------------------------------------------------------------
 

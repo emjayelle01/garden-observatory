@@ -221,6 +221,17 @@ a fallback (SSH hardening is out of current scope). Optional, non-destructive
 operator helper scripts are in [`scripts/`](scripts/README.md). These are
 operator procedures only; they do not change application behaviour.
 
+Deploying application code is not one of those optional helpers. It goes through
+the **approved deployment gateway**, which takes a root-owned approval SHA as
+its authority, accepts only a strict fast-forward of `origin/main` to that SHA,
+runs Git and `uv sync --frozen` as an unprivileged account, uses root for the
+service restart alone, and restores the previous commit, environment and preview
+state if any step after the first change fails. The model, the three actions it
+exposes, the exit codes and the recovery workflow are in
+[`docs/Deployment-Gateway.md`](docs/Deployment-Gateway.md). Provisioning the
+service identity is a separate operation with its own script — conflating the
+two is a defect the gateway exists to prevent.
+
 ## Service identity
 
 In production MGO runs as a dedicated, non-login system account — `mgo` — with

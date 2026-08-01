@@ -1256,6 +1256,18 @@ rather than a hardcoded feature branch, and it needs an action that actually
 fetches and fast-forwards. Until then, every deployment requires a bespoke
 authorisation like this one.
 
+**Remediation status.** That generalisation has been *implemented* on
+`task-012-deployment-gateway-remediation` — a repository-managed gateway at
+`scripts/deploy/mgo-validate` with three actions, transaction rollback and its
+own installer, documented in [Deployment-Gateway.md](../Deployment-Gateway.md)
+and recorded in
+[Task-012-Deployment-Gateway-Remediation.md](Task-012-Deployment-Gateway-Remediation.md).
+It has **not** been reviewed, **not** been installed on the Raspberry Pi and
+**not** been validated there. The gateway running in production is still the
+Task 10 one described above, and nothing about the production host changed. A
+future deployment cannot use the new gateway until it is reviewed and installed
+under separate authorisation.
+
 ### Evidence
 
 | Check | Result |

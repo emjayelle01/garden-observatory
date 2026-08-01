@@ -174,34 +174,48 @@ Normal Git operations then work over SSH: `git fetch`, `git pull --ff-only`,
 
 ## 8. Deployment — align the Pi to `main`
 
-Deployment is unchanged in shape: align to `main` and restart the service. Use
-the helper:
+Deployment goes through the **approved deployment gateway**. It is the only
+supported path, and there is deliberately no manual equivalent: the steps that
+used to be listed here — `git pull`, a resolving `uv sync`, a recursive
+`chgrp`/`chmod`, a direct `sudo systemctl restart` — consulted no approval,
+proved nothing about what they were deploying, and could not undo a half-applied
+deployment.
+
+A deployment needs an approved SHA in place first. **Matthew** installs it in
+`/etc/garden-observatory/claude-approved-sha`; nothing else may write that file.
+Then, on the Pi as `claude`:
+
+```bash
+sudo -n /usr/local/sbin/mgo-validate show-approval
+```
+
+Confirm it prints the commit you intend to deploy, then:
 
 ```bash
 bash /opt/garden-observatory/scripts/deploy/update-main.sh
 ```
 
-or the equivalent manual steps:
+which is a thin wrapper around:
 
 ```bash
-cd /opt/garden-observatory
-git fetch origin
-git checkout main
-git pull --ff-only origin main
-git rev-parse HEAD
-uv sync
-sudo chgrp -R mgo /opt/garden-observatory
-sudo chmod -R g+rX /opt/garden-observatory
-sudo systemctl restart mgo.service
-systemctl --no-pager --full status mgo.service
+sudo -n /usr/local/sbin/mgo-validate deploy-main
 ```
 
-The `chgrp`/`chmod` step keeps newly pulled or synced files readable by the
-runtime account; the helper does it for you.
+The gateway proves the remote `main` matches the approval *before* fetching,
+accepts only a strict fast-forward, runs `uv sync --frozen` as `claude`,
+restarts the service once, requires both an active unit and a healthy endpoint
+within a bound, and restores the preview state it found. Any failure after the
+first change restores the previous commit, environment and preview state and
+still reports failure. It never changes SSH configuration, never takes a
+capture and never opens the preview stream.
 
-The deploy helper is **non-destructive**: it refuses to run with a dirty working
-tree, only fast-forwards `main`, and prints the service status plus probes of
-the four status endpoints afterwards. It never changes SSH configuration.
+Read [`Deployment-Gateway.md`](Deployment-Gateway.md) for the full model,
+including the exit codes and what to do about each. If the gateway is not
+installed yet:
+
+```bash
+sudo bash /opt/garden-observatory/scripts/deploy/install-mgo-validate.sh
+```
 
 The **first** deployment onto the dedicated service identity has extra one-time
 steps (moving the checkout to `/opt`, provisioning the account and directories,
