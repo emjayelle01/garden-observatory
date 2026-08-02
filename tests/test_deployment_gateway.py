@@ -126,6 +126,13 @@ def approval_file(tmp_path: Path) -> Path:
     return _write_approval(tmp_path / "claude-approved-sha", f"{APPROVED_SHA}\n")
 
 
+def _function_body(name: str, next_name: str) -> str:
+    """Slice one shipped function out of the gateway, exactly."""
+    source = _read(GATEWAY)
+    start = source.index(name)
+    return source[start : source.index(next_name, start)]
+
+
 def _stat_double(owner: str = "0", mode: str = "644") -> str:
     """Replace ``stat`` so ownership and mode can be driven on any filesystem.
 
@@ -182,7 +189,7 @@ def test_a_short_sha_is_rejected(tmp_path: Path) -> None:
     result = _validate_approval(path)
 
     assert result.returncode == EX_REQUEST
-    assert "malformed" in result.stderr
+    assert "approval file" in result.stderr or "SHA" in result.stderr
 
 
 def test_a_long_sha_is_rejected(tmp_path: Path) -> None:
@@ -244,6 +251,68 @@ def test_an_extra_token_on_the_line_is_rejected(tmp_path: Path, extra: str) -> N
     path = _write_approval(tmp_path / "approval", extra)
 
     assert _validate_approval(path).returncode == EX_REQUEST
+
+
+def test_a_valid_sha_without_a_final_newline_is_accepted(tmp_path: Path) -> None:
+    """Forty bytes and nothing else is the minimal valid file."""
+    path = _write_approval(tmp_path / "approval", APPROVED_SHA)
+
+    result = _validate_approval(path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == APPROVED_SHA
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [
+        ("terminated second line", f"{APPROVED_SHA}\nmain\n"),
+        ("unterminated second line", f"{APPROVED_SHA}\nmain"),
+        ("empty second line", f"{APPROVED_SHA}\n\n"),
+        ("crlf", f"{APPROVED_SHA}\r\n"),
+        ("bare cr", f"{APPROVED_SHA}\r"),
+        ("trailing nul", f"{APPROVED_SHA}\0"),
+        ("embedded nul", f"{APPROVED_SHA[:20]}\0{APPROVED_SHA[21:]}\n"),
+        ("trailing bytes", f"{APPROVED_SHA}xyz"),
+        ("trailing space", f"{APPROVED_SHA} "),
+        ("trailing tab after newline", f"{APPROVED_SHA}\n\t"),
+        ("control byte", f"{APPROVED_SHA[:20]}\x07{APPROVED_SHA[21:]}\n"),
+    ],
+)
+def test_byte_exact_approval_parsing_refuses_trailing_data(
+    tmp_path: Path, label: str, payload: str
+) -> None:
+    """The regression this closes: one newline is not one logical line.
+
+    ``<sha>\\nmain`` with no final newline contains exactly one newline, so a
+    line count passes and reading the first line returns a valid SHA — while a
+    whole trailing line is ignored. Anchoring on the file's own length refuses
+    that and every relative of it.
+    """
+    path = tmp_path / "approval"
+    path.write_bytes(payload.encode("utf-8", errors="surrogateescape"))
+
+    result = _validate_approval(path)
+
+    assert result.returncode == EX_REQUEST, label
+
+
+def test_an_empty_approval_file_is_rejected(tmp_path: Path) -> None:
+    """Zero bytes is not an approval."""
+    path = tmp_path / "approval"
+    path.write_bytes(b"")
+
+    assert _validate_approval(path).returncode == EX_REQUEST
+
+
+def test_the_approval_parser_does_not_rely_on_a_line_count(tmp_path: Path) -> None:
+    """The corrected parser reconciles the file's length, not its newlines."""
+    body = _function_body("validate_approval_file()", "# --- repository")
+
+    assert "wc -c" in body
+    assert "head -c 40" in body
+    assert "tail -c 1" in body
+    assert "wc -l" not in body
 
 
 def test_a_non_root_owner_is_rejected(approval_file: Path) -> None:
@@ -827,27 +896,191 @@ def test_no_endpoint_probe_uses_a_proxy() -> None:
 
 
 # --------------------------------------------------------------------------
+# exact HTTP status
+# --------------------------------------------------------------------------
+
+
+def _curl_double(status: str, *, body: str = "{}", fail: bool = False) -> str:
+    """Stand in for ``curl``, honouring --output and --write-out.
+
+    Real ``curl`` semantics matter here: it writes the body to the file named
+    by ``--output`` and prints ``--write-out`` on stdout, which is exactly what
+    the gateway relies on to separate the status from the body.
+    """
+    if fail:
+        return "curl() { return 7; }\n"
+    return (
+        "curl() {\n"
+        "    local out=\"\"\n"
+        "    while [[ $# -gt 0 ]]; do\n"
+        '        if [[ "$1" == "--output" ]]; then out="$2"; shift; fi\n'
+        "        shift\n"
+        "    done\n"
+        f'    [[ -n "$out" ]] && printf \'{body}\' > "$out"\n'
+        f"    printf '{status}'\n"
+        "}\n"
+    )
+
+
+@pytest.mark.parametrize("status", ["201", "204", "301", "302", "307", "404", "500"])
+def test_only_an_exact_200_counts_as_healthy(status: str) -> None:
+    """``curl -f`` accepts every 2xx and reports a redirect as success."""
+    result = call_gateway_function(
+        'endpoint_is_ok "http://127.0.0.1:8080/health"',
+        preamble=_curl_double(status),
+    )
+
+    assert result.returncode != 0, status
+
+
+def test_an_exact_200_is_healthy() -> None:
+    """The positive case, so the refusals above mean something."""
+    result = call_gateway_function(
+        'endpoint_is_ok "http://127.0.0.1:8080/health"',
+        preamble=_curl_double("200"),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_transport_failure_is_not_healthy() -> None:
+    """A connection that never happened is not a 200."""
+    result = call_gateway_function(
+        'endpoint_is_ok "http://127.0.0.1:8080/health"',
+        preamble=_curl_double("000", fail=True),
+    )
+
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize("status", ["204", "302", "404", "500"])
+def test_a_non_200_body_is_never_interpreted(status: str) -> None:
+    """An error page must not be read as a status document."""
+    result = call_gateway_function(
+        'read_preview_state "http://127.0.0.1:8080/camera/preview/status"',
+        preamble=_curl_double(status, body='{"state":"running"}'),
+    )
+
+    assert result.returncode != 0
+    assert "running" not in result.stdout
+
+
+def test_a_200_body_is_used() -> None:
+    """Once the status is exactly 200, the document is read."""
+    result = call_gateway_function(
+        'read_preview_state "http://127.0.0.1:8080/camera/preview/status"',
+        preamble=_curl_double("200", body='{"state":"running"}'),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "running"
+
+
+@pytest.mark.parametrize("status", ["201", "202", "204", "302", "404", "500"])
+def test_a_preview_start_requires_an_exact_200(status: str) -> None:
+    """A 202 "accepted" is not a preview that came back."""
+    result = call_gateway_function(
+        'start_preview "http://127.0.0.1:8080/camera/preview/start"',
+        preamble=_curl_double(status),
+    )
+
+    assert result.returncode != 0, status
+
+
+def test_a_preview_start_accepts_an_exact_200() -> None:
+    """The positive case."""
+    result = call_gateway_function(
+        'start_preview "http://127.0.0.1:8080/camera/preview/start"',
+        preamble=_curl_double("200"),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_no_probe_follows_a_redirect() -> None:
+    """``--location`` would turn a moved endpoint into a healthy one.
+
+    Checked over the whole request-issuing function, not per line: every curl
+    invocation here is a continuation, so a per-line scan would only ever see
+    the first one.
+    """
+    for name, following in (
+        ("http_get_200()", "http_post_200()"),
+        ("http_post_200()", "# Literal loopback"),
+    ):
+        body = "\n".join(
+            line
+            for line in _function_body(name, following).splitlines()
+            if not line.strip().startswith("#")
+        )
+        assert "--location" not in body, name
+        assert " -L " not in body, name
+        assert "--max-time" in body, name
+
+
+def test_every_probe_captures_the_status_explicitly() -> None:
+    """The status is compared, not inferred from curl's exit code."""
+    for name in ("http_get_200()", "http_post_200()"):
+        body = _function_body(name, "}\n")
+        assert "--write-out '%{http_code}'" in body
+        assert '[[ "$status" == "200" ]]' in body
+
+
+def test_response_bodies_go_to_temporary_files_that_are_removed() -> None:
+    """Securely created, always cleaned up, never left in a shared directory."""
+    for name, following in (
+        ("endpoint_is_ok()", "# The body, and only when"),
+        ("endpoint_body()", "# Extract the reported preview state"),
+        ("start_preview()", "# The physical producer contract"),
+    ):
+        body = _function_body(name, following)
+        assert "mktemp" in body, name
+        assert "rm -f" in body, name
+
+
+# --------------------------------------------------------------------------
 # preview preservation
 # --------------------------------------------------------------------------
 
 
+def _producer_double(rpicam: int = 1, libcamera: int = 0) -> str:
+    """Stand in for ``pgrep`` so producer counts can be driven exactly."""
+    return (
+        "count_processes() {\n"
+        '    case "$1" in\n'
+        f"        rpicam-vid) printf '{rpicam}\\n' ;;\n"
+        f"        libcamera-vid) printf '{libcamera}\\n' ;;\n"
+        "        *) printf '0\\n' ;;\n"
+        "    esac\n"
+        "}\n"
+    )
+
+
 PREVIEW_DOUBLES = (
     "start_preview() { printf 'START\\n' >> calls; }\n"
-    "count_processes() {\n"
-    '    case "$1" in\n'
-    "        rpicam-vid) printf '1\\n' ;;\n"
-    "        *) printf '0\\n' ;;\n"
-    "    esac\n"
-    "}\n"
     "sleep() { :; }\n"
 )
 
 
 def _restore_preview(
-    previous: str, *, current: str, extra: str = "", cwd: Path
+    previous: str,
+    *,
+    current: str,
+    rpicam: int | None = None,
+    libcamera: int = 0,
+    extra: str = "",
+    cwd: Path,
 ) -> subprocess.CompletedProcess[str]:
+    """Exercise the shipped restoration against a driven world.
+
+    ``rpicam`` defaults to the count that *should* accompany ``current``, so a
+    test only states it when the point is that it disagrees.
+    """
+    if rpicam is None:
+        rpicam = 1 if current == "running" else 0
     preamble = (
         PREVIEW_DOUBLES
+        + _producer_double(rpicam=rpicam, libcamera=libcamera)
         + f"read_preview_state() {{ printf '{current}\\n'; }}\n"
         + extra
     )
@@ -856,16 +1089,6 @@ def _restore_preview(
         preamble=preamble,
         cwd=cwd,
     )
-
-
-def test_a_previously_running_preview_is_restored(tmp_path: Path) -> None:
-    """The deployment borrowed the camera and gives it back."""
-    result = _restore_preview("running", current="running", cwd=tmp_path)
-    # The restart left it stopped, then the start request brought it back.
-    calls = tmp_path / "calls"
-
-    assert result.returncode == 0, result.stderr
-    assert not calls.exists() or calls.read_text(encoding="utf-8") == ""
 
 
 def test_an_already_running_preview_receives_no_duplicate_start(
@@ -879,12 +1102,65 @@ def test_an_already_running_preview_receives_no_duplicate_start(
     assert not (tmp_path / "calls").exists()
 
 
+@pytest.mark.parametrize("previous", ["stopped", "failed", "unknown"])
+def test_a_non_running_preview_that_stays_non_running_passes(
+    tmp_path: Path, previous: str
+) -> None:
+    """stopped -> stopped, failed -> non-running, unknown -> non-running."""
+    result = _restore_preview(previous, current="stopped", cwd=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert not (tmp_path / "calls").exists()
+    assert "non-running state before deployment" in result.stdout
+
+
+@pytest.mark.parametrize("previous", ["stopped", "failed", "unknown"])
+def test_a_non_running_preview_that_drifts_into_running_fails(
+    tmp_path: Path, previous: str
+) -> None:
+    """Drift is surfaced and sent to rollback, not quietly accepted.
+
+    Deliberately no stop request: a camera that started itself is a fault to
+    report, and stopping it would be a second unrequested mutation.
+    """
+    result = _restore_preview(previous, current="running", cwd=tmp_path)
+
+    assert result.returncode != 0
+    assert not (tmp_path / "calls").exists()
+    assert "but is now running" in result.stderr
+
+
+@pytest.mark.parametrize("previous", ["stopped", "failed"])
+def test_a_producer_running_behind_a_stopped_preview_fails(
+    tmp_path: Path, previous: str
+) -> None:
+    """Status saying stopped while a producer lives is not preservation."""
+    result = _restore_preview(previous, current="stopped", rpicam=1, cwd=tmp_path)
+
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("previous", "current"), [("running", "running"), ("stopped", "stopped")]
+)
+def test_a_legacy_producer_fails_in_any_final_state(
+    tmp_path: Path, previous: str, current: str
+) -> None:
+    """A libcamera-vid means something else is holding the camera."""
+    result = _restore_preview(
+        previous, current=current, libcamera=1, cwd=tmp_path
+    )
+
+    assert result.returncode != 0
+
+
 def test_a_stopped_preview_that_was_running_is_started_once(
     tmp_path: Path,
 ) -> None:
     """Exactly one start request, then a poll until it reports running."""
     preamble = (
         PREVIEW_DOUBLES
+        + _producer_double(rpicam=1)
         + "read_preview_state() {\n"
         '    if [[ -f started ]]; then printf "running\\n"; '
         'else printf "stopped\\n"; fi\n'
@@ -901,45 +1177,9 @@ def test_a_stopped_preview_that_was_running_is_started_once(
     assert (tmp_path / "calls").read_text(encoding="utf-8") == "START\n"
 
 
-@pytest.mark.parametrize("previous", ["stopped", "failed", "unknown"])
-def test_a_preview_that_was_not_running_is_left_alone(
-    tmp_path: Path, previous: str
-) -> None:
-    """Completing a deployment is not a reason to start a camera."""
-    result = _restore_preview(previous, current="stopped", cwd=tmp_path)
-
-    assert result.returncode == 0, result.stderr
-    assert not (tmp_path / "calls").exists()
-    assert previous in result.stdout
-
-
 def test_a_duplicate_producer_fails_the_restoration(tmp_path: Path) -> None:
     """Two producers means the old one was never reaped."""
-    extra = (
-        "count_processes() {\n"
-        '    case "$1" in\n'
-        "        rpicam-vid) printf '2\\n' ;;\n"
-        "        *) printf '0\\n' ;;\n"
-        "    esac\n"
-        "}\n"
-    )
-    result = _restore_preview("running", current="running", extra=extra, cwd=tmp_path)
-
-    assert result.returncode != 0
-
-
-def test_a_legacy_producer_fails_the_restoration(tmp_path: Path) -> None:
-    """A libcamera-vid producer is not the backend this deployment expects."""
-    extra = (
-        "count_processes() {\n"
-        '    case "$1" in\n'
-        "        rpicam-vid) printf '1\\n' ;;\n"
-        "        libcamera-vid) printf '1\\n' ;;\n"
-        "        *) printf '0\\n' ;;\n"
-        "    esac\n"
-        "}\n"
-    )
-    result = _restore_preview("running", current="running", extra=extra, cwd=tmp_path)
+    result = _restore_preview("running", current="running", rpicam=2, cwd=tmp_path)
 
     assert result.returncode != 0
 
@@ -993,6 +1233,70 @@ def test_a_failed_sync_is_reported_to_the_caller() -> None:
     )
 
     assert result.returncode != 0
+
+
+def test_the_runtime_probe_imports_the_application(tmp_path: Path) -> None:
+    """An executable bit proves almost nothing about a deployment.
+
+    The restart would otherwise fail with 203/EXEC or an ImportError after the
+    code has already moved, and the diagnosis would happen in the journal
+    instead of here.
+    """
+    log = tmp_path / "runuser.log"
+    result = call_gateway_function(
+        'require_runtime_can_execute "mgo" "/opt/garden-observatory"',
+        preamble=(
+            f'RUNUSER_LOG="{_posix(log)}"\n'
+            'runuser() { printf \'%s\\n\' "$*" >> "$RUNUSER_LOG"; return 0; }\n'
+        ),
+    )
+    calls = log.read_text(encoding="utf-8")
+
+    assert result.returncode == 0, result.stderr
+    assert "import mgo.core.config, mgo.api.app" in calls
+    assert "MGO_CONFIG_PATH=/etc/garden-observatory/mgo.toml" in calls
+    assert ".venv/bin/python" in calls
+    assert ".venv/bin/uvicorn" in calls
+
+
+def test_the_runtime_probe_runs_as_the_runtime_account(tmp_path: Path) -> None:
+    """It answers "can *mgo* load this", not "can root load this"."""
+    log = tmp_path / "runuser.log"
+    call_gateway_function(
+        'require_runtime_can_execute "mgo" "/opt/garden-observatory"',
+        preamble=(
+            f'RUNUSER_LOG="{_posix(log)}"\n'
+            'runuser() { printf \'%s\\n\' "$*" >> "$RUNUSER_LOG"; return 0; }\n'
+        ),
+    )
+
+    for line in log.read_text(encoding="utf-8").splitlines():
+        assert line.startswith("-u mgo --"), line
+
+
+def test_a_failed_runtime_import_stops_the_deployment() -> None:
+    """A probe that cannot import must not be a warning."""
+    result = call_gateway_function(
+        'require_runtime_can_execute "mgo" "/opt/garden-observatory"',
+        preamble=(
+            "runuser() {\n"
+            '    case "$*" in *"import mgo"*) return 1 ;; esac\n'
+            "    return 0\n"
+            "}\n"
+        ),
+    )
+
+    assert result.returncode != 0
+
+
+def test_the_runtime_probe_starts_nothing() -> None:
+    """Import only: no lifespan, no camera, no stream, no writes."""
+    body = _function_body("require_runtime_can_execute()", "# --- restart and")
+
+    assert "-c" in body
+    assert "import" in body
+    for forbidden in ("uvicorn mgo.api.app:app", "--host", "--port", "capture"):
+        assert forbidden not in body, forbidden
 
 
 def test_tracked_file_drift_after_a_sync_is_detected(
@@ -1222,18 +1526,162 @@ def test_the_gateway_accepts_no_caller_supplied_production_value() -> None:
 
 
 # --------------------------------------------------------------------------
+# final verification
+# --------------------------------------------------------------------------
+
+
+def _final_verification(
+    *,
+    approval: str = APPROVED_SHA,
+    branch: str = "main",
+    head: str = APPROVED_SHA,
+    local_main: str = APPROVED_SHA,
+    tracking: str = APPROVED_SHA,
+    porcelain: str = "",
+    stash: str = "",
+    in_progress: bool = False,
+    active: bool = True,
+    healthy: bool = True,
+    preview: str = "running",
+    expected_preview: str = "running",
+    rpicam: int | None = None,
+    libcamera: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    """Drive the shipped final check against a fully described world."""
+    if rpicam is None:
+        rpicam = 1 if expected_preview == "running" else 0
+    preamble = (
+        f'validate_approval_file() {{ printf "{approval}\\n"; }}\n'
+        "git_admin() {\n"
+        "    shift 2\n"
+        '    case "$*" in\n'
+        f'        "branch --show-current") printf \'{branch}\\n\' ;;\n'
+        f'        "rev-parse HEAD") printf \'{head}\\n\' ;;\n'
+        f'        "rev-parse main") printf \'{local_main}\\n\' ;;\n'
+        f'        "rev-parse origin/main") printf \'{tracking}\\n\' ;;\n'
+        f'        "status --porcelain --untracked-files=all")'
+        f" printf '{porcelain}' ;;\n"
+        f'        "stash list") printf \'{stash}\' ;;\n'
+        "        *) printf '' ;;\n"
+        "    esac\n"
+        "}\n"
+        f"operation_in_progress() {{ return {0 if in_progress else 1}; }}\n"
+        f"service_is_active() {{ return {0 if active else 1}; }}\n"
+        f"endpoint_is_ok() {{ return {0 if healthy else 1}; }}\n"
+        f'read_preview_state() {{ printf "{preview}\\n"; }}\n'
+        + _producer_double(rpicam=rpicam, libcamera=libcamera)
+    )
+    return call_gateway_function(
+        f'final_verification "{APPROVED_SHA}" "{expected_preview}"',
+        preamble=preamble,
+    )
+
+
+def test_final_verification_passes_on_a_correct_deployment() -> None:
+    """The positive case, so every refusal below means something."""
+    result = _final_verification()
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("label", "kwargs"),
+    [
+        ("approval no longer names this commit", {"approval": "b" * 40}),
+        ("wrong branch", {"branch": "feature"}),
+        ("wrong HEAD", {"head": "c" * 40}),
+        ("wrong local main", {"local_main": "d" * 40}),
+        ("wrong origin/main", {"tracking": "e" * 40}),
+        ("untracked file", {"porcelain": "?? stray.txt"}),
+        ("dirty tracked file", {"porcelain": " M src/mgo/api/app.py"}),
+        ("stash", {"stash": "stash@{0}: WIP"}),
+        ("operation in progress", {"in_progress": True}),
+        ("inactive service", {"active": False}),
+        ("non-200 health", {"healthy": False}),
+        ("preview did not come back", {"preview": "stopped"}),
+        ("wrong producer count", {"rpicam": 2}),
+        ("legacy producer", {"libcamera": 1}),
+    ],
+)
+def test_final_verification_refuses_every_wrong_end_state(
+    label: str, kwargs: dict[str, object]
+) -> None:
+    """Each earlier step checked its own outcome; this checks the result."""
+    result = _final_verification(**kwargs)  # type: ignore[arg-type]
+
+    assert result.returncode != 0, label
+    assert "final check" in result.stderr, label
+
+
+def test_final_verification_refuses_a_preview_that_should_not_be_running() -> None:
+    """A previously stopped preview must not be running at the end."""
+    result = _final_verification(
+        expected_preview="stopped", preview="running", rpicam=1
+    )
+
+    assert result.returncode != 0
+    assert "final check" in result.stderr
+
+
+def test_final_verification_accepts_a_preserved_non_running_preview() -> None:
+    """failed -> stopped is preservation: it is matched on running-ness."""
+    result = _final_verification(
+        expected_preview="failed", preview="stopped", rpicam=0
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_final_verification_refuses_an_orphan_producer() -> None:
+    """A producer with no preview behind it is not a preserved state."""
+    result = _final_verification(
+        expected_preview="stopped", preview="stopped", rpicam=1
+    )
+
+    assert result.returncode != 0
+
+
+def test_final_verification_runs_after_preview_restoration() -> None:
+    """Ordering: restore, then verify, then claim."""
+    preview, final, success = _ordered_indices(
+        "restore_preview_state", "final_verification", 'log "deployed'
+    )
+
+    assert preview < final < success
+
+
+def test_no_success_is_printed_before_final_verification() -> None:
+    """"deployed" is a conclusion, and only one stage may draw it."""
+    source = _read(GATEWAY)
+    body = source[source.index("action_deploy_main()") :]
+    before = body[: body.index("final_verification")]
+
+    assert 'log "deployed' not in before
+
+
+def test_a_final_verification_failure_rolls_back() -> None:
+    """It is a deployment failure like any other."""
+    source = _read(GATEWAY)
+    body = source[source.index("action_deploy_main()") :]
+    index = body.index("final verification failed")
+
+    assert "fail_after_restart" in body[index - 200 : index + 200]
+
+
+def test_every_cleanliness_check_includes_untracked_files() -> None:
+    """An untracked file is drift the deployment must not carry."""
+    source = _read(GATEWAY)
+
+    assert "--untracked-files=no" not in source
+    assert source.count("--untracked-files=all") >= 4
+
+
+# --------------------------------------------------------------------------
 # transaction rollback
 # --------------------------------------------------------------------------
 
 
 EX_ROLLBACK = 78
-
-
-def _function_body(name: str, next_name: str) -> str:
-    """Slice one shipped function out of the gateway, exactly."""
-    source = _read(GATEWAY)
-    start = source.index(name)
-    return source[start : source.index(next_name, start)]
 
 
 def _rollback_repository(
@@ -1610,57 +2058,323 @@ def test_the_sudoers_policy_names_neither_the_runtime_account_nor_a_group() -> N
 # --------------------------------------------------------------------------
 
 
-def test_the_installer_validates_sudoers_before_installing_anything() -> None:
-    """An invalid policy in /etc/sudoers.d can lock every account out of sudo."""
-    source = _read(INSTALLER)
-    visudo = source.index("visudo -cf")
-    install = source.index('log "installing $GATEWAY_TARGET"')
+EX_RESTORE_FAILED = 78
 
-    assert visudo < install
+# Doubles that let the real transaction run on a filesystem without root.
+#
+# ``install`` is re-implemented rather than skipped so install_file's real
+# control flow — mktemp, copy, rename, temp cleanup — still executes; only the
+# ownership change, which no unprivileged process can perform, is emulated.
+INSTALLER_DOUBLES = """
+install() {
+    local mode=""
+    local directory=0
+    local paths=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -o|-g) shift 2 ;;
+            -m) mode="$2"; shift 2 ;;
+            -d) directory=1; shift ;;
+            *) paths+=("$1"); shift ;;
+        esac
+    done
+    printf 'install\\n' >> "$CALL_LOG"
+    if [[ "$directory" -eq 1 ]]; then
+        mkdir -p "${paths[0]}" || return 1
+        return 0
+    fi
+    cp -f "${paths[0]}" "${paths[1]}" || return 1
+    return 0
+}
+mv() { printf 'mv\\n' >> "$CALL_LOG"; command mv "$@"; }
+mktemp() { printf 'mktemp\\n' >> "$CALL_LOG"; command mktemp "$@"; }
+cp() { printf 'cp\\n' >> "$CALL_LOG"; command cp "$@"; }
+rm() { printf 'rm\\n' >> "$CALL_LOG"; command rm "$@"; }
+visudo() { return 0; }
+file_metadata() {
+    [[ -e "$1" ]] || return 1
+    case "$1" in
+        *sudoers*) printf 'root:root:440\\n' ;;
+        *) printf 'root:root:755\\n' ;;
+    esac
+}
+"""
 
 
-def test_the_installer_checks_shell_syntax_before_installing() -> None:
-    """A truncated gateway would still be executed by sudo."""
-    source = _read(INSTALLER)
+def _install_pair(
+    tmp_path: Path,
+    *,
+    extra: str = "",
+    gateway_body: str = "#!/usr/bin/env bash\ntrue\n",
+    sudoers_body: str = "claude ALL=(root) NOPASSWD: /usr/local/sbin/mgo-validate\n",
+    existing_gateway: str | None = None,
+    existing_sudoers: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    """Run the shipped installation transaction against temporary targets."""
+    sources = tmp_path / "src"
+    targets = tmp_path / "dst"
+    sources.mkdir()
+    targets.mkdir()
+    gateway_source = sources / "mgo-validate"
+    sudoers_source = sources / "mgo-validate.sudoers"
+    gateway_source.write_bytes(gateway_body.encode("utf-8"))
+    sudoers_source.write_bytes(sudoers_body.encode("utf-8"))
 
-    assert source.index("bash -n") < source.index('log "installing $GATEWAY_TARGET"')
+    gateway_target = targets / "mgo-validate"
+    sudoers_target = targets / "mgo-validate.sudoers"
+    if existing_gateway is not None:
+        gateway_target.write_bytes(existing_gateway.encode("utf-8"))
+    if existing_sudoers is not None:
+        sudoers_target.write_bytes(existing_sudoers.encode("utf-8"))
+
+    script = (
+        "set +e\n"
+        f'export CALL_LOG="{_posix(tmp_path / "calls.log")}"\n'
+        ': > "$CALL_LOG"\n'
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        f"{INSTALLER_DOUBLES}\n"
+        f"{extra}\n"
+        "install_pair "
+        f'"{_posix(gateway_source)}" "{_posix(gateway_target)}" "0755" '
+        f'"{_posix(sudoers_source)}" "{_posix(sudoers_target)}" "0440"\n'
+        'printf "outcome=%s\\n" "$?"\n'
+    )
+    return run_bash(script), gateway_target, sudoers_target
 
 
-def test_the_installer_refuses_to_install_without_visudo() -> None:
-    """No validator, no installation — never an unvalidated policy.
+def test_the_installer_installs_both_targets(tmp_path: Path) -> None:
+    """The positive case, so every failure path below means something."""
+    result, gateway, sudoers = _install_pair(tmp_path)
 
-    The refusal is scoped to a real install: a dry run on a host without
-    ``visudo`` reports the gap instead, because it installs nothing.
-    """
-    source = _read(INSTALLER)
-    index = source.index(
-        "visudo is not available; refusing to install an unvalidated policy"
+    assert "outcome=0" in result.stdout, result.stderr
+    assert gateway.exists()
+    assert sudoers.exists()
+
+
+@pytest.mark.parametrize(
+    ("label", "double"),
+    [
+        ("temporary-file creation", "mktemp() { return 1; }"),
+        (
+            "gateway content copy",
+            'install() { case "$*" in *mgo-validate.*) return 1 ;; esac; return 0; }',
+        ),
+        # Scoped to the first rename: a blanket failure would also break the
+        # restoration, which is a different outcome (78) tested separately.
+        (
+            "gateway rename",
+            "MV_FAILS=1\nmv() {\n"
+            '    if [[ "$MV_FAILS" -eq 1 ]]; then MV_FAILS=0; return 1; fi\n'
+            '    command mv "$@"\n}',
+        ),
+        # Scoped to the installed targets: the sources must still checksum
+        # normally, or "expected" and "actual" would agree on the wrong value.
+        (
+            "post-install checksum",
+            "file_checksum() {\n"
+            '    [[ -f "$1" ]] || return 1\n'
+            '    case "$1" in\n'
+            "        */dst/*) printf 'nomatch\\n' ;;\n"
+            '        *) command sha256sum "$1" | awk \'{ print $1 }\' ;;\n'
+            "    esac\n}",
+        ),
+        # Scoped to the sudoers target alone. A double that fails both targets
+        # trips the gateway branch first, so the sudoers verification branch
+        # would never be reached and could be deleted unnoticed.
+        (
+            "sudoers-only post-install checksum",
+            "file_checksum() {\n"
+            '    [[ -f "$1" ]] || return 1\n'
+            '    case "$1" in\n'
+            "        */dst/*sudoers*) printf 'nomatch\\n' ;;\n"
+            '        *) command sha256sum "$1" | awk \'{ print $1 }\' ;;\n'
+            "    esac\n}",
+        ),
+        ("post-install metadata", "file_metadata() { printf 'pi:pi:777\\n'; }"),
+        (
+            "sudoers-only post-install metadata",
+            "file_metadata() {\n"
+            '    [[ -e "$1" ]] || return 1\n'
+            '    case "$1" in\n'
+            "        */dst/*sudoers*) printf 'pi:pi:777\\n' ;;\n"
+            "        *sudoers*) printf 'root:root:440\\n' ;;\n"
+            "        *) printf 'root:root:755\\n' ;;\n"
+            "    esac\n}",
+        ),
+        ("installed policy validation", "policy_is_valid() { return 1; }"),
+    ],
+)
+def test_every_installer_failure_restores_the_previous_pair(
+    tmp_path: Path, label: str, double: str
+) -> None:
+    """The exact original pair comes back — including "absent" as a state."""
+    previous_gateway = "#!/usr/bin/env bash\n# the old gateway\n"
+    previous_sudoers = "# the old policy\n"
+    result, gateway, sudoers = _install_pair(
+        tmp_path,
+        extra=double,
+        existing_gateway=previous_gateway,
+        existing_sudoers=previous_sudoers,
     )
 
-    assert "die" in source[index - 60 : index]
-    assert 'elif [[ "$dry_run" -eq 1 ]]; then' in source
-    assert "the policy was NOT validated" in source
+    assert "outcome=1" in result.stdout, f"{label}: {result.stdout}{result.stderr}"
+    assert gateway.read_text(encoding="utf-8") == previous_gateway, label
+    assert sudoers.read_text(encoding="utf-8") == previous_sudoers, label
 
 
-def test_the_installer_requires_root_for_a_real_run() -> None:
+@pytest.mark.parametrize(
+    ("label", "double"),
+    [
+        (
+            "gateway rename",
+            "MV_FAILS=1\nmv() {\n"
+            '    if [[ "$MV_FAILS" -eq 1 ]]; then MV_FAILS=0; return 1; fi\n'
+            '    command mv "$@"\n}',
+        ),
+        ("installed policy validation", "policy_is_valid() { return 1; }"),
+    ],
+)
+def test_a_failure_with_no_previous_pair_removes_what_it_installed(
+    tmp_path: Path, label: str, double: str
+) -> None:
+    """Absent is a recorded state, and restoring it means removal."""
+    result, gateway, sudoers = _install_pair(tmp_path, extra=double)
+
+    assert "outcome=1" in result.stdout, label
+    assert not gateway.exists(), label
+    assert not sudoers.exists(), label
+
+
+def test_a_sudoers_failure_also_restores_the_gateway(tmp_path: Path) -> None:
+    """A gateway with no policy is half a control plane, so both go back."""
+    previous_gateway = "#!/usr/bin/env bash\n# the old gateway\n"
+    result, gateway, sudoers = _install_pair(
+        tmp_path,
+        extra=(
+            'install() { case "$*" in *sudoers*) return 1 ;; esac;'
+            ' cp -f "${@: -2:1}" "${@: -1}"; }'
+        ),
+        existing_gateway=previous_gateway,
+    )
+
+    assert "outcome=1" in result.stdout, result.stdout + result.stderr
+    assert gateway.read_text(encoding="utf-8") == previous_gateway
+    assert not sudoers.exists()
+
+
+def test_a_failed_restoration_is_reported_distinctly(tmp_path: Path) -> None:
+    """Not restored is a different outcome from restored, and exits 78."""
+    result, _gateway, _sudoers = _install_pair(
+        tmp_path,
+        extra="policy_is_valid() { return 1; }\nrestore_one() { return 1; }",
+        existing_gateway="#!/usr/bin/env bash\nold\n",
+        existing_sudoers="# old\n",
+    )
+
+    assert f"outcome={EX_RESTORE_FAILED}" in result.stdout
+    assert "was NOT restored" in result.stderr
+
+
+def test_install_file_removes_its_temporary_file_on_failure(
+    tmp_path: Path,
+) -> None:
+    """A failed install must not leave a half-written sibling behind."""
+    target_dir = tmp_path / "dst"
+    target_dir.mkdir()
+    source = tmp_path / "source"
+    source.write_text("content\n", encoding="utf-8")
+
+    result = run_bash(
+        "set +e\n"
+        f'export CALL_LOG="{_posix(tmp_path / "calls.log")}"\n'
+        ': > "$CALL_LOG"\n'
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        f"{INSTALLER_DOUBLES}\n"
+        "mv() { return 1; }\n"
+        f'install_file "{_posix(source)}" "{_posix(target_dir / "target")}" "0755"\n'
+        'printf "outcome=%s\\n" "$?"\n'
+    )
+
+    assert "outcome=1" in result.stdout
+    assert list(target_dir.iterdir()) == []
+
+
+def test_a_fully_current_installation_mutates_nothing(tmp_path: Path) -> None:
+    """Correct files are verified and left alone — same inode, same mtime."""
+    sources = tmp_path / "src"
+    targets = tmp_path / "dst"
+    sources.mkdir()
+    targets.mkdir()
+    gateway_source = sources / "mgo-validate"
+    sudoers_source = sources / "mgo-validate.sudoers"
+    gateway_source.write_bytes(b"#!/usr/bin/env bash\ntrue\n")
+    sudoers_source.write_bytes(b"claude ALL=(root) NOPASSWD: /x\n")
+    gateway_target = targets / "mgo-validate"
+    sudoers_target = targets / "mgo-validate.sudoers"
+    gateway_target.write_bytes(gateway_source.read_bytes())
+    sudoers_target.write_bytes(sudoers_source.read_bytes())
+
+    before = {
+        path: (path.stat().st_ino, path.stat().st_mtime_ns)
+        for path in (gateway_target, sudoers_target)
+    }
+
+    result = run_bash(
+        "set +e\n"
+        f'export CALL_LOG="{_posix(tmp_path / "calls.log")}"\n'
+        ': > "$CALL_LOG"\n'
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        f"{INSTALLER_DOUBLES}\n"
+        "run_installation "
+        f'"{_posix(gateway_source)}" "{_posix(gateway_target)}" "0755" '
+        f'"{_posix(sudoers_source)}" "{_posix(sudoers_target)}" "0440" 0 0\n'
+        'printf "outcome=%s\\n" "$?"\n'
+    )
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
+
+    assert "outcome=0" in result.stdout, result.stderr
+    assert "nothing changed" in result.stdout
+    assert calls.strip() == "", f"mutating commands ran: {calls!r}"
+    for path, (inode, mtime) in before.items():
+        assert path.stat().st_ino == inode, path.name
+        assert path.stat().st_mtime_ns == mtime, path.name
+
+
+def test_matching_content_with_wrong_metadata_is_not_current(
+    tmp_path: Path,
+) -> None:
+    """Right bytes, wrong owner or mode, is a defect to repair, not "current"."""
+    target = tmp_path / "mgo-validate"
+    target.write_bytes(b"content\n")
+
+    result = run_bash(
+        "set +e\n"
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        "file_metadata() { printf 'pi:pi:777\\n'; }\n"
+        "file_checksum() { printf 'abc\\n'; }\n"
+        f'target_is_current "{_posix(target)}" "abc" "0755"\n'
+        'printf "outcome=%s\\n" "$?"\n'
+    )
+
+    assert "outcome=1" in result.stdout
+
+
+def test_the_installer_requires_root_for_a_real_run(tmp_path: Path) -> None:
     """Writing to /usr/local/sbin and /etc/sudoers.d needs privilege."""
-    result = run_bash(f'EUID=1001; source "{_posix(INSTALLER)}"')
-
-    assert result.returncode != 0
-
-
-def test_the_installer_dry_run_needs_no_privilege_and_changes_nothing() -> None:
-    """A dry run is a report, so it must be runnable by anyone, anywhere."""
-    result = subprocess.run(
-        [_bash(), str(INSTALLER), "--dry-run"],
-        capture_output=True,
-        text=True,
-        check=False,
+    result = run_bash(
+        "set +e\n"
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        'run_installation "/x" "/y" "0755" "/a" "/b" "0440" 0 1001\n'
+        'printf "outcome=%s\\n" "$?"\n'
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "nothing was changed" in result.stdout
-    assert "would install" in result.stdout or "is current" in result.stdout
+    assert "outcome=1" in result.stdout
+    assert "requires root" in result.stderr
 
 
 def test_the_installer_rejects_an_unknown_argument() -> None:
@@ -1682,24 +2396,111 @@ def test_the_installer_installs_both_files_with_the_required_modes() -> None:
     assert 'readonly GATEWAY_MODE="0755"' in source
     assert 'readonly SUDOERS_MODE="0440"' in source
     assert "-o root -g root" in source
+    assert 'root:root:${expected_mode#0}' in source
 
 
-def test_the_installer_rolls_back_a_partial_installation() -> None:
-    """A gateway with no policy, or a policy with no gateway, is not shipped."""
+def test_no_installer_command_relies_on_errexit_inside_a_condition() -> None:
+    """Bash disables errexit for a function run as an ``if !`` condition."""
+    body = _installer_function_body("install_file()", "# Record a target's")
+
+    for command in ("mktemp", "install ", "mv -f"):
+        assert command in body, command
+    # Each mutating step has its own explicit failure branch.
+    assert body.count("return 1") >= 4
+
+
+def _installer_function_body(name: str, next_name: str) -> str:
     source = _read(INSTALLER)
-    index = source.index("the sudoers policy could not be installed")
+    start = source.index(name)
+    return source[start : source.index(next_name, start)]
 
-    assert "restore_previous" in source[index - 400 : index]
+
+# --- dry run ---------------------------------------------------------------
 
 
-def test_the_installer_verifies_what_reached_the_disk() -> None:
-    """Trusting that a write succeeded is how a partial install goes unnoticed."""
+def _dry_run(tmp_path: Path, *, visudo: str) -> subprocess.CompletedProcess[str]:
+    """Run a dry run with a deterministic fake ``visudo`` on PATH.
+
+    A fake executable rather than a shell function, because the installer asks
+    ``command -v`` whether the tool exists at all — which is the property under
+    test.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    if visudo != "absent":
+        exit_code = 0 if visudo == "valid" else 1
+        path = fake_bin / "visudo"
+        path.write_bytes(f"#!/usr/bin/env bash\nexit {exit_code}\n".encode())
+        # chmod through bash, not Python: on Windows os.chmod only toggles the
+        # read-only attribute, and Git Bash would not treat the file as
+        # executable, so ``command -v`` would report it missing.
+        run_bash(f'chmod +x "{_posix(path)}"')
+
+    # A drive-lettered path cannot go on PATH as-is: the colon after the drive
+    # letter is the PATH separator, so "C:/x" is searched as "C" and "/x".
+    return run_bash(
+        f"fake_bin='{_posix(fake_bin)}'\n"
+        "if command -v cygpath >/dev/null 2>&1; then\n"
+        '    fake_bin="$(cygpath -u "$fake_bin")"\n'
+        "fi\n"
+        'export PATH="$fake_bin:$PATH"\n'
+        f'"{_posix(INSTALLER)}" --dry-run\n'
+    )
+
+
+def test_a_dry_run_with_a_valid_policy_reports_and_changes_nothing(
+    tmp_path: Path,
+) -> None:
+    """A dry run is a report — but only once validation has actually passed."""
+    result = _dry_run(tmp_path, visudo="valid")
+
+    assert result.returncode == 0, result.stderr
+    assert "nothing was changed" in result.stdout
+
+
+def test_a_dry_run_fails_when_the_policy_is_invalid(tmp_path: Path) -> None:
+    """An invalid policy is a finding, not a footnote in a successful report."""
+    result = _dry_run(tmp_path, visudo="invalid")
+
+    assert result.returncode != 0
+    assert "failed validation" in result.stderr
+    assert "dry run complete" not in result.stdout
+
+
+def test_a_dry_run_fails_closed_without_visudo(tmp_path: Path) -> None:
+    """The help says a dry run validates everything, so it must not skip it."""
+    result = _dry_run(tmp_path, visudo="absent")
+
+    assert result.returncode != 0
+    assert "visudo is not available" in result.stderr
+    assert "dry run complete" not in result.stdout
+
+
+def test_a_real_run_fails_closed_without_visudo() -> None:
+    """Never an unvalidated policy under /etc/sudoers.d."""
+    result = run_bash(
+        "set +e\n"
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        "command() { return 1; }\n"
+        f'run_installation "{_posix(GATEWAY)}" "/y" "0755" '
+        f'"{_posix(SUDOERS)}" "/b" "0440" 0 0\n'
+        'printf "outcome=%s\\n" "$?"\n'
+    )
+
+    assert "outcome=1" in result.stdout
+    assert "visudo is not available" in result.stderr
+
+
+def test_validation_precedes_every_mutation() -> None:
+    """Both checks come before the first thing that writes."""
     source = _read(INSTALLER)
+    body = source[source.index("run_installation()") :]
+    syntax = body.index("bash -n")
+    validation = body.index("visudo -cf")
+    install = body.index("install_pair \\")
 
-    assert "verify_installed" in source
-    assert "does not match its source" in source
-    assert "wrong mode" in source
-    assert "wrong owner" in source
+    assert syntax < validation < install
 
 
 def test_the_installer_touches_no_approval_repository_or_service() -> None:
@@ -1880,11 +2681,51 @@ def test_the_task_record_does_not_claim_the_production_gateway_changed() -> None
     )
     text = _read(record)
     index = text.index("Remediation status")
-    section = text[index : index + 900]
+    section = text[index : index + 1600]
 
-    assert "not** been reviewed" in section
+    assert "not** been re-reviewed" in section
     assert "not** been installed" in section
-    assert "still the\nTask 10 one" in section or "still the" in section
+    assert "not** been validated" in section
+    assert "still the" in section
+    assert "nothing about the production host changed" in section
+
+
+def test_the_remediation_record_states_the_review_corrections_truthfully() -> None:
+    """Corrected is not re-reviewed, and neither is installed or validated."""
+    record = (
+        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
+    )
+    text = _read(record)
+
+    assert "Repository review corrections implemented" in text
+    assert "not yet re-reviewed" in text
+    assert "Re-review | **Not performed**" in text
+    assert "Installation on the Raspberry Pi | **Not performed**" in text
+    assert "Raspberry Pi validation of the gateway | **Not performed**" in text
+    assert "the gateway installed there is still\nthe Task 10 one" in text.replace(
+        "The gateway", "the gateway"
+    )
+
+
+@pytest.mark.parametrize(
+    "finding",
+    [
+        "Finding 1 — approval parsing was not byte-exact",
+        "Finding 2 — the installer relied on errexit inside a conditional",
+        "Finding 3 — the installer had no real transaction",
+        "Finding 4 — an identical installation still rewrote files",
+        "Finding 5 — HTTP 200 was not enforced",
+        "Finding 6 — a non-running preview was not preserved, only skipped",
+        "Finding 7 — there was no final verification",
+    ],
+)
+def test_every_review_finding_is_recorded(finding: str) -> None:
+    """All seven findings and their corrections are written down."""
+    record = (
+        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
+    )
+
+    assert finding in _read(record)
 
 
 # --------------------------------------------------------------------------

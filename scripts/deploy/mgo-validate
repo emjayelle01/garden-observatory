@@ -40,6 +40,7 @@ set -Eeuo pipefail
 
 readonly MGO_REPOSITORY="/opt/garden-observatory"
 readonly MGO_APPROVAL_FILE="/etc/garden-observatory/claude-approved-sha"
+readonly MGO_PRODUCTION_CONFIG="/etc/garden-observatory/mgo.toml"
 readonly MGO_SERVICE="mgo.service"
 readonly MGO_ADMIN_ACCOUNT="claude"
 readonly MGO_RUNTIME_ACCOUNT="mgo"
@@ -148,7 +149,8 @@ validate_approval_file() {
     local path="$1"
     local owner
     local mode
-    local line_count
+    local size
+    local last_byte
     local content
 
     [[ -e "$path" ]] \
@@ -187,14 +189,34 @@ validate_approval_file() {
             ;;
     esac
 
-    # Count lines from the raw bytes: a trailing newline is the only line
-    # terminator allowed, and a second line is a refusal, not a hint.
-    line_count="$(wc -l <"$path")"
-    [[ "$line_count" -le 1 ]] \
-        || die "$EX_REQUEST" "the approval file must contain exactly one line"
+    # Byte-exact, by reconciling the file's own length against its content.
+    #
+    # Counting newlines and reading the first line is not enough: the bytes
+    # "<valid sha>\nmain" contain exactly one newline, so the count passes, the
+    # read returns a valid SHA, and a whole trailing line is silently ignored.
+    # Anchoring on the size closes that and every relative of it at once — a
+    # CR, a NUL, a trailing space, an empty second line or any trailing data
+    # all make the file the wrong length.
+    size="$(wc -c <"$path")"
+    size="${size//[[:space:]]/}"
+    if [[ "$size" == "41" ]]; then
+        # The only permitted 41st byte is a single final LF, compared as a hex
+        # byte rather than as a string. Command substitution strips trailing
+        # newlines *and* silently drops NUL, so testing the captured text for
+        # emptiness would accept a trailing NUL as if it were a newline.
+        last_byte="$(tail -c 1 "$path" | od -An -tx1 | tr -d '[:space:]')"
+        [[ "$last_byte" == "0a" ]] \
+            || die "$EX_REQUEST" \
+                "the approval file may end only with a single newline"
+    elif [[ "$size" != "40" ]]; then
+        die "$EX_REQUEST" \
+            "the approval file must hold one 40-character SHA and nothing else"
+    fi
 
-    # Read without stripping so surrounding whitespace is still visible here.
-    IFS= read -r content <"$path" || true
+    # A NUL or control byte inside the first forty bytes either disappears in
+    # command substitution (leaving fewer than forty characters) or fails the
+    # character class. Either way the exact-length pattern below refuses it.
+    content="$(head -c 40 "$path")"
 
     [[ "$content" =~ ^[0-9a-f]{40}$ ]] \
         || die "$EX_REQUEST" "approved SHA is missing or malformed"
@@ -274,17 +296,28 @@ require_repository_preconditions() {
 # An interrupted merge, rebase, cherry-pick or revert leaves state that a
 # fast-forward would either refuse or silently build on. Neither is a safe
 # starting point for a deployment.
-require_no_operation_in_progress() {
+#
+# Split into a predicate and a requirement because final verification needs the
+# same fact without exiting: after the restart a failure has to reach the
+# rollback path, not terminate the process where it stands.
+operation_in_progress() {
     local repository="$1"
     local git_dir="$repository/.git"
     local marker
 
     for marker in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD \
         rebase-merge rebase-apply; do
-        [[ ! -e "$git_dir/$marker" ]] \
-            || die "$EX_PRECONDITION" \
-                "a Git operation is in progress in the production repository"
+        [[ ! -e "$git_dir/$marker" ]] || return 0
     done
+    return 1
+}
+
+require_no_operation_in_progress() {
+    local repository="$1"
+
+    ! operation_in_progress "$repository" \
+        || die "$EX_PRECONDITION" \
+            "a Git operation is in progress in the production repository"
 }
 
 # Accept the expected repository over HTTPS or SSH, with or without .git, and
@@ -322,16 +355,71 @@ service_active_enter_timestamp() {
     systemctl show "$service" -p ActiveEnterTimestamp --value
 }
 
-# Literal loopback, proxies disabled: a deployment health check must describe
-# this host, not whatever a proxy or redirect would answer for.
-endpoint_is_ok() {
+# Fetch a URL and require exactly HTTP 200, capturing the body separately.
+#
+# curl -f is not a status check. It accepts every 2xx — a 201 or a 204 with no
+# body would pass — and it reports a redirect as success without following it,
+# so a moved endpoint reads as healthy. The status is therefore captured and
+# compared exactly, redirects are never followed (no --location), proxies are
+# disabled and the address is literal loopback, so the answer describes this
+# host and nothing else. The body is written to a caller-owned file and is only
+# meaningful once this function has returned success.
+http_get_200() {
     local url="$1"
-    curl --noproxy '*' -fsS -o /dev/null --max-time 5 "$url"
+    local body_file="$2"
+    local status
+
+    status="$(curl --noproxy '*' -sS --max-time 5 \
+        --request GET \
+        --output "$body_file" \
+        --write-out '%{http_code}' \
+        "$url")" || return 1
+
+    [[ "$status" == "200" ]]
 }
 
+http_post_200() {
+    local url="$1"
+    local body_file="$2"
+    local status
+
+    status="$(curl --noproxy '*' -sS --max-time 20 \
+        --request POST \
+        --output "$body_file" \
+        --write-out '%{http_code}' \
+        "$url")" || return 1
+
+    [[ "$status" == "200" ]]
+}
+
+# Literal loopback, proxies disabled, exactly 200 or nothing.
+endpoint_is_ok() {
+    local url="$1"
+    local body_file
+    local outcome=0
+
+    body_file="$(mktemp)" || return 1
+    http_get_200 "$url" "$body_file" || outcome=1
+    rm -f "$body_file"
+    return "$outcome"
+}
+
+# The body, and only when the status was exactly 200.
+#
+# A non-200 response body is never returned to a caller: interpreting an error
+# page as a status document is how a deployment convinces itself the camera is
+# fine.
 endpoint_body() {
     local url="$1"
-    curl --noproxy '*' -fsS --max-time 5 "$url"
+    local body_file
+
+    body_file="$(mktemp)" || return 1
+    if ! http_get_200 "$url" "$body_file"; then
+        rm -f "$body_file"
+        return 1
+    fi
+    cat "$body_file"
+    rm -f "$body_file"
 }
 
 # Extract the reported preview state from a status document.
@@ -459,21 +547,43 @@ require_clean_after_sync() {
     local repository="$2"
     local porcelain
 
+    # --untracked-files=all: a sync that dropped a stray file into the tree is
+    # drift too, and the deployment must not carry on as if the tree were the
+    # one the commit describes. Ignored paths such as .venv are still ignored.
     porcelain="$(git_admin "$admin_account" "$repository" \
-        status --porcelain --untracked-files=no)"
+        status --porcelain --untracked-files=all)"
     [[ -z "$porcelain" ]] \
         || return 1
 }
 
-# The runtime account has to be able to traverse the checkout and execute the
-# interpreter, or the restart fails with 203/EXEC after the code has already
-# moved. Checked before the restart, not diagnosed after it.
+# Prove the runtime account can actually run the deployed application.
+#
+# An executable bit on the launcher proves almost nothing: the restart fails
+# with 203/EXEC or an ImportError after the code has already moved, and the
+# diagnosis happens in the journal instead of here. So the probe imports the
+# application as the runtime account, with the production configuration
+# selector, using the deployed interpreter.
+#
+# Import only. No lifespan is entered, no camera is opened, no stream is read
+# and nothing is written: this answers "can it load" and deliberately not
+# "does it work", which is what the restart and health check are for.
 require_runtime_can_execute() {
     local runtime_account="$1"
     local repository="$2"
 
     runuser -u "$runtime_account" -- \
+        test -x "$repository/.venv/bin/python" \
+        || return 1
+
+    runuser -u "$runtime_account" -- \
         test -x "$repository/.venv/bin/uvicorn" \
+        || return 1
+
+    runuser -u "$runtime_account" -- \
+        env "MGO_CONFIG_PATH=$MGO_PRODUCTION_CONFIG" \
+        "$repository/.venv/bin/python" -c \
+        'import mgo.core.config, mgo.api.app' \
+        >/dev/null 2>&1 \
         || return 1
 }
 
@@ -521,7 +631,25 @@ await_recovery() {
 # an operating state, it does not exercise the camera.
 start_preview() {
     local start_url="$1"
-    curl --noproxy '*' -fsS -o /dev/null --max-time 20 -X POST "$start_url"
+    local body_file
+    local outcome=0
+
+    body_file="$(mktemp)" || return 1
+    http_post_200 "$start_url" "$body_file" || outcome=1
+    rm -f "$body_file"
+    return "$outcome"
+}
+
+# The physical producer contract for a given preview state.
+#
+# One rpicam-vid when preview should be running, none when it should not, and
+# never a libcamera-vid — a legacy producer means something other than this
+# deployment is holding the camera.
+require_producer_count() {
+    local expected="$1"
+
+    [[ "$(count_processes rpicam-vid)" -eq "$expected" ]] || return 1
+    [[ "$(count_processes libcamera-vid)" -eq 0 ]] || return 1
 }
 
 restore_preview_state() {
@@ -533,33 +661,135 @@ restore_preview_state() {
     local elapsed=0
     local producers
 
-    if [[ "$previous_state" != "running" ]]; then
-        log "preview was $previous_state before deployment; leaving it alone"
+    current="$(read_preview_state "$status_url")" || return 1
+
+    if [[ "$previous_state" == "running" ]]; then
+        if [[ "$current" == "running" ]]; then
+            # Nothing to restore. A second start would be a duplicate request
+            # against a camera that already has an owner.
+            log "preview is already running; no start request issued"
+        else
+            start_preview "$start_url" || return 1
+
+            while [[ "$elapsed" -lt "$timeout" ]]; do
+                current="$(read_preview_state "$status_url")" || return 1
+                [[ "$current" == "running" ]] && break
+                sleep 1
+                elapsed=$((elapsed + 1))
+            done
+            [[ "$current" == "running" ]] || return 1
+        fi
+
+        require_producer_count 1 || return 1
         return 0
     fi
 
-    current="$(read_preview_state "$status_url")" || return 1
-
+    # Preview was not running before the deployment, so preservation has to be
+    # proven rather than assumed. Returning success without looking would make
+    # "left alone" mean "not checked".
+    #
+    # Drift into running is a failure and enters the rollback path. It is
+    # deliberately not papered over with a stop request: a camera that started
+    # itself is a fault to surface, and issuing an unasked-for stop would be a
+    # second unrequested mutation on top of the first.
     if [[ "$current" == "running" ]]; then
-        # Nothing to restore. A second start would be a duplicate request
-        # against a camera that already has an owner.
-        log "preview is already running; no start request issued"
-    else
-        start_preview "$start_url" || return 1
-
-        while [[ "$elapsed" -lt "$timeout" ]]; do
-            current="$(read_preview_state "$status_url")" || return 1
-            [[ "$current" == "running" ]] && break
-            sleep 1
-            elapsed=$((elapsed + 1))
-        done
-        [[ "$current" == "running" ]] || return 1
+        warn "preview was $previous_state before deployment but is now running"
+        return 1
     fi
 
-    producers="$(count_processes rpicam-vid)"
-    [[ "$producers" -eq 1 ]] || return 1
-    [[ "$(count_processes libcamera-vid)" -eq 0 ]] || return 1
+    log "preview is $current, matching its non-running state before deployment"
+    require_producer_count 0 || return 1
     return 0
+}
+
+# --- final verification ----------------------------------------------------
+
+# Prove the deployment actually landed, before anything claims it did.
+#
+# Every earlier step checked its own outcome, which is not the same as checking
+# the *result*. This re-reads the whole picture — authority, refs, tree,
+# service, endpoint and camera — and is the only thing entitled to conclude
+# that production is where it was asked to be. A failure here is a deployment
+# failure like any other and goes to the rollback path.
+#
+# validate_approval_file exits rather than returning, so it is called inside a
+# command substitution: the exit ends that subshell and surfaces here as a
+# non-zero status, which is what lets this function stay non-fatal.
+final_verification() {
+    local approved="$1"
+    local expected_preview="$2"
+    local reapproved
+    local branch
+    local head
+    local local_branch
+    local tracking
+    local porcelain
+    local stash
+    local current
+
+    reapproved="$(validate_approval_file "$MGO_APPROVAL_FILE" 2>/dev/null)" \
+        || { warn "final check: the approval file no longer parses"; return 1; }
+    [[ "$reapproved" == "$approved" ]] \
+        || { warn "final check: the approval no longer names this commit"; return 1; }
+
+    branch="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        branch --show-current)" || return 1
+    [[ "$branch" == "$MGO_BRANCH" ]] \
+        || { warn "final check: the checkout is not on $MGO_BRANCH"; return 1; }
+
+    head="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" rev-parse HEAD)" \
+        || return 1
+    [[ "$head" == "$approved" ]] \
+        || { warn "final check: HEAD is not the approved SHA"; return 1; }
+
+    local_branch="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        rev-parse "$MGO_BRANCH")" || return 1
+    [[ "$local_branch" == "$approved" ]] \
+        || { warn "final check: $MGO_BRANCH is not the approved SHA"; return 1; }
+
+    tracking="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        rev-parse "$MGO_REMOTE/$MGO_BRANCH")" || return 1
+    [[ "$tracking" == "$approved" ]] \
+        || { warn "final check: $MGO_REMOTE/$MGO_BRANCH is not the approved SHA"; return 1; }
+
+    porcelain="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        status --porcelain --untracked-files=all)" || return 1
+    [[ -z "$porcelain" ]] \
+        || { warn "final check: the working tree is not clean"; return 1; }
+
+    stash="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" stash list)" \
+        || return 1
+    [[ -z "$stash" ]] \
+        || { warn "final check: a stash appeared during deployment"; return 1; }
+
+    if operation_in_progress "$MGO_REPOSITORY"; then
+        warn "final check: a Git operation is in progress"
+        return 1
+    fi
+
+    service_is_active "$MGO_SERVICE" \
+        || { warn "final check: $MGO_SERVICE is not active"; return 1; }
+
+    endpoint_is_ok "$MGO_HEALTH_URL" \
+        || { warn "final check: health did not answer with 200"; return 1; }
+
+    current="$(read_preview_state "$MGO_PREVIEW_STATUS_URL")" \
+        || { warn "final check: the preview state could not be read"; return 1; }
+
+    # Matched on whether preview is running, not on the exact token: a
+    # restarted service reports a fresh "stopped" where it previously reported
+    # "failed", and that is preservation, not drift.
+    if [[ "$expected_preview" == "running" ]]; then
+        [[ "$current" == "running" ]] \
+            || { warn "final check: preview did not come back"; return 1; }
+        require_producer_count 1 \
+            || { warn "final check: the producer count is wrong"; return 1; }
+    else
+        [[ "$current" != "running" ]] \
+            || { warn "final check: preview is running but was $expected_preview"; return 1; }
+        require_producer_count 0 \
+            || { warn "final check: a producer is running but preview is not"; return 1; }
+    fi
 }
 
 # --- transaction rollback --------------------------------------------------
@@ -613,8 +843,10 @@ rollback_repository() {
     head="$(git_admin "$admin_account" "$repository" rev-parse HEAD)" || true
     current_branch="$(git_admin "$admin_account" "$repository" \
         branch --show-current)" || true
+    # --untracked-files=all here too: a restoration that left a stray file
+    # behind has not restored the tree, whatever the commit says.
     porcelain="$(git_admin "$admin_account" "$repository" \
-        status --porcelain --untracked-files=no)" || true
+        status --porcelain --untracked-files=all)" || true
 
     if [[ "$head" != "$previous_sha" || "$current_branch" != "$branch" \
         || -n "$porcelain" ]]; then
@@ -847,6 +1079,12 @@ action_deploy_main() {
         "$MGO_PREVIEW_STATUS_URL" "$MGO_PREVIEW_START_URL" \
         "$MGO_PREVIEW_TIMEOUT_SECONDS"; then
         fail_after_restart "the preview state could not be restored" \
+            "$head" "$previous_preview"
+    fi
+
+    # Nothing has been claimed yet. This is the stage entitled to claim it.
+    if ! final_verification "$approved" "$previous_preview"; then
+        fail_after_restart "final verification failed" \
             "$head" "$previous_preview"
     fi
 
