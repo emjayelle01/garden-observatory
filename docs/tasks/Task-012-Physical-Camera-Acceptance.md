@@ -1262,11 +1262,18 @@ authorisation like this one.
 own installer, documented in [Deployment-Gateway.md](../Deployment-Gateway.md)
 and recorded in
 [Task-012-Deployment-Gateway-Remediation.md](Task-012-Deployment-Gateway-Remediation.md).
-It has **not** been reviewed, **not** been installed on the Raspberry Pi and
+It has since been **reviewed once**: repository review found seven blocking
+defects — approval parsing that was not byte-exact, an installer relying on
+errexit inside a conditional, no real installer transaction, an installer that
+rewrote already-correct files, `curl -f` standing in for an exact HTTP 200,
+a non-running preview that was skipped rather than preserved, and no final
+verification stage. All seven are corrected on that branch.
+
+It has **not** been re-reviewed, **not** been installed on the Raspberry Pi and
 **not** been validated there. The gateway running in production is still the
 Task 10 one described above, and nothing about the production host changed. A
-future deployment cannot use the new gateway until it is reviewed and installed
-under separate authorisation.
+future deployment cannot use the new gateway until it is re-reviewed and
+installed under separate authorisation.
 
 ### Evidence
 

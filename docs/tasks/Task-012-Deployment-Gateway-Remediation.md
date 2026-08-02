@@ -2,19 +2,25 @@
 
 ## Status
 
-**Definition committed; implementation, review, installation and Raspberry Pi
-validation not performed.**
+**Repository review corrections implemented; not yet re-reviewed. The gateway
+is not installed, there has been no Raspberry Pi validation, and the production
+gateway is unchanged.**
 
 | Gate | Outcome |
 | ---- | ------- |
 | Remediation definition | Complete (this record, first commit) |
-| Gateway implementation | Pending |
-| Rollback transaction | Pending |
-| Installer and sudoers | Pending |
-| Documentation | Pending |
-| Repository review | **Not performed** |
-| Installation on the Raspberry Pi | **Not performed** — requires review and a separately approved SHA |
+| Gateway implementation | Complete |
+| Rollback transaction | Complete |
+| Installer and sudoers | Complete |
+| Documentation | Complete |
+| Repository review | **Round 1 complete** — seven blocking defects found |
+| Review corrections | Complete — all seven corrected |
+| Re-review | **Not performed** |
+| Installation on the Raspberry Pi | **Not performed** — requires re-review and a separately approved SHA |
 | Raspberry Pi validation of the gateway | **Not performed** |
+
+Nothing here has run on the Raspberry Pi. The gateway installed there is still
+the Task 10 one, and physical camera acceptance remains pending in full.
 
 Nothing in this task changes the gateway that is installed on the production
 Raspberry Pi. It changes what the *repository* ships. Installing it is a
@@ -160,6 +166,91 @@ because `preview.auto_start` remains `false` in production. A preview that was
 stopped or failed stays that way: completing a deployment is not a reason to
 start a camera nobody asked for. The stream is never opened, no frame is
 inspected, and no capture endpoint is called.
+
+## Repository review — seven blocking defects corrected
+
+Review round 1 found seven defects. All are corrected; none had reached the
+Raspberry Pi, because nothing here has ever been installed.
+
+### Finding 1 — approval parsing was not byte-exact
+
+`wc -l <= 1` plus one `read` of the first line accepted `<valid sha>\nmain`
+with no final newline: one newline passed the count, the read returned a valid
+SHA, and a whole trailing line was ignored.
+
+The parse is now anchored on the file's own length — exactly 40 bytes, or 41
+with a single final LF — and that final byte is compared as a **hex value**,
+because command substitution silently drops a NUL and would otherwise let a
+trailing NUL pass for a newline. CR, CRLF, embedded control bytes, trailing
+spaces, empty second lines and trailing data are all refused, and `wc -l` is
+gone.
+
+### Finding 2 — the installer relied on errexit inside a conditional
+
+`if ! install_file ...` disables errexit for everything the function runs, so
+an internal `install` failure could fall through to the rename and publish a
+truncated file that `sudo` would execute.
+
+Every mutating command now checks its own status and returns immediately, and
+a failed step removes its own temporary file. Nothing in the installer depends
+on errexit inside a conditional call.
+
+### Finding 3 — the installer had no real transaction
+
+Both previous states are now recorded before the first mutation, with
+**"absent" as a recorded state** whose restoration is removal. Any failure —
+temporary file, either copy, either rename, either checksum, either metadata
+check, or the installed-policy validation — restores **both** targets. The
+installed policy is re-validated with `visudo -cf` after installation, because
+validating what was about to be written is not validating what landed. A
+restoration that itself fails exits **78** and never claims the host is clean.
+
+### Finding 4 — an identical installation still rewrote files
+
+The installer set a flag and carried on through installation. It now verifies
+and exits **before** any temporary file exists, leaving inode and modification
+time untouched. Matching content with the wrong owner or mode is explicitly
+*not* current: that is a defect, and it is repaired transactionally.
+
+### Finding 5 — HTTP 200 was not enforced
+
+`curl -f` accepts every 2xx and reports a redirect as success. Health,
+preview-status and preview-start now capture the status and compare it to
+exactly `200`, never follow redirects, keep proxies disabled and literal
+loopback, write bodies to `mktemp` files that are always removed, and **never
+interpret a body from a non-200 response**.
+
+### Finding 6 — a non-running preview was not preserved, only skipped
+
+Restoration returned success immediately when preview had not been running,
+which made "left alone" mean "not checked". It now proves the state: a
+previously non-running preview must still be non-running with **zero**
+producers, and drift into running is a failure that enters the post-restart
+rollback path. It is deliberately not papered over with a stop request — a
+camera that started itself is a fault to surface, and an unasked-for stop would
+be a second unrequested mutation.
+
+### Finding 7 — there was no final verification
+
+A new stage runs after preview restoration and before any success message,
+re-reading approval, branch, `HEAD`, local `main`, `origin/main`, tree
+cleanliness **including untracked files**, stash, in-progress operations,
+service state, exact-200 health, preview state and producer counts. A failure
+takes the rollback path, and `deployed` is never printed before it passes.
+
+### Also corrected
+
+- **Untracked files** are now included in every cleanliness check — after the
+  sync, in rollback verification and in final verification. Ignored paths such
+  as `.venv` remain ignored.
+- **Runtime readiness** no longer tests an executable bit. It proves, as the
+  runtime account with the production configuration selected, that the deployed
+  interpreter and launcher are executable and that `mgo.core.config` and
+  `mgo.api.app` import. Import only — no lifespan, no camera, no stream, no
+  writes. A failure takes the pre-restart rollback path.
+- **Dry run fails closed.** The help says it validates everything, so a host
+  without `visudo` now fails in dry-run mode too rather than reporting a
+  success it did not earn.
 
 ## Boundaries
 

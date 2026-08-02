@@ -42,6 +42,16 @@ Root-owned, not group- or world-writable, and containing exactly one line of
 exactly forty lowercase hexadecimal characters — nothing else. No branch name,
 no path, no comment, no second line, no surrounding whitespace.
 
+The parse is **byte-exact**, anchored on the file's own length rather than on a
+newline count. That distinction matters: the bytes `<valid sha>\nmain` with no
+final newline contain exactly one newline, so a line count passes and reading
+the first line returns a valid SHA — while a whole trailing line is silently
+ignored. A file must therefore be exactly 40 bytes, or 41 with a single final
+LF, and that final byte is compared as a hex value because command substitution
+silently drops a NUL and would otherwise let a trailing NUL pass as a newline.
+CR, CRLF, embedded control bytes, trailing spaces and trailing data are all
+refused for the same reason.
+
 **Only Matthew writes this file.** The gateway only ever reads it, and no action
 it exposes can change it. Installing an approval is how a deployment is
 authorised; clearing it is how that authorisation is withdrawn.
@@ -142,6 +152,22 @@ dependency set that the lockfile never recorded and the test suite never ran
 against. A missing `uv`, a failed sync, or a sync that modified a tracked file
 each stop the deployment — none of them is a degraded success.
 
+## 9a. Runtime readiness
+
+Before the restart, the gateway proves the **runtime account** can actually
+load the deployed code: that the deployed interpreter and launcher are
+executable, and that `mgo.core.config` and `mgo.api.app` import as `mgo` with
+the production configuration selected.
+
+An executable bit on the launcher proves almost nothing. Without this, a
+missing module or an unreadable path surfaces as `203/EXEC` or an `ImportError`
+*after* the code has already moved, and the diagnosis happens in the journal
+instead of in the deployment.
+
+It is a probe, not a rehearsal: import only. No lifespan is entered, no camera
+is opened, no stream is read and nothing is written. A failed probe takes the
+pre-restart rollback path.
+
 ## 10. Preview-state preservation
 
 `preview.auto_start` is `false` in production, so a restart leaves preview
@@ -151,17 +177,48 @@ running before the deployment, the deployment took the camera away.
 So the gateway records the preview state **before** it touches anything, and
 afterwards:
 
-- preview was running, and is now stopped → exactly one `POST /camera/preview/start`, then poll until it reports running;
+- preview was running, and is now stopped → exactly one `POST /camera/preview/start`, then poll until it reports running, then require exactly one `rpicam-vid`;
 - preview was running, and already is → no request at all;
-- preview was stopped, failed, or anything else → left exactly as it was.
+- preview was **not** running → it must still not be running, and there must be **zero** producers.
 
-Then it requires exactly one physical `rpicam-vid` producer and no
-`libcamera-vid`.
+Preservation of a non-running preview is *proven*, not assumed. Returning
+success without looking would make "left alone" mean "not checked" — so a
+previously stopped or failed preview that is now running, or a producer alive
+behind a preview that reports stopped, is a **failure** that takes the
+post-restart rollback path.
+
+Drift into running is deliberately not papered over with a stop request. A
+camera that started itself is a fault to surface, and issuing an unasked-for
+stop would be a second unrequested mutation on top of the first.
+
+A `libcamera-vid` in any final state is a failure: something other than this
+deployment is holding the camera.
 
 Completing a deployment is never a reason to start a camera nobody asked for.
 The gateway **never** opens the preview stream, never inspects a frame and never
 calls the capture endpoint — deployment restores an operating state, it does not
 exercise the camera.
+
+## 10a. Final verification
+
+After preview restoration and **before anything claims success**, the gateway
+re-reads the whole picture and only then concludes the deployment landed:
+
+approval still parses and still names this commit · branch is `main` · `HEAD`,
+local `main` and `origin/main` all equal the approved SHA · the tree is clean
+**including untracked files** · no stash · no Git operation in progress · the
+service is active · health answers exactly 200 · preview matches the recorded
+pre-deployment operating state · the producer count matches it · no
+`libcamera-vid`.
+
+Every earlier step checked its own outcome, which is not the same as checking
+the *result*. A failure here is a deployment failure like any other and takes
+the post-restart rollback path — and `deployed` is never printed before it
+passes.
+
+Cleanliness is checked with `--untracked-files=all` everywhere — after the
+sync, during rollback verification and here. An untracked file is drift the
+deployment must not carry, though ignored paths such as `.venv` remain ignored.
 
 ## 11. Transaction rollback
 
@@ -201,15 +258,36 @@ sudo bash scripts/deploy/install-mgo-validate.sh             # install
 
 The installer validates the gateway with `bash -n` and the policy with
 `visudo -cf` **before** installing either — an invalid file under
-`/etc/sudoers.d` can lock every account out of `sudo` on the host. Both files
-are written atomically, `root:root`, `0755` for the gateway and `0440` for the
-policy, then verified on disk by checksum, owner and mode. If the policy cannot
-be installed after the gateway, the gateway is rolled back: the host is never
-left with half a control plane.
+`/etc/sudoers.d` can lock every account out of `sudo` on the host. **A dry run
+validates too**: it promises to validate everything, so a host without `visudo`
+fails in both modes rather than reporting a success it did not earn.
 
-The installer is idempotent, and it never touches the approval file, the
-repository or the service. It provisions the deployment control plane and
-nothing else.
+Both files are written atomically, `root:root`, `0755` for the gateway and
+`0440` for the policy, then verified on disk by checksum, owner and mode, and
+the *installed* policy is re-validated with `visudo -cf` before success —
+validating what was about to be written is not the same as validating what
+landed.
+
+The transaction records **both** previous states before the first mutation,
+and "absent" is a recorded state whose restoration is removal. Any failure
+after that point — a temporary file, a copy, a rename, either checksum, either
+metadata check, or the installed-policy validation — restores **both** targets.
+The host is never left with half a control plane. A restoration that itself
+fails exits **78** and says so; it never claims the host is clean.
+
+Every mutating command checks its own status. None of this relies on `errexit`
+inside a function invoked as an `if !` condition, where Bash disables it — an
+unchecked failure there would fall through to the rename and publish a
+truncated file that `sudo` would happily execute.
+
+The installer is idempotent in the strict sense: when both files are already
+correct in content **and** owner **and** mode, and the installed policy is
+valid, it verifies and exits before creating a temporary file — same inode,
+same modification time, nothing written. Matching content with the wrong owner
+or mode is *not* current; it is a defect, and it is repaired transactionally.
+
+It never touches the approval file, the repository or the service. It
+provisions the deployment control plane and nothing else.
 
 ## 14. Sudoers boundary
 
