@@ -41,6 +41,15 @@ set -Eeuo pipefail
 readonly MGO_REPOSITORY="/opt/garden-observatory"
 readonly MGO_APPROVAL_FILE="/etc/garden-observatory/claude-approved-sha"
 readonly MGO_PRODUCTION_CONFIG="/etc/garden-observatory/mgo.toml"
+
+# The system interpreter, used only to parse a JSON status document. The
+# application's own environment is deliberately not involved: parsing a
+# response must not depend on the code being deployed.
+readonly MGO_JSON_PARSER="/usr/bin/python3"
+
+# A fixed, root-controlled temporary directory. Inheriting TMPDIR would let a
+# caller choose where response bodies and staging files are written.
+readonly MGO_ROOT_TMPDIR="/run/mgo-validate-tmp"
 readonly MGO_SERVICE="mgo.service"
 readonly MGO_ADMIN_ACCOUNT="claude"
 readonly MGO_RUNTIME_ACCOUNT="mgo"
@@ -141,10 +150,47 @@ require_root_caller() {
 # leave root-owned objects in a checkout the account has to keep managing, and
 # running them as the runtime account would give the service write access to
 # its own code.
+# The home directory the account database records, proven absolute.
+#
+# Never the caller's HOME. Git finds ~/.gitconfig and ~/.ssh through it, so a
+# caller who could choose it could choose the SSH key and the Git configuration
+# a root-invoked deployment uses.
+account_home() {
+    local account="$1"
+    local home
+
+    home="$(getent passwd "$account" | cut -d: -f6)" || return 1
+    [[ -n "$home" ]] || return 1
+    [[ "$home" == /* ]] || return 1
+    printf '%s\n' "$home"
+}
+
+# Run a command as the unprivileged administrative account, in an environment
+# this gateway constructed rather than one it inherited.
+#
+# ``env -i`` empties it first, so nothing survives by omission: GIT_DIR,
+# GIT_WORK_TREE, GIT_INDEX_FILE, GIT_CONFIG*, GIT_SSH*, UV_PROJECT,
+# UV_CONFIG_FILE, VIRTUAL_ENV, PYTHONPATH, PYTHONHOME, CURL_HOME, TMPDIR and
+# every proxy variable are gone because the list starts empty. Any one of them
+# could redirect a root-invoked deployment at a different repository, index,
+# configuration, interpreter or remote.
+#
+# SSH to the expected repository still works: it comes from the account's own
+# fixed home, which is where the deployment key lives.
 run_as_admin() {
     local admin_account="$1"
     shift
-    runuser -u "$admin_account" -- "$@"
+    local home
+
+    home="$(account_home "$admin_account")" || return 1
+
+    runuser -u "$admin_account" -- env -i \
+        "HOME=$home" \
+        "USER=$admin_account" \
+        "LOGNAME=$admin_account" \
+        "PATH=$MGO_SAFE_PATH" \
+        "LC_ALL=C" \
+        "$@"
 }
 
 # Git, always as the administrative account, always against a named repository.
@@ -171,6 +217,52 @@ git_admin() {
 #
 # No PID file, no staleness protocol. flock is released by the kernel when the
 # holder exits, however it exits, so there is no stale state to reason about.
+# The lock object itself is a security boundary.
+#
+# An unprivileged process that can open the lock file read-only can hold an
+# exclusive flock on it and deny every deployment and restart indefinitely. So
+# the file must be root-owned and 0600 — unreadable to anyone else — and it must
+# be a regular file reached through a real directory, never a symlink pointing
+# somewhere an ordinary account controls.
+#
+# An unsafe object is refused, never followed and never replaced: replacing it
+# would drop whatever lock a legitimate holder has on the old inode.
+require_secure_lock_object() {
+    local lock_path="$1"
+    local directory
+    local ownership
+    local mode
+
+    directory="$(dirname "$lock_path")"
+    [[ ! -L "$directory" ]] || return 1
+    [[ -d "$directory" ]] || return 1
+
+    [[ ! -L "$lock_path" ]] || return 1
+    [[ -f "$lock_path" ]] || return 1
+
+    ownership="$(stat -c '%u:%g' "$lock_path")" || return 1
+    [[ "$ownership" == "0:0" ]] || return 1
+
+    mode="$(stat -c '%a' "$lock_path")" || return 1
+    [[ "$mode" == "600" ]] || return 1
+}
+
+# Create the lock file, losing safely to a simultaneous creator.
+#
+# noclobber gives O_EXCL, so two first-run callers cannot both create it and the
+# loser never replaces the winner's inode — it simply proceeds to validate what
+# is there. The umask makes the file 0600 from the moment it exists rather than
+# briefly wider.
+create_lock_object() {
+    local lock_path="$1"
+
+    (
+        umask 0077
+        set -C
+        : >"$lock_path"
+    ) 2>/dev/null || return 0
+}
+
 acquire_transaction_lock() {
     local lock_path="$1"
     local directory
@@ -180,6 +272,14 @@ acquire_transaction_lock() {
         mkdir -p "$directory" \
             || die "$EX_PRECONDITION" "the lock directory could not be created"
     fi
+
+    if [[ ! -e "$lock_path" && ! -L "$lock_path" ]]; then
+        create_lock_object "$lock_path"
+    fi
+
+    require_secure_lock_object "$lock_path" \
+        || die "$EX_PRECONDITION" \
+            "the deployment lock is not a root-owned 0600 regular file"
 
     # Descriptor 9 literally, matching MGO_LOCK_FD. A redirection target cannot
     # be a variable without dynamic evaluation, which has no place in a script
@@ -413,6 +513,7 @@ require_restart_preconditions() {
     local expected_repository="$3"
     local remote="$4"
     local approved="$5"
+    local canonical
     local branch
     local head
     local local_branch
@@ -425,6 +526,14 @@ require_restart_preconditions() {
 
     [[ -d "$repository/.git" ]] \
         || die "$EX_PRECONDITION" "no repository at the production path"
+
+    # The same canonical-path proof deployment makes. Restarting is privileged
+    # too, and a symlinked component would point every check below at a
+    # different tree than the one the service is about to run.
+    canonical="$(cd "$repository" && pwd -P)"
+    [[ "$canonical" == "$(cd "$repository" && pwd -L)" ]] \
+        || die "$EX_PRECONDITION" \
+            "the production path resolves through a symlink"
 
     branch="$(git_admin "$admin_account" "$repository" branch --show-current)"
     [[ -n "$branch" ]] \
@@ -505,7 +614,8 @@ http_get_200() {
     local body_file="$2"
     local status
 
-    status="$(curl --noproxy '*' -sS --max-time 5 \
+    status="$(curl --disable --noproxy '*' -sS --max-time 5 \
+        --no-location --max-redirs 0 \
         --request GET \
         --output "$body_file" \
         --write-out '%{http_code}' \
@@ -519,7 +629,8 @@ http_post_200() {
     local body_file="$2"
     local status
 
-    status="$(curl --noproxy '*' -sS --max-time 20 \
+    status="$(curl --disable --noproxy '*' -sS --max-time 20 \
+        --no-location --max-redirs 0 \
         --request POST \
         --output "$body_file" \
         --write-out '%{http_code}' \
@@ -553,23 +664,10 @@ endpoint_is_ok() {
     return "$outcome"
 }
 
-# The body, and only when the status was exactly 200.
-#
-# A non-200 response body is never returned to a caller: interpreting an error
-# page as a status document is how a deployment convinces itself the camera is
-# fine.
-endpoint_body() {
-    local url="$1"
-    local body_file
-
-    body_file="$(mktemp)" || return 1
-    if ! http_get_200 "$url" "$body_file"; then
-        discard_temporary "$body_file" || true
-        return 1
-    fi
-    cat "$body_file"
-    discard_temporary "$body_file" || return 1
-}
+# There is deliberately no "fetch the body as a string" helper. The one caller
+# that needs a body — the preview status read — keeps it in a file and hands
+# that file to the parser, so an arbitrary remote response never passes through
+# the shell.
 
 # Extract the reported preview state, or fail.
 #
@@ -581,23 +679,55 @@ endpoint_body() {
 # baseline a whole deployment measured itself against. Exactly one occurrence
 # of the field is required: none is missing data, and two are ambiguous even
 # when they agree, because nothing here can say which one the API meant.
-preview_state_from_status() {
-    local body="$1"
-    local matches
-    local occurrences
-    local state
+preview_state_from_file() {
+    local body_file="$1"
+    local parser="$2"
 
-    matches="$(printf '%s' "$body" \
-        | grep -o '"state"[[:space:]]*:[[:space:]]*"[A-Za-z_]*"' || true)"
-    [[ -n "$matches" ]] || return 1
+    # The file is handed to the parser by path. Passing the bytes through
+    # command substitution would put an arbitrary remote response through the
+    # shell's word splitting and NUL handling on the way to being parsed, which
+    # is precisely what a status document should never get to touch.
+    "$parser" -c '
+import json
+import sys
 
-    occurrences="$(printf '%s\n' "$matches" | grep -c . || true)"
-    [[ "$occurrences" -eq 1 ]] || return 1
 
-    state="$(printf '%s' "$matches" | grep -o '"[A-Za-z_]*"$' | tr -d '"')"
-    [[ -n "$state" ]] || return 1
+class Obj(list):
+    """A JSON object, kept as ordered pairs so duplicates stay visible."""
 
-    printf '%s\n' "$state"
+
+with open(sys.argv[1], "rb") as handle:
+    raw = handle.read()
+
+if b"\x00" in raw:
+    sys.exit(1)
+
+try:
+    text = raw.decode("utf-8")
+except UnicodeDecodeError:
+    sys.exit(1)
+
+try:
+    # Strict: json.loads refuses leading or trailing non-JSON data outright,
+    # so a document with a state fragment glued to it never parses at all.
+    document = json.loads(text, object_pairs_hook=Obj)
+except ValueError:
+    sys.exit(1)
+
+# A JSON array also arrives as a list, so objects carry their own type.
+if not isinstance(document, Obj):
+    sys.exit(1)
+
+keys = [key for key, _ in document]
+if keys.count("state") != 1:
+    sys.exit(1)
+
+value = next(value for key, value in document if key == "state")
+if not isinstance(value, str):
+    sys.exit(1)
+
+sys.stdout.write(value + "\n")
+' "$body_file"
 }
 
 # Stable, transient or unsupported.
@@ -625,10 +755,28 @@ classify_preview_state() {
 
 read_preview_state() {
     local url="$1"
-    local body
+    local body_file
+    local state
+    local outcome=0
 
-    body="$(endpoint_body "$url")" || return 1
-    preview_state_from_status "$body"
+    body_file="$(mktemp)" || return 1
+    if ! http_get_200 "$url" "$body_file"; then
+        discard_temporary "$body_file" || true
+        return 1
+    fi
+
+    state="$(preview_state_from_file "$body_file" "$MGO_JSON_PARSER")" || outcome=1
+    discard_temporary "$body_file" || outcome=1
+    [[ "$outcome" -eq 0 ]] || return 1
+
+    # The vocabulary check lives here rather than in the parser so that the
+    # parser answers exactly one question: what does this document say.
+    case "$state" in
+        running | stopped | failed | starting | stopping) ;;
+        *) return 1 ;;
+    esac
+
+    printf '%s\n' "$state"
 }
 
 # Read a settled preview state, refusing anything a deployment cannot rest on.
@@ -775,6 +923,9 @@ require_clean_after_sync() {
 require_runtime_can_execute() {
     local runtime_account="$1"
     local repository="$2"
+    local home
+
+    home="$(account_home "$runtime_account")" || return 1
 
     runuser -u "$runtime_account" -- \
         test -x "$repository/.venv/bin/python" \
@@ -784,8 +935,16 @@ require_runtime_can_execute() {
         test -x "$repository/.venv/bin/uvicorn" \
         || return 1
 
-    runuser -u "$runtime_account" -- \
-        env "MGO_CONFIG_PATH=$MGO_PRODUCTION_CONFIG" \
+    # An empty environment plus exactly what the import needs. PYTHONPATH or
+    # VIRTUAL_ENV inherited from the caller could make this probe import a
+    # different application than the one about to be started.
+    runuser -u "$runtime_account" -- env -i \
+        "HOME=$home" \
+        "USER=$runtime_account" \
+        "LOGNAME=$runtime_account" \
+        "PATH=/usr/bin:/bin" \
+        "LC_ALL=C" \
+        "MGO_CONFIG_PATH=$MGO_PRODUCTION_CONFIG" \
         "$repository/.venv/bin/python" -c \
         'import mgo.core.config, mgo.api.app' \
         >/dev/null 2>&1 \
@@ -1423,13 +1582,53 @@ action_deploy_main() {
 main() {
     local action="${1:-}"
 
+    # The root side of this process runs curl, stat, systemctl, flock and
+    # mktemp. Its environment is constructed here rather than inherited, so a
+    # caller cannot steer any of them — TMPDIR in particular decides where
+    # response bodies and staging files are written.
     PATH="$MGO_SAFE_PATH"
-    export PATH
+    HOME="/root"
+    LC_ALL="C"
+    export PATH HOME LC_ALL
 
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_CONFIG GIT_CONFIG_GLOBAL \
+        GIT_CONFIG_SYSTEM GIT_SSH GIT_SSH_COMMAND UV_PROJECT UV_CONFIG_FILE \
+        VIRTUAL_ENV PYTHONPATH PYTHONHOME CURL_HOME SSH_AUTH_SOCK \
+        HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
+        http_proxy https_proxy all_proxy no_proxy
+
+    # The request is judged before the host is touched. An unsupported action
+    # must not be able to make this process create a directory on its way to
+    # being refused.
     [[ -n "$action" ]] || die "$EX_REQUEST" "no action supplied"
     shift
     [[ "$#" -eq 0 ]] \
         || die "$EX_REQUEST" "this gateway takes no arguments beyond an action"
+
+    case "$action" in
+        show-approval | deploy-main | restart-api) ;;
+        install)
+            # Removed deliberately. The old action provisioned service identity
+            # while its name promised code deployment, and it could not deploy
+            # code at all. Both meanings now have their own entry point.
+            die "$EX_REQUEST" \
+                "the install action has been removed; use deploy-main to deploy application code, or scripts/deploy/install-service-identity.sh to provision service identity"
+            ;;
+        *)
+            die "$EX_REQUEST" \
+                "unsupported action; expected show-approval, deploy-main or restart-api"
+            ;;
+    esac
+
+    if [[ ! -d "$MGO_ROOT_TMPDIR" ]]; then
+        mkdir -p "$MGO_ROOT_TMPDIR" \
+            || die "$EX_PRECONDITION" \
+                "the temporary directory could not be created"
+    fi
+    chmod 0700 "$MGO_ROOT_TMPDIR" \
+        || die "$EX_PRECONDITION" "the temporary directory could not be secured"
+    TMPDIR="$MGO_ROOT_TMPDIR"
+    export TMPDIR
 
     case "$action" in
         show-approval)
@@ -1443,17 +1642,6 @@ main() {
         restart-api)
             require_root_caller "$MGO_ADMIN_ACCOUNT" "$EUID" "${SUDO_USER:-}"
             action_restart_api
-            ;;
-        install)
-            # Removed deliberately. The old action provisioned service identity
-            # while its name promised code deployment, and it could not deploy
-            # code at all. Both meanings now have their own entry point.
-            die "$EX_REQUEST" \
-                "the install action has been removed; use deploy-main to deploy application code, or scripts/deploy/install-service-identity.sh to provision service identity"
-            ;;
-        *)
-            die "$EX_REQUEST" \
-                "unsupported action; expected show-approval, deploy-main or restart-api"
             ;;
     esac
 }

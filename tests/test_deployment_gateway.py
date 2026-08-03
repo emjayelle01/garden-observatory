@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -459,11 +460,180 @@ def test_the_unprivileged_runner_drops_privilege_before_the_command() -> None:
     """``run_as_admin`` hands off through ``runuser``, never running as root."""
     result = call_gateway_function(
         'run_as_admin "claude" git status',
-        preamble='runuser() { printf "runuser %s\\n" "$*"; }\n',
+        preamble=(
+            'account_home() { printf "/home/claude\\n"; }\n'
+            'runuser() { printf "runuser %s\\n" "$*"; }\n'
+        ),
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "runuser -u claude -- git status"
+    assert result.stdout.strip().startswith("runuser -u claude -- env -i ")
+    assert result.stdout.strip().endswith("git status")
+
+
+HOSTILE_ENVIRONMENT = (
+    'export GIT_DIR="/tmp/evil.git"\n'
+    'export GIT_WORK_TREE="/tmp/evil"\n'
+    'export GIT_INDEX_FILE="/tmp/evil.index"\n'
+    'export GIT_CONFIG="/tmp/evil.gitconfig"\n'
+    'export GIT_SSH_COMMAND="ssh -i /tmp/evil"\n'
+    'export UV_PROJECT="/tmp/evil"\n'
+    'export UV_CONFIG_FILE="/tmp/evil.toml"\n'
+    'export VIRTUAL_ENV="/tmp/evil-venv"\n'
+    'export PYTHONPATH="/tmp/evil"\n'
+    'export PYTHONHOME="/tmp/evil"\n'
+    'export CURL_HOME="/tmp/evil"\n'
+    'export TMPDIR="/tmp/evil-tmp"\n'
+    'export HOME="/tmp/evil-home"\n'
+    'export HTTP_PROXY="http://evil"\n'
+    'export ALL_PROXY="http://evil"\n'
+)
+
+
+def test_the_admin_environment_is_constructed_not_inherited() -> None:
+    """``env -i`` empties it, so nothing survives by omission.
+
+    GIT_DIR, GIT_WORK_TREE, UV_PROJECT, PYTHONPATH and the rest could each
+    redirect a root-invoked deployment at a different repository, index,
+    configuration or interpreter.
+    """
+    log_marker = "runuser"
+    result = call_gateway_function(
+        'run_as_admin "claude" git status',
+        preamble=(
+            HOSTILE_ENVIRONMENT
+            + 'account_home() { printf "/home/claude\\n"; }\n'
+            + 'runuser() { printf "%s\\n" "$*"; }\n'
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    line = result.stdout.strip()
+    assert line.startswith("-u claude -- env -i "), line
+    assert "HOME=/home/claude" in line
+    assert "USER=claude" in line
+    assert "LC_ALL=C" in line
+    for hostile in ("evil", "GIT_DIR", "PYTHONPATH", "UV_PROJECT", "TMPDIR"):
+        assert hostile not in line, hostile
+    assert log_marker not in line
+
+
+def test_the_admin_home_comes_from_the_account_database() -> None:
+    """Never the caller's HOME: Git finds ~/.ssh and ~/.gitconfig through it."""
+    body = _function_body("account_home()", "# Run a command as the unprivileged")
+
+    assert "getent passwd" in body
+    assert '"$home" == /*' in body
+
+
+def test_an_unusable_account_home_stops_the_command() -> None:
+    """A relative or missing home is refused rather than guessed at."""
+    for home in ("", "relative/path"):
+        result = call_gateway_function(
+            'run_as_admin "claude" git status',
+            preamble=(
+                f'getent() {{ printf "claude:x:1001:1001::{home}:/bin/bash\\n"; }}\n'
+                'runuser() { printf "ran\\n"; }\n'
+            ),
+        )
+        assert result.returncode != 0, home
+
+
+def test_the_runtime_probe_environment_is_constructed_not_inherited(
+    tmp_path: Path,
+) -> None:
+    """PYTHONPATH or VIRTUAL_ENV could make the probe import another app.
+
+    The double logs to a file rather than stdout: the import probe redirects
+    its own output to /dev/null, so a stdout double would never see it.
+    """
+    log_file = tmp_path / "runuser.log"
+    result = call_gateway_function(
+        'require_runtime_can_execute "mgo" "/opt/garden-observatory"',
+        preamble=(
+            HOSTILE_ENVIRONMENT
+            + f'PROBE_LOG="{_posix(log_file)}"\n'
+            + 'account_home() { printf "/var/lib/garden-observatory\\n"; }\n'
+            + 'runuser() { printf "%s\\n" "$*" >> "$PROBE_LOG"; return 0; }\n'
+        ),
+    )
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    probe = [line for line in lines if "python" in line and " -c " in line]
+
+    assert result.returncode == 0, result.stderr
+    assert probe, lines
+    assert "env -i" in probe[0]
+    assert "HOME=/var/lib/garden-observatory" in probe[0]
+    assert "PATH=/usr/bin:/bin" in probe[0]
+    assert "MGO_CONFIG_PATH=/etc/garden-observatory/mgo.toml" in probe[0]
+    for hostile in ("evil", "PYTHONPATH", "VIRTUAL_ENV"):
+        assert hostile not in probe[0], hostile
+
+
+def test_the_root_environment_is_fixed_before_any_action_runs() -> None:
+    """curl, stat, systemctl, flock and mktemp all inherit it."""
+    body = _function_body("main()", "# Program when executed")
+    # The first case validates the request; the dispatch case follows the
+    # environment setup, so an unsupported action is refused before the host is
+    # touched at all.
+    validation = body.index('case "$action"')
+    dispatch = body.index("require_root_caller")
+
+    assert body.index('PATH="$MGO_SAFE_PATH"') < validation
+    assert body.index('HOME="/root"') < validation
+    assert body.index("unset GIT_DIR") < validation
+    assert body.index('TMPDIR="$MGO_ROOT_TMPDIR"') < dispatch
+
+
+def test_an_unsupported_action_is_refused_before_the_host_is_touched() -> None:
+    """A bad request must not make this process create a directory."""
+    body = _function_body("main()", "# Program when executed")
+
+    assert body.index("unsupported action") < body.index("$MGO_ROOT_TMPDIR")
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "UV_PROJECT",
+        "UV_CONFIG_FILE",
+        "VIRTUAL_ENV",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "CURL_HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ],
+)
+def test_every_behaviour_altering_variable_is_unset_at_the_root_boundary(
+    variable: str,
+) -> None:
+    """Named explicitly, so adding one to the list is a deliberate act."""
+    body = _function_body("main()", "# Program when executed")
+    unset_block = body[body.index("unset GIT_DIR") : body.index("if [[ ! -d")]
+
+    assert variable in unset_block
+
+
+def test_the_temporary_directory_is_root_controlled() -> None:
+    """TMPDIR decides where response bodies and staging files are written."""
+    source = _read(GATEWAY)
+
+    assert 'readonly MGO_ROOT_TMPDIR="/run/mgo-validate-tmp"' in source
+    body = _function_body("main()", "# Program when executed")
+    assert "chmod 0700" in body
 
 
 def test_no_git_or_uv_call_bypasses_the_unprivileged_runner() -> None:
@@ -808,51 +978,132 @@ def test_divergent_history_is_rejected(
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("body", "expected"),
-    [
-        ('{"enabled":true,"state":"running","owner":"preview"}', "running"),
-        ('{"enabled":true,"state":"stopped","owner":null}', "stopped"),
-        ('{"state":"failed","last_error":null}', "failed"),
-        ('{"state": "starting"}', "starting"),
-    ],
-)
-def test_the_preview_state_is_read_from_the_status_document(
-    body: str, expected: str
-) -> None:
-    """One bounded field read; the gateway needs no JSON parser."""
-    result = call_gateway_function(f"preview_state_from_status '{body}'")
+def _python() -> str:
+    """The interpreter standing in for the Pi's ``/usr/bin/python3``."""
+    return _posix(Path(sys.executable))
 
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == expected
+
+def _parse_state(
+    tmp_path: Path, payload: bytes
+) -> subprocess.CompletedProcess[str]:
+    """Run the shipped JSON parser against a real response file."""
+    body = tmp_path / "body.json"
+    body.write_bytes(payload)
+    return call_gateway_function(
+        f'preview_state_from_file "{_posix(body)}" "{_python()}"'
+    )
 
 
 @pytest.mark.parametrize(
-    ("label", "body"),
+    ("label", "payload", "expected"),
     [
-        ("missing field", "{}"),
-        ("empty body", ""),
-        ("empty state", '{"state":""}'),
-        ("duplicated identical", '{"state":"running","x":1,"state":"running"}'),
-        ("conflicting", '{"state":"running","camera":{"state":"stopped"}}'),
-        ("malformed", '{"state":'),
-        ("not a string", '{"state":3}'),
+        ("compact", b'{"enabled":true,"state":"running","owner":"preview"}', "running"),
+        (
+            "formatted",
+            b'{\n  "enabled": true,\n  "state": "stopped",\n  "owner": null\n}\n',
+            "stopped",
+        ),
+        ("failed", b'{"state":"failed","last_error":null}', "failed"),
+        ("spaced", b'{"state" : "starting"}', "starting"),
+        (
+            "nested plus one valid top-level",
+            b'{"state":"running","camera":{"state":"available"}}',
+            "running",
+        ),
     ],
 )
-def test_an_unusable_state_field_is_refused_not_invented(
-    label: str, body: str
+def test_a_real_json_document_yields_its_top_level_state(
+    tmp_path: Path, label: str, payload: bytes, expected: str
 ) -> None:
-    """There is no fallback value.
+    """Parsed as JSON, not pattern-matched.
 
-    Reporting a missing field as "unknown" invents a state, and that invention
-    was then accepted as the baseline an entire deployment measured itself
-    against. Two occurrences are refused even when they agree: nothing here can
-    say which one the API meant.
+    A nested ``state`` no longer competes with the real one, and formatting is
+    irrelevant because the document is actually parsed.
     """
-    result = call_gateway_function(f"preview_state_from_status '{body}'")
+    result = _parse_state(tmp_path, payload)
+
+    assert result.returncode == 0, f"{label}: {result.stderr}"
+    assert result.stdout.strip() == expected, label
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [
+        ("missing state", b"{}"),
+        ("empty body", b""),
+        ("malformed with a matching fragment", b'{"state":"running"'),
+        ("trailing garbage", b'{"state":"running"} rubbish'),
+        ("leading garbage", b'rubbish {"state":"running"}'),
+        ("duplicate top-level state", b'{"state":"running","state":"running"}'),
+        ("conflicting duplicate", b'{"state":"running","state":"stopped"}'),
+        ("nested only", b'{"camera":{"state":"running"}}'),
+        ("not an object", b'["state","running"]'),
+        ("bare string", b'"running"'),
+        ("non-string state", b'{"state":3}'),
+        ("null state", b'{"state":null}'),
+        ("invalid utf-8", b'{"state":"run\xffning"}'),
+        ("embedded nul", b'{"state":"run\x00ning"}'),
+    ],
+)
+def test_an_unusable_status_document_is_refused_not_invented(
+    tmp_path: Path, label: str, payload: bytes
+) -> None:
+    """There is no fallback value, and no fragment survives a broken document.
+
+    A grep could find ``"state":"running"`` inside a truncated or
+    garbage-padded response and hand it back as a deployment baseline. A parser
+    refuses the document outright, which is the only honest answer.
+    """
+    result = _parse_state(tmp_path, payload)
 
     assert result.returncode != 0, label
     assert result.stdout.strip() == "", label
+
+
+@pytest.mark.parametrize("state", ["paused", "unknown", "RUNNING", ""])
+def test_an_unsupported_state_token_is_refused(tmp_path: Path, state: str) -> None:
+    """The vocabulary is closed, and the check sits outside the parser."""
+    body = tmp_path / "body.json"
+    body.write_bytes(f'{{"state":"{state}"}}'.encode())
+    result = call_gateway_function(
+        'read_preview_state "url"',
+        preamble=(
+            "mktemp() { printf '%s\\n' \"$1\"; }\n"
+            "http_get_200() { return 0; }\n"
+            "discard_temporary() { return 0; }\n"
+            "preview_state_from_file() {\n"
+            f'    "{_python()}" -c \'import sys; sys.stdout.write("{state}\\n")\'\n'
+            "}\n"
+        ),
+    )
+
+    assert result.returncode != 0
+
+
+def test_the_state_parser_is_not_grep() -> None:
+    """The correction is structural: pattern matching is gone."""
+    body = _function_body("preview_state_from_file()", "# Stable, transient")
+
+    assert "grep" not in body
+    assert "json.loads" in body
+    assert "object_pairs_hook" in body
+    assert 'readonly MGO_JSON_PARSER="/usr/bin/python3"' in _read(GATEWAY)
+
+
+def test_the_parser_reads_the_file_rather_than_shell_arguments() -> None:
+    """An arbitrary remote response never passes through the shell."""
+    body = _function_body("preview_state_from_file()", "# Stable, transient")
+
+    assert '"$body_file"' in body
+    assert "$(cat" not in body
+
+
+def test_the_parser_does_not_import_the_application() -> None:
+    """Parsing a response must not depend on the code being deployed."""
+    body = _function_body("preview_state_from_file()", "# Stable, transient")
+
+    assert "import mgo" not in body
+    assert ".venv" not in body
 
 
 # --------------------------------------------------------------------------
@@ -982,11 +1233,16 @@ def test_a_non_200_body_is_never_interpreted(status: str) -> None:
     assert "running" not in result.stdout
 
 
-def test_a_200_body_is_used() -> None:
-    """Once the status is exactly 200, the document is read."""
+def test_a_200_body_is_used(tmp_path: Path) -> None:
+    """Once the status is exactly 200, the document is parsed and used."""
     result = call_gateway_function(
         'read_preview_state "http://127.0.0.1:8080/camera/preview/status"',
-        preamble=_curl_double("200", body='{"state":"running"}'),
+        preamble=(
+            _curl_double("200", body='{"state":"running"}')
+            # The parser is exercised directly elsewhere; here the point is
+            # that a 200 body reaches it at all.
+            + "preview_state_from_file() { printf 'running\\n'; }\n"
+        ),
     )
 
     assert result.returncode == 0, result.stderr
@@ -1012,6 +1268,46 @@ def test_a_preview_start_accepts_an_exact_200() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_every_probe_ignores_curl_configuration() -> None:
+    """``--disable`` first, so no ``.curlrc`` can rewrite the request.
+
+    A configuration file could add ``--location``, change the proxy or alter
+    the timeout, and the gateway would obey it silently — at root.
+    """
+    for name, following in (
+        ("http_get_200()", "http_post_200()"),
+        ("http_post_200()", "# Literal loopback"),
+    ):
+        body = _function_body(name, following)
+        index = body.index("curl ")
+        options = body[index + len("curl ") :].split()
+
+        assert options[0] == "--disable", name
+        assert "--no-location" in body, name
+        assert "--max-redirs" in body, name
+        assert "--noproxy" in body, name
+
+
+@pytest.mark.parametrize(
+    ("label", "status"),
+    [("moved permanently", "301"), ("found", "302"), ("temporary", "307")],
+)
+def test_configuration_cannot_make_a_redirect_look_healthy(
+    label: str, status: str
+) -> None:
+    """Even a curl told to follow redirects reports the redirect's own status.
+
+    The double answers with the redirect status the way a configured curl
+    would, and the exact-200 comparison still refuses it.
+    """
+    for call in (
+        'endpoint_is_ok "http://127.0.0.1:8080/health"',
+        'start_preview "http://127.0.0.1:8080/camera/preview/start"',
+    ):
+        result = call_gateway_function(call, preamble=_curl_double(status))
+        assert result.returncode != 0, f"{label}: {call}"
 
 
 def test_no_probe_follows_a_redirect() -> None:
@@ -1046,8 +1342,8 @@ def test_every_probe_captures_the_status_explicitly() -> None:
 def test_response_bodies_go_to_temporary_files_that_are_removed() -> None:
     """Securely created, always cleaned up, never left in a shared directory."""
     for name, following in (
-        ("endpoint_is_ok()", "# The body, and only when"),
-        ("endpoint_body()", "# Extract the reported preview state"),
+        ("endpoint_is_ok()", "# There is deliberately no"),
+        ("read_preview_state()", "read_stable_preview_state()"),
         ("start_preview()", "# The physical producer contract"),
     ):
         body = _function_body(name, following)
@@ -1293,6 +1589,7 @@ def test_the_runtime_probe_imports_the_application(tmp_path: Path) -> None:
         'require_runtime_can_execute "mgo" "/opt/garden-observatory"',
         preamble=(
             f'RUNUSER_LOG="{_posix(log)}"\n'
+            'account_home() { printf "/var/lib/garden-observatory\\n"; }\n'
             'runuser() { printf \'%s\\n\' "$*" >> "$RUNUSER_LOG"; return 0; }\n'
         ),
     )
@@ -1312,6 +1609,7 @@ def test_the_runtime_probe_runs_as_the_runtime_account(tmp_path: Path) -> None:
         'require_runtime_can_execute "mgo" "/opt/garden-observatory"',
         preamble=(
             f'RUNUSER_LOG="{_posix(log)}"\n'
+            'account_home() { printf "/var/lib/garden-observatory\\n"; }\n'
             'runuser() { printf \'%s\\n\' "$*" >> "$RUNUSER_LOG"; return 0; }\n'
         ),
     )
@@ -1325,6 +1623,7 @@ def test_a_failed_runtime_import_stops_the_deployment() -> None:
     result = call_gateway_function(
         'require_runtime_can_execute "mgo" "/opt/garden-observatory"',
         preamble=(
+            'account_home() { printf "/var/lib/garden-observatory\\n"; }\n'
             "runuser() {\n"
             '    case "$*" in *"import mgo"*) return 1 ;; esac\n'
             "    return 0\n"
@@ -1593,12 +1892,22 @@ def _flock_double(*, busy: bool) -> str:
     return f"flock() {{ return {1 if busy else 0}; }}\n"
 
 
+def _secure_lock_double() -> str:
+    """Report the lock object as root-owned and 0600.
+
+    Windows has no POSIX ownership, so the *contract* is exercised directly by
+    the lock-object tests below and stood in for here, where the subject is the
+    acquisition sequence rather than the file's metadata.
+    """
+    return "require_secure_lock_object() { return 0; }\n"
+
+
 def test_a_busy_control_plane_refuses_rather_than_waits(tmp_path: Path) -> None:
     """Non-blocking by design: a second caller cannot know what the first will do."""
     lock = tmp_path / "mgo-deployment.lock"
     result = call_gateway_function(
         f'acquire_transaction_lock "{_posix(lock)}"',
-        preamble=_flock_double(busy=True),
+        preamble=_flock_double(busy=True) + _secure_lock_double(),
     )
 
     assert result.returncode == EX_BUSY
@@ -1610,7 +1919,7 @@ def test_an_uncontended_lock_is_acquired(tmp_path: Path) -> None:
     lock = tmp_path / "mgo-deployment.lock"
     result = call_gateway_function(
         f'acquire_transaction_lock "{_posix(lock)}"',
-        preamble=_flock_double(busy=False),
+        preamble=_flock_double(busy=False) + _secure_lock_double(),
     )
 
     assert result.returncode == 0, result.stderr
@@ -1622,7 +1931,7 @@ def test_the_lock_directory_is_created_when_absent(tmp_path: Path) -> None:
     lock = tmp_path / "nested" / "mgo-deployment.lock"
     result = call_gateway_function(
         f'acquire_transaction_lock "{_posix(lock)}"',
-        preamble=_flock_double(busy=False),
+        preamble=_flock_double(busy=False) + _secure_lock_double(),
     )
 
     assert result.returncode == 0, result.stderr
@@ -1695,12 +2004,156 @@ def test_the_lock_is_never_released_before_the_process_exits() -> None:
     assert code.count("exec 9") == 1
 
 
+def _lock_check(
+    tmp_path: Path, *, ownership: str = "0:0", mode: str = "600", make: str = "file"
+) -> subprocess.CompletedProcess[str]:
+    """Drive the shipped lock-object contract against a real path."""
+    lock = tmp_path / "lock" / "mgo-deployment.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    if make == "file":
+        lock.write_bytes(b"")
+    elif make == "directory":
+        lock.mkdir()
+    stat_double = (
+        "stat() {\n"
+        '    case "$2" in\n'
+        f"        '%u:%g') printf '{ownership}\\n' ;;\n"
+        f"        '%a') printf '{mode}\\n' ;;\n"
+        "        *) printf '\\n' ;;\n"
+        "    esac\n"
+        "}\n"
+    )
+    return call_gateway_function(
+        f'require_secure_lock_object "{_posix(lock)}"', preamble=stat_double
+    )
+
+
+def test_a_root_owned_private_lock_is_accepted(tmp_path: Path) -> None:
+    """0600 root:root is the only shape that keeps the lock out of reach."""
+    assert _lock_check(tmp_path).returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("label", "kwargs"),
+    [
+        ("world-readable", {"mode": "644"}),
+        ("group-readable", {"mode": "640"}),
+        ("world-writable", {"mode": "666"}),
+        ("non-root owner", {"ownership": "1001:1001"}),
+        ("non-root group", {"ownership": "0:984"}),
+        ("directory", {"make": "directory"}),
+        ("absent", {"make": "none"}),
+    ],
+)
+def test_an_insecure_lock_object_is_refused(
+    tmp_path: Path, label: str, kwargs: dict[str, str]
+) -> None:
+    """A readable lock file is a denial-of-deployment primitive.
+
+    Any unprivileged process that can open it read-only can hold an exclusive
+    flock on it and block every deployment and restart indefinitely.
+    """
+    assert _lock_check(tmp_path, **kwargs).returncode != 0, label  # type: ignore[arg-type]
+
+
+def test_the_lock_symlink_refusal_precedes_the_regular_file_check() -> None:
+    """A symlink to a valid file passes ``-f``, so ``-L`` must come first.
+
+    Asserted against the shipped text: this suite runs on hosts that cannot
+    create symlinks, and a skip would delete the check from the record.
+    """
+    body = _function_body("require_secure_lock_object()", "# Create the lock file")
+    symlink_index = body.index('[[ ! -L "$lock_path" ]]')
+    regular_index = body.index('[[ -f "$lock_path" ]]')
+
+    assert symlink_index < regular_index
+    # The parent directory is proven real before the lock itself is examined.
+    assert body.index('[[ ! -L "$directory" ]]') < symlink_index
+
+
+def test_the_installer_lock_refuses_a_symlink_too() -> None:
+    """The installer enforces the identical object contract."""
+    body = _installer_function_body(
+        "require_secure_lock_object()", "# The one repair"
+    )
+
+    assert body.index('[[ ! -L "$lock_path" ]]') < body.index('[[ -f "$lock_path" ]]')
+    assert '[[ ! -L "$directory" ]]' in body
+
+
+def test_the_installer_never_replaces_an_insecure_lock_inode() -> None:
+    """A legitimate holder's lock lives on the inode, so only the mode is repaired.
+
+    Replacing the file would silently drop whatever lock is held on the old
+    inode, which is the opposite of what a lock is for.
+    """
+    repair = _installer_function_body(
+        "repair_lock_mode()", "acquire_transaction_lock()"
+    )
+    acquire = _installer_function_body(
+        "acquire_transaction_lock()", "# --- inspection"
+    )
+
+    assert "chmod 0600" in repair
+    for destructive in ("rm ", "mv ", "> \"$lock_path\"", "install "):
+        assert destructive not in repair, destructive
+
+    # An existing object is repaired at most, then re-validated before flock.
+    assert "repair_lock_mode" in acquire
+    assert acquire.index("repair_lock_mode") < acquire.index("flock -n")
+    assert acquire.count("require_secure_lock_object") >= 2
+
+
+def test_an_unsafe_lock_object_is_never_replaced() -> None:
+    """Replacing it would drop a legitimate holder's lock on the old inode."""
+    body = _function_body("require_secure_lock_object()", "# Create the lock file")
+
+    assert "rm " not in body
+    assert "mv " not in body
+    assert ">" not in body.replace("return 1", "")
+
+
+def test_the_lock_is_created_privately_and_without_clobbering(
+    tmp_path: Path,
+) -> None:
+    """noclobber gives O_EXCL, so a simultaneous creator never loses its inode."""
+    body = _function_body("create_lock_object()", "acquire_transaction_lock()")
+
+    assert "umask 0077" in body
+    assert "set -C" in body
+
+    lock = tmp_path / "fresh.lock"
+    result = call_gateway_function(f'create_lock_object "{_posix(lock)}"')
+
+    assert result.returncode == 0, result.stderr
+    assert lock.exists()
+
+
+def test_the_lock_object_is_validated_before_flock() -> None:
+    """Checking after taking the lock would be checking too late."""
+    body = _function_body("acquire_transaction_lock()", "# --- approval file")
+
+    assert body.index("require_secure_lock_object") < body.index("flock -n")
+    assert body.index("require_secure_lock_object") < body.index("exec 9>>")
+
+
+def test_the_gateway_and_installer_secure_the_same_lock_object() -> None:
+    """One path, one contract, one inode."""
+    gateway = _read(GATEWAY)
+    installer = _read(INSTALLER)
+
+    assert 'readonly MGO_LOCK_FILE="/run/lock/mgo-deployment.lock"' in gateway
+    assert 'readonly LOCK_FILE="/run/lock/mgo-deployment.lock"' in installer
+    assert "require_secure_lock_object" in gateway
+    assert "require_secure_lock_object" in installer
+
+
 def test_a_busy_lock_changes_nothing(tmp_path: Path) -> None:
     """A refusal must not have touched the repository, service or camera."""
     lock = tmp_path / "mgo-deployment.lock"
     result = call_gateway_function(
         f'acquire_transaction_lock "{_posix(lock)}"\nprintf "unreachable\\n"',
-        preamble=_flock_double(busy=True),
+        preamble=_flock_double(busy=True) + _secure_lock_double(),
     )
 
     assert result.returncode == EX_BUSY
@@ -2052,6 +2505,36 @@ def test_restart_api_refuses_every_unsafe_checkout(
     result = _restart_preconditions(**kwargs)  # type: ignore[arg-type]
 
     assert result.returncode == EX_PRECONDITION, label
+
+
+def test_restart_api_proves_the_production_path_is_canonical() -> None:
+    """Restarting is privileged too.
+
+    A symlinked component would point every check below it at a different tree
+    than the one the service is about to run.
+    """
+    body = _function_body(
+        "require_restart_preconditions()", "# --- service and endpoint state"
+    )
+
+    assert "pwd -P" in body
+    assert "pwd -L" in body
+    assert "resolves through a symlink" in body
+    assert body.index("pwd -P") < body.index("branch --show-current")
+
+
+def test_both_privileged_actions_prove_the_canonical_path() -> None:
+    """The same proof, in deployment and in restart alike."""
+    deployment = _function_body(
+        "require_repository_preconditions()", "# An interrupted merge"
+    )
+    restart = _function_body(
+        "require_restart_preconditions()", "# --- service and endpoint state"
+    )
+
+    for body in (deployment, restart):
+        assert "pwd -P" in body
+        assert "pwd -L" in body
 
 
 def test_restart_api_discovers_the_branch_rather_than_accepting_one() -> None:

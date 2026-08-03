@@ -82,6 +82,49 @@ USAGE
 
 # --- control-plane lock ----------------------------------------------------
 
+# The same lock-object contract the gateway enforces.
+#
+# A readable lock file lets any unprivileged process hold an exclusive flock on
+# it and deny every deployment and restart, so it must be a root-owned 0600
+# regular file reached through a real directory.
+require_secure_lock_object() {
+    local lock_path="$1"
+    local directory
+    local ownership
+    local mode
+
+    directory="$(dirname "$lock_path")"
+    [[ ! -L "$directory" ]] || return 1
+    [[ -d "$directory" ]] || return 1
+
+    [[ ! -L "$lock_path" ]] || return 1
+    [[ -f "$lock_path" ]] || return 1
+
+    ownership="$(stat -c '%u:%g' "$lock_path")" || return 1
+    [[ "$ownership" == "0:0" ]] || return 1
+
+    mode="$(stat -c '%a' "$lock_path")" || return 1
+    [[ "$mode" == "600" ]]
+}
+
+# The one repair this installer is allowed to make.
+#
+# During the separately authorised first installation the lock may exist with a
+# wider mode, left by an earlier gateway that did not enforce one. Tightening
+# the mode is safe; replacing the file is not, because a legitimate holder's
+# lock lives on the inode. So the inode is never touched.
+repair_lock_mode() {
+    local lock_path="$1"
+    local ownership
+
+    [[ ! -L "$lock_path" ]] || return 1
+    [[ -f "$lock_path" ]] || return 1
+    ownership="$(stat -c '%u:%g' "$lock_path")" || return 1
+    [[ "$ownership" == "0:0" ]] || return 1
+
+    chmod 0600 "$lock_path"
+}
+
 acquire_transaction_lock() {
     local lock_path="$1"
     local directory
@@ -90,6 +133,18 @@ acquire_transaction_lock() {
     if [[ ! -d "$directory" ]]; then
         mkdir -p "$directory" || return "$EX_FAILED"
     fi
+
+    if [[ ! -e "$lock_path" && ! -L "$lock_path" ]]; then
+        (
+            umask 0077
+            set -C
+            : >"$lock_path"
+        ) 2>/dev/null || true
+    elif ! require_secure_lock_object "$lock_path"; then
+        repair_lock_mode "$lock_path" || return "$EX_FAILED"
+    fi
+
+    require_secure_lock_object "$lock_path" || return "$EX_FAILED"
 
     exec 9>>"$lock_path" || return "$EX_FAILED"
     flock -n "$LOCK_FD" || return "$EX_BUSY"
@@ -249,7 +304,7 @@ restore_one() {
         [[ -f "$backup" ]] || return 1
         # Copy rather than rename: the backup lives on tmpfs and the target may
         # not, so a rename can cross filesystems and fail.
-        cp --preserve=all --no-dereference "$backup" "$target" || return 1
+        cp -f --preserve=all --no-dereference "$backup" "$target" || return 1
         rm -f -- "$backup" || return 1
         return 0
     fi
