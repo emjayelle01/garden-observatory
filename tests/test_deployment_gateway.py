@@ -815,8 +815,6 @@ def test_divergent_history_is_rejected(
         ('{"enabled":true,"state":"stopped","owner":null}', "stopped"),
         ('{"state":"failed","last_error":null}', "failed"),
         ('{"state": "starting"}', "starting"),
-        ("{}", "unknown"),
-        ("", "unknown"),
     ],
 )
 def test_the_preview_state_is_read_from_the_status_document(
@@ -829,13 +827,32 @@ def test_the_preview_state_is_read_from_the_status_document(
     assert result.stdout.strip() == expected
 
 
-def test_the_preview_state_read_prefers_the_first_state_field() -> None:
-    """A nested document must not let a later field win."""
-    body = '{"state":"running","camera":{"state":"available"}}'
+@pytest.mark.parametrize(
+    ("label", "body"),
+    [
+        ("missing field", "{}"),
+        ("empty body", ""),
+        ("empty state", '{"state":""}'),
+        ("duplicated identical", '{"state":"running","x":1,"state":"running"}'),
+        ("conflicting", '{"state":"running","camera":{"state":"stopped"}}'),
+        ("malformed", '{"state":'),
+        ("not a string", '{"state":3}'),
+    ],
+)
+def test_an_unusable_state_field_is_refused_not_invented(
+    label: str, body: str
+) -> None:
+    """There is no fallback value.
 
+    Reporting a missing field as "unknown" invents a state, and that invention
+    was then accepted as the baseline an entire deployment measured itself
+    against. Two occurrences are refused even when they agree: nothing here can
+    say which one the API meant.
+    """
     result = call_gateway_function(f"preview_state_from_status '{body}'")
 
-    assert result.stdout.strip() == "running"
+    assert result.returncode != 0, label
+    assert result.stdout.strip() == "", label
 
 
 # --------------------------------------------------------------------------
@@ -1035,7 +1052,36 @@ def test_response_bodies_go_to_temporary_files_that_are_removed() -> None:
     ):
         body = _function_body(name, following)
         assert "mktemp" in body, name
-        assert "rm -f" in body, name
+        assert "discard_temporary" in body, name
+
+
+def test_a_failed_temporary_cleanup_is_not_reported_as_success() -> None:
+    """A helper that leaks its own scratch file has not succeeded."""
+    result = call_gateway_function(
+        'endpoint_is_ok "http://127.0.0.1:8080/health"',
+        preamble=_curl_double("200") + "discard_temporary() { return 1; }\n",
+    )
+
+    assert result.returncode != 0
+
+
+def test_a_failed_cleanup_after_a_preview_start_is_not_success() -> None:
+    """Same contract on the one write the gateway makes."""
+    result = call_gateway_function(
+        'start_preview "http://127.0.0.1:8080/camera/preview/start"',
+        preamble=_curl_double("200") + "discard_temporary() { return 1; }\n",
+    )
+
+    assert result.returncode != 0
+
+
+def test_cleanup_never_broadens_into_a_wildcard() -> None:
+    """One tracked path, never a pattern and never a directory."""
+    body = _function_body("discard_temporary()", "endpoint_is_ok()")
+
+    assert 'rm -f -- "$path"' in body
+    assert "*" not in body
+    assert "-r" not in body
 
 
 # --------------------------------------------------------------------------
@@ -1444,8 +1490,8 @@ def test_restart_api_requires_the_deployed_commit_to_be_approved() -> None:
     ]
 
     assert "validate_approval_file" in body
-    assert '"$head" == "$approved"' in body
-    assert '"$tracking" == "$approved"' in body
+    assert "require_restart_preconditions" in body
+    assert "acquire_transaction_lock" in body
     assert "await_recovery" in body
 
 
@@ -1520,9 +1566,514 @@ def test_the_gateway_accepts_no_caller_supplied_production_value() -> None:
     ):
         assert constant in source
 
-    assert "eval" not in source
-    assert "${MGO_REPOSITORY:-" not in source
-    assert "${MGO_APPROVAL_FILE:-" not in source
+    code = "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith("#")
+    )
+    assert "eval" not in code
+    assert "${MGO_REPOSITORY:-" not in code
+    assert "${MGO_APPROVAL_FILE:-" not in code
+
+
+# --------------------------------------------------------------------------
+# control-plane lock
+# --------------------------------------------------------------------------
+
+
+EX_BUSY = 75
+
+
+def _flock_double(*, busy: bool) -> str:
+    """Stand in for ``flock``, which Git Bash does not ship.
+
+    Only the kernel primitive is doubled. The shipped logic around it — opening
+    descriptor 9, the exit codes, the refusal message, the ordering — still
+    executes. The exclusion itself is the kernel's and is exercised for real
+    during Raspberry Pi validation.
+    """
+    return f"flock() {{ return {1 if busy else 0}; }}\n"
+
+
+def test_a_busy_control_plane_refuses_rather_than_waits(tmp_path: Path) -> None:
+    """Non-blocking by design: a second caller cannot know what the first will do."""
+    lock = tmp_path / "mgo-deployment.lock"
+    result = call_gateway_function(
+        f'acquire_transaction_lock "{_posix(lock)}"',
+        preamble=_flock_double(busy=True),
+    )
+
+    assert result.returncode == EX_BUSY
+    assert "already in progress" in result.stderr
+
+
+def test_an_uncontended_lock_is_acquired(tmp_path: Path) -> None:
+    """The positive case."""
+    lock = tmp_path / "mgo-deployment.lock"
+    result = call_gateway_function(
+        f'acquire_transaction_lock "{_posix(lock)}"',
+        preamble=_flock_double(busy=False),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert lock.exists()
+
+
+def test_the_lock_directory_is_created_when_absent(tmp_path: Path) -> None:
+    """/run/lock may not survive a reboot on every host."""
+    lock = tmp_path / "nested" / "mgo-deployment.lock"
+    result = call_gateway_function(
+        f'acquire_transaction_lock "{_posix(lock)}"',
+        preamble=_flock_double(busy=False),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert lock.parent.is_dir()
+
+
+@pytest.mark.parametrize(
+    "action", ["action_deploy_main", "action_restart_api"]
+)
+def test_every_mutating_action_takes_the_lock_first(action: str) -> None:
+    """deploy-main and restart-api contend for the same checkout and service."""
+    body = _function_body(f"{action}()", "\n}\n")
+    executable = [
+        line.strip()
+        for line in body.splitlines()
+        if line.strip()
+        and not line.strip().startswith("#")
+        and not line.strip().startswith("local ")
+        and "()" not in line
+    ]
+
+    assert any("acquire_transaction_lock" in line for line in executable), action
+    assert "acquire_transaction_lock" in executable[0], action
+
+
+def test_show_approval_is_not_blocked_by_the_lock() -> None:
+    """A read-only action must not be excluded by a running deployment."""
+    body = _function_body("action_show_approval()", "action_restart_api()")
+
+    assert "acquire_transaction_lock" not in body
+
+
+def test_both_actions_and_the_installer_share_one_lock_path() -> None:
+    """Two locks would exclude nothing."""
+    gateway = _read(GATEWAY)
+    installer = _read(INSTALLER)
+
+    assert 'readonly MGO_LOCK_FILE="/run/lock/mgo-deployment.lock"' in gateway
+    assert 'readonly LOCK_FILE="/run/lock/mgo-deployment.lock"' in installer
+    assert "readonly MGO_LOCK_FD=9" in gateway
+    assert "readonly LOCK_FD=9" in installer
+
+
+def test_the_lock_is_held_on_a_descriptor_nothing_closes() -> None:
+    """A lock released between the restart and the final check is not a lock."""
+    body = _function_body("acquire_transaction_lock()", "# --- approval file")
+
+    assert "exec 9>>" in body
+    assert 'flock -n "$MGO_LOCK_FD"' in body
+    assert "flock -w" not in body
+    assert "while" not in body
+
+
+def test_the_lock_is_never_released_before_the_process_exits() -> None:
+    """Rollback is the *most* dangerous moment to let a second caller in.
+
+    Nothing in the gateway closes or unlocks descriptor 9. The kernel releases
+    it when the process ends, which is the only moment the transaction is
+    genuinely over — success, ordinary failure or rollback alike.
+    """
+    code = "\n".join(
+        line
+        for line in _read(GATEWAY).splitlines()
+        if not line.strip().startswith("#")
+    )
+
+    assert "9>&-" not in code
+    assert "9<&-" not in code
+    assert "flock -u" not in code
+    assert code.count("exec 9") == 1
+
+
+def test_a_busy_lock_changes_nothing(tmp_path: Path) -> None:
+    """A refusal must not have touched the repository, service or camera."""
+    lock = tmp_path / "mgo-deployment.lock"
+    result = call_gateway_function(
+        f'acquire_transaction_lock "{_posix(lock)}"\nprintf "unreachable\\n"',
+        preamble=_flock_double(busy=True),
+    )
+
+    assert result.returncode == EX_BUSY
+    assert "unreachable" not in result.stdout
+
+
+def test_the_installer_takes_the_lock_before_inspecting_targets() -> None:
+    """Installing replaces the file a running deployment is executing from."""
+    source = _read(INSTALLER)
+    body = source[source.index("run_installation()") :]
+
+    assert body.index("acquire_transaction_lock") < body.index("target_is_current")
+
+
+def test_a_busy_installer_reports_the_shared_exit_code() -> None:
+    """One vocabulary for a busy control plane, whichever entry point saw it."""
+    source = _read(INSTALLER)
+
+    assert "readonly EX_BUSY=75" in source
+    assert 'return "$EX_BUSY"' in source
+
+
+# --------------------------------------------------------------------------
+# preview baseline
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ("running", "stable"),
+        ("stopped", "stable"),
+        ("failed", "stable"),
+        ("starting", "transient"),
+        ("stopping", "transient"),
+        ("unknown", "unsupported"),
+        ("paused", "unsupported"),
+    ],
+)
+def test_preview_states_are_classified(state: str, expected: str) -> None:
+    """A settled camera can be a baseline; a transitioning one cannot."""
+    result = call_gateway_function(f'classify_preview_state "{state}"')
+
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.parametrize("state", ["starting", "stopping"])
+def test_a_transient_state_is_not_a_deployment_baseline(state: str) -> None:
+    """Deploying against a camera mid-transition measures against nothing."""
+    result = call_gateway_function(
+        'read_stable_preview_state "url"',
+        preamble=f'read_preview_state() {{ printf "{state}\\n"; }}\n',
+    )
+
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("state", "rpicam", "libcamera", "accepted"),
+    [
+        ("running", 1, 0, True),
+        ("running", 0, 0, False),
+        ("running", 2, 0, False),
+        ("stopped", 0, 0, True),
+        ("stopped", 1, 0, False),
+        ("failed", 0, 0, True),
+        ("failed", 1, 0, False),
+        ("running", 1, 1, False),
+        ("stopped", 0, 1, False),
+        ("failed", 0, 1, False),
+    ],
+)
+def test_the_baseline_reconciles_status_with_processes(
+    state: str, rpicam: int, libcamera: int, accepted: bool
+) -> None:
+    """Status and processes disagreeing means nobody knows what the camera is doing.
+
+    An inconsistent baseline is refused, never repaired: a deployment that
+    "restored" it would be restoring a fiction.
+    """
+    result = call_gateway_function(
+        f'require_preview_baseline "{state}"',
+        preamble=_producer_double(rpicam=rpicam, libcamera=libcamera),
+    )
+
+    assert (result.returncode == 0) is accepted
+
+
+def test_the_baseline_is_captured_only_after_reconciliation() -> None:
+    """Ordering: read a stable state, reconcile it, then record it."""
+    stable, reconcile, pid = _ordered_indices(
+        "read_stable_preview_state", "require_preview_baseline", "previous_pid="
+    )
+
+    assert stable < reconcile < pid
+
+
+def test_the_baseline_read_precedes_every_mutation() -> None:
+    """Refusing an unusable baseline must happen before anything moves."""
+    reconcile, merge = _ordered_indices(
+        "require_preview_baseline", "merge --ff-only"
+    )
+
+    assert reconcile < merge
+
+
+def test_no_preview_transition_happens_during_preflight() -> None:
+    """Preflight observes; it does not start or stop a camera."""
+    source = _read(GATEWAY)
+    body = source[source.index("action_deploy_main()") :]
+    preflight = body[: body.index("merge --ff-only")]
+
+    assert "start_preview" not in preflight
+    assert "restore_preview_state" not in preflight
+
+
+# --------------------------------------------------------------------------
+# fast-forward failure
+# --------------------------------------------------------------------------
+
+
+def test_a_failed_fast_forward_enters_the_rollback(tmp_path: Path) -> None:
+    """A non-zero Git exit is not proof that nothing moved.
+
+    The command can fail part-way through a checkout, on a permission or I/O
+    error, or after the ref has already been updated.
+    """
+    source = _read(GATEWAY)
+    body = source[source.index("action_deploy_main()") :]
+    index = body.index("the fast-forward failed")
+
+    assert "fail_before_restart" in body[index - 200 : index + 200]
+    assert 'die "$EX_PRECONDITION" "the fast-forward was refused"' not in source
+
+
+def test_the_transaction_opens_before_the_merge_is_invoked() -> None:
+    """Everything from the merge onward is inside the transaction."""
+    source = _read(GATEWAY)
+    body = source[source.index("action_deploy_main()") :]
+    merge = body.index("merge --ff-only")
+    after = body[merge:]
+
+    # No bare exit between the merge and the success message.
+    tail = after[: after.index('log "deployed')]
+    assert 'die "$EX_PRECONDITION"' not in tail
+    assert 'die "$EX_DEPLOY"' not in tail
+
+
+def test_the_checkout_is_verified_immediately_after_the_merge() -> None:
+    """What the merge left behind is checked before anything builds on it."""
+    merge, verify, sync = _ordered_indices(
+        "merge --ff-only", "verify_after_fast_forward", "sync_environment"
+    )
+
+    assert merge < verify < sync
+
+
+@pytest.mark.parametrize(
+    ("label", "kwargs"),
+    [
+        ("wrong HEAD", {"head": "f" * 40}),
+        ("wrong local main", {"local_main": "f" * 40}),
+        ("wrong origin/main", {"tracking": "f" * 40}),
+        ("wrong branch", {"branch": "feature"}),
+        ("dirty tree", {"porcelain": " M src/mgo/api/app.py"}),
+        ("untracked file", {"porcelain": "?? stray.txt"}),
+        ("operation marker", {"in_progress": True}),
+    ],
+)
+def test_post_fast_forward_verification_refuses_a_wrong_checkout(
+    label: str, kwargs: dict[str, object]
+) -> None:
+    """A merge that "succeeded" into the wrong state is still a failure."""
+    defaults: dict[str, object] = {
+        "branch": "main",
+        "head": APPROVED_SHA,
+        "local_main": APPROVED_SHA,
+        "tracking": APPROVED_SHA,
+        "porcelain": "",
+        "in_progress": False,
+    }
+    defaults.update(kwargs)
+    preamble = (
+        "git_admin() {\n"
+        "    shift 2\n"
+        '    case "$*" in\n'
+        f'        "branch --show-current") printf \'{defaults["branch"]}\\n\' ;;\n'
+        f'        "rev-parse HEAD") printf \'{defaults["head"]}\\n\' ;;\n'
+        f'        "rev-parse main") printf \'{defaults["local_main"]}\\n\' ;;\n'
+        f'        "rev-parse origin/main") printf \'{defaults["tracking"]}\\n\' ;;\n'
+        '        "status --porcelain --untracked-files=all")'
+        f" printf '{defaults['porcelain']}' ;;\n"
+        "        *) printf '' ;;\n"
+        "    esac\n"
+        "}\n"
+        "operation_in_progress() { return "
+        f"{0 if defaults['in_progress'] else 1}; }}\n"
+    )
+    result = call_gateway_function(
+        f'verify_after_fast_forward "{APPROVED_SHA}"', preamble=preamble
+    )
+
+    assert result.returncode != 0, label
+
+
+def test_post_fast_forward_verification_accepts_a_correct_checkout() -> None:
+    """The positive case."""
+    preamble = (
+        "git_admin() {\n"
+        "    shift 2\n"
+        '    case "$*" in\n'
+        "        \"branch --show-current\") printf 'main\\n' ;;\n"
+        f"        \"rev-parse HEAD\") printf '{APPROVED_SHA}\\n' ;;\n"
+        f"        \"rev-parse main\") printf '{APPROVED_SHA}\\n' ;;\n"
+        f"        \"rev-parse origin/main\") printf '{APPROVED_SHA}\\n' ;;\n"
+        "        *) printf '' ;;\n"
+        "    esac\n"
+        "}\n"
+        "operation_in_progress() { return 1; }\n"
+    )
+    result = call_gateway_function(
+        f'verify_after_fast_forward "{APPROVED_SHA}"', preamble=preamble
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_pre_restart_rollback_proves_the_service_still_serves() -> None:
+    """A PID and a timestamp do not say the API is answering."""
+    body = _function_body(
+        "fail_before_restart()", "# Branch, HEAD, tree and in-progress"
+    )
+
+    assert "rollback_repository_state_is_intact" in body
+    assert "stash list" in body
+    assert "service_is_active" in body
+    assert "endpoint_is_ok" in body
+    assert "read_stable_preview_state" in body
+    assert "require_preview_baseline" in body
+    assert "restart_service" not in body
+
+
+def test_the_pre_restart_rollback_never_restarts_the_service() -> None:
+    """Nothing disturbed it, so restarting would cause the outage."""
+    body = _function_body(
+        "fail_before_restart()", "# Branch, HEAD, tree and in-progress"
+    )
+
+    assert "restart_service" not in body
+    assert 'die "$EX_DEPLOY"' in body
+    assert "the service was never restarted" in body
+
+
+# --------------------------------------------------------------------------
+# branch-aware restart-api
+# --------------------------------------------------------------------------
+
+
+def _restart_preconditions(
+    *,
+    branch: str = "main",
+    head: str = APPROVED_SHA,
+    local_branch: str | None = None,
+    porcelain: str = "",
+    stash: str = "",
+    worktrees: int = 1,
+    remote_ok: bool = True,
+    in_progress: bool = False,
+    upstream: str | None = "origin/main",
+    upstream_sha: str = APPROVED_SHA,
+) -> subprocess.CompletedProcess[str]:
+    if local_branch is None:
+        local_branch = head
+    upstream_case = (
+        f"        *\"--symbolic-full-name\"*) printf '{upstream}\\n' ;;\n"
+        if upstream is not None
+        else '        *"--symbolic-full-name"*) return 1 ;;\n'
+    )
+    preamble = (
+        "git_admin() {\n"
+        "    shift 2\n"
+        '    case "$*" in\n'
+        f'        "branch --show-current") printf \'{branch}\\n\' ;;\n'
+        f'        "rev-parse HEAD") printf \'{head}\\n\' ;;\n'
+        + upstream_case
+        + f'        "rev-parse {upstream}") printf \'{upstream_sha}\\n\' ;;\n'
+        f'        "rev-parse {branch}") printf \'{local_branch}\\n\' ;;\n'
+        '        "status --porcelain --untracked-files=all")'
+        f" printf '{porcelain}' ;;\n"
+        f'        "stash list") printf \'{stash}\' ;;\n'
+        f'        "worktree list") printf \'%s\\n\' {"x " * worktrees} ;;\n'
+        "        \"remote get-url origin\")"
+        " printf 'https://github.com/emjayelle01/garden-observatory.git\\n' ;;\n"
+        "        *) printf '' ;;\n"
+        "    esac\n"
+        "}\n"
+        f"remote_matches_repository() {{ return {0 if remote_ok else 1}; }}\n"
+        "operation_in_progress() { return "
+        f"{0 if in_progress else 1}; }}\n"
+    )
+    return call_gateway_function(
+        "require_restart_preconditions "
+        f'"claude" "{_posix(PROJECT_ROOT)}" '
+        f'"emjayelle01/garden-observatory" "origin" "{APPROVED_SHA}"',
+        preamble=preamble,
+    )
+
+
+def test_restart_api_accepts_an_approved_main() -> None:
+    """The ordinary case is unchanged by becoming branch-aware."""
+    result = _restart_preconditions()
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_restart_api_accepts_an_approved_feature_branch() -> None:
+    """Pi validation of an approved feature SHA no longer needs bespoke steps."""
+    result = _restart_preconditions(
+        branch="task-013-thing", upstream="origin/task-013-thing"
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("label", "kwargs"),
+    [
+        ("detached HEAD", {"branch": ""}),
+        ("HEAD not at branch tip", {"local_branch": "a" * 40}),
+        ("dirty tree", {"porcelain": " M src/mgo/api/app.py"}),
+        ("untracked file", {"porcelain": "?? stray.txt"}),
+        ("stash", {"stash": "stash@{0}: WIP"}),
+        ("operation in progress", {"in_progress": True}),
+        ("additional worktree", {"worktrees": 2}),
+        ("wrong origin", {"remote_ok": False}),
+        ("unapproved HEAD", {"head": "b" * 40, "local_branch": "b" * 40}),
+        ("no upstream", {"upstream": None}),
+        (
+            "wrong upstream branch",
+            {"branch": "task-013-thing", "upstream": "origin/main"},
+        ),
+        ("upstream SHA mismatch", {"upstream_sha": "c" * 40}),
+    ],
+)
+def test_restart_api_refuses_every_unsafe_checkout(
+    label: str, kwargs: dict[str, object]
+) -> None:
+    """Read-only, but not permissive."""
+    result = _restart_preconditions(**kwargs)  # type: ignore[arg-type]
+
+    assert result.returncode == EX_PRECONDITION, label
+
+
+def test_restart_api_discovers_the_branch_rather_than_accepting_one() -> None:
+    """The branch comes from the checkout, never from the caller."""
+    body = _function_body(
+        "require_restart_preconditions()", "# --- service and endpoint state"
+    )
+
+    assert "branch --show-current" in body
+    assert '"$remote/$branch"' in body
+    assert "fetch" not in body
+    assert "merge" not in body
+    assert "sync" not in body
+
+
+def test_deploy_main_remains_main_only() -> None:
+    """Branch-awareness is restart-api's, and only restart-api's."""
+    body = _function_body("action_deploy_main()", "\n}\n")
+
+    assert "require_repository_preconditions" in body
+    assert "require_restart_preconditions" not in body
+    assert '"$MGO_BRANCH"' in body
 
 
 # --------------------------------------------------------------------------
@@ -1841,10 +2392,16 @@ def test_a_failed_rollback_never_claims_production_was_restored() -> None:
 def test_the_rollback_does_not_loop() -> None:
     """One attempt. A retrying rollback turns one failure into a flap."""
     for name, following in (
-        ("fail_before_restart()", "fail_after_restart()"),
+        ("fail_before_restart()", "# Branch, HEAD, tree and in-progress"),
         ("fail_after_restart()", "# --- actions"),
     ):
-        body = _function_body(name, following)
+        # Executable lines only: the prose explaining *why* there is no retry
+        # naturally contains the words a naive scan would trip on.
+        body = "\n".join(
+            line
+            for line in _function_body(name, following).splitlines()
+            if not line.strip().startswith("#")
+        )
         assert "while" not in body
         assert "until" not in body
         # Neither handler calls the other, or itself, a second time.
@@ -1860,7 +2417,7 @@ def test_the_rollback_handlers_take_their_target_only_from_their_caller() -> Non
     not see it.
     """
     for name, following in (
-        ("fail_before_restart()", "fail_after_restart()"),
+        ("fail_before_restart()", "# Branch, HEAD, tree and in-progress"),
         ("fail_after_restart()", "# --- actions"),
     ):
         body = _function_body(name, following)
@@ -2092,10 +2649,10 @@ cp() { printf 'cp\\n' >> "$CALL_LOG"; command cp "$@"; }
 rm() { printf 'rm\\n' >> "$CALL_LOG"; command rm "$@"; }
 visudo() { return 0; }
 file_metadata() {
-    [[ -e "$1" ]] || return 1
+    is_regular_file "$1" || return 1
     case "$1" in
-        *sudoers*) printf 'root:root:440\\n' ;;
-        *) printf 'root:root:755\\n' ;;
+        *sudoers*) printf '0:0:440\\n' ;;
+        *) printf '0:0:755\\n' ;;
     esac
 }
 """
@@ -2134,10 +2691,13 @@ def _install_pair(
         f'source "{_posix(INSTALLER)}"\n'
         "set +e\n"
         f"{INSTALLER_DOUBLES}\n"
+        # install(1) is doubled, so the transaction directory is made directly.
+        "open_transaction_directory() { mkdir -p \"$1\"; }\n"
         f"{extra}\n"
         "install_pair "
         f'"{_posix(gateway_source)}" "{_posix(gateway_target)}" "0755" '
-        f'"{_posix(sudoers_source)}" "{_posix(sudoers_target)}" "0440"\n'
+        f'"{_posix(sudoers_source)}" "{_posix(sudoers_target)}" "0440" '
+        f'"{_posix(tmp_path / "transaction")}"\n'
         'printf "outcome=%s\\n" "$?"\n'
     )
     return run_bash(script), gateway_target, sudoers_target
@@ -2328,9 +2888,17 @@ def test_a_fully_current_installation_mutates_nothing(tmp_path: Path) -> None:
         f'source "{_posix(INSTALLER)}"\n'
         "set +e\n"
         f"{INSTALLER_DOUBLES}\n"
+        "visudo() { return 0; }\n"
+        'command() {\n'
+        '    if [[ "$1" == "-v" ]]; then return 0; fi\n'
+        '    builtin command "$@"\n'
+        "}\n"
+        "acquire_transaction_lock() { return 0; }\n"
         "run_installation "
         f'"{_posix(gateway_source)}" "{_posix(gateway_target)}" "0755" '
-        f'"{_posix(sudoers_source)}" "{_posix(sudoers_target)}" "0440" 0 0\n'
+        f'"{_posix(sudoers_source)}" "{_posix(sudoers_target)}" "0440" 0 0 '
+        f'"{_posix(tmp_path / "transaction")}" '
+        f'"{_posix(tmp_path / "lock")}"\n'
         'printf "outcome=%s\\n" "$?"\n'
     )
     calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
@@ -2361,6 +2929,228 @@ def test_matching_content_with_wrong_metadata_is_not_current(
     )
 
     assert "outcome=1" in result.stdout
+
+
+# --- source and target types -----------------------------------------------
+
+
+def _type_double(unsafe: str) -> str:
+    """Report one path as a non-regular type.
+
+    Windows cannot create symlinks, FIFOs, sockets or devices, so the *type* is
+    emulated while the shipped refusal logic executes for real. The directory
+    case below is a genuine filesystem execution on every host, and all of them
+    execute for real during Raspberry Pi validation.
+    """
+    return (
+        "is_regular_file() {\n"
+        # Anchored at the end: "/dst/mgo-validate" must not also match
+        # "/dst/mgo-validate.sudoers".
+        f'    case "$1" in *{unsafe}) return 1 ;; esac\n'
+        '    [[ ! -L "$1" ]] || return 1\n'
+        '    [[ -f "$1" ]]\n'
+        "}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "unsafe", "message"),
+    [
+        ("symlink gateway source", "src/mgo-validate", "gateway source"),
+        ("symlink sudoers source", "src/mgo-validate.sudoers", "sudoers source"),
+        ("symlink gateway target", "dst/mgo-validate", "gateway target"),
+        ("symlink sudoers target", "dst/mgo-validate.sudoers", "sudoers target"),
+    ],
+)
+def test_an_unsafe_file_type_is_refused_before_any_mutation(
+    tmp_path: Path, label: str, unsafe: str, message: str
+) -> None:
+    """A link to matching content is not the file, and must not be replaced.
+
+    ``-f`` follows symlinks, so such a target would pass every content check
+    while installing over it replaced the link and restoring put back an
+    ordinary file where a link used to be.
+    """
+    # The target cases need a target to have a type at all; an absent target is
+    # a supported state and would never reach the check.
+    existing = "old\n" if unsafe.startswith("dst/") else None
+    result, gateway, sudoers = _install_pair(
+        tmp_path,
+        extra=_type_double(unsafe),
+        existing_gateway=existing,
+        existing_sudoers=existing,
+    )
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
+
+    assert "outcome=1" in result.stdout, label
+    assert message in result.stderr, label
+    assert calls.strip() == "", f"{label}: mutating commands ran"
+    if existing is not None:
+        assert gateway.read_text(encoding="utf-8") == existing, label
+        assert sudoers.read_text(encoding="utf-8") == existing, label
+
+
+def test_a_directory_where_a_target_belongs_is_refused(tmp_path: Path) -> None:
+    """A real filesystem execution, on every host: not emulated."""
+    sources = tmp_path / "src"
+    targets = tmp_path / "dst"
+    sources.mkdir()
+    targets.mkdir()
+    (sources / "mgo-validate").write_bytes(b"#!/usr/bin/env bash\ntrue\n")
+    (sources / "mgo-validate.sudoers").write_bytes(b"claude ALL=(root) x\n")
+    (targets / "mgo-validate").mkdir()
+
+    result = run_bash(
+        f'export CALL_LOG="{_posix(tmp_path / "calls.log")}"\n'
+        ': > "$CALL_LOG"\n'
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        f"{INSTALLER_DOUBLES}\n"
+        "install_pair "
+        f'"{_posix(sources / "mgo-validate")}" '
+        f'"{_posix(targets / "mgo-validate")}" "0755" '
+        f'"{_posix(sources / "mgo-validate.sudoers")}" '
+        f'"{_posix(targets / "mgo-validate.sudoers")}" "0440" '
+        f'"{_posix(tmp_path / "transaction")}"\n'
+        'printf "outcome=%s\\n" "$?"\n'
+    )
+
+    assert "outcome=1" in result.stdout, result.stderr
+    assert "gateway target is not a regular file" in result.stderr
+    assert (targets / "mgo-validate").is_dir()
+
+
+def test_an_absent_pair_installs_cleanly(tmp_path: Path) -> None:
+    """Absent is a supported starting state."""
+    result, gateway, sudoers = _install_pair(tmp_path)
+
+    assert "outcome=0" in result.stdout, result.stderr
+    assert gateway.is_file()
+    assert sudoers.is_file()
+
+
+def test_a_regular_existing_pair_is_replaced(tmp_path: Path) -> None:
+    """So is a regular file."""
+    result, gateway, _sudoers = _install_pair(
+        tmp_path, existing_gateway="old\n", existing_sudoers="# old\n"
+    )
+
+    assert "outcome=0" in result.stdout, result.stderr
+    assert gateway.read_text(encoding="utf-8") != "old\n"
+
+
+# --- transaction directory -------------------------------------------------
+
+
+def test_backups_never_land_in_the_sudoers_include_directory(
+    tmp_path: Path,
+) -> None:
+    """A backup under /etc/sudoers.d is a second policy in a directory sudo reads."""
+    result, _gateway, sudoers = _install_pair(
+        tmp_path,
+        extra="policy_is_valid() { return 1; }",
+        existing_gateway="old\n",
+        existing_sudoers="# old\n",
+    )
+    sudoers_directory = sudoers.parent
+
+    assert "outcome=1" in result.stdout
+    leftovers = [
+        path.name
+        for path in sudoers_directory.iterdir()
+        if "previous" in path.name or path.name.startswith("previous")
+    ]
+    assert leftovers == [], leftovers
+
+
+def test_the_transaction_directory_is_root_owned_and_private() -> None:
+    """0700, root:root, and outside every included configuration directory."""
+    source = _read(INSTALLER)
+
+    assert 'readonly TRANSACTION_DIRECTORY="/run/mgo-validate-install"' in source
+    assert "install -d -o root -g root -m 0700" in source
+    assert "/etc/sudoers.d" not in _installer_function_body(
+        "open_transaction_directory()", "# Record a target's"
+    )
+
+
+def test_a_transaction_directory_failure_stops_before_mutation(
+    tmp_path: Path,
+) -> None:
+    """No scratch space, no transaction."""
+    result, gateway, _sudoers = _install_pair(
+        tmp_path, extra="open_transaction_directory() { return 1; }"
+    )
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
+
+    assert "outcome=1" in result.stdout
+    assert "transaction directory could not be created" in result.stderr
+    assert "install" not in calls
+    assert not gateway.exists()
+
+
+def test_a_cleanup_failure_after_success_is_not_success(tmp_path: Path) -> None:
+    """A run that left the previous policy on disk has not finished."""
+    result, _gateway, _sudoers = _install_pair(
+        tmp_path, extra="close_transaction_directory() { return 1; }"
+    )
+
+    assert "outcome=1" in result.stdout
+    assert "transaction directory could not be removed" in result.stderr
+
+
+def test_a_cleanup_failure_after_rollback_is_reported(tmp_path: Path) -> None:
+    """Restored but not tidied is still not a clean outcome."""
+    result, _gateway, _sudoers = _install_pair(
+        tmp_path,
+        extra=(
+            "policy_is_valid() { return 1; }\n"
+            "close_transaction_directory() { return 1; }"
+        ),
+        existing_gateway="old\n",
+        existing_sudoers="# old\n",
+    )
+
+    assert f"outcome={EX_RESTORE_FAILED}" in result.stdout
+    assert "cleanup failed" in result.stderr
+
+
+def test_a_successful_installation_leaves_no_transaction_artefacts(
+    tmp_path: Path,
+) -> None:
+    """Nothing of the transaction survives it."""
+    result, _gateway, _sudoers = _install_pair(
+        tmp_path, existing_gateway="old\n", existing_sudoers="# old\n"
+    )
+
+    assert "outcome=0" in result.stdout, result.stderr
+    assert not (tmp_path / "transaction").exists()
+
+
+def test_a_successful_rollback_leaves_no_transaction_artefacts(
+    tmp_path: Path,
+) -> None:
+    """Nor does a failed installation that restored cleanly."""
+    result, _gateway, _sudoers = _install_pair(
+        tmp_path,
+        extra="policy_is_valid() { return 1; }",
+        existing_gateway="old\n",
+        existing_sudoers="# old\n",
+    )
+
+    assert "outcome=1" in result.stdout
+    assert not (tmp_path / "transaction").exists()
+
+
+def test_a_restoration_preserves_numeric_owner_group_and_mode() -> None:
+    """Restoring an approximation of the file is not restoring the file."""
+    body = _installer_function_body("record_previous()", "restore_one()")
+    restore = _installer_function_body("restore_one()", "# Both targets, always")
+
+    assert "--preserve=all" in body
+    assert "--no-dereference" in body
+    assert "--preserve=all" in restore
+    assert "--no-dereference" in restore
 
 
 def test_the_installer_requires_root_for_a_real_run(tmp_path: Path) -> None:
@@ -2396,7 +3186,9 @@ def test_the_installer_installs_both_files_with_the_required_modes() -> None:
     assert 'readonly GATEWAY_MODE="0755"' in source
     assert 'readonly SUDOERS_MODE="0440"' in source
     assert "-o root -g root" in source
-    assert 'root:root:${expected_mode#0}' in source
+    # Numeric, so the comparison does not depend on what passwd renders.
+    assert '"0:0:${expected_mode#0}"' in source
+    assert "stat -c '%u:%g:%a'" in source
 
 
 def test_no_installer_command_relies_on_errexit_inside_a_condition() -> None:
@@ -2683,7 +3475,7 @@ def test_the_task_record_does_not_claim_the_production_gateway_changed() -> None
     index = text.index("Remediation status")
     section = text[index : index + 1600]
 
-    assert "not** been re-reviewed" in section
+    assert "not** been final-reviewed" in section
     assert "not** been installed" in section
     assert "not** been validated" in section
     assert "still the" in section
@@ -2697,14 +3489,50 @@ def test_the_remediation_record_states_the_review_corrections_truthfully() -> No
     )
     text = _read(record)
 
-    assert "Repository review corrections implemented" in text
-    assert "not yet re-reviewed" in text
-    assert "Re-review | **Not performed**" in text
+    assert "Re-review round 2 findings corrected" in text
+    assert "not yet final-reviewed" in text
+    assert "Final review | **Not performed**" in text
     assert "Installation on the Raspberry Pi | **Not performed**" in text
     assert "Raspberry Pi validation of the gateway | **Not performed**" in text
-    assert "the gateway installed there is still\nthe Task 10 one" in text.replace(
-        "The gateway", "the gateway"
+    assert "production\ngateway is unchanged" in text
+    assert "Physical camera acceptance remains pending" in text
+
+
+@pytest.mark.parametrize(
+    "finding",
+    [
+        "Finding 1 — no exclusive deployment transaction",
+        "Finding 2 — the pre-deployment preview state was not proven",
+        "Finding 3 — a failed fast-forward bypassed the rollback",
+        "Finding 4 — the installer followed unsafe target types",
+        "Finding 5 — restart-api lost branch-aware validation",
+    ],
+)
+def test_every_re_review_finding_is_recorded(finding: str) -> None:
+    """All five round-2 findings and their corrections are written down."""
+    record = (
+        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
     )
+
+    assert finding in _read(record)
+
+
+@pytest.mark.parametrize(
+    "topic",
+    [
+        "/run/lock/mgo-deployment.lock",
+        "First installation is the exception",
+        "no fallback state",
+        "starting",
+        "transaction opens before the merge is invoked",
+        "branch-aware",
+    ],
+)
+def test_the_deployment_document_covers_the_round_two_corrections(
+    topic: str,
+) -> None:
+    """The operator-facing model keeps pace with the code."""
+    assert topic in _read(DEPLOYMENT_DOC)
 
 
 @pytest.mark.parametrize(

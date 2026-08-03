@@ -57,6 +57,23 @@ readonly MGO_SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 readonly MGO_RECOVERY_TIMEOUT_SECONDS=60
 readonly MGO_PREVIEW_TIMEOUT_SECONDS=20
 
+# The control-plane mutex. One lock for every mutating action — deploy-main,
+# restart-api and the installer — because they contend for the same three
+# things: the checkout, the service and the camera.
+readonly MGO_LOCK_FILE="/run/lock/mgo-deployment.lock"
+
+# A fixed descriptor, opened once and never closed by any action. A lock held
+# on a descriptor that something later closes is not a lock: it would be
+# released between the restart and the final verification, which is exactly the
+# window a second caller must not be able to enter.
+readonly MGO_LOCK_FD=9
+
+# Preview vocabulary. Only these three describe a settled camera; the transient
+# pair describe one mid-transition, which is not a baseline anything may be
+# deployed against.
+readonly MGO_STABLE_PREVIEW_STATES="running stopped failed"
+readonly MGO_TRANSIENT_PREVIEW_STATES="starting stopping"
+
 # --- exit codes ------------------------------------------------------------
 # Distinct codes so an operator (or a wrapper) can tell "you asked for
 # something I will not do" from "production is in a state I could not restore".
@@ -64,6 +81,7 @@ readonly MGO_PREVIEW_TIMEOUT_SECONDS=20
 readonly EX_REQUEST=64      # bad action, or unusable approval state
 readonly EX_PRECONDITION=65 # the host or repository is not fit to deploy
 readonly EX_DEPLOY=70       # deployment failed; production was restored
+readonly EX_BUSY=75         # another control-plane action holds the lock
 readonly EX_ROLLBACK=78     # deployment failed AND restoration failed
 
 # The stage a failed rollback stopped at, for the operator-facing message.
@@ -135,6 +153,44 @@ git_admin() {
     local repository="$2"
     shift 2
     run_as_admin "$admin_account" git -C "$repository" "$@"
+}
+
+# --- control-plane lock ----------------------------------------------------
+
+# Take the exclusive control-plane lock, or refuse.
+#
+# Without this, two deploy-main calls can both read the same old HEAD, both
+# pass the same approval and ancestry proofs, both fast-forward, restart the
+# service twice, race each other's preview restoration and then run two
+# incompatible rollbacks over one checkout. A restart-api arriving between the
+# restart and the final verification is the same class of problem.
+#
+# Non-blocking and never retried. A busy control plane is a fact to report, not
+# a queue to join: the second caller has no way to know what the first will do
+# to the checkout, so waiting would only make the collision later.
+#
+# No PID file, no staleness protocol. flock is released by the kernel when the
+# holder exits, however it exits, so there is no stale state to reason about.
+acquire_transaction_lock() {
+    local lock_path="$1"
+    local directory
+
+    directory="$(dirname "$lock_path")"
+    if [[ ! -d "$directory" ]]; then
+        mkdir -p "$directory" \
+            || die "$EX_PRECONDITION" "the lock directory could not be created"
+    fi
+
+    # Descriptor 9 literally, matching MGO_LOCK_FD. A redirection target cannot
+    # be a variable without dynamic evaluation, which has no place in a script
+    # that runs as root; the constant states the number once, and the tests
+    # assert the two agree.
+    exec 9>>"$lock_path" \
+        || die "$EX_PRECONDITION" "the deployment lock could not be opened"
+
+    flock -n "$MGO_LOCK_FD" \
+        || die "$EX_BUSY" \
+            "another deployment or restart is already in progress"
 }
 
 # --- approval file ---------------------------------------------------------
@@ -338,6 +394,86 @@ remote_matches_repository() {
     return 1
 }
 
+# Read-only preconditions for restarting whatever is already checked out.
+#
+# Deliberately branch-aware, unlike deployment. deploy-main is main-only by
+# contract, but restart-api also serves separately authorised validation of an
+# approved feature SHA on the Pi — and tying it to origin/main would push that
+# work back to bespoke, hand-written restart instructions, which is the whole
+# defect this gateway exists to remove.
+#
+# The branch is discovered from the checkout, never supplied by the caller, and
+# it must track the identically named branch on the expected remote at the
+# approved SHA. For main that is exactly the old origin/main requirement.
+#
+# Nothing here fetches, merges, syncs or mutates anything.
+require_restart_preconditions() {
+    local admin_account="$1"
+    local repository="$2"
+    local expected_repository="$3"
+    local remote="$4"
+    local approved="$5"
+    local branch
+    local head
+    local local_branch
+    local porcelain
+    local stash
+    local worktrees
+    local remote_url
+    local upstream
+    local upstream_sha
+
+    [[ -d "$repository/.git" ]] \
+        || die "$EX_PRECONDITION" "no repository at the production path"
+
+    branch="$(git_admin "$admin_account" "$repository" branch --show-current)"
+    [[ -n "$branch" ]] \
+        || die "$EX_PRECONDITION" "the checkout is in detached HEAD"
+
+    head="$(git_admin "$admin_account" "$repository" rev-parse HEAD)"
+    local_branch="$(git_admin "$admin_account" "$repository" \
+        rev-parse "$branch")"
+    [[ "$head" == "$local_branch" ]] \
+        || die "$EX_PRECONDITION" "HEAD does not match the checked-out branch"
+
+    porcelain="$(git_admin "$admin_account" "$repository" \
+        status --porcelain --untracked-files=all)"
+    [[ -z "$porcelain" ]] \
+        || die "$EX_PRECONDITION" "the working tree is not clean"
+
+    stash="$(git_admin "$admin_account" "$repository" stash list)"
+    [[ -z "$stash" ]] \
+        || die "$EX_PRECONDITION" "the repository has a stash"
+
+    require_no_operation_in_progress "$repository"
+
+    worktrees="$(git_admin "$admin_account" "$repository" worktree list | wc -l)"
+    [[ "$worktrees" -eq 1 ]] \
+        || die "$EX_PRECONDITION" "the repository has an unexpected worktree"
+
+    remote_url="$(git_admin "$admin_account" "$repository" \
+        remote get-url "$remote")"
+    remote_matches_repository "$remote_url" "$expected_repository" \
+        || die "$EX_PRECONDITION" "$remote is not the expected repository"
+
+    [[ "$head" == "$approved" ]] \
+        || die "$EX_PRECONDITION" "the checked-out commit is not the approved SHA"
+
+    upstream="$(git_admin "$admin_account" "$repository" \
+        rev-parse --abbrev-ref --symbolic-full-name "$branch@{upstream}" \
+        2>/dev/null)" \
+        || die "$EX_PRECONDITION" "$branch has no upstream branch"
+
+    [[ "$upstream" == "$remote/$branch" ]] \
+        || die "$EX_PRECONDITION" \
+            "$branch does not track $remote/$branch"
+
+    upstream_sha="$(git_admin "$admin_account" "$repository" \
+        rev-parse "$upstream")"
+    [[ "$upstream_sha" == "$approved" ]] \
+        || die "$EX_PRECONDITION" "$upstream is not the approved SHA"
+}
+
 # --- service and endpoint state -------------------------------------------
 
 service_is_active() {
@@ -393,6 +529,19 @@ http_post_200() {
 }
 
 # Literal loopback, proxies disabled, exactly 200 or nothing.
+# Remove a temporary file and say whether it went.
+#
+# A helper that leaves its own scratch file behind and reports success is how a
+# host accumulates response bodies under /tmp until something else fails. The
+# removal is scoped to one tracked path — never a pattern, never a directory.
+discard_temporary() {
+    local path="$1"
+
+    [[ -n "$path" ]] || return 0
+    rm -f -- "$path" || return 1
+    [[ ! -e "$path" ]]
+}
+
 endpoint_is_ok() {
     local url="$1"
     local body_file
@@ -400,7 +549,7 @@ endpoint_is_ok() {
 
     body_file="$(mktemp)" || return 1
     http_get_200 "$url" "$body_file" || outcome=1
-    rm -f "$body_file"
+    discard_temporary "$body_file" || outcome=1
     return "$outcome"
 }
 
@@ -415,34 +564,63 @@ endpoint_body() {
 
     body_file="$(mktemp)" || return 1
     if ! http_get_200 "$url" "$body_file"; then
-        rm -f "$body_file"
+        discard_temporary "$body_file" || true
         return 1
     fi
     cat "$body_file"
-    rm -f "$body_file"
+    discard_temporary "$body_file" || return 1
 }
 
-# Extract the reported preview state from a status document.
+# Extract the reported preview state, or fail.
 #
 # A bounded field read rather than a JSON parser: the gateway must not gain a
-# dependency, and it only ever needs this one lowercase token.
+# dependency, and it only ever needs this one token.
+#
+# There is deliberately no fallback value. Reporting a missing field as
+# "unknown" invents a state, and that invention was then accepted as the
+# baseline a whole deployment measured itself against. Exactly one occurrence
+# of the field is required: none is missing data, and two are ambiguous even
+# when they agree, because nothing here can say which one the API meant.
 preview_state_from_status() {
     local body="$1"
+    local matches
+    local occurrences
     local state
 
-    # A document without the field is a legitimate outcome, not an error, so
-    # the pipeline's non-zero status is absorbed and reported as "unknown".
-    state="$(printf '%s' "$body" \
-        | grep -o '"state"[[:space:]]*:[[:space:]]*"[a-z_]*"' \
-        | head -n 1 \
-        | grep -o '"[a-z_]*"$' \
-        | tr -d '"' || true)"
+    matches="$(printf '%s' "$body" \
+        | grep -o '"state"[[:space:]]*:[[:space:]]*"[A-Za-z_]*"' || true)"
+    [[ -n "$matches" ]] || return 1
 
-    if [[ -z "$state" ]]; then
-        printf 'unknown\n'
-    else
-        printf '%s\n' "$state"
-    fi
+    occurrences="$(printf '%s\n' "$matches" | grep -c . || true)"
+    [[ "$occurrences" -eq 1 ]] || return 1
+
+    state="$(printf '%s' "$matches" | grep -o '"[A-Za-z_]*"$' | tr -d '"')"
+    [[ -n "$state" ]] || return 1
+
+    printf '%s\n' "$state"
+}
+
+# Stable, transient or unsupported.
+#
+# The distinction is the point: a settled camera can be a baseline, a
+# transitioning one cannot, and a token this gateway does not recognise is not
+# something to guess about.
+classify_preview_state() {
+    local state="$1"
+
+    case " $MGO_STABLE_PREVIEW_STATES " in
+        *" $state "*)
+            printf 'stable\n'
+            return 0
+            ;;
+    esac
+    case " $MGO_TRANSIENT_PREVIEW_STATES " in
+        *" $state "*)
+            printf 'transient\n'
+            return 0
+            ;;
+    esac
+    printf 'unsupported\n'
 }
 
 read_preview_state() {
@@ -451,6 +629,33 @@ read_preview_state() {
 
     body="$(endpoint_body "$url")" || return 1
     preview_state_from_status "$body"
+}
+
+# Read a settled preview state, refusing anything a deployment cannot rest on.
+read_stable_preview_state() {
+    local url="$1"
+    local state
+    local kind
+
+    state="$(read_preview_state "$url")" || return 1
+    kind="$(classify_preview_state "$state")"
+    [[ "$kind" == "stable" ]] || return 1
+    printf '%s\n' "$state"
+}
+
+# Reconcile what the API says with what is actually running.
+#
+# Status and processes disagreeing is not something to repair on the way past.
+# It means the camera is not in the state anyone thinks it is, and a deployment
+# that "restored" such a baseline would be restoring a fiction.
+require_preview_baseline() {
+    local state="$1"
+
+    case "$state" in
+        running) require_producer_count 1 ;;
+        stopped | failed) require_producer_count 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 count_processes() {
@@ -636,7 +841,7 @@ start_preview() {
 
     body_file="$(mktemp)" || return 1
     http_post_200 "$start_url" "$body_file" || outcome=1
-    rm -f "$body_file"
+    discard_temporary "$body_file" || outcome=1
     return "$outcome"
 }
 
@@ -661,7 +866,9 @@ restore_preview_state() {
     local elapsed=0
     local producers
 
-    current="$(read_preview_state "$status_url")" || return 1
+    # Stable only. A malformed or transient response is a failure here too: it
+    # is not evidence that a non-running preview was preserved.
+    current="$(read_stable_preview_state "$status_url")" || return 1
 
     if [[ "$previous_state" == "running" ]]; then
         if [[ "$current" == "running" ]]; then
@@ -773,8 +980,8 @@ final_verification() {
     endpoint_is_ok "$MGO_HEALTH_URL" \
         || { warn "final check: health did not answer with 200"; return 1; }
 
-    current="$(read_preview_state "$MGO_PREVIEW_STATUS_URL")" \
-        || { warn "final check: the preview state could not be read"; return 1; }
+    current="$(read_stable_preview_state "$MGO_PREVIEW_STATUS_URL")" \
+        || { warn "final check: the preview state is not readable or settled"; return 1; }
 
     # Matched on whether preview is running, not on the exact token: a
     # restarted service reports a fresh "stopped" where it previously reported
@@ -790,6 +997,42 @@ final_verification() {
         require_producer_count 0 \
             || { warn "final check: a producer is running but preview is not"; return 1; }
     fi
+}
+
+# Confirm the fast-forward left the checkout where it was supposed to.
+#
+# A successful exit status says the command believed it worked. This says the
+# repository agrees — and it runs before the environment sync, so nothing is
+# built on top of a checkout that is not the approved commit.
+verify_after_fast_forward() {
+    local approved="$1"
+    local branch
+    local head
+    local local_branch
+    local tracking
+    local porcelain
+
+    branch="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        branch --show-current)" || return 1
+    [[ "$branch" == "$MGO_BRANCH" ]] || return 1
+
+    head="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" rev-parse HEAD)" \
+        || return 1
+    [[ "$head" == "$approved" ]] || return 1
+
+    local_branch="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        rev-parse "$MGO_BRANCH")" || return 1
+    [[ "$local_branch" == "$approved" ]] || return 1
+
+    tracking="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        rev-parse "$MGO_REMOTE/$MGO_BRANCH")" || return 1
+    [[ "$tracking" == "$approved" ]] || return 1
+
+    porcelain="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        status --porcelain --untracked-files=all)" || return 1
+    [[ -z "$porcelain" ]] || return 1
+
+    ! operation_in_progress "$MGO_REPOSITORY"
 }
 
 # --- transaction rollback --------------------------------------------------
@@ -867,6 +1110,9 @@ fail_before_restart() {
     local previous_sha="$2"
     local expected_pid="$3"
     local expected_timestamp="$4"
+    local expected_preview="$5"
+    local stash
+    local current
 
     warn "deployment failed before the restart: $reason"
     warn "restoring $previous_sha"
@@ -877,6 +1123,22 @@ fail_before_restart() {
             "deployment failed and rollback failed at the $ROLLBACK_STAGE stage; production was NOT restored"
     fi
 
+    # The service was never restarted, so it should still be the *same*
+    # process, serving, with the camera exactly as it was found. A PID and a
+    # timestamp alone do not say that: a process can survive while the API
+    # behind it stops answering, or while the preview it owned dies.
+    if ! rollback_repository_state_is_intact "$previous_sha"; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and the restored repository is not intact; production was NOT restored"
+    fi
+
+    stash="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" stash list)" \
+        || stash="unreadable"
+    if [[ -n "$stash" ]]; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and a stash was left behind; production was NOT restored"
+    fi
+
     if [[ "$(service_main_pid "$MGO_SERVICE")" != "$expected_pid" \
         || "$(service_active_enter_timestamp "$MGO_SERVICE")" \
             != "$expected_timestamp" ]]; then
@@ -884,8 +1146,55 @@ fail_before_restart() {
             "deployment failed and the running service changed unexpectedly; production was NOT restored"
     fi
 
+    if ! service_is_active "$MGO_SERVICE"; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and the service is no longer active; production was NOT restored"
+    fi
+
+    if ! endpoint_is_ok "$MGO_HEALTH_URL"; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and health does not answer 200; production was NOT restored"
+    fi
+
+    current="$(read_stable_preview_state "$MGO_PREVIEW_STATUS_URL")" || current=""
+    if [[ "$current" != "$expected_preview" ]]; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and the preview state changed; production was NOT restored"
+    fi
+    if ! require_preview_baseline "$expected_preview"; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and the producer count no longer matches; production was NOT restored"
+    fi
+
     die "$EX_DEPLOY" \
         "deployment failed; rollback succeeded; the service was never restarted"
+}
+
+# Branch, HEAD, tree and in-progress state after a restoration.
+rollback_repository_state_is_intact() {
+    local previous_sha="$1"
+    local branch
+    local head
+    local local_branch
+    local porcelain
+
+    branch="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        branch --show-current)" || return 1
+    [[ "$branch" == "$MGO_BRANCH" ]] || return 1
+
+    head="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" rev-parse HEAD)" \
+        || return 1
+    [[ "$head" == "$previous_sha" ]] || return 1
+
+    local_branch="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        rev-parse "$MGO_BRANCH")" || return 1
+    [[ "$local_branch" == "$previous_sha" ]] || return 1
+
+    porcelain="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        status --porcelain --untracked-files=all)" || return 1
+    [[ -z "$porcelain" ]] || return 1
+
+    ! operation_in_progress "$MGO_REPOSITORY"
 }
 
 # §16.2 — a failure at or after the restart.
@@ -937,24 +1246,13 @@ action_show_approval() {
 
 action_restart_api() {
     local approved
-    local head
-    local tracking
     local recovered
 
+    acquire_transaction_lock "$MGO_LOCK_FILE"
+
     approved="$(validate_approval_file "$MGO_APPROVAL_FILE")"
-    require_repository_preconditions "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
-        "$MGO_EXPECTED_REPOSITORY" "$MGO_BRANCH" "$MGO_REMOTE"
-
-    head="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" rev-parse HEAD)"
-    [[ "$head" == "$approved" ]] \
-        || die "$EX_PRECONDITION" \
-            "the deployed commit is not the approved SHA"
-
-    tracking="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
-        rev-parse "$MGO_REMOTE/$MGO_BRANCH")"
-    [[ "$tracking" == "$approved" ]] \
-        || die "$EX_PRECONDITION" \
-            "$MGO_REMOTE/$MGO_BRANCH is not the approved SHA"
+    require_restart_preconditions "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        "$MGO_EXPECTED_REPOSITORY" "$MGO_REMOTE" "$approved"
 
     systemctl cat "$MGO_SERVICE" >/dev/null 2>&1 \
         || die "$EX_PRECONDITION" "the service unit is not installed"
@@ -981,6 +1279,12 @@ action_deploy_main() {
     local previous_timestamp
     local recovered
 
+    # 0. exclusive control plane, before a single mutable fact is read.
+    #
+    # Reading HEAD or the preview state before locking would mean the baseline
+    # this transaction captures could already be someone else's midpoint.
+    acquire_transaction_lock "$MGO_LOCK_FILE"
+
     # 1. approval
     approved="$(validate_approval_file "$MGO_APPROVAL_FILE")"
     log "approved SHA $approved"
@@ -1002,8 +1306,16 @@ action_deploy_main() {
     # Captured before anything moves. These are the only values a rollback
     # will ever restore to; none of them can be supplied by a caller.
     head="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" rev-parse HEAD)"
-    previous_preview="$(read_preview_state "$MGO_PREVIEW_STATUS_URL")" \
-        || die "$EX_PRECONDITION" "the preview state could not be read"
+
+    # A settled state, reconciled against the processes, before it becomes the
+    # thing every later step measures itself against.
+    previous_preview="$(read_stable_preview_state "$MGO_PREVIEW_STATUS_URL")" \
+        || die "$EX_PRECONDITION" \
+            "the preview state is missing, ambiguous, transient or unsupported"
+    require_preview_baseline "$previous_preview" \
+        || die "$EX_PRECONDITION" \
+            "the reported preview state and the running producers disagree"
+
     previous_pid="$(service_main_pid "$MGO_SERVICE")"
     previous_timestamp="$(service_active_enter_timestamp "$MGO_SERVICE")"
     log "currently at commit $head"
@@ -1041,25 +1353,38 @@ action_deploy_main() {
         "$head" "$approved"
 
     # 8. mutate — every failure from here restores what was captured above.
+    #
+    # Including the merge itself. A non-zero exit from Git is not proof that
+    # nothing moved: the command can fail part-way through a checkout, on a
+    # permission or I/O error, or after the ref has already been updated. The
+    # transaction therefore opens *before* the merge is invoked, not after it
+    # succeeds.
     log "fast-forwarding $head -> $approved"
-    # A refused fast-forward changes nothing, so there is nothing to restore.
-    git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
-        merge --ff-only "$MGO_REMOTE/$MGO_BRANCH" \
-        || die "$EX_PRECONDITION" "the fast-forward was refused"
+    if ! git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+        merge --ff-only "$MGO_REMOTE/$MGO_BRANCH"; then
+        fail_before_restart "the fast-forward failed" \
+            "$head" "$previous_pid" "$previous_timestamp" "$previous_preview"
+    fi
+
+    # What the merge left behind, checked before anything is built on it.
+    if ! verify_after_fast_forward "$approved"; then
+        fail_before_restart "the checkout is wrong after the fast-forward" \
+            "$head" "$previous_pid" "$previous_timestamp" "$previous_preview"
+    fi
 
     if ! sync_environment "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY"; then
         fail_before_restart "the frozen dependency sync failed" \
-            "$head" "$previous_pid" "$previous_timestamp"
+            "$head" "$previous_pid" "$previous_timestamp" "$previous_preview"
     fi
     if ! require_clean_after_sync "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY"; then
         fail_before_restart "the sync changed a tracked file" \
-            "$head" "$previous_pid" "$previous_timestamp"
+            "$head" "$previous_pid" "$previous_timestamp" "$previous_preview"
     fi
     if ! require_runtime_can_execute "$MGO_RUNTIME_ACCOUNT" \
         "$MGO_REPOSITORY"; then
         fail_before_restart \
             "the runtime account cannot execute the deployed environment" \
-            "$head" "$previous_pid" "$previous_timestamp"
+            "$head" "$previous_pid" "$previous_timestamp" "$previous_preview"
     fi
 
     log "restarting $MGO_SERVICE"
