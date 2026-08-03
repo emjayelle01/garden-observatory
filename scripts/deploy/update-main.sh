@@ -20,7 +20,7 @@
 # the defect this replaced.
 #
 # There is deliberately no fallback. If the gateway is not installed, the answer
-# is to install it (sudo bash scripts/deploy/install-mgo-validate.sh), not to
+# is to install it (sudo ./scripts/deploy/install-mgo-validate.sh), not to
 # deploy around it.
 
 set -Eeuo pipefail
@@ -37,7 +37,7 @@ if [[ ! -x "$GATEWAY" ]]; then
     printf 'update-main: the deployment gateway is not installed at %s\n' \
         "$GATEWAY" >&2
     printf 'update-main: install it with:\n' >&2
-    printf '  sudo bash scripts/deploy/install-mgo-validate.sh\n' >&2
+    printf '  sudo ./scripts/deploy/install-mgo-validate.sh\n' >&2
     exit 1
 fi
 

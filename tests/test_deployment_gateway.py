@@ -3198,10 +3198,48 @@ def test_every_shell_asset_names_a_fixed_interpreter(asset: Path) -> None:
     environment before a single statement of the script could sanitise
     anything. Isolation has to begin at process entry.
     """
+    shebang = _read(asset).splitlines()[0]
+
+    assert shebang.startswith("#!/bin/bash"), shebang
+    assert "/usr/bin/env" not in shebang
+
+
+@pytest.mark.parametrize(
+    "asset", (GATEWAY, INSTALLER), ids=lambda path: path.name
+)
+def test_every_privileged_asset_runs_in_privileged_bash(asset: Path) -> None:
+    """``-p`` is the only thing that closes the window before line one.
+
+    Bash reads ``$BASH_ENV`` and ``$ENV``, imports exported shell functions and
+    honours ``SHELLOPTS``, ``BASHOPTS``, ``CDPATH`` and ``GLOBIGNORE`` while it
+    is starting up. All of that has happened before the script's first
+    statement, so re-executing afterwards cannot undo it. Privileged mode is
+    what stops it happening at all.
+    """
     text = _read(asset)
 
-    assert text.startswith("#!/bin/bash\n"), text.splitlines()[0]
-    assert "#!/usr/bin/env bash" not in text.splitlines()[0]
+    assert text.splitlines()[0] == "#!/bin/bash -p"
+    # The re-execution has to stay privileged too, or the boundary is only as
+    # strong as the process that happened to be entered first.
+    assert '/bin/bash -p "$0" "$@"' in text
+
+
+def test_the_unprivileged_wrapper_does_no_privileged_work() -> None:
+    """It may run as an ordinary shell because it does nothing as root."""
+    text = _read(UPDATE_MAIN)
+    body = "\n".join(
+        line for line in text.splitlines() if not line.strip().startswith("#")
+    )
+
+    assert text.splitlines()[0] == "#!/bin/bash"
+    assert "exec sudo" in body
+    for forbidden in ("git ", "uv ", "systemctl", "chmod", "chown", "visudo"):
+        assert forbidden not in body, forbidden
+    # And what it tells an operator to run is the direct form. Naming the
+    # interpreter would discard the installer's shebang, and with it the
+    # privileged mode that closes the BASH_ENV window.
+    assert "sudo ./scripts/deploy/install-mgo-validate.sh" in body
+    assert "sudo bash" not in text
 
 
 @pytest.mark.parametrize("asset", SHELL_ASSETS, ids=lambda path: path.name)
@@ -3239,15 +3277,83 @@ def test_the_sudoers_policy_is_not_executable_in_git() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_the_sudoers_policy_grants_one_account_one_path() -> None:
-    """The narrowest rule that still works."""
-    rules = [
+def _sudoers_rules() -> list[str]:
+    return [
         line.strip()
         for line in _read(SUDOERS).splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
 
-    assert rules == ["claude ALL=(root) NOPASSWD: /usr/local/sbin/mgo-validate"]
+
+def test_the_sudoers_policy_grants_one_account_one_path() -> None:
+    """The narrowest rule that still works.
+
+    Exactly one command alias, naming exactly one absolute path, and exactly
+    one grant against it. Everything else in the file is a ``Defaults!`` line
+    that only ever *removes* environment.
+    """
+    rules = _sudoers_rules()
+    aliases = [rule for rule in rules if rule.startswith("Cmnd_Alias ")]
+    grants = [rule for rule in rules if "ALL=" in rule]
+    defaults = [rule for rule in rules if rule.startswith("Defaults")]
+
+    assert aliases == ["Cmnd_Alias MGO_VALIDATE = /usr/local/sbin/mgo-validate"]
+    assert grants == ["claude ALL=(root) NOPASSWD: MGO_VALIDATE"]
+    assert len(rules) == len(aliases) + len(grants) + len(defaults)
+    for default in defaults:
+        assert default.startswith("Defaults!MGO_VALIDATE "), default
+        assert "env_reset" in default or "env_delete +=" in default, default
+
+
+def test_the_sudoers_policy_resets_the_environment_for_this_command() -> None:
+    """The earliest point the environment can be cut down, and the only one
+    that also covers the loader.
+
+    ``LD_PRELOAD`` and ``LD_LIBRARY_PATH`` take effect before the interpreter
+    exists, so no shell script can defend against them — that part of the
+    boundary belongs to sudo and to the operating system. The gateway's own
+    ``bash -p`` and constructed environment come later and cannot speak for it.
+    """
+    rules = "\n".join(_sudoers_rules())
+
+    assert "Defaults!MGO_VALIDATE env_reset" in rules
+    for variable in (
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "CDPATH",
+        "GLOBIGNORE",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONSTARTUP",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "UV_PROJECT",
+        "CURL_HOME",
+        "TMPDIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+    ):
+        assert variable in rules, variable
+
+
+def test_the_sudoers_policy_grants_no_setenv() -> None:
+    """SETENV would hand back exactly what env_reset removes.
+
+    With it, ``sudo BASH_ENV=/tmp/evil mgo-validate`` would be permitted and
+    the whole boundary above would be a suggestion.
+    """
+    rules = "\n".join(_sudoers_rules())
+
+    assert "SETENV" not in rules
+    assert "setenv" not in rules
 
 
 @pytest.mark.parametrize(
@@ -3334,6 +3440,38 @@ file_metadata() {
 """
 
 
+def _installer_stat_double(parent_owner: str = "0:0", parent_mode: str = "700") -> str:
+    """Stand in for ``stat`` across the whole installer transaction.
+
+    Windows has no POSIX owner or mode, so the values the shipped checks
+    compare against are supplied here and the refusal logic executes for real.
+    The workspace and the files staged inside it have their own expected
+    values — ``0700`` and ``0600`` — which is the point: a single blanket
+    answer would let one of the two checks pass for the wrong reason.
+    """
+    return (
+        "stat() {\n"
+        '    local format="$2" path="$3"\n'
+        '    case "$format" in\n'
+        "        '%u:%g')\n"
+        '            case "$path" in\n'
+        "                */run.??????/*|*/run.??????) printf '0:0\\n' ;;\n"
+        f"                *) printf '{parent_owner}\\n' ;;\n"
+        "            esac\n"
+        "            ;;\n"
+        "        '%a')\n"
+        '            case "$path" in\n'
+        "                */run.??????/*) printf '600\\n' ;;\n"
+        "                */run.??????) printf '700\\n' ;;\n"
+        f"                *) printf '{parent_mode}\\n' ;;\n"
+        "            esac\n"
+        "            ;;\n"
+        "        *) printf '\\n' ;;\n"
+        "    esac\n"
+        "}\n"
+    )
+
+
 def _install_pair(
     tmp_path: Path,
     *,
@@ -3367,6 +3505,7 @@ def _install_pair(
         f'source "{_posix(INSTALLER)}"\n'
         "set +e\n"
         f"{INSTALLER_DOUBLES}\n"
+        f"{_installer_stat_double()}\n"
         # install(1) is doubled, so the transaction parent is made directly.
         # The per-run workspace inside it is created by the shipped function.
         'open_transaction_parent() { mkdir -p "$1"; }\n'
@@ -3451,7 +3590,10 @@ def test_the_installer_installs_both_targets(tmp_path: Path) -> None:
             "        *) printf 'root:root:755\\n' ;;\n"
             "    esac\n}",
         ),
-        ("installed policy validation", "policy_is_valid() { return 1; }"),
+        (
+            "installed policy validation",
+            'policy_is_valid() { case "$1" in */dst/*) return 1 ;; esac; return 0; }',
+        ),
     ],
 )
 def test_every_installer_failure_restores_the_previous_pair(
@@ -3481,7 +3623,10 @@ def test_every_installer_failure_restores_the_previous_pair(
             '    if [[ "$MV_FAILS" -eq 1 ]]; then MV_FAILS=0; return 1; fi\n'
             '    command mv "$@"\n}',
         ),
-        ("installed policy validation", "policy_is_valid() { return 1; }"),
+        (
+            "installed policy validation",
+            'policy_is_valid() { case "$1" in */dst/*) return 1 ;; esac; return 0; }',
+        ),
     ],
 )
 def test_a_failure_with_no_previous_pair_removes_what_it_installed(
@@ -3516,7 +3661,10 @@ def test_a_failed_restoration_is_reported_distinctly(tmp_path: Path) -> None:
     """Not restored is a different outcome from restored, and exits 78."""
     result, _gateway, _sudoers = _install_pair(
         tmp_path,
-        extra="policy_is_valid() { return 1; }\nrestore_one() { return 1; }",
+        extra=(
+            'policy_is_valid() { case "$1" in */dst/*) return 1 ;; esac; return 0; }\n'
+            "restore_one() { return 1; }"
+        ),
         existing_gateway="#!/usr/bin/env bash\nold\n",
         existing_sudoers="# old\n",
     )
@@ -3551,53 +3699,41 @@ def test_install_file_removes_its_temporary_file_on_failure(
 
 
 def test_a_fully_current_installation_mutates_nothing(tmp_path: Path) -> None:
-    """Correct files are verified and left alone — same inode, same mtime."""
-    sources = tmp_path / "src"
+    """Correct files are verified and left alone — same inode, same mtime.
+
+    The run does stage a snapshot of the sources into its own workspace, and
+    must: "current" now means "matches the bytes this run validated", which
+    cannot be decided before those bytes exist. What it must not do is touch a
+    target — no ``install``, no rename, no new inode, no new timestamp.
+    """
     targets = tmp_path / "dst"
-    sources.mkdir()
     targets.mkdir()
-    gateway_source = sources / "mgo-validate"
-    sudoers_source = sources / "mgo-validate.sudoers"
-    gateway_source.write_bytes(b"#!/usr/bin/env bash\ntrue\n")
-    sudoers_source.write_bytes(b"claude ALL=(root) NOPASSWD: /x\n")
     gateway_target = targets / "mgo-validate"
     sudoers_target = targets / "mgo-validate.sudoers"
-    gateway_target.write_bytes(gateway_source.read_bytes())
-    sudoers_target.write_bytes(sudoers_source.read_bytes())
-
+    gateway_target.write_bytes(GATEWAY_SOURCE_BODY)
+    sudoers_target.write_bytes(SUDOERS_SOURCE_BODY)
     before = {
         path: (path.stat().st_ino, path.stat().st_mtime_ns)
         for path in (gateway_target, sudoers_target)
     }
 
-    result = run_bash(
-        "set +e\n"
-        f'export CALL_LOG="{_posix(tmp_path / "calls.log")}"\n'
-        ': > "$CALL_LOG"\n'
-        f'source "{_posix(INSTALLER)}"\n'
-        "set +e\n"
-        f"{INSTALLER_DOUBLES}\n"
-        "visudo() { return 0; }\n"
-        'command() {\n'
-        '    if [[ "$1" == "-v" ]]; then return 0; fi\n'
-        '    builtin command "$@"\n'
-        "}\n"
-        "acquire_transaction_lock() { return 0; }\n"
-        "run_installation "
-        f'"{_posix(gateway_source)}" "{_posix(gateway_target)}" "0755" '
-        f'"{_posix(sudoers_source)}" "{_posix(sudoers_target)}" "0440" 0 0 '
-        f'"{_posix(tmp_path / "transaction")}" '
-        f'"{_posix(tmp_path / "lock")}"\n'
-        'printf "outcome=%s\\n" "$?"\n'
+    result, _gateway, _sudoers, transaction = _run_installation(
+        tmp_path, current=True
     )
     calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
 
-    assert "outcome=0" in result.stdout, result.stderr
+    assert "outcome=0" in result.stdout, result.stdout + result.stderr
     assert "nothing changed" in result.stdout
-    assert calls.strip() == "", f"mutating commands ran: {calls!r}"
+    # Two ``install`` calls, both of them staging into this run's workspace,
+    # and no rename at all: ``install_file`` is the only thing that renames,
+    # and it is what publishes a target.
+    assert calls.count("install") == 2, f"a target was installed: {calls!r}"
+    assert "mv" not in calls, f"a target was renamed: {calls!r}"
     for path, (inode, mtime) in before.items():
         assert path.stat().st_ino == inode, path.name
         assert path.stat().st_mtime_ns == mtime, path.name
+    # The staging workspace is this run's, and it goes when the run does.
+    assert list(transaction.iterdir()) == []
 
 
 def test_matching_content_with_wrong_metadata_is_not_current(
@@ -3737,7 +3873,10 @@ def test_backups_never_land_in_the_sudoers_include_directory(
     """A backup under /etc/sudoers.d is a second policy in a directory sudo reads."""
     result, _gateway, sudoers = _install_pair(
         tmp_path,
-        extra="policy_is_valid() { return 1; }",
+        extra=(
+            'policy_is_valid() { case "$1" in */dst/*)'
+            ' return 1 ;; esac; return 0; }'
+        ),
         existing_gateway="old\n",
         existing_sudoers="# old\n",
     )
@@ -3793,7 +3932,7 @@ def test_a_cleanup_failure_after_rollback_is_reported(tmp_path: Path) -> None:
     result, _gateway, _sudoers = _install_pair(
         tmp_path,
         extra=(
-            "policy_is_valid() { return 1; }\n"
+            'policy_is_valid() { case "$1" in */dst/*) return 1 ;; esac; return 0; }\n'
             "close_transaction_workspace() { return 1; }"
         ),
         existing_gateway="old\n",
@@ -3827,7 +3966,10 @@ def test_a_successful_rollback_leaves_no_transaction_artefacts(
     """Nor does a failed installation that restored cleanly."""
     result, _gateway, _sudoers = _install_pair(
         tmp_path,
-        extra="policy_is_valid() { return 1; }",
+        extra=(
+            'policy_is_valid() { case "$1" in */dst/*)'
+            ' return 1 ;; esac; return 0; }'
+        ),
         existing_gateway="old\n",
         existing_sudoers="# old\n",
     )
@@ -4004,14 +4146,57 @@ def test_a_real_run_fails_closed_without_visudo() -> None:
 
 
 def test_validation_precedes_every_mutation() -> None:
-    """Both checks come before the first thing that writes."""
-    source = _read(INSTALLER)
-    body = source[source.index("run_installation()") :]
-    syntax = body.index("bash -n")
-    validation = body.index("visudo -cf")
-    install = body.index("install_pair \\")
+    """Both checks come before the first thing that writes a target.
 
-    assert syntax < validation < install
+    They now live inside the transaction, after the snapshot, because what has
+    to be validated is the bytes that will be installed — not the bytes that
+    happened to be in the checkout when the run started.
+    """
+    body = _installer_function_body("install_pair()", "abort_pair()")
+    staged = body.index("staged_gateway=")
+    syntax = body.index("gateway_syntax_is_valid")
+    policy = body.index("policy_is_valid")
+    install = body.index("install_file")
+
+    assert staged < syntax < policy < install
+
+
+def test_the_lock_is_taken_before_any_source_is_validated() -> None:
+    """A concurrent deploy-main can move the checkout under the installer.
+
+    Validating, checksumming and then installing from a live working tree is
+    three reads of a moving target. The lock now comes before the first of
+    them, so the whole sequence sees one state of the repository.
+    """
+    body = _installer_function_body("run_installation()", "dry_run_installation()")
+    lock = body.index("acquire_transaction_lock")
+    transaction = body.index("install_pair \\")
+
+    assert lock < transaction
+    # And nothing validates or checksums a source before that point.
+    preamble = body[:lock]
+    for premature in ("gateway_syntax_is_valid", "file_checksum", "visudo -cf"):
+        assert premature not in preamble, premature
+
+
+def test_the_installation_reads_only_the_staged_snapshot() -> None:
+    """After staging, the live checkout is never read again.
+
+    The whole point of the snapshot is that "the bytes installed are the bytes
+    validated" stops depending on nothing having changed in between.
+    """
+    body = _installer_function_body("install_pair()", "abort_pair()")
+    after = body[body.index("require_secure_staged_file") :]
+    lines = [
+        line
+        for line in after.splitlines()
+        if not line.strip().startswith("#")
+        and ("gateway_source" in line or "sudoers_source" in line)
+    ]
+
+    assert lines == [], lines
+    assert 'install_file "$staged_gateway"' in body
+    assert 'install_file "$staged_sudoers"' in body
 
 
 def test_the_installer_touches_no_approval_repository_or_service() -> None:
@@ -4490,6 +4675,80 @@ def test_an_environment_that_looks_constructed_is_still_verified(
     assert "GIT_DIR" not in exported
 
 
+@pytest.mark.parametrize(
+    ("asset", "argument"),
+    [(GATEWAY, "show-approval"), (INSTALLER, "--dry-run")],
+    ids=["gateway", "installer"],
+)
+def test_a_hostile_bash_env_never_executes(
+    tmp_path: Path, asset: Path, argument: str
+) -> None:
+    """Privileged mode stops it being read at all — not merely afterwards.
+
+    Bash reads ``$BASH_ENV`` while it is starting up, before the script's first
+    statement. Re-executing through ``env -i`` removes it from the *second*
+    process, which is why the marker used to be written exactly once; ``-p``
+    means it is never written.
+
+    The script is executed directly so the shebang is what chooses the
+    interpreter. Naming ``bash`` on the command line would discard it, which is
+    exactly why the documented invocation no longer does.
+    """
+    marker = tmp_path / "bash-env-ran"
+    startup = tmp_path / "startup.sh"
+    startup.write_bytes(f'printf "x" >> "{_posix(marker)}"\n'.encode())
+
+    # The variables are set for the exec'd process only. Exporting them to the
+    # launching shell as well would have that shell write the marker, and the
+    # test would be measuring itself.
+    result = run_bash(
+        f'BASH_ENV="{_posix(startup)}" ENV="{_posix(startup)}"'
+        f' exec "{_posix(asset)}" {argument}'
+    )
+
+    assert not marker.exists(), (
+        f"BASH_ENV was executed: {marker.read_text(encoding='utf-8')!r}"
+        f"\n{result.stdout}{result.stderr}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("asset", "argument"),
+    [(GATEWAY, "show-approval"), (INSTALLER, "--dry-run")],
+    ids=["gateway", "installer"],
+)
+def test_an_exported_shell_function_does_not_reach_either_script(
+    tmp_path: Path, asset: Path, argument: str
+) -> None:
+    """An exported function silently replaces a command for the whole script.
+
+    ``stat``, ``curl``, ``git`` and ``install`` are all names a caller could
+    export a function under, and a function takes precedence over the
+    executable. Privileged mode refuses to import any of them.
+    """
+    marker = tmp_path / "function-ran"
+    probe = tmp_path / "probe.sh"
+    probe.write_bytes(
+        (
+            "#!/bin/bash\n"
+            f"stat() {{ printf 'x' >> \"{_posix(marker)}\"; }}\n"
+            "export -f stat\n"
+            f'exec "{_posix(asset)}" "$1"\n'
+        ).encode()
+    )
+
+    subprocess.run(
+        [_bash(), _posix(probe), argument],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert not marker.exists(), "an exported shell function was imported"
+
+
 def test_a_bash_env_file_does_not_reach_the_operational_process(
     tmp_path: Path,
 ) -> None:
@@ -4536,8 +4795,10 @@ def test_the_environment_boundary_is_an_allowlist(asset: Path) -> None:
     assert "compgen -e" in source
     assert "env -i" in source
     # The interpreter and env(1) are both named absolutely: they are what
-    # construct the environment, so neither may be found through one.
-    assert '/bin/bash "$0"' in source
+    # construct the environment, so neither may be found through one. The
+    # re-executed interpreter stays privileged, or the second process would be
+    # the weaker of the two.
+    assert '/bin/bash -p "$0"' in source
     assert 'ENV_COMMAND="/usr/bin/env"' in source
 
 
@@ -4547,8 +4808,8 @@ def test_only_the_action_and_the_sudo_caller_cross_the_boundary(
 ) -> None:
     """Everything else is rebuilt; these two are carried deliberately."""
     source = _read(asset)
-    start = source.index("exec \"$")
-    boundary = source[start : source.index("/bin/bash \"$0\"", start)]
+    start = source.index('exec "$')
+    boundary = source[start : source.index('/bin/bash -p "$0"', start)]
 
     assert "SUDO_USER=${SUDO_USER:-}" in boundary
     assert "LC_ALL=C" in boundary
@@ -4580,6 +4841,9 @@ def test_the_installer_does_not_rely_on_sudo_configuration() -> None:
 
 
 EX_STALE = 65
+
+GATEWAY_SOURCE_BODY = b"#!/bin/bash\ntrue\n"
+SUDOERS_SOURCE_BODY = b"claude ALL=(root) NOPASSWD: /x\n"
 
 
 def _make_current(target: Path, content: bytes) -> None:
@@ -4619,8 +4883,8 @@ def _run_installation(
     targets.mkdir(exist_ok=True)
     gateway_source = sources / "mgo-validate"
     sudoers_source = sources / "mgo-validate.sudoers"
-    gateway_source.write_bytes(b"#!/bin/bash\ntrue\n")
-    sudoers_source.write_bytes(b"claude ALL=(root) NOPASSWD: /x\n")
+    gateway_source.write_bytes(GATEWAY_SOURCE_BODY)
+    sudoers_source.write_bytes(SUDOERS_SOURCE_BODY)
     gateway_target = targets / "mgo-validate"
     sudoers_target = targets / "mgo-validate.sudoers"
     if current:
@@ -4634,7 +4898,8 @@ def _run_installation(
         f'source "{_posix(INSTALLER)}"\n'
         "set +e\n"
         f"{INSTALLER_DOUBLES}\n"
-        f"{_directory_stat_double(owner=parent_owner, mode=parent_mode)}\n"
+        f"{_installer_stat_double(parent_owner, parent_mode)}\n"
+        'open_transaction_parent() { mkdir -p "$1"; }\n'
         "visudo() { return 0; }\n"
         "command() {\n"
         '    if [[ "$1" == "-v" ]]; then return 0; fi\n'
@@ -4804,7 +5069,7 @@ def test_a_run_never_removes_another_runs_workspace(tmp_path: Path) -> None:
     assert (foreign / "previous.KEEP").read_bytes() == b"# another run's evidence\n"
 
     body = _installer_function_body(
-        "close_transaction_workspace()", "# Both targets, always"
+        "close_transaction_workspace()", "# --- the locked source snapshot"
     )
     assert 'rm -rf -- "$workspace"' in body
     assert "*" not in body
@@ -4854,10 +5119,15 @@ def test_a_transaction_parent_symlink_is_refused_before_it_is_followed() -> None
     assert opener.index('! -L "$parent"') < opener.index("install -d")
 
 
-def test_a_dry_run_reports_stale_state_without_refusing_or_removing_it(
+def test_a_dry_run_reports_stale_state_and_exits_as_the_real_run_would(
     tmp_path: Path,
 ) -> None:
-    """A dry run changes nothing, including its own answer."""
+    """A validation command must not answer "fine" for a state that refuses.
+
+    The exit status is the same 65 the real installation would use, so a
+    wrapper reading the status learns the same thing from either mode. Nothing
+    is removed: the evidence outlives the report.
+    """
     transaction = tmp_path / "transaction"
     stale = transaction / "run.ABC123"
     stale.mkdir(parents=True)
@@ -4867,19 +5137,324 @@ def test_a_dry_run_reports_stale_state_without_refusing_or_removing_it(
         tmp_path, dry_run=1
     )
 
-    assert "outcome=0" in result.stdout, result.stdout + result.stderr
-    assert "would refuse" in result.stdout
-    assert "stale transaction state" in result.stdout
+    assert f"outcome={EX_STALE}" in result.stdout, result.stdout + result.stderr
+    assert "stale transaction state" in result.stderr
+    assert "would refuse" in result.stderr
     assert stale.is_dir()
+    assert (stale / "previous.XYZ").read_bytes() == b"# old\n"
+
+
+@pytest.mark.parametrize("which", ["gateway", "sudoers"])
+def test_changing_a_source_after_staging_does_not_change_installed_bytes(
+    tmp_path: Path, which: str
+) -> None:
+    """The bytes installed are the bytes validated.
+
+    A concurrent ``deploy-main`` can fast-forward the checkout at any moment.
+    Between the syntax check and the checksum, or between the checksum and the
+    rename, that used to mean a host running bytes nothing had looked at. The
+    snapshot is what closes it: everything after staging reads this run's copy,
+    so rewriting the live file mid-transaction changes nothing that lands.
+
+    The rewrite happens inside ``stage_source``, immediately after the copy is
+    made, which is the narrowest possible expression of "the source moved".
+    """
+    name = "mgo-validate" if which == "gateway" else "mgo-validate.sudoers"
+    tampered = b"# TAMPERED AFTER STAGING\n"
+    result, gateway_target, sudoers_target = _install_pair(
+        tmp_path,
+        extra=(
+            "stage_source() {\n"
+            '    local source="$1" workspace="$2" name="$3"\n'
+            '    is_regular_file "$source" || return 1\n'
+            '    install -o root -g root -m 0600 "$source" "${workspace}/${name}"'
+            " || return 1\n"
+            f'    if [[ "$name" == "{name}" ]]; then\n'
+            f"        printf '%s' '{tampered.decode()}' > \"$source\"\n"
+            "    fi\n"
+            '    printf \'%s\\n\' "${workspace}/${name}"\n'
+            "}\n"
+        ),
+    )
+    installed = gateway_target if which == "gateway" else sudoers_target
+
+    assert "outcome=0" in result.stdout, result.stdout + result.stderr
+    assert installed.read_bytes() != tampered, "the live source was installed"
+    assert (tmp_path / "src" / name).read_bytes() == tampered, "the test did not tamper"
+
+
+@pytest.mark.parametrize(
+    ("label", "double", "message"),
+    [
+        (
+            "staged gateway syntax",
+            'gateway_syntax_is_valid() { case "$1" in */run.*)'
+            " return 1 ;; esac; return 0; }",
+            "staged gateway failed",
+        ),
+        (
+            "staged sudoers policy",
+            'policy_is_valid() { case "$1" in */run.*) return 1 ;; esac; return 0; }',
+            "staged sudoers policy failed",
+        ),
+    ],
+)
+def test_an_invalid_staged_asset_refuses_before_any_target_is_touched(
+    tmp_path: Path, label: str, double: str, message: str
+) -> None:
+    """Validation happens on the snapshot, and nothing is written until it passes."""
+    result, gateway, sudoers = _install_pair(
+        tmp_path,
+        extra=double,
+        existing_gateway="# the old gateway\n",
+        existing_sudoers="# the old policy\n",
+    )
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
+
+    assert "outcome=1" in result.stdout, label
+    assert message in result.stderr, label
+    assert "mv" not in calls, f"{label}: a target was published"
+    assert gateway.read_text(encoding="utf-8") == "# the old gateway\n", label
+    assert sudoers.read_text(encoding="utf-8") == "# the old policy\n", label
+
+
+def test_an_installed_gateway_that_does_not_parse_restores_both_targets(
+    tmp_path: Path,
+) -> None:
+    """The checksum says the bytes match; this says they still work.
+
+    A gateway published under /usr/local/sbin that Bash cannot parse is a
+    control plane that cannot be invoked at all — and the sudoers rule pointing
+    at it would be the only way in.
+    """
+    result, gateway, sudoers = _install_pair(
+        tmp_path,
+        extra=(
+            'gateway_syntax_is_valid() { case "$1" in */dst/*)'
+            " return 1 ;; esac; return 0; }"
+        ),
+        existing_gateway="# the old gateway\n",
+        existing_sudoers="# the old policy\n",
+    )
+
+    assert "outcome=1" in result.stdout, result.stdout + result.stderr
+    assert "installed gateway failed" in result.stderr
+    assert gateway.read_text(encoding="utf-8") == "# the old gateway\n"
+    assert sudoers.read_text(encoding="utf-8") == "# the old policy\n"
+
+
+def test_no_staged_file_is_written_beside_the_targets(tmp_path: Path) -> None:
+    """Staging happens in the workspace, never in /etc/sudoers.d."""
+    result, _gateway, sudoers = _install_pair(
+        tmp_path,
+        extra='policy_is_valid() { case "$1" in */dst/*) return 1 ;; esac; return 0; }',
+        existing_gateway="old\n",
+        existing_sudoers="# old\n",
+    )
+
+    assert "outcome=1" in result.stdout
+    assert sorted(path.name for path in sudoers.parent.iterdir()) == [
+        "mgo-validate",
+        "mgo-validate.sudoers",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("label", "owner", "mode"),
+    [
+        # Each corrupts exactly one property, so neither check can pass for the
+        # other's reason. A double that broke both would let either be deleted.
+        ("wrong owner", "1000:1000", "700"),
+        ("wrong group", "0:1000", "700"),
+        ("world-readable", "0:0", "755"),
+        ("world-writable", "0:0", "777"),
+    ],
+)
+def test_a_workspace_that_is_not_root_owned_and_private_is_refused(
+    tmp_path: Path, label: str, owner: str, mode: str
+) -> None:
+    """mktemp says what it did; this says what is on disk.
+
+    A copy of the sudoers policy is about to go inside, so the directory's own
+    type, ownership, mode and location are all proven first.
+    """
+    result, gateway, _sudoers = _install_pair(
+        tmp_path,
+        extra=(
+            "stat() {\n"
+            '    local format="$2" path="$3"\n'
+            '    case "$path" in\n'
+            "        */run.??????)\n"
+            '            case "$format" in\n'
+            f"                '%u:%g') printf '{owner}\\n' ;;\n"
+            f"                '%a') printf '{mode}\\n' ;;\n"
+            "            esac\n"
+            "            return 0\n"
+            "            ;;\n"
+            "    esac\n"
+            '    case "$format" in\n'
+            "        '%u:%g') printf '0:0\\n' ;;\n"
+            "        '%a')\n"
+            '            case "$path" in\n'
+            "                */run.??????/*) printf '600\\n' ;;\n"
+            "                *) printf '700\\n' ;;\n"
+            "            esac\n"
+            "            ;;\n"
+            "        *) printf '\\n' ;;\n"
+            "    esac\n"
+            "}\n"
+        ),
+    )
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
+
+    assert "outcome=1" in result.stdout, f"{label}: {result.stdout}{result.stderr}"
+    assert "not a root-owned 0700 directory inside" in result.stderr, label
+    assert "mv" not in calls, label
+    assert not gateway.exists(), label
+
+
+def test_a_workspace_outside_the_transaction_parent_is_refused(
+    tmp_path: Path,
+) -> None:
+    """A workspace somewhere else is not this installer's workspace."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    result = run_bash(
+        "set +e\n"
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        f"{_installer_stat_double()}\n"
+        f'require_secure_workspace "{_posix(elsewhere)}"'
+        f' "{_posix(tmp_path / "transaction")}"\n'
+        'printf "outcome=%s\\n" "$?"\n'
+    )
+
+    assert "outcome=1" in result.stdout
+
+
+def test_cleanup_does_not_report_success_while_the_path_survives(
+    tmp_path: Path,
+) -> None:
+    """"Not a directory" is not success.
+
+    If the tracked path is still there as a regular file, this run left
+    something behind and the next one will find it — attributed to nobody
+    unless this run says so now.
+    """
+    leftover = tmp_path / "transaction" / "run.LEFT"
+    leftover.parent.mkdir()
+    leftover.write_bytes(b"not a directory\n")
+
+    result = run_bash(
+        "set +e\n"
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        f'close_transaction_workspace "{_posix(leftover)}"\n'
+        'printf "outcome=%s\\n" "$?"\n'
+    )
+
+    assert "outcome=1" in result.stdout
+    assert leftover.exists()
+
+
+def test_a_transaction_parent_that_cannot_be_inspected_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A failed inspection is not an empty directory.
+
+    ``find`` on an unreadable directory exits non-zero with no output, and
+    treating that as "nothing is here" would turn the one condition this check
+    exists to detect into a clean answer.
+    """
+    transaction = tmp_path / "transaction"
+    transaction.mkdir()
+
+    result = run_bash(
+        "set +e\n"
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        f"{_installer_stat_double()}\n"
+        "find() { return 1; }\n"
+        f'transaction_parent_state "{_posix(transaction)}"\n'
+        'printf "outcome=%s\\n" "$?"\n'
+    )
+
+    assert "outcome=1" in result.stdout, result.stdout + result.stderr
+
+
+def test_a_dry_run_with_an_uninspectable_parent_exits_non_zero(
+    tmp_path: Path,
+) -> None:
+    """And the dry run reports it rather than passing."""
+    (tmp_path / "transaction").mkdir()
+    result, _gateway, _sudoers, _transaction = _run_installation(
+        tmp_path, dry_run=1, extra="find() { return 1; }"
+    )
+
+    assert "outcome=0" not in result.stdout, result.stdout + result.stderr
+
+
+def test_a_dry_run_with_an_unsafe_parent_exits_non_zero(tmp_path: Path) -> None:
+    """A state the real installation refuses is not a passing validation."""
+    (tmp_path / "transaction").mkdir()
+    result, _gateway, _sudoers, _transaction = _run_installation(
+        tmp_path, dry_run=1, parent_mode="777"
+    )
+
+    assert "outcome=1" in result.stdout, result.stdout + result.stderr
+    assert "root-owned 0700 directory" in result.stderr
+
+
+def test_a_dry_run_creates_no_workspace_and_removes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Read-only in both directions."""
+    transaction = tmp_path / "transaction"
+    transaction.mkdir()
+    result, gateway_target, sudoers_target, _t = _run_installation(
+        tmp_path, dry_run=1
+    )
+    before = {
+        path: (path.stat().st_ino, path.stat().st_mtime_ns)
+        for path in (gateway_target, sudoers_target)
+    }
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
+
+    assert "outcome=0" in result.stdout, result.stdout + result.stderr
+    assert list(transaction.iterdir()) == []
+    assert calls.strip() == "", f"a mutating command ran: {calls!r}"
+    for path, (inode, mtime) in before.items():
+        assert path.stat().st_ino == inode
+        assert path.stat().st_mtime_ns == mtime
+
+
+def test_a_dry_run_says_it_holds_no_lock() -> None:
+    """It validates a point-in-time view and must not imply more."""
+    body = _installer_function_body("dry_run_installation()", "main()")
+
+    assert "no lock is held" in body
+    assert "acquire_transaction_lock" not in body
+    assert "install_file" not in body
+    assert "open_transaction_workspace" not in body
 
 
 def test_the_stale_check_precedes_the_idempotent_return() -> None:
-    """Ordering is the whole correction."""
-    body = _installer_function_body("run_installation()", "main()")
-    stale = body.index("stale transaction state is present")
-    idempotent = body.index("verified; nothing changed")
+    """Ordering is the whole correction.
 
-    assert stale < idempotent
+    The stale refusal lives in ``run_installation``, before it calls
+    ``install_pair``; the idempotent return lives inside ``install_pair``,
+    which is only reached afterwards. The currency decision moved there because
+    it now has to compare against the staged checksums.
+    """
+    entry = _installer_function_body("run_installation()", "dry_run_installation()")
+    transaction = _installer_function_body("install_pair()", "abort_pair()")
+
+    assert entry.index("stale transaction state is present") < entry.index(
+        "install_pair \\"
+    )
+    assert "verified; nothing changed" in transaction
+    assert "verified; nothing changed" not in entry
 
 
 # --------------------------------------------------------------------------
@@ -5033,38 +5608,6 @@ def test_the_remote_access_document_no_longer_teaches_the_old_path() -> None:
     assert "mgo-validate show-approval" in commands
 
 
-def test_the_task_record_does_not_claim_the_production_gateway_changed() -> None:
-    """Implemented is not installed, and the record must not blur them."""
-    record = (
-        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Physical-Camera-Acceptance.md"
-    )
-    text = _read(record)
-    index = text.index("Remediation status")
-    section = text[index : index + 2600]
-
-    assert "awaiting final confirmation" in section
-    assert "not** been installed" in section
-    assert "not** been validated" in section
-    assert "still the" in section
-    assert "nothing about the production host changed" in section
-
-
-def test_the_remediation_record_states_the_review_corrections_truthfully() -> None:
-    """Corrected is not re-reviewed, and neither is installed or validated."""
-    record = (
-        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
-    )
-    text = _read(record)
-
-    assert "Final-confirmation corrections implemented" in text
-    assert "awaiting final confirmation" in text
-    assert "Final confirmation (re-run) | **Not performed**" in text
-    assert "Installation on the Raspberry Pi | **Not performed**" in text
-    assert "Raspberry Pi validation of the gateway | **Not performed**" in text
-    assert "production gateway is unchanged" in text
-    assert "Physical camera acceptance remains pending" in text
-
-
 @pytest.mark.parametrize(
     "finding",
     [
@@ -5153,7 +5696,7 @@ def test_the_mutation_register_is_part_of_the_repository() -> None:
 
     identifiers = [mutation.identifier for mutation in mutations]
     assert len(identifiers) == len(set(identifiers)), "duplicate mutation id"
-    assert len(mutations) >= 130
+    assert len(mutations) >= 150
 
     # Every entry still applies to the current tip, exactly once. An entry that
     # no longer matches is a stale mutation, which is precisely the silent

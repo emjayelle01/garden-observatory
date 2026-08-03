@@ -44,6 +44,8 @@ class Mutation(NamedTuple):
 
 GATEWAY = "scripts/deploy/mgo-validate"
 INSTALLER = "scripts/deploy/install-mgo-validate.sh"
+SUDOERS = "scripts/deploy/mgo-validate.sudoers"
+WRAPPER = "scripts/deploy/update-main.sh"
 
 
 MUTATIONS: tuple[Mutation, ...] = (
@@ -205,21 +207,49 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'env-shebang',
         GATEWAY,
-        '#!/bin/bash\n'
-        '',
-        '#!/usr/bin/env bash\n'
-        '',
+        '#!/bin/bash -p\n',
+        '#!/usr/bin/env bash\n',
         'fixed_interpreter',
         "The interpreter is chosen by the caller's PATH.",
     ),
     Mutation(
         'installer-shebang',
         INSTALLER,
-        '#!/bin/bash\n'
-        '',
-        '#!/usr/bin/env bash\n'
-        '',
+        '#!/bin/bash -p\n',
+        '#!/usr/bin/env bash\n',
         'fixed_interpreter',
+        'Same, for the installer.',
+    ),
+    Mutation(
+        'gateway-unprivileged-shebang',
+        GATEWAY,
+        '#!/bin/bash -p\n',
+        '#!/bin/bash\n',
+        'privileged_bash',
+        'BASH_ENV runs before the first statement, unopposed.',
+    ),
+    Mutation(
+        'installer-unprivileged-shebang',
+        INSTALLER,
+        '#!/bin/bash -p\n',
+        '#!/bin/bash\n',
+        'privileged_bash',
+        'Same, for the installer.',
+    ),
+    Mutation(
+        'gateway-unprivileged-reexec',
+        GATEWAY,
+        '            /bin/bash -p "$0" "$@"',
+        '            /bin/bash "$0" "$@"',
+        'privileged_bash or environment_boundary_is_an_allowlist',
+        'The operational process is the weaker of the two.',
+    ),
+    Mutation(
+        'installer-unprivileged-reexec',
+        INSTALLER,
+        '            /bin/bash -p "$0" "$@"',
+        '            /bin/bash "$0" "$@"',
+        'privileged_bash or environment_boundary_is_an_allowlist',
         'Same, for the installer.',
     ),
     Mutation(
@@ -276,8 +306,8 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'env-reexec-interpreter',
         GATEWAY,
-        '            /bin/bash "$0" "$@"',
-        '            bash "$0" "$@"',
+        '            /bin/bash -p "$0" "$@"',
+        '            bash -p "$0" "$@"',
         'environment_boundary_is_an_allowlist',
         'The re-execution resolves bash through PATH again.',
     ),
@@ -1164,21 +1194,37 @@ MUTATIONS: tuple[Mutation, ...] = (
         '"Cleanup failed" is reported as "verified; nothing changed".',
     ),
     Mutation(
-        'installer-stale-after-idempotent',
+        'installer-dry-run-stale-exits-zero',
         INSTALLER,
-        '    # Before any conclusion about the installed targets, including the\n'
-        '    # comfortable one. Stale transaction state means a previous run did not\n'
-        '    # finish, and "both targets are correct" is not an answer to that.\n'
-        '    if [[ "$transaction_state" -eq 1 ]]; then',
-        '    if [[ "$gateway_current" -eq 1 && "$sudoers_current" -eq 1 ]]; then\n'
-        'log "gateway and sudoers policy are already installed, correct and valid"\n'
-        '        log "verified; nothing changed"\n'
-        '        return 0\n'
-        '    fi\n'
-        '\n'
-        '    if [[ "$transaction_state" -eq 1 ]]; then',
-        'stale_check_precedes_the_idempotent_return or stale_transaction',
-        'The idempotent return happens before anything looks.',
+        '        # The code the real installation would exit with, so a wrapper '
+        'reading\n'
+        '        # the status learns the same thing from either mode.\n'
+        '        outcome="$EX_STALE"',
+        '        log "dry run: would refuse"',
+        'dry_run_reports_stale_state',
+        'A validation command answers "fine" for a state that refuses.',
+    ),
+    Mutation(
+        'installer-dry-run-always-succeeds',
+        INSTALLER,
+        '    warn "dry run complete; nothing was changed, and the installation '
+        'would refuse"\n'
+        '    return "$outcome"',
+        '    warn "dry run complete; nothing was changed, and the installation '
+        'would refuse"\n'
+        '    return 0',
+        'dry_run',
+        'Every dry run exits zero, whatever it just reported.',
+    ),
+    Mutation(
+        'installer-parent-inspection-failure-ignored',
+        INSTALLER,
+        '    entries="$(find "$parent" -mindepth 1 -maxdepth 1 -print -quit)" '
+        '|| return 1',
+        '    entries="$(find "$parent" -mindepth 1 -maxdepth 1 -print -quit '
+        '2>/dev/null || true)"',
+        'cannot_be_inspected_fails_closed or uninspectable',
+        'An unreadable transaction parent reads as an empty one.',
     ),
     Mutation(
         'installer-shared-workspace',
@@ -1199,14 +1245,58 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'installer-deletes-unknown-state',
         INSTALLER,
-        '    [[ -n "$workspace" ]] || return 1\n'
-        '    [[ -d "$workspace" ]] || return 0\n'
         '    rm -rf -- "$workspace" || return 1',
-        '    [[ -n "$workspace" ]] || return 1\n'
-        '    [[ -d "$workspace" ]] || return 0\n'
         '    rm -rf -- "$(dirname "$workspace")"/* || return 1',
         'run_never_removes_another',
         "One run destroys another run's recovery evidence.",
+    ),
+    Mutation(
+        'installer-cleanup-succeeds-with-leftovers',
+        INSTALLER,
+        '    [[ ! -L "$workspace" ]] || return 1\n'
+        '    [[ -d "$workspace" ]] || return 1\n'
+        '    rm -rf -- "$workspace" || return 1\n'
+        '    [[ ! -e "$workspace" && ! -L "$workspace" ]]',
+        '    [[ -d "$workspace" ]] || return 0\n'
+        '    rm -rf -- "$workspace" || return 1\n'
+        '    return 0',
+        'cleanup_does_not_report_success',
+        'A surviving object is reported as a finished cleanup.',
+    ),
+    Mutation(
+        'installer-workspace-unverified',
+        INSTALLER,
+        '    require_secure_workspace "$workspace" "$transaction" || {',
+        '    true || {',
+        'workspace_that_is_not_root_owned',
+        'The sudoers policy is copied into a directory nobody checked.',
+    ),
+    Mutation(
+        'installer-workspace-owner-unverified',
+        INSTALLER,
+        '    ownership="$(stat -c \'%u:%g\' "$workspace")" || return 1\n'
+        '    [[ "$ownership" == "0:0" ]] || return 1',
+        '    ownership="$(stat -c \'%u:%g\' "$workspace")" || return 1',
+        'workspace_that_is_not_root_owned',
+        'An unprivileged account owns the staging directory.',
+    ),
+    Mutation(
+        'installer-workspace-mode-unverified',
+        INSTALLER,
+        '    mode="$(stat -c \'%a\' "$workspace")" || return 1\n'
+        '    [[ "$mode" == "700" ]]',
+        '    mode="$(stat -c \'%a\' "$workspace")" || return 1\n'
+        '    [[ -n "$mode" ]]',
+        'workspace_that_is_not_root_owned',
+        'A world-readable staging directory exposes the sudoers policy.',
+    ),
+    Mutation(
+        'installer-workspace-location-unverified',
+        INSTALLER,
+        '    [[ "$workspace" == "$parent"/* ]] || return 1',
+        '    true',
+        'workspace_outside_the_transaction_parent',
+        'A workspace somewhere else is accepted as this run\'s.',
     ),
     Mutation(
         'installer-parent-owner',
@@ -1316,13 +1406,51 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'installer-source-syntax-unchecked',
         INSTALLER,
-        '    if ! bash -n "$gateway_source"; then\n'
-        '        warn "the gateway failed its shell syntax check"\n'
+        '    gateway_syntax_is_valid "$staged_gateway" || {\n'
+        '        warn "the staged gateway failed its shell syntax check"\n'
+        '        close_transaction_workspace "$workspace" || true\n'
         '        return "$EX_FAILED"\n'
-        '    fi',
+        '    }',
         '    true',
-        'validation_precedes_every_mutation',
+        'validation_precedes_every_mutation or invalid_staged_asset',
         'A syntactically broken gateway is installed as root.',
+    ),
+    Mutation(
+        'installer-installed-syntax-unchecked',
+        INSTALLER,
+        '    if ! gateway_syntax_is_valid "$gateway_target"; then',
+        '    if false; then',
+        'installed_gateway_that_does_not_parse',
+        'A published gateway that Bash cannot parse is never invoked again.',
+    ),
+    Mutation(
+        'installer-installs-the-live-source',
+        INSTALLER,
+        '    if ! install_file "$staged_gateway" "$gateway_target" '
+        '"$gateway_mode"; then',
+        '    if ! install_file "$gateway_source" "$gateway_target" '
+        '"$gateway_mode"; then',
+        'changing_a_source or staged_snapshot',
+        'The bytes installed are not the bytes validated.',
+    ),
+    Mutation(
+        'installer-installs-the-live-policy',
+        INSTALLER,
+        '    if ! install_file "$staged_sudoers" "$sudoers_target" '
+        '"$sudoers_mode"; then',
+        '    if ! install_file "$sudoers_source" "$sudoers_target" '
+        '"$sudoers_mode"; then',
+        'changing_a_source or staged_snapshot',
+        'Same, for the sudoers policy.',
+    ),
+    Mutation(
+        'installer-staged-file-unverified',
+        INSTALLER,
+        '    require_secure_staged_file "$staged_gateway" "$workspace" \\\n'
+        '        && require_secure_staged_file "$staged_sudoers" "$workspace" || {',
+        '    true || {',
+        'staged',
+        'A staged copy nobody checked becomes the installed bytes.',
     ),
     Mutation(
         'installer-visudo-optional',
@@ -1347,10 +1475,22 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'installer-lock-not-taken',
         INSTALLER,
-        '        acquire_transaction_lock "$lock_path" || lock_outcome="$?"',
-        '        lock_outcome=0',
+        '    acquire_transaction_lock "$lock_path" || lock_outcome="$?"',
+        '    lock_outcome=0',
         'installer_takes_the_lock_before_inspecting or busy_installer',
         'The file a running deploy-main is executing from is replaced.',
+    ),
+    Mutation(
+        'installer-validates-before-the-lock',
+        INSTALLER,
+        '    # --- the lock comes first --------------------------------------'
+        '----------',
+        '    gateway_syntax_is_valid "$gateway_source" || return "$EX_FAILED"\n'
+        '    file_checksum "$gateway_source" >/dev/null || return "$EX_FAILED"\n'
+        '    # --- the lock comes first --------------------------------------'
+        '----------',
+        'lock_is_taken_before_any_source_is_validated',
+        'A concurrent deployment can move the checkout mid-validation.',
     ),
     Mutation(
         'installer-busy-code',
@@ -1363,18 +1503,11 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'installer-rewrites-current',
         INSTALLER,
-        '    if [[ "$gateway_current" -eq 1 && "$sudoers_current" -eq 1 ]]; then\n'
-        '        log "gateway and sudoers policy are already installed, correct and '
-        'valid"\n'
-        '        log "verified; nothing changed"\n'
-        '        return 0\n'
-        '    fi',
-        '    if false; then\n'
-        '        log "gateway and sudoers policy are already installed, correct and '
-        'valid"\n'
-        '        log "verified; nothing changed"\n'
-        '        return 0\n'
-        '    fi',
+        '    if target_is_current "$gateway_target" "$gateway_sum" "$gateway_mode" \\\n'
+        '        && target_is_current "$sudoers_target" "$sudoers_sum" '
+        '"$sudoers_mode" \\\n'
+        '        && policy_is_valid "$sudoers_target"; then',
+        '    if false; then',
         'fully_current_installation_mutates_nothing or clean_idempotent_run',
         'Correct files are rewritten for nothing.',
     ),
@@ -1406,5 +1539,53 @@ MUTATIONS: tuple[Mutation, ...] = (
         'readonly MGO_REPOSITORY="${MGO_REPOSITORY_OVERRIDE:-/opt/garden-observatory}"',
         'accepts_no_caller_supplied_production_value or falls_back_to_the_environment',
         'A fixed production constant becomes tunable.',
+    ),
+    Mutation(
+        'documented-sudo-bash-invocation',
+        WRAPPER,
+        "    printf '  sudo ./scripts/deploy/install-mgo-validate.sh\\n' >&2",
+        "    printf '  sudo bash scripts/deploy/install-mgo-validate.sh\\n' >&2",
+        'unprivileged_wrapper_does_no_privileged_work',
+        'The documented command discards the shebang, and privileged mode.',
+    ),
+    Mutation(
+        'sudoers-setenv',
+        SUDOERS,
+        'claude ALL=(root) NOPASSWD: MGO_VALIDATE\n',
+        'claude ALL=(root) NOPASSWD: SETENV: MGO_VALIDATE\n',
+        'grants_no_setenv',
+        'sudo VAR=value hands back everything env_reset removes.',
+    ),
+    Mutation(
+        'sudoers-no-env-reset',
+        SUDOERS,
+        'Defaults!MGO_VALIDATE env_reset\n',
+        '\n',
+        'resets_the_environment_for_this_command',
+        "The command's environment depends on the rest of the host's policy.",
+    ),
+    Mutation(
+        'sudoers-keeps-bash-env',
+        SUDOERS,
+        'Defaults!MGO_VALIDATE env_delete += "BASH_ENV ENV SHELLOPTS BASHOPTS"\n',
+        '\n',
+        'resets_the_environment_for_this_command',
+        'The shell-startup variables stop being named at the sudo boundary.',
+    ),
+    Mutation(
+        'sudoers-keeps-loader-variables',
+        SUDOERS,
+        'Defaults!MGO_VALIDATE env_delete += "LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT"\n',
+        '\n',
+        'resets_the_environment_for_this_command',
+        'The one class of variable no shell script can defend against.',
+    ),
+    Mutation(
+        'sudoers-widens-the-command',
+        SUDOERS,
+        'Cmnd_Alias MGO_VALIDATE = /usr/local/sbin/mgo-validate\n',
+        'Cmnd_Alias MGO_VALIDATE = /usr/local/sbin/\n',
+        'grants_one_account_one_path or grants_nothing_else',
+        'A directory prefix grants every executable inside it.',
     ),
 )

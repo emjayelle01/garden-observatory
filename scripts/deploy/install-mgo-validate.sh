@@ -1,14 +1,22 @@
-#!/bin/bash
+#!/bin/bash -p
 #
 # install-mgo-validate.sh — install the deployment gateway and its sudoers rule.
 #
 # The interpreter is fixed, not resolved through the environment: `/usr/bin/env
 # bash` would search an inherited PATH for something called bash before this
-# file could sanitise anything.
+# file could sanitise anything. `-p` is privileged mode, which stops Bash
+# reading $BASH_ENV and $ENV, importing exported shell functions, and honouring
+# SHELLOPTS, BASHOPTS, CDPATH and GLOBIGNORE during its own startup — none of
+# which any statement in this file could undo afterwards.
 #
-# Run as root on the Raspberry Pi:
-#   sudo bash scripts/deploy/install-mgo-validate.sh
-#   bash scripts/deploy/install-mgo-validate.sh --dry-run
+# Run as root on the Raspberry Pi, **executed directly** so the shebang above
+# is the interpreter that runs:
+#   sudo ./scripts/deploy/install-mgo-validate.sh
+#   ./scripts/deploy/install-mgo-validate.sh --dry-run
+#
+# Never `sudo bash scripts/deploy/install-mgo-validate.sh`: naming the
+# interpreter on the command line discards the shebang, and with it privileged
+# mode.
 #
 # Installs two files:
 #   scripts/deploy/mgo-validate         -> /usr/local/sbin/mgo-validate  0755
@@ -50,6 +58,13 @@ readonly EX_STALE=65
 readonly EX_BUSY=75
 readonly EX_RESTORE_FAILED=78
 
+# An internal signal, never a process exit status: install_pair uses it to say
+# "both targets were already correct and I changed nothing", which run_installation
+# reports as success. It exists because the currency decision now has to happen
+# *after* the locked snapshot — the checksums it compares against are the staged
+# ones — and so can no longer be made by the caller beforehand.
+readonly EX_CURRENT=64
+
 # The same construction the gateway performs, for the same reasons: this script
 # runs stat, install, mktemp, cp, mv, sha256sum, visudo and bash, and every one
 # of them reads the environment. Correctness must not depend on the host's
@@ -90,12 +105,21 @@ die() {
 
 usage() {
     cat <<'USAGE'
-Usage: install-mgo-validate.sh [--dry-run]
+Usage: sudo ./install-mgo-validate.sh [--dry-run]
+
+Run it directly, as above. Naming the interpreter on the command line
+discards the shebang, and with it the privileged mode that stops Bash
+reading BASH_ENV and importing exported shell functions before this
+script's first statement.
 
   --dry-run   Validate everything and report what would change. Installs
               nothing and leaves the host untouched. Validation is not
               skipped: a dry run on a host without visudo fails, because it
-              cannot honour the promise to validate everything.
+              cannot honour the promise to validate everything. The exit
+              status agrees with the report — a state the real installation
+              would refuse exits non-zero here too, with the same code.
+              It holds no lock, so it describes a point-in-time view of the
+              sources and claims no exclusion against a concurrent deployment.
 USAGE
 }
 
@@ -158,7 +182,7 @@ require_constructed_environment() {
             "LC_ALL=C" \
             "SUDO_USER=${SUDO_USER:-}" \
             "MGO_INSTALL_ENVIRONMENT_CONSTRUCTED=1" \
-            /bin/bash "$0" "$@"
+            /bin/bash -p "$0" "$@"
     fi
 
     PATH="$SAFE_PATH"
@@ -378,6 +402,7 @@ require_secure_transaction_parent() {
 # left or why, and destroying it would destroy the evidence an operator needs.
 transaction_parent_state() {
     local parent="$1"
+    local entries
 
     [[ ! -L "$parent" ]] || return 1
     if [[ ! -e "$parent" ]]; then
@@ -387,7 +412,12 @@ transaction_parent_state() {
 
     # -print -quit: existence, not an inventory, and it must not depend on
     # glob settings to notice a dotted name.
-    if [[ -n "$(find "$parent" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    #
+    # The status is checked. An unreadable directory makes find fail with no
+    # output, and treating that as "nothing is here" would turn the one
+    # condition this function exists to detect into a clean answer.
+    entries="$(find "$parent" -mindepth 1 -maxdepth 1 -print -quit)" || return 1
+    if [[ -n "$entries" ]]; then
         return 2
     fi
     return 0
@@ -418,14 +448,98 @@ open_transaction_workspace() {
     mktemp -d --tmpdir="$parent" "run.XXXXXX"
 }
 
+# What a workspace must be before anything is staged in it.
+#
+# mktemp -d creates it 0700 and owned by the caller, but that is a claim about
+# what mktemp did, not about what is on disk — and this run is about to put a
+# copy of the sudoers policy inside. The location is checked too: a workspace
+# outside the fixed parent is not this installer's workspace.
+require_secure_workspace() {
+    local workspace="$1"
+    local parent="$2"
+    local ownership
+    local mode
+
+    [[ -n "$workspace" ]] || return 1
+    [[ "$workspace" == "$parent"/* ]] || return 1
+
+    [[ ! -L "$workspace" ]] || return 1
+    [[ -d "$workspace" ]] || return 1
+
+    ownership="$(stat -c '%u:%g' "$workspace")" || return 1
+    [[ "$ownership" == "0:0" ]] || return 1
+
+    mode="$(stat -c '%a' "$workspace")" || return 1
+    [[ "$mode" == "700" ]]
+}
+
 # Remove this run's workspace, and say whether it went.
+#
+# "Not a directory" is not success. If the tracked path is still there as a
+# regular file, a symlink or anything else, this run left something behind and
+# the next one will find it — so it must report that now rather than let the
+# discovery happen later, attributed to nobody.
 close_transaction_workspace() {
     local workspace="$1"
 
     [[ -n "$workspace" ]] || return 1
-    [[ -d "$workspace" ]] || return 0
+    if [[ ! -e "$workspace" && ! -L "$workspace" ]]; then
+        return 0
+    fi
+    [[ ! -L "$workspace" ]] || return 1
+    [[ -d "$workspace" ]] || return 1
     rm -rf -- "$workspace" || return 1
-    [[ ! -e "$workspace" ]]
+    [[ ! -e "$workspace" && ! -L "$workspace" ]]
+}
+
+# --- the locked source snapshot --------------------------------------------
+
+# Copy one repository source into this run's workspace, printing where it went.
+#
+# Everything after this point reads the copy. The live checkout is a moving
+# target: a concurrent deploy-main can fast-forward it between the syntax check
+# and the checksum, or between the checksum and the install, and the result
+# would be a host running bytes nothing validated. Taking the snapshot under
+# the lock makes "the bytes installed are the bytes validated" a fact rather
+# than a race that usually goes the right way.
+stage_source() {
+    local source="$1"
+    local workspace="$2"
+    local name="$3"
+    local staged="${workspace}/${name}"
+
+    is_regular_file "$source" || return 1
+    # 0600, root-owned: the staged sudoers policy is as sensitive as the
+    # installed one, and nothing else needs to read either.
+    install -o root -g root -m 0600 "$source" "$staged" || return 1
+    printf '%s\n' "$staged"
+}
+
+# A staged copy must be exactly what this run put there.
+require_secure_staged_file() {
+    local staged="$1"
+    local workspace="$2"
+    local ownership
+    local mode
+
+    [[ "$staged" == "$workspace"/* ]] || return 1
+    is_regular_file "$staged" || return 1
+
+    ownership="$(stat -c '%u:%g' "$staged")" || return 1
+    [[ "$ownership" == "0:0" ]] || return 1
+
+    mode="$(stat -c '%a' "$staged")" || return 1
+    [[ "$mode" == "600" ]]
+}
+
+# The shipped gateway must parse, under the same interpreter mode it will run
+# in. A syntax error published under /usr/local/sbin is a control plane that
+# cannot be invoked at all.
+gateway_syntax_is_valid() {
+    local path="$1"
+
+    is_regular_file "$path" || return 1
+    /bin/bash -p -n "$path" >/dev/null 2>&1
 }
 
 # Record a target's previous state into the transaction directory.
@@ -512,6 +626,8 @@ install_pair() {
     local sudoers_mode="$6"
     local transaction="${7:-$TRANSACTION_DIRECTORY}"
     local workspace
+    local staged_gateway
+    local staged_sudoers
     local gateway_sum
     local sudoers_sum
     local gateway_backup
@@ -528,9 +644,6 @@ install_pair() {
     target_type_is_supported "$sudoers_target" \
         || { warn "the sudoers target is not a regular file"; return "$EX_FAILED"; }
 
-    gateway_sum="$(file_checksum "$gateway_source")" || return "$EX_FAILED"
-    sudoers_sum="$(file_checksum "$sudoers_source")" || return "$EX_FAILED"
-
     open_transaction_parent "$transaction" || {
         warn "the transaction directory could not be created"
         return "$EX_FAILED"
@@ -539,6 +652,80 @@ install_pair() {
         warn "the transaction workspace could not be created"
         return "$EX_FAILED"
     }
+    require_secure_workspace "$workspace" "$transaction" || {
+        warn "the transaction workspace is not a root-owned 0700 directory inside $transaction"
+        close_transaction_workspace "$workspace" || true
+        return "$EX_FAILED"
+    }
+
+    # --- the locked snapshot -------------------------------------------------
+    #
+    # Both sources are copied here, and everything below reads the copies. The
+    # live checkout is under a concurrent deploy-main's control; the workspace
+    # is under this run's. Validating one and installing the other is how a host
+    # ends up running bytes nothing checked.
+    staged_gateway="$(stage_source "$gateway_source" "$workspace" "mgo-validate")" || {
+        warn "the gateway source could not be staged"
+        close_transaction_workspace "$workspace" || true
+        return "$EX_FAILED"
+    }
+    staged_sudoers="$(stage_source "$sudoers_source" "$workspace" "mgo-validate.sudoers")" || {
+        warn "the sudoers source could not be staged"
+        close_transaction_workspace "$workspace" || true
+        return "$EX_FAILED"
+    }
+    require_secure_staged_file "$staged_gateway" "$workspace" \
+        && require_secure_staged_file "$staged_sudoers" "$workspace" || {
+        warn "a staged source is not a root-owned 0600 regular file"
+        close_transaction_workspace "$workspace" || true
+        return "$EX_FAILED"
+    }
+
+    # Validated from the snapshot, not from the checkout. An invalid file under
+    # /etc/sudoers.d can lock every account out of sudo, so this happens before
+    # either target is touched.
+    log "checking staged gateway syntax"
+    gateway_syntax_is_valid "$staged_gateway" || {
+        warn "the staged gateway failed its shell syntax check"
+        close_transaction_workspace "$workspace" || true
+        return "$EX_FAILED"
+    }
+    log "checking staged sudoers policy"
+    policy_is_valid "$staged_sudoers" || {
+        warn "the staged sudoers policy failed validation"
+        close_transaction_workspace "$workspace" || true
+        return "$EX_FAILED"
+    }
+
+    # And the expected checksums come from the snapshot too, so "installed
+    # matches expected" is a statement about the bytes that were validated.
+    gateway_sum="$(file_checksum "$staged_gateway")" || {
+        close_transaction_workspace "$workspace" || true
+        return "$EX_FAILED"
+    }
+    sudoers_sum="$(file_checksum "$staged_sudoers")" || {
+        close_transaction_workspace "$workspace" || true
+        return "$EX_FAILED"
+    }
+
+    # Verified and finished before a target is touched. An installer that
+    # rewrites files that are already correct changes their inode and
+    # modification time for nothing, and cannot be run safely on a whim.
+    #
+    # This is judged against the *staged* checksums, which is why it happens
+    # here rather than before the snapshot: "current" has to mean "matches the
+    # bytes this run validated".
+    if target_is_current "$gateway_target" "$gateway_sum" "$gateway_mode" \
+        && target_is_current "$sudoers_target" "$sudoers_sum" "$sudoers_mode" \
+        && policy_is_valid "$sudoers_target"; then
+        log "gateway and sudoers policy are already installed, correct and valid"
+        if ! close_transaction_workspace "$workspace"; then
+            warn "the transaction directory could not be removed"
+            return "$EX_FAILED"
+        fi
+        log "verified; nothing changed"
+        return "$EX_CURRENT"
+    fi
 
     gateway_backup="$(record_previous "$gateway_target" "$workspace")" || {
         warn "the existing gateway could not be recorded"
@@ -553,8 +740,10 @@ install_pair() {
     }
 
     # --- from here, any failure restores both targets ---
+    #
+    # Installed from the snapshot. Nothing below reads the live checkout again.
     log "installing $gateway_target"
-    if ! install_file "$gateway_source" "$gateway_target" "$gateway_mode"; then
+    if ! install_file "$staged_gateway" "$gateway_target" "$gateway_mode"; then
         abort_pair "the gateway could not be installed" \
             "$workspace" \
             "$gateway_target" "$gateway_backup" \
@@ -563,7 +752,7 @@ install_pair() {
     fi
 
     log "installing $sudoers_target"
-    if ! install_file "$sudoers_source" "$sudoers_target" "$sudoers_mode"; then
+    if ! install_file "$staged_sudoers" "$sudoers_target" "$sudoers_mode"; then
         abort_pair "the sudoers policy could not be installed" \
             "$workspace" \
             "$gateway_target" "$gateway_backup" \
@@ -588,6 +777,16 @@ install_pair() {
     fi
 
     # Validate what actually landed, not only what was about to be written.
+    # The checksum says the bytes match; these say the bytes still *work* after
+    # the rename, under the interpreter and the parser that will read them.
+    if ! gateway_syntax_is_valid "$gateway_target"; then
+        abort_pair "the installed gateway failed its shell syntax check" \
+            "$workspace" \
+            "$gateway_target" "$gateway_backup" \
+            "$sudoers_target" "$sudoers_backup"
+        return "$?"
+    fi
+
     if ! policy_is_valid "$sudoers_target"; then
         abort_pair "the installed sudoers policy failed validation" \
             "$workspace" \
@@ -650,10 +849,6 @@ run_installation() {
     local lock_path="${10:-$LOCK_FILE}"
     local lock_outcome
     local transaction_state
-    local gateway_sum
-    local sudoers_sum
-    local gateway_current=0
-    local sudoers_current=0
     local outcome
 
     if [[ "$dry_run" -eq 0 && "$effective_uid" -ne 0 ]]; then
@@ -664,42 +859,38 @@ run_installation() {
     [[ -f "$gateway_source" ]] || { warn "gateway source is missing"; return "$EX_FAILED"; }
     [[ -f "$sudoers_source" ]] || { warn "sudoers source is missing"; return "$EX_FAILED"; }
 
-    # An invalid file under /etc/sudoers.d can lock every account out of sudo,
-    # so both sources are validated before either target is touched — and a dry
-    # run validates too, because validating everything is what it promises. A
-    # host without visudo therefore fails in both modes rather than reporting a
-    # success it did not earn.
-    log "checking gateway syntax"
-    if ! bash -n "$gateway_source"; then
-        warn "the gateway failed its shell syntax check"
-        return "$EX_FAILED"
-    fi
-
-    log "checking sudoers syntax"
+    # visudo is required in both modes. A dry run promises to validate
+    # everything, so a host without it fails rather than reporting a success it
+    # did not earn.
     if ! command -v visudo >/dev/null 2>&1; then
         warn "visudo is not available; refusing to proceed without validation"
         return "$EX_FAILED"
     fi
-    if ! visudo -cf "$sudoers_source" >/dev/null; then
-        warn "the sudoers policy failed validation"
-        return "$EX_FAILED"
+
+    if [[ "$dry_run" -eq 1 ]]; then
+        dry_run_installation \
+            "$gateway_source" "$gateway_target" "$gateway_mode" \
+            "$sudoers_source" "$sudoers_target" "$sudoers_mode" \
+            "$transaction" "$lock_path"
+        return "$?"
     fi
 
-    # The same lock the gateway takes. Installing replaces the file a running
-    # deploy-main is executing from, so the two must exclude each other. Taken
-    # before the installed assets are even inspected, since a concurrent
-    # deployment could be changing what they describe.
-    if [[ "$dry_run" -eq 0 ]]; then
-        lock_outcome=0
-        acquire_transaction_lock "$lock_path" || lock_outcome="$?"
-        if [[ "$lock_outcome" -eq "$EX_BUSY" ]]; then
-            warn "another deployment or restart is already in progress"
-            return "$EX_BUSY"
-        fi
-        if [[ "$lock_outcome" -ne 0 ]]; then
-            warn "the deployment lock could not be opened"
-            return "$EX_FAILED"
-        fi
+    # --- the lock comes first ------------------------------------------------
+    #
+    # Before any source is read for validation, not after. The installer used
+    # to check syntax, validate the policy and checksum the sources, and only
+    # then take the lock — leaving a window in which a concurrent deploy-main
+    # could fast-forward the checkout underneath all three. Everything that
+    # follows now happens with the control plane held.
+    lock_outcome=0
+    acquire_transaction_lock "$lock_path" || lock_outcome="$?"
+    if [[ "$lock_outcome" -eq "$EX_BUSY" ]]; then
+        warn "another deployment or restart is already in progress"
+        return "$EX_BUSY"
+    fi
+    if [[ "$lock_outcome" -ne 0 ]]; then
+        warn "the deployment lock could not be opened"
+        return "$EX_FAILED"
     fi
 
     # Read under the lock, so a workspace belonging to a run that is still
@@ -707,41 +898,6 @@ run_installation() {
     transaction_state=0
     transaction_parent_state "$transaction" || transaction_state="$?"
 
-    gateway_sum="$(file_checksum "$gateway_source")" || return "$EX_FAILED"
-    sudoers_sum="$(file_checksum "$sudoers_source")" || return "$EX_FAILED"
-
-    if target_is_current "$gateway_target" "$gateway_sum" "$gateway_mode"; then
-        gateway_current=1
-    fi
-    if target_is_current "$sudoers_target" "$sudoers_sum" "$sudoers_mode" \
-        && policy_is_valid "$sudoers_target"; then
-        sudoers_current=1
-    fi
-
-    if [[ "$dry_run" -eq 1 ]]; then
-        if [[ "$gateway_current" -eq 1 ]]; then
-            log "dry run: $gateway_target is current"
-        else
-            log "dry run: would install $gateway_target ($gateway_mode root:root)"
-        fi
-        if [[ "$sudoers_current" -eq 1 ]]; then
-            log "dry run: $sudoers_target is current"
-        else
-            log "dry run: would install $sudoers_target ($sudoers_mode root:root)"
-        fi
-        if [[ "$transaction_state" -eq 1 ]]; then
-            log "dry run: would refuse; $transaction is not a root-owned 0700 directory"
-        fi
-        if [[ "$transaction_state" -eq 2 ]]; then
-            log "dry run: would refuse; stale transaction state is present in $transaction"
-        fi
-        log "dry run complete; nothing was changed"
-        return 0
-    fi
-
-    # Before any conclusion about the installed targets, including the
-    # comfortable one. Stale transaction state means a previous run did not
-    # finish, and "both targets are correct" is not an answer to that.
     if [[ "$transaction_state" -eq 1 ]]; then
         warn "the transaction directory $transaction is not a root-owned 0700 directory"
         return "$EX_FAILED"
@@ -752,24 +908,100 @@ run_installation() {
         return "$EX_STALE"
     fi
 
-    # Verified and finished before a temporary file exists. An installer that
-    # rewrites files that are already correct changes their inode and
-    # modification time for nothing, and cannot be run safely on a whim.
-    if [[ "$gateway_current" -eq 1 && "$sudoers_current" -eq 1 ]]; then
-        log "gateway and sudoers policy are already installed, correct and valid"
-        log "verified; nothing changed"
-        return 0
-    fi
-
     outcome=0
     install_pair \
         "$gateway_source" "$gateway_target" "$gateway_mode" \
         "$sudoers_source" "$sudoers_target" "$sudoers_mode" \
         "$transaction" || outcome="$?"
+    [[ "$outcome" -ne "$EX_CURRENT" ]] || return 0
     [[ "$outcome" -eq 0 ]] || return "$outcome"
 
     log "installed and verified"
     log "the approval file, the production repository and mgo.service were not touched"
+}
+
+# A report, and an exit status that agrees with it.
+#
+# Read-only and deliberately non-locking, so it validates a point-in-time view
+# of the sources and claims no exclusion against a concurrent deployment. What
+# it must not do is exit zero for a state the real installation would refuse: a
+# validation command that answers "fine" and then refuses when run for real has
+# told the operator nothing.
+dry_run_installation() {
+    local gateway_source="$1"
+    local gateway_target="$2"
+    local gateway_mode="$3"
+    local sudoers_source="$4"
+    local sudoers_target="$5"
+    local sudoers_mode="$6"
+    local transaction="$7"
+    local lock_path="$8"
+    local transaction_state
+    local gateway_sum
+    local sudoers_sum
+    local outcome=0
+
+    log "dry run: validating a point-in-time view; no lock is held"
+
+    if ! gateway_syntax_is_valid "$gateway_source"; then
+        warn "the gateway failed its shell syntax check"
+        outcome="$EX_FAILED"
+    fi
+    if ! visudo -cf "$sudoers_source" >/dev/null 2>&1; then
+        warn "the sudoers policy failed validation"
+        outcome="$EX_FAILED"
+    fi
+    if ! target_type_is_supported "$gateway_target"; then
+        warn "the gateway target is not a regular file"
+        outcome="$EX_FAILED"
+    fi
+    if ! target_type_is_supported "$sudoers_target"; then
+        warn "the sudoers target is not a regular file"
+        outcome="$EX_FAILED"
+    fi
+    # The lock object is inspected, never taken: a dry run must not be able to
+    # block a real deployment, but an unsafe lock is a refusal it would meet.
+    if [[ -e "$lock_path" || -L "$lock_path" ]] \
+        && ! require_secure_lock_object "$lock_path"; then
+        warn "the deployment lock is not a root-owned 0600 regular file"
+        outcome="$EX_FAILED"
+    fi
+
+    gateway_sum="$(file_checksum "$gateway_source")" || return "$EX_FAILED"
+    sudoers_sum="$(file_checksum "$sudoers_source")" || return "$EX_FAILED"
+
+    if target_is_current "$gateway_target" "$gateway_sum" "$gateway_mode"; then
+        log "dry run: $gateway_target is current"
+    else
+        log "dry run: would install $gateway_target ($gateway_mode root:root)"
+    fi
+    if target_is_current "$sudoers_target" "$sudoers_sum" "$sudoers_mode" \
+        && policy_is_valid "$sudoers_target"; then
+        log "dry run: $sudoers_target is current"
+    else
+        log "dry run: would install $sudoers_target ($sudoers_mode root:root)"
+    fi
+
+    transaction_state=0
+    transaction_parent_state "$transaction" || transaction_state="$?"
+    if [[ "$transaction_state" -eq 1 ]]; then
+        warn "the transaction directory $transaction is not a root-owned 0700 directory"
+        outcome="$EX_FAILED"
+    fi
+    if [[ "$transaction_state" -eq 2 ]]; then
+        warn "stale transaction state is present in $transaction: a previous run did not complete its cleanup"
+        warn "it is preserved for inspection; remove it deliberately before installing again"
+        # The code the real installation would exit with, so a wrapper reading
+        # the status learns the same thing from either mode.
+        outcome="$EX_STALE"
+    fi
+
+    if [[ "$outcome" -eq 0 ]]; then
+        log "dry run complete; nothing was changed and validation passed"
+        return 0
+    fi
+    warn "dry run complete; nothing was changed, and the installation would refuse"
+    return "$outcome"
 }
 
 main() {

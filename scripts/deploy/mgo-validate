@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 #
 # mgo-validate — the approved production deployment gateway.
 #
@@ -8,6 +8,20 @@
 # made by whatever environment the caller arrived with, before a single
 # statement of this file could sanitise anything. /bin/bash is the interpreter
 # this repository supports in production.
+#
+# `-p` is privileged mode, and it is the only thing that closes the window
+# *before* the first statement. Bash reads $BASH_ENV and $ENV, imports exported
+# shell functions, and honours SHELLOPTS, BASHOPTS, CDPATH and GLOBIGNORE while
+# it is starting up — all of that has already happened by the time any line of
+# this file runs, so no amount of re-execution afterwards can undo it. In
+# privileged mode Bash does none of it.
+#
+# What this cannot do is speak for anything that ran before Bash: the dynamic
+# loader honours LD_PRELOAD and LD_LIBRARY_PATH before the interpreter exists.
+# That boundary belongs to the operating system and to sudo's own environment
+# handling, which is why the sudoers policy resets the environment for this
+# command as well. A shell script cannot undo code that ran before it started,
+# and this one does not claim to.
 #
 # Installed to /usr/local/sbin/mgo-validate by
 # scripts/deploy/install-mgo-validate.sh and reachable only through the sudoers
@@ -222,7 +236,7 @@ require_constructed_environment() {
             "LC_ALL=C" \
             "SUDO_USER=${SUDO_USER:-}" \
             "MGO_ENVIRONMENT_CONSTRUCTED=1" \
-            /bin/bash "$0" "$@"
+            /bin/bash -p "$0" "$@"
     fi
 
     PATH="$MGO_SAFE_PATH"

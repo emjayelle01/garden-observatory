@@ -20,4 +20,39 @@
 # The gateway is root-owned and mode 0755, so the caller cannot edit what this
 # rule lets them run.
 
-claude ALL=(root) NOPASSWD: /usr/local/sbin/mgo-validate
+Cmnd_Alias MGO_VALIDATE = /usr/local/sbin/mgo-validate
+
+# The environment boundary, scoped to this one command.
+#
+# The gateway constructs its own environment and runs under `bash -p`, but both
+# of those happen *after* sudo has decided what to hand it. This is the earliest
+# point at which the environment can be cut down, and it is the only one that
+# also covers the dynamic loader — LD_PRELOAD and LD_LIBRARY_PATH take effect
+# before the interpreter exists, so no shell script can defend against them.
+# That part of the boundary belongs to sudo and to the operating system.
+#
+# env_reset is sudo's default on Debian, but a default is a thing that can be
+# changed elsewhere in the policy. Stating it for this command means the
+# gateway's environment does not depend on the rest of the host's sudoers.
+Defaults!MGO_VALIDATE env_reset
+
+# Removed even if some other part of the policy adds them to env_keep:
+# env_delete wins over env_keep. Each of these steers something real — the
+# shell's own startup, the loader, the interpreter, Git, uv, curl, or where
+# temporary files are written.
+Defaults!MGO_VALIDATE env_delete += "BASH_ENV ENV SHELLOPTS BASHOPTS"
+Defaults!MGO_VALIDATE env_delete += "CDPATH GLOBIGNORE IFS PS4"
+Defaults!MGO_VALIDATE env_delete += "LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT"
+Defaults!MGO_VALIDATE env_delete += "PYTHONPATH PYTHONHOME PYTHONINSPECT"
+Defaults!MGO_VALIDATE env_delete += "PYTHONSTARTUP PYTHONWARNINGS VIRTUAL_ENV"
+Defaults!MGO_VALIDATE env_delete += "GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE"
+Defaults!MGO_VALIDATE env_delete += "GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM"
+Defaults!MGO_VALIDATE env_delete += "GIT_SSH GIT_SSH_COMMAND SSH_AUTH_SOCK"
+Defaults!MGO_VALIDATE env_delete += "UV_PROJECT UV_CONFIG_FILE CURL_HOME TMPDIR"
+Defaults!MGO_VALIDATE env_delete += "HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY"
+Defaults!MGO_VALIDATE env_delete += "http_proxy https_proxy all_proxy no_proxy"
+
+# One account, one absolute path, no password, and deliberately no SETENV:
+# SETENV would let the caller reintroduce through `sudo VAR=value` exactly what
+# the resets above remove.
+claude ALL=(root) NOPASSWD: MGO_VALIDATE
