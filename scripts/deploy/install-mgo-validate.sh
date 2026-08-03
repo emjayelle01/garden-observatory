@@ -1,6 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #
 # install-mgo-validate.sh — install the deployment gateway and its sudoers rule.
+#
+# The interpreter is fixed, not resolved through the environment: `/usr/bin/env
+# bash` would search an inherited PATH for something called bash before this
+# file could sanitise anything.
 #
 # Run as root on the Raspberry Pi:
 #   sudo bash scripts/deploy/install-mgo-validate.sh
@@ -42,8 +46,18 @@ readonly GATEWAY_MODE="0755"
 readonly SUDOERS_MODE="0440"
 
 readonly EX_FAILED=1
+readonly EX_STALE=65
 readonly EX_BUSY=75
 readonly EX_RESTORE_FAILED=78
+
+# The same construction the gateway performs, for the same reasons: this script
+# runs stat, install, mktemp, cp, mv, sha256sum, visudo and bash, and every one
+# of them reads the environment. Correctness must not depend on the host's
+# optional sudo `env_reset` or `secure_path` settings being configured.
+readonly SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+readonly ROOT_HOME="/root"
+readonly ENV_COMMAND="/usr/bin/env"
+readonly PERMITTED_ENVIRONMENT="HOME LC_ALL MGO_INSTALL_ENVIRONMENT_CONSTRUCTED OLDPWD PATH PWD SHLVL SUDO_USER _"
 
 # The same control-plane lock the gateway takes. Installing replaces the very
 # file a running deploy-main is executing from, so the two must exclude each
@@ -54,6 +68,11 @@ readonly LOCK_FD=9
 # Backups live here, not beside the target. A backup written into
 # /etc/sudoers.d is a second policy file in a directory sudo includes, and
 # renaming it back later is not worth that risk. Root-owned, 0700, on tmpfs.
+#
+# This is the *parent*. Each run creates its own uniquely named workspace
+# inside it and removes only that workspace, so a run can never delete
+# another's evidence, and anything left behind is attributable rather than
+# anonymous.
 readonly TRANSACTION_DIRECTORY="/run/mgo-validate-install"
 
 log() {
@@ -78,6 +97,77 @@ Usage: install-mgo-validate.sh [--dry-run]
               skipped: a dry run on a host without visudo fails, because it
               cannot honour the promise to validate everything.
 USAGE
+}
+
+# --- execution environment -------------------------------------------------
+
+# The three fixed values, and nothing else exported.
+#
+# An allowlist, because the property is "nothing else is here". A denylist can
+# only ever say "not these", which is the weaker statement this installer used
+# to rely on through sudo's optional env_reset.
+environment_is_constructed() {
+    local name
+
+    [[ "${PATH:-}" == "$SAFE_PATH" ]] || return 1
+    [[ "${HOME:-}" == "$ROOT_HOME" ]] || return 1
+    [[ "${LC_ALL:-}" == "C" ]] || return 1
+
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        case " $PERMITTED_ENVIRONMENT " in
+            *" $name "*) ;;
+            *) return 1 ;;
+        esac
+    done < <(compgen -e || true)
+    return 0
+}
+
+purge_environment() {
+    local name
+    local failures=0
+
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        case " $PERMITTED_ENVIRONMENT " in
+            *" $name "*) continue ;;
+        esac
+        unset "$name" 2>/dev/null || failures=$((failures + 1))
+    done < <(compgen -e || true)
+    [[ "$failures" -eq 0 ]]
+}
+
+# Re-execute in a constructed environment, then make it true, or refuse.
+#
+# The re-execution is what BASH_ENV, ENV, LD_PRELOAD and LD_LIBRARY_PATH
+# require: they have already acted by the time a script's first statement runs,
+# so only a fresh interpreter started from ``env -i`` escapes them. The purge is
+# what makes the result a guarantee rather than a request — it removes anything
+# a platform runtime injected, and reduces a forged marker to nothing more than
+# a guard against re-executing twice.
+#
+# TMPDIR is deliberately not carried across: every temporary file this
+# installer creates is named relative to a fixed directory instead.
+require_constructed_environment() {
+    environment_is_constructed && return 0
+
+    if [[ -z "${MGO_INSTALL_ENVIRONMENT_CONSTRUCTED:-}" ]]; then
+        exec "$ENV_COMMAND" -i \
+            "PATH=$SAFE_PATH" \
+            "HOME=$ROOT_HOME" \
+            "LC_ALL=C" \
+            "SUDO_USER=${SUDO_USER:-}" \
+            "MGO_INSTALL_ENVIRONMENT_CONSTRUCTED=1" \
+            /bin/bash "$0" "$@"
+    fi
+
+    PATH="$SAFE_PATH"
+    HOME="$ROOT_HOME"
+    LC_ALL="C"
+    export PATH HOME LC_ALL
+    purge_environment || die "the execution environment could not be constructed"
+    environment_is_constructed \
+        || die "the execution environment could not be constructed"
 }
 
 # --- control-plane lock ----------------------------------------------------
@@ -254,17 +344,88 @@ install_file() {
 #
 # An empty result means "this target did not exist", which is a state like any
 # other: restoring it means removing whatever we installed.
-# A root-owned 0700 scratch directory, created before the first mutation.
-open_transaction_directory() {
-    local directory="$1"
+# The transaction parent must be a private, root-owned directory.
+#
+# It holds copies of the previous sudoers policy, so anything able to read it
+# can read that policy, and anything able to write it can choose what a failed
+# installation restores. A symlink is refused rather than followed: it would
+# put the backups wherever whoever planted it chose.
+require_secure_transaction_parent() {
+    local parent="$1"
+    local ownership
+    local mode
 
-    if [[ -L "$directory" ]]; then
-        return 1
+    [[ ! -L "$parent" ]] || return 1
+    [[ -d "$parent" ]] || return 1
+
+    ownership="$(stat -c '%u:%g' "$parent")" || return 1
+    [[ "$ownership" == "0:0" ]] || return 1
+
+    mode="$(stat -c '%a' "$parent")" || return 1
+    [[ "$mode" == "700" ]]
+}
+
+# Absent or safe and empty (0); unsupported or insecure (1); stale (2).
+#
+# The stale case is the one that matters. A run whose cleanup failed leaves its
+# workspace behind, and on the next run both installed targets can be correct —
+# so without this check the installer would report "verified; nothing changed"
+# over the top of an unfinished transaction, turning "installation succeeded
+# but cleanup failed" into a clean bill of health with the recovery artefacts
+# still on disk.
+#
+# Reported, never resolved: this installer does not know what an unfinished run
+# left or why, and destroying it would destroy the evidence an operator needs.
+transaction_parent_state() {
+    local parent="$1"
+
+    [[ ! -L "$parent" ]] || return 1
+    if [[ ! -e "$parent" ]]; then
+        return 0
     fi
-    if [[ -e "$directory" ]]; then
-        [[ -d "$directory" ]] || return 1
+    require_secure_transaction_parent "$parent" || return 1
+
+    # -print -quit: existence, not an inventory, and it must not depend on
+    # glob settings to notice a dotted name.
+    if [[ -n "$(find "$parent" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+        return 2
     fi
-    install -d -o root -g root -m 0700 "$directory" || return 1
+    return 0
+}
+
+# A root-owned 0700 scratch parent, created before the first mutation.
+open_transaction_parent() {
+    local parent="$1"
+
+    [[ ! -L "$parent" ]] || return 1
+    if [[ -e "$parent" ]]; then
+        [[ -d "$parent" ]] || return 1
+    fi
+    install -d -o root -g root -m 0700 "$parent" || return 1
+    require_secure_transaction_parent "$parent"
+}
+
+# This run's own workspace, uniquely named, inside the parent.
+#
+# Created while the deployment lock is held, so the name cannot collide and no
+# other run can be operating in the parent at the same time. Every backup and
+# staging file this run makes belongs to this directory and no other, which is
+# what lets cleanup remove exactly what this run created — no pattern, no
+# wildcard, and nothing that could reach another run's evidence.
+open_transaction_workspace() {
+    local parent="$1"
+
+    mktemp -d --tmpdir="$parent" "run.XXXXXX"
+}
+
+# Remove this run's workspace, and say whether it went.
+close_transaction_workspace() {
+    local workspace="$1"
+
+    [[ -n "$workspace" ]] || return 1
+    [[ -d "$workspace" ]] || return 0
+    rm -rf -- "$workspace" || return 1
+    [[ ! -e "$workspace" ]]
 }
 
 # Record a target's previous state into the transaction directory.
@@ -312,15 +473,6 @@ restore_one() {
     [[ ! -e "$target" ]]
 }
 
-# Remove every artefact this transaction created. Reported, never assumed.
-close_transaction_directory() {
-    local directory="$1"
-
-    [[ -d "$directory" ]] || return 0
-    rm -rf -- "$directory" || return 1
-    [[ ! -e "$directory" ]]
-}
-
 # Both targets, always. A restoration that put one back is not a restoration.
 restore_pair() {
     local gateway_target="$1"
@@ -359,6 +511,7 @@ install_pair() {
     local sudoers_target="$5"
     local sudoers_mode="$6"
     local transaction="${7:-$TRANSACTION_DIRECTORY}"
+    local workspace
     local gateway_sum
     local sudoers_sum
     local gateway_backup
@@ -378,20 +531,24 @@ install_pair() {
     gateway_sum="$(file_checksum "$gateway_source")" || return "$EX_FAILED"
     sudoers_sum="$(file_checksum "$sudoers_source")" || return "$EX_FAILED"
 
-    open_transaction_directory "$transaction" || {
+    open_transaction_parent "$transaction" || {
         warn "the transaction directory could not be created"
         return "$EX_FAILED"
     }
-
-    gateway_backup="$(record_previous "$gateway_target" "$transaction")" || {
-        warn "the existing gateway could not be recorded"
-        close_transaction_directory "$transaction" || true
+    workspace="$(open_transaction_workspace "$transaction")" || {
+        warn "the transaction workspace could not be created"
         return "$EX_FAILED"
     }
-    sudoers_backup="$(record_previous "$sudoers_target" "$transaction")" || {
+
+    gateway_backup="$(record_previous "$gateway_target" "$workspace")" || {
+        warn "the existing gateway could not be recorded"
+        close_transaction_workspace "$workspace" || true
+        return "$EX_FAILED"
+    }
+    sudoers_backup="$(record_previous "$sudoers_target" "$workspace")" || {
         warn "the existing sudoers policy could not be recorded"
         # Nothing has been mutated yet.
-        close_transaction_directory "$transaction" || true
+        close_transaction_workspace "$workspace" || true
         return "$EX_FAILED"
     }
 
@@ -399,7 +556,7 @@ install_pair() {
     log "installing $gateway_target"
     if ! install_file "$gateway_source" "$gateway_target" "$gateway_mode"; then
         abort_pair "the gateway could not be installed" \
-            "$transaction" \
+            "$workspace" \
             "$gateway_target" "$gateway_backup" \
             "$sudoers_target" "$sudoers_backup"
         return "$?"
@@ -408,7 +565,7 @@ install_pair() {
     log "installing $sudoers_target"
     if ! install_file "$sudoers_source" "$sudoers_target" "$sudoers_mode"; then
         abort_pair "the sudoers policy could not be installed" \
-            "$transaction" \
+            "$workspace" \
             "$gateway_target" "$gateway_backup" \
             "$sudoers_target" "$sudoers_backup"
         return "$?"
@@ -416,7 +573,7 @@ install_pair() {
 
     if ! verify_installed "$gateway_target" "$gateway_sum" "$gateway_mode"; then
         abort_pair "the installed gateway does not match its source" \
-            "$transaction" \
+            "$workspace" \
             "$gateway_target" "$gateway_backup" \
             "$sudoers_target" "$sudoers_backup"
         return "$?"
@@ -424,7 +581,7 @@ install_pair() {
 
     if ! verify_installed "$sudoers_target" "$sudoers_sum" "$sudoers_mode"; then
         abort_pair "the installed sudoers policy does not match its source" \
-            "$transaction" \
+            "$workspace" \
             "$gateway_target" "$gateway_backup" \
             "$sudoers_target" "$sudoers_backup"
         return "$?"
@@ -433,7 +590,7 @@ install_pair() {
     # Validate what actually landed, not only what was about to be written.
     if ! policy_is_valid "$sudoers_target"; then
         abort_pair "the installed sudoers policy failed validation" \
-            "$transaction" \
+            "$workspace" \
             "$gateway_target" "$gateway_backup" \
             "$sudoers_target" "$sudoers_backup"
         return "$?"
@@ -441,8 +598,12 @@ install_pair() {
 
     # Cleanup is part of the transaction, not an afterthought. A run that left
     # a copy of the previous sudoers policy on disk has not finished, and
-    # saying otherwise would hide it.
-    if ! close_transaction_directory "$transaction"; then
+    # saying otherwise would hide it — the next run refuses on exactly this
+    # evidence, so reporting success here would be reporting it twice wrongly.
+    #
+    # Only this run's workspace is removed. The parent stays, empty, and
+    # anything else inside it belongs to a run that is not this one.
+    if ! close_transaction_workspace "$workspace"; then
         warn "the transaction directory could not be removed"
         return "$EX_FAILED"
     fi
@@ -451,7 +612,7 @@ install_pair() {
 
 abort_pair() {
     local reason="$1"
-    local transaction="$2"
+    local workspace="$2"
     shift 2
 
     warn "$reason"
@@ -459,7 +620,7 @@ abort_pair() {
         warn "installation failed AND restoration failed; the host was NOT restored"
         return "$EX_RESTORE_FAILED"
     fi
-    if ! close_transaction_directory "$transaction"; then
+    if ! close_transaction_workspace "$workspace"; then
         warn "installation failed, both targets were restored, but cleanup failed"
         return "$EX_RESTORE_FAILED"
     fi
@@ -488,6 +649,7 @@ run_installation() {
     local transaction="${9:-$TRANSACTION_DIRECTORY}"
     local lock_path="${10:-$LOCK_FILE}"
     local lock_outcome
+    local transaction_state
     local gateway_sum
     local sudoers_sum
     local gateway_current=0
@@ -540,6 +702,11 @@ run_installation() {
         fi
     fi
 
+    # Read under the lock, so a workspace belonging to a run that is still
+    # going cannot be mistaken for one a finished run abandoned.
+    transaction_state=0
+    transaction_parent_state "$transaction" || transaction_state="$?"
+
     gateway_sum="$(file_checksum "$gateway_source")" || return "$EX_FAILED"
     sudoers_sum="$(file_checksum "$sudoers_source")" || return "$EX_FAILED"
 
@@ -562,8 +729,27 @@ run_installation() {
         else
             log "dry run: would install $sudoers_target ($sudoers_mode root:root)"
         fi
+        if [[ "$transaction_state" -eq 1 ]]; then
+            log "dry run: would refuse; $transaction is not a root-owned 0700 directory"
+        fi
+        if [[ "$transaction_state" -eq 2 ]]; then
+            log "dry run: would refuse; stale transaction state is present in $transaction"
+        fi
         log "dry run complete; nothing was changed"
         return 0
+    fi
+
+    # Before any conclusion about the installed targets, including the
+    # comfortable one. Stale transaction state means a previous run did not
+    # finish, and "both targets are correct" is not an answer to that.
+    if [[ "$transaction_state" -eq 1 ]]; then
+        warn "the transaction directory $transaction is not a root-owned 0700 directory"
+        return "$EX_FAILED"
+    fi
+    if [[ "$transaction_state" -eq 2 ]]; then
+        warn "stale transaction state is present in $transaction: a previous run did not complete its cleanup"
+        warn "it is preserved for inspection; remove it deliberately before installing again"
+        return "$EX_STALE"
     fi
 
     # Verified and finished before a temporary file exists. An installer that
@@ -590,6 +776,9 @@ main() {
     local script_dir
     local dry_run=0
     local outcome=0
+
+    # Before anything else, including reading the arguments.
+    require_constructed_environment "$@"
 
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

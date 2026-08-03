@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #
 # update-main.sh — deploy origin/main to this Pi through the approved gateway.
 #

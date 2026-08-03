@@ -15,6 +15,7 @@ test says so.
 
 from __future__ import annotations
 
+import importlib.util
 import shutil
 import subprocess
 import sys
@@ -367,12 +368,12 @@ def test_the_symlink_refusal_precedes_the_regular_file_check() -> None:
     Asserted against the shipped text: this repository's suite runs on hosts
     that cannot create symlinks, and a skip would hide the check entirely.
     """
-    source = _read(GATEWAY)
-    symlink_index = source.index('[[ ! -L "$path" ]]')
-    regular_index = source.index('[[ -f "$path" ]]')
+    body = _function_body("validate_approval_file()", "# --- repository preconditions")
+    symlink_index = body.index('[[ ! -L "$path" ]]')
+    regular_index = body.index('[[ -f "$path" ]]')
 
     assert symlink_index < regular_index
-    following = source[symlink_index : symlink_index + 200]
+    following = body[symlink_index : symlink_index + 200]
     assert "die" in following
     assert "symlink" in following
 
@@ -570,19 +571,30 @@ def test_the_runtime_probe_environment_is_constructed_not_inherited(
         assert hostile not in probe[0], hostile
 
 
-def test_the_root_environment_is_fixed_before_any_action_runs() -> None:
-    """curl, stat, systemctl, flock and mktemp all inherit it."""
-    body = _function_body("main()", "# Program when executed")
-    # The first case validates the request; the dispatch case follows the
-    # environment setup, so an unsupported action is refused before the host is
-    # touched at all.
-    validation = body.index('case "$action"')
-    dispatch = body.index("require_root_caller")
+def _main_body() -> str:
+    """The entry point alone.
 
-    assert body.index('PATH="$MGO_SAFE_PATH"') < validation
-    assert body.index('HOME="/root"') < validation
-    assert body.index("unset GIT_DIR") < validation
-    assert body.index('TMPDIR="$MGO_ROOT_TMPDIR"') < dispatch
+    Sliced on the leading newline, because ``main()`` also matches inside
+    ``action_deploy_main()``.
+    """
+    source = _read(GATEWAY)
+    start = source.index("\nmain() {")
+    return source[start : source.index("# Program when executed", start)]
+
+
+def test_the_root_environment_is_constructed_before_anything_else() -> None:
+    """curl, stat, systemctl, flock, mktemp, python3, git and uv all read it."""
+    body = _main_body()
+    construction = body.index("require_constructed_environment")
+    # The first case validates the request; the dispatch case follows it, so an
+    # unsupported action is refused before the host is touched at all.
+    validation = body.index('case "$action"')
+
+    assert construction < body.index("unset GIT_DIR") < validation
+    # Nothing is read from the request beyond assigning its first word, and
+    # nothing is written anywhere, before the environment is constructed.
+    assert construction < body.index("die ")
+    assert construction < body.index("prepare_root_tmpdir")
 
 
 def test_an_unsupported_action_is_refused_before_the_host_is_touched() -> None:
@@ -615,14 +627,28 @@ def test_an_unsupported_action_is_refused_before_the_host_is_touched() -> None:
         "http_proxy",
         "https_proxy",
         "all_proxy",
+        "BASH_ENV",
+        "ENV",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "PYTHONINSPECT",
+        "PYTHONSTARTUP",
+        "PYTHONWARNINGS",
+        "TMPDIR",
     ],
 )
 def test_every_behaviour_altering_variable_is_unset_at_the_root_boundary(
     variable: str,
 ) -> None:
-    """Named explicitly, so adding one to the list is a deliberate act."""
+    """Named explicitly, so adding one to the list is a deliberate act.
+
+    Defence in depth rather than the mechanism: the constructed environment
+    already contains none of them. The register is kept because an explicit
+    list of what is known to steer Git, uv, Python, curl or the loader is worth
+    reviewing on its own.
+    """
     body = _function_body("main()", "# Program when executed")
-    unset_block = body[body.index("unset GIT_DIR") : body.index("if [[ ! -d")]
+    unset_block = body[body.index("unset GIT_DIR") : body.index('[[ -n "$action" ]]')]
 
     assert variable in unset_block
 
@@ -632,8 +658,7 @@ def test_the_temporary_directory_is_root_controlled() -> None:
     source = _read(GATEWAY)
 
     assert 'readonly MGO_ROOT_TMPDIR="/run/mgo-validate-tmp"' in source
-    body = _function_body("main()", "# Program when executed")
-    assert "chmod 0700" in body
+    assert 'readonly MGO_ROOT_TMPDIR_PARENT="/run"' in source
 
 
 def test_no_git_or_uv_call_bypasses_the_unprivileged_runner() -> None:
@@ -1068,7 +1093,7 @@ def test_an_unsupported_state_token_is_refused(tmp_path: Path, state: str) -> No
     result = call_gateway_function(
         'read_preview_state "url"',
         preamble=(
-            "mktemp() { printf '%s\\n' \"$1\"; }\n"
+            "make_temporary_file() { command mktemp; }\n"
             "http_get_200() { return 0; }\n"
             "discard_temporary() { return 0; }\n"
             "preview_state_from_file() {\n"
@@ -1078,6 +1103,86 @@ def test_an_unsupported_state_token_is_refused(tmp_path: Path, state: str) -> No
     )
 
     assert result.returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [
+        ("NaN as the state", b'{"state":NaN}'),
+        ("NaN elsewhere", b'{"state":"running","frames":NaN}'),
+        ("Infinity", b'{"state":"running","uptime":Infinity}'),
+        ("negative Infinity", b'{"state":"running","drift":-Infinity}'),
+    ],
+)
+def test_a_non_standard_numeric_constant_is_refused(
+    tmp_path: Path, label: str, payload: bytes
+) -> None:
+    """NaN, Infinity and -Infinity are Python extensions, not JSON.
+
+    ``json.loads`` accepts all three by default, so a document containing one
+    would parse and its ``state`` would be handed back as a deployment
+    baseline. A document that is not JSON is not a status document, and this
+    gateway does not get to decide what a non-standard token meant.
+    """
+    result = _parse_state(tmp_path, payload)
+
+    assert result.returncode != 0, label
+    assert result.stdout.strip() == "", label
+
+
+def test_an_unusable_document_is_refused_cleanly(tmp_path: Path) -> None:
+    """Refused, not crashed.
+
+    A parser that falls out of a type check with a traceback is still refusing,
+    but it refuses by accident: the next document that happens not to raise
+    would be accepted. It also puts a Python stack trace in front of an
+    operator who asked about a camera.
+    """
+    for payload in (
+        b'["state","running"]',
+        b'"running"',
+        b'{"state":3}',
+        b"{}",
+        b"",
+    ):
+        result = _parse_state(tmp_path, payload)
+
+        assert result.returncode == 1, payload
+        assert "Traceback" not in result.stderr, payload
+        assert result.stdout.strip() == "", payload
+
+
+def test_the_parser_decodes_strictly(tmp_path: Path) -> None:
+    """Invalid UTF-8 is refused, never repaired into something plausible.
+
+    ``errors="replace"`` turns an undecodable byte into U+FFFD and hands back a
+    document that parses — so a corrupted response would yield a state.
+    """
+    body = _function_body("preview_state_from_file()", "# Stable, transient")
+    decode = [line for line in body.splitlines() if ".decode(" in line]
+
+    assert decode == ['    text = raw.decode("utf-8")'], decode
+    assert _parse_state(tmp_path, b'{"state":"run\xffning"}').returncode != 0
+
+
+def test_the_parser_refuses_constants_explicitly() -> None:
+    """Refused by contract, not by whatever the interpreter happens to do."""
+    body = _function_body("preview_state_from_file()", "# Stable, transient")
+
+    assert "parse_constant=refuse_constant" in body
+    assert "raise ValueError" in body
+
+
+def test_the_parser_runs_in_an_isolated_interpreter() -> None:
+    """PYTHONINSPECT, PYTHONSTARTUP and PYTHONWARNINGS all change a run.
+
+    ``-I`` implies ``-E``, so every PYTHON* variable is ignored, and the user
+    site directory is left out — belt and braces alongside the constructed
+    environment the whole process already runs in.
+    """
+    body = _function_body("preview_state_from_file()", "# Stable, transient")
+
+    assert '"$MGO_ENV_COMMAND" -i "$parser" -I -c' in body
 
 
 def test_the_state_parser_is_not_grep() -> None:
@@ -1175,9 +1280,14 @@ def _curl_double(status: str, *, body: str = "{}", fail: bool = False) -> str:
     by ``--output`` and prints ``--write-out`` on stdout, which is exactly what
     the gateway relies on to separate the status from the body.
     """
+    # The response body goes to a real temporary file, but not to the fixed
+    # production directory, which does not exist on a development host. The
+    # contract that the *shipped* helper names that directory explicitly is
+    # asserted separately.
+    temporary = "make_temporary_file() { command mktemp; }\n"
     if fail:
-        return "curl() { return 7; }\n"
-    return (
+        return temporary + "curl() { return 7; }\n"
+    return temporary + (
         "curl() {\n"
         "    local out=\"\"\n"
         "    while [[ $# -gt 0 ]]; do\n"
@@ -1326,9 +1436,14 @@ def test_no_probe_follows_a_redirect() -> None:
             for line in _function_body(name, following).splitlines()
             if not line.strip().startswith("#")
         )
-        assert "--location" not in body, name
-        assert " -L " not in body, name
         assert "--max-time" in body, name
+        # Both halves: nothing that follows a redirect, and the two options
+        # that refuse to. Asserting only the absence would be satisfied by a
+        # probe that had simply lost its refusals.
+        assert "--location" not in body.replace("--no-location", ""), name
+        assert " -L " not in body, name
+        assert "--no-location" in body, name
+        assert "--max-redirs 0" in body, name
 
 
 def test_every_probe_captures_the_status_explicitly() -> None:
@@ -1347,7 +1462,7 @@ def test_response_bodies_go_to_temporary_files_that_are_removed() -> None:
         ("start_preview()", "# The physical producer contract"),
     ):
         body = _function_body(name, following)
-        assert "mktemp" in body, name
+        assert "make_temporary_file" in body, name
         assert "discard_temporary" in body, name
 
 
@@ -1800,7 +1915,19 @@ def test_restart_api_requires_the_deployed_commit_to_be_approved() -> None:
 
 
 def test_the_install_action_is_rejected() -> None:
-    """The ambiguous verb is gone, and says where each meaning went."""
+    """The ambiguous verb is gone, and says where each meaning went.
+
+    Executed, not only described: a refusal that exists in the text but is not
+    reached — because the word slipped back into the accepted set — refuses
+    nothing.
+    """
+    result = run_bash(f'"{_posix(GATEWAY)}" install')
+
+    assert result.returncode == EX_REQUEST
+    assert "has been removed" in result.stderr
+    assert "deploy-main" in result.stderr
+    assert "install-service-identity.sh" in result.stderr
+
     source = _read(GATEWAY)
     index = source.index("        install)")
     body = source[index : index + 600]
@@ -1912,6 +2039,11 @@ def test_a_busy_control_plane_refuses_rather_than_waits(tmp_path: Path) -> None:
 
     assert result.returncode == EX_BUSY
     assert "already in progress" in result.stderr
+    # The double answers "busy" however it is called, so the option that makes
+    # the real flock non-blocking is asserted on the shipped text: without it
+    # the second caller would wait instead of reporting.
+    body = _function_body("acquire_transaction_lock()", "# --- approval file")
+    assert "flock -n" in body
 
 
 def test_an_uncontended_lock_is_acquired(tmp_path: Path) -> None:
@@ -2469,6 +2601,19 @@ def test_restart_api_accepts_an_approved_main() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_restart_api_refuses_a_checkout_behind_its_approved_upstream() -> None:
+    """The deployed commit must be the approved one, not merely related to it.
+
+    A branch tracking the right remote at the right SHA can still have a
+    working copy sitting behind it. Restarting that would launder an
+    unapproved commit into service while every ref check agreed.
+    """
+    result = _restart_preconditions(head="b" * 40, upstream_sha=APPROVED_SHA)
+
+    assert result.returncode == EX_PRECONDITION
+    assert "not the approved SHA" in result.stderr
+
+
 def test_restart_api_accepts_an_approved_feature_branch() -> None:
     """Pi validation of an approved feature SHA no longer needs bespoke steps."""
     result = _restart_preconditions(
@@ -2648,9 +2793,15 @@ def test_final_verification_refuses_every_wrong_end_state(
 
 
 def test_final_verification_refuses_a_preview_that_should_not_be_running() -> None:
-    """A previously stopped preview must not be running at the end."""
+    """A previously stopped preview must not be running at the end.
+
+    The producer count is deliberately consistent with the reported state, so
+    that this exercises the state comparison alone. With a producer running too
+    the orphan-producer check below would catch it first, and the comparison
+    could be deleted unnoticed.
+    """
     result = _final_verification(
-        expected_preview="stopped", preview="running", rpicam=1
+        expected_preview="stopped", preview="running", rpicam=0
     )
 
     assert result.returncode != 0
@@ -2707,7 +2858,16 @@ def test_every_cleanliness_check_includes_untracked_files() -> None:
     source = _read(GATEWAY)
 
     assert "--untracked-files=no" not in source
-    assert source.count("--untracked-files=all") >= 4
+    # Every executable ``status --porcelain`` carries the flag, checked by
+    # pairing the counts rather than by a lower bound. A lower bound is
+    # satisfied by dropping one of them, and dropping one is exactly the defect
+    # this asserts against: one place reading a different cleanliness from the
+    # rest. Comment lines are stripped because they name the flag too.
+    body = "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith("#")
+    )
+    assert body.count("status --porcelain") == 7
+    assert body.count("--untracked-files=all") == 7
 
 
 # --------------------------------------------------------------------------
@@ -2790,6 +2950,11 @@ def test_a_rollback_verifies_rather_than_assumes(
     assert "rev-parse HEAD" in body
     assert "branch --show-current" in body
     assert "status --porcelain" in body
+    # And the values are actually compared. Reading three facts and then not
+    # looking at them is how "verifies" quietly becomes "assumes".
+    assert '"$head" != "$previous_sha"' in body
+    assert '"$current_branch" != "$branch"' in body
+    assert '-n "$porcelain"' in body
 
 
 def test_only_the_rollback_path_uses_reset() -> None:
@@ -2918,7 +3083,21 @@ def test_the_rollback_handlers_take_their_target_only_from_their_caller() -> Non
 
 def test_no_production_value_falls_back_to_the_environment() -> None:
     """``${VAR:-default}`` is how a fixed constant quietly becomes tunable."""
-    allowed = {"${SUDO_USER:-}", "${1:-}", "${BASH_SOURCE[0]}"}
+    allowed = {
+        "${SUDO_USER:-}",
+        "${1:-}",
+        "${BASH_SOURCE[0]}",
+        # The environment boundary reads these three in order to *replace*
+        # them, and tolerates their absence rather than tripping ``set -u``.
+        "${PATH:-}",
+        "${HOME:-}",
+        "${LC_ALL:-}",
+        "${TMPDIR:-}",
+        "${MGO_ENVIRONMENT_CONSTRUCTED:-}",
+        # The established parameter-for-testability pattern: the default is the
+        # production constant, and no production call site passes an argument.
+        "${1:-$MGO_ROOT_TMPDIR}",
+    }
     for line in _read(GATEWAY).splitlines():
         stripped = line.strip()
         if stripped.startswith("#") or ":-" not in stripped:
@@ -3007,8 +3186,22 @@ def test_every_shell_asset_uses_strict_mode(asset: Path) -> None:
     """Strict mode is the repository's standing convention for shell."""
     text = _read(asset)
 
-    assert text.startswith("#!/usr/bin/env bash")
     assert "set -Eeuo pipefail" in text or "set -euo pipefail" in text
+
+
+@pytest.mark.parametrize("asset", SHELL_ASSETS, ids=lambda path: path.name)
+def test_every_shell_asset_names_a_fixed_interpreter(asset: Path) -> None:
+    """``/usr/bin/env bash`` picks the interpreter out of the environment.
+
+    The kernel runs env, which searches an inherited PATH for something called
+    bash — so the choice of interpreter would be made by the caller's
+    environment before a single statement of the script could sanitise
+    anything. Isolation has to begin at process entry.
+    """
+    text = _read(asset)
+
+    assert text.startswith("#!/bin/bash\n"), text.splitlines()[0]
+    assert "#!/usr/bin/env bash" not in text.splitlines()[0]
 
 
 @pytest.mark.parametrize("asset", SHELL_ASSETS, ids=lambda path: path.name)
@@ -3174,8 +3367,9 @@ def _install_pair(
         f'source "{_posix(INSTALLER)}"\n'
         "set +e\n"
         f"{INSTALLER_DOUBLES}\n"
-        # install(1) is doubled, so the transaction directory is made directly.
-        "open_transaction_directory() { mkdir -p \"$1\"; }\n"
+        # install(1) is doubled, so the transaction parent is made directly.
+        # The per-run workspace inside it is created by the shipped function.
+        'open_transaction_parent() { mkdir -p "$1"; }\n'
         f"{extra}\n"
         "install_pair "
         f'"{_posix(gateway_source)}" "{_posix(gateway_target)}" "0755" '
@@ -3219,6 +3413,18 @@ def test_the_installer_installs_both_targets(tmp_path: Path) -> None:
             '    [[ -f "$1" ]] || return 1\n'
             '    case "$1" in\n'
             "        */dst/*) printf 'nomatch\\n' ;;\n"
+            '        *) command sha256sum "$1" | awk \'{ print $1 }\' ;;\n'
+            "    esac\n}",
+        ),
+        # Scoped to the gateway target alone, for the mirror-image reason: a
+        # double that fails both would be caught by the sudoers branch, so the
+        # gateway verification could be deleted unnoticed.
+        (
+            "gateway-only post-install checksum",
+            "file_checksum() {\n"
+            '    [[ -f "$1" ]] || return 1\n'
+            '    case "$1" in\n'
+            "        */dst/mgo-validate) printf 'nomatch\\n' ;;\n"
             '        *) command sha256sum "$1" | awk \'{ print $1 }\' ;;\n'
             "    esac\n}",
         ),
@@ -3553,7 +3759,7 @@ def test_the_transaction_directory_is_root_owned_and_private() -> None:
     assert 'readonly TRANSACTION_DIRECTORY="/run/mgo-validate-install"' in source
     assert "install -d -o root -g root -m 0700" in source
     assert "/etc/sudoers.d" not in _installer_function_body(
-        "open_transaction_directory()", "# Record a target's"
+        "open_transaction_parent()", "# This run's own workspace"
     )
 
 
@@ -3562,7 +3768,7 @@ def test_a_transaction_directory_failure_stops_before_mutation(
 ) -> None:
     """No scratch space, no transaction."""
     result, gateway, _sudoers = _install_pair(
-        tmp_path, extra="open_transaction_directory() { return 1; }"
+        tmp_path, extra="open_transaction_parent() { return 1; }"
     )
     calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
 
@@ -3575,7 +3781,7 @@ def test_a_transaction_directory_failure_stops_before_mutation(
 def test_a_cleanup_failure_after_success_is_not_success(tmp_path: Path) -> None:
     """A run that left the previous policy on disk has not finished."""
     result, _gateway, _sudoers = _install_pair(
-        tmp_path, extra="close_transaction_directory() { return 1; }"
+        tmp_path, extra="close_transaction_workspace() { return 1; }"
     )
 
     assert "outcome=1" in result.stdout
@@ -3588,7 +3794,7 @@ def test_a_cleanup_failure_after_rollback_is_reported(tmp_path: Path) -> None:
         tmp_path,
         extra=(
             "policy_is_valid() { return 1; }\n"
-            "close_transaction_directory() { return 1; }"
+            "close_transaction_workspace() { return 1; }"
         ),
         existing_gateway="old\n",
         existing_sudoers="# old\n",
@@ -3601,13 +3807,18 @@ def test_a_cleanup_failure_after_rollback_is_reported(tmp_path: Path) -> None:
 def test_a_successful_installation_leaves_no_transaction_artefacts(
     tmp_path: Path,
 ) -> None:
-    """Nothing of the transaction survives it."""
+    """Nothing of this run's transaction survives it.
+
+    The parent remains — it is a fixed, root-owned 0700 directory, not an
+    artefact — but it is empty, which is what the next run requires in order to
+    conclude that no previous run was interrupted.
+    """
     result, _gateway, _sudoers = _install_pair(
         tmp_path, existing_gateway="old\n", existing_sudoers="# old\n"
     )
 
     assert "outcome=0" in result.stdout, result.stderr
-    assert not (tmp_path / "transaction").exists()
+    assert list((tmp_path / "transaction").iterdir()) == []
 
 
 def test_a_successful_rollback_leaves_no_transaction_artefacts(
@@ -3622,13 +3833,28 @@ def test_a_successful_rollback_leaves_no_transaction_artefacts(
     )
 
     assert "outcome=1" in result.stdout
-    assert not (tmp_path / "transaction").exists()
+    assert list((tmp_path / "transaction").iterdir()) == []
+
+
+def _without_comments(text: str) -> str:
+    """Executable lines only.
+
+    The comments here explain the very flags being asserted, so a text check
+    over the whole function passes on the prose after the code has lost them.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.strip().startswith("#")
+    )
 
 
 def test_a_restoration_preserves_numeric_owner_group_and_mode() -> None:
     """Restoring an approximation of the file is not restoring the file."""
-    body = _installer_function_body("record_previous()", "restore_one()")
-    restore = _installer_function_body("restore_one()", "# Both targets, always")
+    body = _without_comments(
+        _installer_function_body("record_previous()", "restore_one()")
+    )
+    restore = _without_comments(
+        _installer_function_body("restore_one()", "# Both targets, always")
+    )
 
     assert "--preserve=all" in body
     assert "--no-dereference" in body
@@ -3694,33 +3920,43 @@ def _installer_function_body(name: str, next_name: str) -> str:
 
 
 def _dry_run(tmp_path: Path, *, visudo: str) -> subprocess.CompletedProcess[str]:
-    """Run a dry run with a deterministic fake ``visudo`` on PATH.
+    """Run a dry run with a deterministic ``visudo`` outcome.
 
-    A fake executable rather than a shell function, because the installer asks
-    ``command -v`` whether the tool exists at all — which is the property under
-    test.
+    The installer no longer honours a caller-supplied PATH — that is the point
+    of the process-entry boundary — so a fake executable dropped into a
+    temporary directory can no longer be reached. The three outcomes are
+    therefore driven at the two points the installer actually consults:
+    ``command -v visudo`` for presence and ``visudo -cf`` for validity. That
+    ``command -v`` is what decides presence is asserted separately, on the
+    shipped text.
     """
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    if visudo != "absent":
-        exit_code = 0 if visudo == "valid" else 1
-        path = fake_bin / "visudo"
-        path.write_bytes(f"#!/usr/bin/env bash\nexit {exit_code}\n".encode())
-        # chmod through bash, not Python: on Windows os.chmod only toggles the
-        # read-only attribute, and Git Bash would not treat the file as
-        # executable, so ``command -v`` would report it missing.
-        run_bash(f'chmod +x "{_posix(path)}"')
-
-    # A drive-lettered path cannot go on PATH as-is: the colon after the drive
-    # letter is the PATH separator, so "C:/x" is searched as "C" and "/x".
-    return run_bash(
-        f"fake_bin='{_posix(fake_bin)}'\n"
-        "if command -v cygpath >/dev/null 2>&1; then\n"
-        '    fake_bin="$(cygpath -u "$fake_bin")"\n'
-        "fi\n"
-        'export PATH="$fake_bin:$PATH"\n'
-        f'"{_posix(INSTALLER)}" --dry-run\n'
+    present = "0" if visudo != "absent" else "1"
+    doubles = (
+        'command() {\n'
+        f'    if [[ "$1" == "-v" ]]; then return {present}; fi\n'
+        '    builtin command "$@"\n'
+        "}\n"
     )
+    if visudo != "absent":
+        doubles += f"visudo() {{ return {0 if visudo == 'valid' else 1}; }}\n"
+
+    return run_bash(
+        "set +e\n"
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        f"{doubles}"
+        f'run_installation "{_posix(GATEWAY)}" "{_posix(tmp_path / "gw")}" "0755" '
+        f'"{_posix(SUDOERS)}" "{_posix(tmp_path / "policy")}" "0440" 1 1000 '
+        f'"{_posix(tmp_path / "transaction")}" "{_posix(tmp_path / "lock")}"\n'
+    )
+
+
+def test_the_presence_of_visudo_is_decided_by_command_v() -> None:
+    """Presence is asked of the shell, not assumed from a path."""
+    body = _installer_function_body("run_installation()", "main()")
+
+    assert "command -v visudo" in body
+    assert body.index("command -v visudo") < body.index("visudo -cf")
 
 
 def test_a_dry_run_with_a_valid_policy_reports_and_changes_nothing(
@@ -3796,6 +4032,854 @@ def test_the_installer_is_separate_from_service_identity_provisioning() -> None:
     identity = _read(DEPLOY_DIRECTORY / "install-service-identity.sh")
 
     assert "mgo-validate" not in identity
+
+
+# --------------------------------------------------------------------------
+# the root temporary directory
+# --------------------------------------------------------------------------
+
+
+def _directory_stat_double(owner: str = "0:0", mode: str = "700") -> str:
+    """Drive numeric ownership and mode for a directory on any filesystem.
+
+    Windows has no POSIX owner or mode, and a developer's real values are
+    irrelevant to the contract: what matters is that the shipped logic refuses
+    the combinations it is shown. On the Raspberry Pi these execute against the
+    kernel's own answers.
+    """
+    return (
+        "stat() {\n"
+        '    case "$2" in\n'
+        f"        '%u:%g') printf '{owner}\\n' ;;\n"
+        f"        '%a') printf '{mode}\\n' ;;\n"
+        "        *) printf '\\n' ;;\n"
+        "    esac\n"
+        "}\n"
+    )
+
+
+NAME = "mgo-validate-tmp"
+
+
+def _prepare_tmpdir(
+    parent: Path,
+    *,
+    owner: str = "0:0",
+    mode: str = "700",
+) -> subprocess.CompletedProcess[str]:
+    """Prepare a temporary directory under a parent, as the shipped code does.
+
+    The parent is resolved to the path ``pwd -P`` reports, because that is what
+    the shipped physical-path proof compares against — on this host a
+    drive-lettered path and its POSIX form name the same directory by different
+    strings, and the production constant is already the physical one.
+    """
+    return call_gateway_function(
+        f'parent="$(cd "{_posix(parent)}" && pwd -P)" || parent="{_posix(parent)}"\n'
+        f'prepare_root_tmpdir "$parent/{NAME}" "$parent"\n'
+        'printf "outcome=%s TMPDIR=%s\\n" "$?" "${TMPDIR:-<unset>}"',
+        preamble=_directory_stat_double(owner=owner, mode=mode),
+    )
+
+
+def test_an_absent_temporary_directory_is_created_privately(tmp_path: Path) -> None:
+    """Absence is handled by creating it, privately, before it is trusted."""
+    parent = tmp_path / "run"
+    parent.mkdir()
+
+    result = _prepare_tmpdir(parent)
+
+    assert "outcome=0" in result.stdout, result.stderr
+    assert (parent / NAME).is_dir()
+    assert "TMPDIR=" in result.stdout
+    assert result.stdout.strip().endswith(f"/{NAME}")
+
+
+def test_the_temporary_directory_is_created_in_one_step(tmp_path: Path) -> None:
+    """The umask applies at creation, so there is no window at a wider mode.
+
+    A ``mkdir`` followed by a ``chmod`` publishes the directory first and
+    secures it afterwards, and anything that entered in between is already in.
+    """
+    body = _function_body("create_root_tmpdir()", "# Establish the temporary")
+
+    assert "umask 0077" in body
+    assert "chmod" not in body
+    assert body.index("umask 0077") < body.index("mkdir")
+
+    # And it executes: the shipped function creates the directory for real.
+    path = tmp_path / "mgo-validate-tmp"
+    result = call_gateway_function(f'create_root_tmpdir "{_posix(path)}"')
+
+    assert result.returncode == 0, result.stderr
+    assert path.is_dir()
+
+
+def test_a_root_owned_private_temporary_directory_is_accepted(
+    tmp_path: Path,
+) -> None:
+    """The positive case, so the refusals below mean something."""
+    parent = tmp_path / "run"
+    parent.mkdir()
+    (parent / NAME).mkdir()
+
+    result = _prepare_tmpdir(parent)
+
+    assert "outcome=0" in result.stdout, result.stderr
+
+
+@pytest.mark.parametrize("owner", ["1000:1000", "0:1000", "1000:0"])
+def test_a_temporary_directory_owned_by_another_account_is_refused(
+    tmp_path: Path, owner: str
+) -> None:
+    """Anything an unprivileged account owns, it can also replace."""
+    parent = tmp_path / "run"
+    parent.mkdir()
+    (parent / NAME).mkdir()
+
+    result = _prepare_tmpdir(parent, owner=owner)
+
+    assert result.returncode == EX_PRECONDITION, owner
+    assert "root-owned 0700 directory" in result.stderr
+
+
+@pytest.mark.parametrize("mode", ["755", "750", "770", "777", "701", "600"])
+def test_a_temporary_directory_with_any_other_mode_is_refused(
+    tmp_path: Path, mode: str
+) -> None:
+    """Exactly 0700, not "no wider than": a mode is a value, not a range."""
+    parent = tmp_path / "run"
+    parent.mkdir()
+    (parent / NAME).mkdir()
+
+    result = _prepare_tmpdir(parent, mode=mode)
+
+    assert result.returncode == EX_PRECONDITION, mode
+
+
+def test_a_regular_file_where_the_temporary_directory_belongs_is_refused(
+    tmp_path: Path,
+) -> None:
+    """A real filesystem execution of the single check that refuses four types.
+
+    ``-d`` is what separates a directory from a regular file, a FIFO, a socket
+    and a device: one check, one refusal, and this executes it for the one of
+    the four a Windows filesystem can actually produce. All four execute during
+    Raspberry Pi validation.
+    """
+    parent = tmp_path / "run"
+    parent.mkdir()
+    path = parent / NAME
+    path.write_bytes(b"not a directory\n")
+
+    result = _prepare_tmpdir(parent)
+
+    assert result.returncode == EX_PRECONDITION, result.stdout
+    assert "root-owned 0700 directory" in result.stderr
+    assert path.read_bytes() == b"not a directory\n"
+
+
+def test_a_temporary_directory_symlink_is_refused_before_anything_follows_it() -> None:
+    """``-d`` follows a symlink; ``-L`` is what refuses one.
+
+    Asserted on the shipped text because this filesystem will not create a
+    symlink. The ordering is the whole property: the old code proved the path
+    was a directory with ``-d`` — which a link to one satisfies — and then
+    applied ``chmod`` to whatever the link pointed at.
+    """
+    prepare = _function_body("prepare_root_tmpdir()", "# One tracked temporary file")
+    secure = _function_body("require_secure_root_tmpdir()", "# Create it private")
+
+    assert prepare.index('-L "$path"') < prepare.index("create_root_tmpdir")
+    assert prepare.index('-L "$path"') < prepare.index("require_secure_root_tmpdir")
+    assert secure.index('! -L "$path"') < secure.index('-d "$path"')
+
+
+def test_the_temporary_directory_is_never_repaired() -> None:
+    """An unsafe object is refused, not adopted.
+
+    Repairing it would mean this gateway asserting ownership of a directory
+    something else created, which is a decision for an operator.
+    """
+    for name, following in (
+        ("require_secure_root_tmpdir()", "# Create it private"),
+        ("create_root_tmpdir()", "# Establish the temporary"),
+        ("prepare_root_tmpdir()", "# One tracked temporary file"),
+    ):
+        body = _function_body(name, following)
+        assert "chmod" not in body, name
+        assert "chown" not in body, name
+        assert "rm " not in body, name
+
+
+def test_the_temporary_directory_parent_must_be_its_physical_path(
+    tmp_path: Path,
+) -> None:
+    """A symlinked ``/run`` would move every response body somewhere else.
+
+    The failure is executed for real: an unresolvable parent stops the check
+    before ownership is ever read.
+    """
+    parent = tmp_path / "absent"
+
+    result = _prepare_tmpdir(parent)
+
+    assert result.returncode == EX_PRECONDITION
+    body = _function_body("require_secure_root_tmpdir()", "# Create it private")
+    assert "pwd -P" in body
+    assert '"$canonical" == "$parent"' in body
+
+
+def test_a_caller_tmpdir_cannot_choose_where_a_temporary_file_goes(
+    tmp_path: Path,
+) -> None:
+    """``--tmpdir=`` states the location at the call site."""
+    fixed = tmp_path / "fixed"
+    fixed.mkdir()
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+
+    result = call_gateway_function(
+        f'make_temporary_file "{_posix(fixed)}"',
+        preamble=f'export TMPDIR="{_posix(hostile)}"\n',
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().startswith(_posix(fixed))
+    assert list(hostile.iterdir()) == []
+    assert len(list(fixed.iterdir())) == 1
+
+
+def test_every_temporary_file_is_named_relative_to_the_fixed_directory() -> None:
+    """No bare ``mktemp`` survives: a bare one consults TMPDIR."""
+    body = _function_body("make_temporary_file()", "# --- caller and privilege")
+    assert '--tmpdir="$directory"' in body
+    assert 'directory="${1:-$MGO_ROOT_TMPDIR}"' in body
+
+    for line in _read(GATEWAY).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "mktemp" not in stripped:
+            continue
+        assert "--tmpdir=" in stripped, stripped
+
+
+def test_show_approval_prepares_nothing_and_changes_nothing() -> None:
+    """A read-only action must not create a directory, a lock or a file."""
+    body = _function_body("main()", "# Program when executed")
+    dispatch = body[body.index("# The temporary directory is prepared per action") :]
+    show = dispatch[dispatch.index("show-approval)") : dispatch.index("deploy-main)")]
+
+    assert "prepare_root_tmpdir" not in show
+    assert "acquire_transaction_lock" not in show
+    # Prepared per action, and only for the two that mutate anything.
+    assert body.count("prepare_root_tmpdir") == 2
+
+    action = _function_body("action_show_approval()", "action_restart_api()")
+    for forbidden in ("mktemp", "mkdir", "acquire_transaction_lock", "chmod"):
+        assert forbidden not in action, forbidden
+
+
+def test_a_failed_temporary_directory_cleanup_is_not_success() -> None:
+    """Cleanup failure remains non-zero, wherever it happens."""
+    result = call_gateway_function(
+        'endpoint_is_ok "http://127.0.0.1:8080/health"',
+        preamble=_curl_double("200") + "discard_temporary() { return 1; }\n",
+    )
+
+    assert result.returncode != 0
+
+
+# --------------------------------------------------------------------------
+# environment isolation at process entry
+# --------------------------------------------------------------------------
+
+
+HOSTILE_PROCESS_ENVIRONMENT = {
+    "BASH_ENV": "/tmp/evil-bashenv.sh",
+    "ENV": "/tmp/evil-env.sh",
+    "PYTHONINSPECT": "1",
+    "PYTHONSTARTUP": "/tmp/evil-startup.py",
+    "PYTHONWARNINGS": "error",
+    "PYTHONPATH": "/tmp/evil",
+    "PYTHONHOME": "/tmp/evil",
+    "GIT_DIR": "/tmp/evil.git",
+    "GIT_WORK_TREE": "/tmp/evil",
+    "GIT_SSH_COMMAND": "ssh -i /tmp/evil",
+    "UV_PROJECT": "/tmp/evil",
+    "UV_CONFIG_FILE": "/tmp/evil.toml",
+    "VIRTUAL_ENV": "/tmp/evil-venv",
+    "CURL_HOME": "/tmp/evil",
+    "TMPDIR": "/tmp/evil-tmp",
+    "LD_LIBRARY_PATH": "/tmp/evil-lib",
+    # LD_PRELOAD is deliberately absent from this map. It is honoured by the
+    # loader before the interpreter starts, so a hostile value does not produce
+    # a script that behaves wrongly — it produces no interpreter at all, which
+    # no script can defend against from the inside. It is unset at the root
+    # boundary and asserted in the register test instead.
+    "SSH_AUTH_SOCK": "/tmp/evil.sock",
+    "HTTP_PROXY": "http://evil",
+    "HTTPS_PROXY": "http://evil",
+    "ALL_PROXY": "http://evil",
+    "MGO_EVIL": "1",
+}
+
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _entry_probe(tmp_path: Path, asset: Path, *, marker: str = "") -> Path:
+    """A program that reports the environment its ``main`` actually runs in.
+
+    It sources the shipped asset and replaces the first thing ``main`` calls
+    after constructing the environment, so what is printed is the environment
+    every later command would inherit. The re-execution names ``$0``, which is
+    this probe, so the probe is what runs again — exercising the shipped
+    re-execution rather than describing it.
+    """
+    probe = tmp_path / "probe.sh"
+    probe.write_bytes(
+        (
+            "#!/bin/bash\n"
+            "set +e\n"
+            f'source "{_posix(asset)}"\n'
+            "set +e\n"
+            f"{marker}"
+            "_report() {\n"
+            "    compgen -e | sort | tr '\\n' ' '\n"
+            '    printf "\\nPATH=%s\\nHOME=%s\\nLC_ALL=%s\\nTMPDIR=%s\\n" \\\n'
+            '        "$PATH" "$HOME" "${LC_ALL:-<unset>}" "${TMPDIR:-<unset>}"\n'
+            "    exit 0\n"
+            "}\n"
+            "require_root_caller() { _report; }\n"
+            "run_installation() { _report; }\n"
+            'main "$@"\n'
+        ).encode()
+    )
+    return probe
+
+
+def _run_probe(
+    probe: Path, *, extra: dict[str, str] | None = None, argument: str = "show-approval"
+) -> subprocess.CompletedProcess[str]:
+    import os
+
+    environment = dict(os.environ)
+    environment.update(HOSTILE_PROCESS_ENVIRONMENT)
+    environment["PATH"] = "/tmp/evil-bin:" + environment.get("PATH", "")
+    if extra:
+        environment.update(extra)
+    return subprocess.run(
+        [_bash(), _posix(probe), argument],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("asset", "argument"),
+    [(GATEWAY, "show-approval"), (INSTALLER, "--dry-run")],
+    ids=["gateway", "installer"],
+)
+def test_no_inherited_variable_survives_into_operational_execution(
+    tmp_path: Path, asset: Path, argument: str
+) -> None:
+    """Twenty-two hostile variables, none of which reaches a command.
+
+    Each of these steers something real: the interpreter, the repository, the
+    index, the SSH key, the parser, the loader, the proxy, or where temporary
+    files are written. Unsetting a named list would leave whatever the list
+    forgot; starting from an empty environment leaves nothing.
+    """
+    probe = _entry_probe(tmp_path, asset)
+    result = _run_probe(probe, argument=argument)
+    exported = result.stdout.splitlines()[0].split()
+
+    assert result.returncode == 0, result.stderr
+    for variable in HOSTILE_PROCESS_ENVIRONMENT:
+        assert variable not in exported, variable
+    assert f"PATH={SAFE_PATH}" in result.stdout
+    assert "HOME=/root" in result.stdout
+    assert "LC_ALL=C" in result.stdout
+    assert "TMPDIR=<unset>" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("asset", "argument"),
+    [(GATEWAY, "show-approval"), (INSTALLER, "--dry-run")],
+    ids=["gateway", "installer"],
+)
+def test_an_inherited_path_cannot_choose_which_executable_runs(
+    tmp_path: Path, asset: Path, argument: str
+) -> None:
+    """PATH decides which git, which curl, which python3 and which stat."""
+    probe = _entry_probe(tmp_path, asset)
+    result = _run_probe(probe, argument=argument)
+
+    assert result.returncode == 0, result.stderr
+    assert f"PATH={SAFE_PATH}" in result.stdout
+    assert "/tmp/evil-bin" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("asset", "marker", "argument"),
+    [
+        (GATEWAY, 'export MGO_ENVIRONMENT_CONSTRUCTED="1"\n', "show-approval"),
+        (
+            INSTALLER,
+            'export MGO_INSTALL_ENVIRONMENT_CONSTRUCTED="1"\n',
+            "--dry-run",
+        ),
+    ],
+    ids=["gateway", "installer"],
+)
+def test_presenting_the_marker_does_not_skip_construction(
+    tmp_path: Path, asset: Path, marker: str, argument: str
+) -> None:
+    """The marker only prevents a second re-execution.
+
+    If it were trusted as permission to skip sanitisation, a caller could set
+    it alongside a hostile PATH and keep the whole environment. Instead the
+    process asserts the three fixed values itself and removes everything else,
+    so a forged marker buys nothing.
+    """
+    probe = _entry_probe(tmp_path, asset, marker=marker)
+    result = _run_probe(probe, argument=argument)
+    exported = result.stdout.splitlines()[0].split()
+
+    assert result.returncode == 0, result.stderr
+    for variable in HOSTILE_PROCESS_ENVIRONMENT:
+        assert variable not in exported, variable
+    assert f"PATH={SAFE_PATH}" in result.stdout
+    assert "HOME=/root" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("asset", "argument"),
+    [(GATEWAY, "show-approval"), (INSTALLER, "--dry-run")],
+    ids=["gateway", "installer"],
+)
+def test_an_environment_that_looks_constructed_is_still_verified(
+    tmp_path: Path, asset: Path, argument: str
+) -> None:
+    """The three fixed values are necessary, not sufficient.
+
+    A caller who sets PATH, HOME and LC_ALL to exactly the right values, and
+    one hostile variable alongside them, would pass a check that only compared
+    those three. What makes the answer "this is the constructed environment" is
+    that *nothing else is exported* — which is why the check is an allowlist
+    over the whole environment rather than three comparisons.
+
+    The witness is deliberately a variable **no denylist names**. GIT_DIR would
+    prove nothing here: it is in the explicit unset register, so it would go
+    whether or not the allowlist worked. What an allowlist buys is the variable
+    nobody thought of.
+    """
+    probe = _entry_probe(tmp_path, asset)
+    result = _run_probe(
+        probe,
+        extra={"PATH": SAFE_PATH, "HOME": "/root", "LC_ALL": "C", "MGO_EVIL": "1"},
+        argument=argument,
+    )
+    exported = result.stdout.splitlines()[0].split()
+
+    assert result.returncode == 0, result.stderr
+    assert "MGO_EVIL" not in exported
+    assert "GIT_DIR" not in exported
+
+
+def test_a_bash_env_file_does_not_reach_the_operational_process(
+    tmp_path: Path,
+) -> None:
+    """BASH_ENV is read by the interpreter before a script's first statement.
+
+    Nothing the script does could undo that, which is precisely why the
+    operational work happens in a second process started from an empty
+    environment. The evidence is that the file is sourced once, not twice: the
+    re-executed interpreter never sees BASH_ENV at all.
+    """
+    marker = tmp_path / "sourced"
+    startup = tmp_path / "startup.sh"
+    startup.write_bytes(f'printf "x" >> "{_posix(marker)}"\n'.encode())
+    probe = _entry_probe(tmp_path, GATEWAY)
+
+    result = _run_probe(probe, extra={"BASH_ENV": _posix(startup)})
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == "x"
+    assert "BASH_ENV" not in result.stdout.splitlines()[0].split()
+
+
+@pytest.mark.parametrize("asset", [GATEWAY, INSTALLER], ids=lambda p: p.name)
+def test_shellopts_does_not_survive_the_boundary(
+    tmp_path: Path, asset: Path
+) -> None:
+    """An exported SHELLOPTS turns shell options on in every child shell."""
+    probe = _entry_probe(tmp_path, asset)
+    argument = "show-approval" if asset is GATEWAY else "--dry-run"
+
+    result = _run_probe(probe, extra={"SHELLOPTS": "noclobber"}, argument=argument)
+    exported = result.stdout.splitlines()[0].split()
+
+    assert result.returncode == 0, result.stderr
+    assert "SHELLOPTS" not in exported
+
+
+@pytest.mark.parametrize("asset", [GATEWAY, INSTALLER], ids=lambda p: p.name)
+def test_the_environment_boundary_is_an_allowlist(asset: Path) -> None:
+    """"Nothing else is here" is not a statement a denylist can make."""
+    source = _read(asset)
+
+    assert "PERMITTED_ENVIRONMENT" in source
+    assert "compgen -e" in source
+    assert "env -i" in source
+    # The interpreter and env(1) are both named absolutely: they are what
+    # construct the environment, so neither may be found through one.
+    assert '/bin/bash "$0"' in source
+    assert 'ENV_COMMAND="/usr/bin/env"' in source
+
+
+@pytest.mark.parametrize("asset", [GATEWAY, INSTALLER], ids=lambda p: p.name)
+def test_only_the_action_and_the_sudo_caller_cross_the_boundary(
+    asset: Path,
+) -> None:
+    """Everything else is rebuilt; these two are carried deliberately."""
+    source = _read(asset)
+    start = source.index("exec \"$")
+    boundary = source[start : source.index("/bin/bash \"$0\"", start)]
+
+    assert "SUDO_USER=${SUDO_USER:-}" in boundary
+    assert "LC_ALL=C" in boundary
+    assert "TMPDIR" not in boundary
+    # Named as the fixed constants, not passed through. "PATH=" alone would be
+    # satisfied by "PATH=$PATH", which is the whole defect.
+    if asset is GATEWAY:
+        assert "PATH=$MGO_SAFE_PATH" in boundary
+        assert "HOME=$MGO_ROOT_HOME" in boundary
+    else:
+        assert "PATH=$SAFE_PATH" in boundary
+        assert "HOME=$ROOT_HOME" in boundary
+
+
+def test_the_installer_does_not_rely_on_sudo_configuration() -> None:
+    """``env_reset`` and ``secure_path`` are optional; correctness is not."""
+    source = _read(INSTALLER)
+
+    assert f'readonly SAFE_PATH="{SAFE_PATH}"' in source
+    assert 'readonly ROOT_HOME="/root"' in source
+    assert "require_constructed_environment" in _installer_function_body(
+        "main()", "# Program when executed"
+    )
+
+
+# --------------------------------------------------------------------------
+# the installer transaction workspace
+# --------------------------------------------------------------------------
+
+
+EX_STALE = 65
+
+
+def _make_current(target: Path, content: bytes) -> None:
+    """Put `content` at `target`, tolerating a file a previous run installed.
+
+    Rewriting a file the shipped installer has just created through ``mv`` is
+    not always permitted on this filesystem, and the write is unnecessary when
+    the bytes already match — which is exactly the case in the sequenced tests
+    that install first and then run again.
+    """
+    if target.exists() and target.read_bytes() == content:
+        return
+    if target.exists():
+        target.chmod(0o600)
+        target.unlink()
+    target.write_bytes(content)
+
+
+def _run_installation(
+    tmp_path: Path,
+    *,
+    extra: str = "",
+    current: bool = True,
+    parent_owner: str = "0:0",
+    parent_mode: str = "700",
+    dry_run: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
+    """Run the shipped ``run_installation`` against temporary paths.
+
+    The lock is stubbed because it is exercised on its own elsewhere; the
+    transaction parent, its state and the per-run workspace are all real.
+    """
+    sources = tmp_path / "src"
+    targets = tmp_path / "dst"
+    transaction = tmp_path / "transaction"
+    sources.mkdir(exist_ok=True)
+    targets.mkdir(exist_ok=True)
+    gateway_source = sources / "mgo-validate"
+    sudoers_source = sources / "mgo-validate.sudoers"
+    gateway_source.write_bytes(b"#!/bin/bash\ntrue\n")
+    sudoers_source.write_bytes(b"claude ALL=(root) NOPASSWD: /x\n")
+    gateway_target = targets / "mgo-validate"
+    sudoers_target = targets / "mgo-validate.sudoers"
+    if current:
+        _make_current(gateway_target, gateway_source.read_bytes())
+        _make_current(sudoers_target, sudoers_source.read_bytes())
+
+    script = (
+        "set +e\n"
+        f'export CALL_LOG="{_posix(tmp_path / "calls.log")}"\n'
+        ': > "$CALL_LOG"\n'
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        f"{INSTALLER_DOUBLES}\n"
+        f"{_directory_stat_double(owner=parent_owner, mode=parent_mode)}\n"
+        "visudo() { return 0; }\n"
+        "command() {\n"
+        '    if [[ "$1" == "-v" ]]; then return 0; fi\n'
+        '    builtin command "$@"\n'
+        "}\n"
+        "acquire_transaction_lock() { return 0; }\n"
+        f"{extra}\n"
+        "run_installation "
+        f'"{_posix(gateway_source)}" "{_posix(gateway_target)}" "0755" '
+        f'"{_posix(sudoers_source)}" "{_posix(sudoers_target)}" "0440" '
+        f"{dry_run} 0 "
+        f'"{_posix(transaction)}" "{_posix(tmp_path / "lock")}"\n'
+        'printf "outcome=%s\\n" "$?"\n'
+    )
+    return run_bash(script), gateway_target, sudoers_target, transaction
+
+
+def test_a_clean_first_installation_succeeds(tmp_path: Path) -> None:
+    """Nothing installed, no transaction parent: the ordinary starting state."""
+    result, gateway, sudoers, transaction = _run_installation(
+        tmp_path, current=False
+    )
+
+    assert "outcome=0" in result.stdout, result.stdout + result.stderr
+    assert gateway.is_file()
+    assert sudoers.is_file()
+    assert list(transaction.iterdir()) == []
+
+
+def test_a_clean_idempotent_run_changes_nothing(tmp_path: Path) -> None:
+    """Both targets correct, policy valid, no stale state: verified."""
+    result, _gateway, _sudoers, _transaction = _run_installation(tmp_path)
+
+    assert "outcome=0" in result.stdout, result.stdout + result.stderr
+    assert "nothing changed" in result.stdout
+
+
+def test_stale_transaction_state_refuses_an_otherwise_idempotent_run(
+    tmp_path: Path,
+) -> None:
+    """"Both targets are correct" is not an answer to "a run did not finish".
+
+    This is the defect: a cleanup failure left the workspace behind, and the
+    next run reached its idempotent-success return before looking, reporting
+    "verified; nothing changed" over an unfinished transaction.
+    """
+    transaction = tmp_path / "transaction"
+    stale = transaction / "run.ABC123"
+    stale.mkdir(parents=True)
+    (stale / "previous.XYZ").write_bytes(b"# the previous sudoers policy\n")
+
+    result, _gateway, _sudoers, _transaction = _run_installation(tmp_path)
+
+    assert f"outcome={EX_STALE}" in result.stdout, result.stdout + result.stderr
+    assert "stale transaction state" in result.stderr
+    assert "nothing changed" not in result.stdout
+
+
+def test_a_stale_backup_file_alone_refuses_an_idempotent_run(
+    tmp_path: Path,
+) -> None:
+    """Any entry at all, not only a directory: a loose backup is evidence too."""
+    transaction = tmp_path / "transaction"
+    transaction.mkdir()
+    (transaction / "previous.ABC123").write_bytes(b"# the previous policy\n")
+
+    result, _gateway, _sudoers, _transaction = _run_installation(tmp_path)
+
+    assert f"outcome={EX_STALE}" in result.stdout, result.stdout + result.stderr
+    assert "stale transaction state" in result.stderr
+
+
+def test_stale_transaction_evidence_is_preserved_not_destroyed(
+    tmp_path: Path,
+) -> None:
+    """Removing it would destroy what an operator needs to understand it."""
+    transaction = tmp_path / "transaction"
+    stale = transaction / "run.ABC123"
+    stale.mkdir(parents=True)
+    backup = stale / "previous.XYZ"
+    backup.write_bytes(b"# the previous sudoers policy\n")
+
+    result, _gateway, _sudoers, _transaction = _run_installation(tmp_path)
+
+    assert f"outcome={EX_STALE}" in result.stdout
+    assert backup.read_bytes() == b"# the previous sudoers policy\n"
+    assert "preserved for inspection" in result.stderr
+
+
+def test_a_second_run_keeps_refusing_until_the_stale_state_is_resolved(
+    tmp_path: Path,
+) -> None:
+    """The refusal is not a one-off warning that clears itself."""
+    transaction = tmp_path / "transaction"
+    stale = transaction / "run.ABC123"
+    stale.mkdir(parents=True)
+    (stale / "previous.XYZ").write_bytes(b"# old\n")
+
+    first, _g, _s, _t = _run_installation(tmp_path)
+    second, _g2, _s2, _t2 = _run_installation(tmp_path)
+
+    assert f"outcome={EX_STALE}" in first.stdout
+    assert f"outcome={EX_STALE}" in second.stdout
+    assert stale.is_dir()
+
+
+def test_a_cleanup_failure_is_visible_to_the_next_run(tmp_path: Path) -> None:
+    """The two halves of the defect, in sequence.
+
+    A run whose cleanup fails exits non-zero and leaves its workspace behind;
+    the next run finds it and refuses instead of reporting a clean host.
+    """
+    first, _g, _s, transaction = _run_installation(
+        tmp_path,
+        current=False,
+        extra="close_transaction_workspace() { return 1; }",
+    )
+
+    # Not success, and the workspace survives — which holds whether the run
+    # reached its cleanup after installing (1) or after rolling back (78).
+    # Pinning the exact code here would make this test depend on whether a
+    # rename happened to succeed, which is not what it is about.
+    assert "outcome=0" not in first.stdout, first.stdout + first.stderr
+    assert list(transaction.iterdir()) != []
+
+    second, _g2, _s2, _t2 = _run_installation(tmp_path)
+
+    assert f"outcome={EX_STALE}" in second.stdout, second.stdout + second.stderr
+
+
+def test_each_run_gets_its_own_workspace(tmp_path: Path) -> None:
+    """Unique names, so one run's artefacts are never another's."""
+    transaction = tmp_path / "transaction"
+    transaction.mkdir()
+
+    result = run_bash(
+        "set +e\n"
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        f'open_transaction_workspace "{_posix(transaction)}"\n'
+        f'open_transaction_workspace "{_posix(transaction)}"\n'
+    )
+    workspaces = [line for line in result.stdout.splitlines() if line.strip()]
+
+    assert len(workspaces) == 2, result.stderr
+    assert workspaces[0] != workspaces[1]
+    assert len(list(transaction.iterdir())) == 2
+
+
+def test_a_run_never_removes_another_runs_workspace(tmp_path: Path) -> None:
+    """Cleanup is scoped to one tracked path — no pattern, no wildcard."""
+    transaction = tmp_path / "transaction"
+    foreign = transaction / "run.FOREIGN"
+    foreign.mkdir(parents=True)
+    (foreign / "previous.KEEP").write_bytes(b"# another run's evidence\n")
+
+    result = run_bash(
+        "set +e\n"
+        f'source "{_posix(INSTALLER)}"\n'
+        "set +e\n"
+        f'workspace="$(open_transaction_workspace "{_posix(transaction)}")"\n'
+        'close_transaction_workspace "$workspace"\n'
+        'printf "outcome=%s gone=%s\\n" "$?" "$([[ -e "$workspace" ]] || echo yes)"\n'
+    )
+
+    assert "outcome=0 gone=yes" in result.stdout, result.stdout + result.stderr
+    assert (foreign / "previous.KEEP").read_bytes() == b"# another run's evidence\n"
+
+    body = _installer_function_body(
+        "close_transaction_workspace()", "# Both targets, always"
+    )
+    assert 'rm -rf -- "$workspace"' in body
+    assert "*" not in body
+
+
+def test_the_transaction_parent_must_be_root_owned(tmp_path: Path) -> None:
+    """It holds copies of the sudoers policy a rollback would restore."""
+    transaction = tmp_path / "transaction"
+    transaction.mkdir()
+
+    result, _gateway, _sudoers, _transaction = _run_installation(
+        tmp_path, parent_owner="1000:1000"
+    )
+
+    assert "outcome=1" in result.stdout, result.stdout + result.stderr
+    assert "root-owned 0700 directory" in result.stderr
+
+
+@pytest.mark.parametrize("mode", ["755", "770", "777", "750"])
+def test_the_transaction_parent_must_be_private(tmp_path: Path, mode: str) -> None:
+    """Anything readable exposes the previous policy; anything writable steers it."""
+    transaction = tmp_path / "transaction"
+    transaction.mkdir()
+
+    result, _gateway, _sudoers, _transaction = _run_installation(
+        tmp_path, parent_mode=mode
+    )
+
+    assert "outcome=1" in result.stdout, mode
+    assert "root-owned 0700 directory" in result.stderr
+
+
+def test_a_transaction_parent_symlink_is_refused_before_it_is_followed() -> None:
+    """Asserted on the shipped text: this filesystem will not create one."""
+    state = _installer_function_body(
+        "transaction_parent_state()", "# A root-owned 0700 scratch parent"
+    )
+    secure = _installer_function_body(
+        "require_secure_transaction_parent()", "# Absent or safe and empty"
+    )
+    opener = _installer_function_body(
+        "open_transaction_parent()", "# This run's own workspace"
+    )
+
+    assert state.index('! -L "$parent"') < state.index('-e "$parent"')
+    assert secure.index('! -L "$parent"') < secure.index('-d "$parent"')
+    assert opener.index('! -L "$parent"') < opener.index("install -d")
+
+
+def test_a_dry_run_reports_stale_state_without_refusing_or_removing_it(
+    tmp_path: Path,
+) -> None:
+    """A dry run changes nothing, including its own answer."""
+    transaction = tmp_path / "transaction"
+    stale = transaction / "run.ABC123"
+    stale.mkdir(parents=True)
+    (stale / "previous.XYZ").write_bytes(b"# old\n")
+
+    result, _gateway, _sudoers, _transaction = _run_installation(
+        tmp_path, dry_run=1
+    )
+
+    assert "outcome=0" in result.stdout, result.stdout + result.stderr
+    assert "would refuse" in result.stdout
+    assert "stale transaction state" in result.stdout
+    assert stale.is_dir()
+
+
+def test_the_stale_check_precedes_the_idempotent_return() -> None:
+    """Ordering is the whole correction."""
+    body = _installer_function_body("run_installation()", "main()")
+    stale = body.index("stale transaction state is present")
+    idempotent = body.index("verified; nothing changed")
+
+    assert stale < idempotent
 
 
 # --------------------------------------------------------------------------
@@ -4028,6 +5112,43 @@ def test_the_deployment_document_covers_the_round_two_corrections(
     assert topic in _read(DEPLOYMENT_DOC)
 
 
+def test_the_mutation_register_is_part_of_the_repository() -> None:
+    """A mutation set that exists only as an action taken cannot be re-run.
+
+    That is the defect this register closes: earlier rounds recorded outcomes
+    rather than mutations, so re-running them against a later tip meant
+    reconstructing them from memory, and four had already gone stale unnoticed.
+    """
+    register = PROJECT_ROOT / "tests" / "mutation_register.py"
+    runner = PROJECT_ROOT / "scripts" / "dev" / "run-mutations.py"
+
+    assert register.is_file()
+    assert runner.is_file()
+
+    # Loaded by path: ``tests`` is a plain directory, not an importable
+    # package, and making it one to satisfy a test would change collection.
+    specification = importlib.util.spec_from_file_location(
+        "mgo_mutation_register", register
+    )
+    assert specification is not None and specification.loader is not None
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    mutations = module.MUTATIONS
+
+    identifiers = [mutation.identifier for mutation in mutations]
+    assert len(identifiers) == len(set(identifiers)), "duplicate mutation id"
+    assert len(mutations) >= 130
+
+    # Every entry still applies to the current tip, exactly once. An entry that
+    # no longer matches is a stale mutation, which is precisely the silent
+    # failure this file exists to make loud.
+    for mutation in mutations:
+        asset = _read(PROJECT_ROOT / mutation.asset)
+        assert asset.count(mutation.old) == 1, mutation.identifier
+        assert mutation.tests, mutation.identifier
+        assert mutation.note.endswith("."), mutation.identifier
+
+
 @pytest.mark.parametrize(
     "finding",
     [
@@ -4060,7 +5181,15 @@ def test_the_gateway_sets_a_fixed_safe_path_when_it_runs() -> None:
 
     assert 'PATH="$MGO_SAFE_PATH"' in source
     main_body = source[source.index("main() {") :]
-    assert main_body.index('PATH="$MGO_SAFE_PATH"') < main_body.index('case "$action"')
+    # The fixed path is now established by the constructed environment, which
+    # main() requires before it looks at anything else.
+    assert main_body.index("require_constructed_environment") < main_body.index(
+        'case "$action"'
+    )
+    boundary = _function_body(
+        "require_constructed_environment()", "# --- the root temporary directory"
+    )
+    assert 'PATH="$MGO_SAFE_PATH"' in boundary
 
 
 def test_the_gateway_is_a_library_when_sourced_and_a_program_when_executed() -> None:
