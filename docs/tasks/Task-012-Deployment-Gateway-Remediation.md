@@ -2,9 +2,9 @@
 
 ## Status
 
-**Final-review corrections implemented; awaiting final confirmation. The gateway
-is not installed, there has been no Raspberry Pi validation, and the production
-gateway is unchanged. Physical camera acceptance remains pending.**
+**Final-confirmation corrections implemented; awaiting final confirmation. The
+gateway is not installed, there has been no Raspberry Pi validation, and the
+production gateway is unchanged. Physical camera acceptance remains pending.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -19,7 +19,10 @@ gateway is unchanged. Physical camera acceptance remains pending.**
 | Re-review corrections | Complete — all five corrected |
 | Final review | **Complete** — four further blocking defects found |
 | Final-review corrections | Complete — all four corrected |
-| Final confirmation | **Not performed** |
+| Final confirmation | **Round one complete** — four further blocking defects found |
+| Final-confirmation corrections | Complete — all four corrected |
+| Mutation register | Complete — checked in and re-run in full against the current tip |
+| Final confirmation (re-run) | **Not performed** |
 | Installation on the Raspberry Pi | **Not performed** — requires re-review and a separately approved SHA |
 | Raspberry Pi validation of the gateway | **Not performed** |
 
@@ -411,6 +414,117 @@ root-owned `TMPDIR`, and explicitly unsets the whole list. Request validation
 was also moved ahead of all of it, so an unsupported action is refused before
 the process creates anything. The canonical-path proof, previously only in
 deployment, now also guards `restart-api`.
+
+## Final confirmation — four blocking defects corrected
+
+Final confirmation found four more. All are corrected; none reached the
+Raspberry Pi, because nothing here has ever been installed.
+
+### Finding 1 — the implementation had not passed the complete mutation set
+
+The previous round disclosed that its 56 earlier mutations were not re-run
+after the latest code changes, and then aggregated the historical results into
+a current-tip claim of "70 of 70". That claim was not available: a mutation
+written against code a later round rewrote goes stale silently, and four had
+already been found stale in round two.
+
+The root cause was that the mutations existed only as actions someone took.
+There was no machine-readable register, so "re-run them all" meant
+"reconstruct them from memory", which is exactly the thing that cannot be
+audited.
+
+There is now a register in the repository — `tests/mutation_register.py`, run
+by `scripts/dev/run-mutations.py`. Each entry names one deliberate defect, the
+asset it applies to, and the tests that must fail because of it. Each is
+applied to a byte-exact copy, tested, restored, and the restoration confirmed
+by digest. An entry whose `old` text no longer appears exactly once fails as
+**stale** rather than passing quietly, which is the failure mode this round was
+called to fix.
+
+Two mutations are deliberately **not** registered, with the reason recorded
+beside them: removing the SHA pattern's anchors, and removing the NUL check.
+Both are equivalent mutants — the byte-exact size reconciliation and strict
+JSON parsing respectively make them unobservable — and registering a defect
+that cannot change behaviour would mean recording a permanent false negative.
+
+Building the register also found real gaps in the tests, which is the process
+working rather than a separate defect. Eleven mutations initially survived, and
+each is now caught: the redirect refusals were asserted only by absence; the
+cleanliness count was a lower bound that dropping one still satisfied; the
+non-blocking `flock` option was invisible behind its own double; the rollback
+verification asserted that three facts were read but not that they were
+compared; a restart-api check was masked by a second check that happened to
+catch the same case; the installer's backup flags were asserted against a
+comment that named them; and the parser's type and decode checks were refusing
+by traceback rather than by contract.
+
+### Finding 2 — the root temporary directory was not secured
+
+`/run/mgo-validate-tmp` was treated as safe whenever `-d` succeeded, and then
+`chmod`ped. `-d` follows symlinks, so a link planted at that path satisfied the
+check and the `chmod` was applied to whatever it pointed at. Nothing proved
+numeric ownership before the path was exported as `TMPDIR`.
+
+It is now proven: `/run` must resolve to its own physical path; the temporary
+path must not be a symlink (checked first); it must be absent or a real
+directory; an existing one must be numeric `0:0` with mode exactly `0700`. An
+unsupported type or a non-root owner is refused. Nothing is chmodded, chowned
+or replaced — adopting a directory something else created is an operator's
+decision. When absent it is created under `umask 0077`, private from the moment
+it exists. Every temporary file names the directory explicitly with
+`mktemp --tmpdir=`, so its location stops being a property of the environment.
+
+`show-approval` no longer prepares it. The directory is created only for the
+two actions that mutate anything; the read-only action takes no lock, creates
+no directory, writes no temporary file and changes nothing.
+
+### Finding 3 — environment isolation did not begin at process entry
+
+Both scripts used `#!/usr/bin/env bash`, which resolves the interpreter through
+an inherited `PATH` before either could sanitise anything, and the root side
+merely unset a named list and called the remainder constructed.
+
+Both now name `/bin/bash` directly, and both require a constructed environment
+as the first thing `main` does — re-executing themselves through
+`/usr/bin/env -i` when they are not already in one. The re-execution is what
+`BASH_ENV`, `ENV`, `LD_PRELOAD` and `LD_LIBRARY_PATH` require: all four have
+already acted by the time a script's first statement runs, so only a fresh
+interpreter escapes them. The second process then asserts the three fixed
+values itself and removes every other exported variable, which reduces a forged
+marker to a guard against re-executing twice.
+
+The check is an allowlist over the whole environment. "Nothing else is here" is
+not a statement a denylist can make. The named `unset` register is kept as
+defence in depth and as a reviewable list, not as the mechanism.
+
+The JSON parser is additionally started with `env -i` and `-I`, so
+`PYTHONINSPECT`, `PYTHONSTARTUP`, `PYTHONWARNINGS`, `PYTHONPATH` and the user
+site directory cannot reach it even if something upstream reintroduced them.
+`claude` and `mgo` keep their existing minimal environments, including
+`claude`'s fixed account `HOME` so the approved deployment SSH key still works.
+`SSH_AUTH_SOCK` is not inherited. The installer establishes the same boundary,
+so neither script depends on sudo's optional `env_reset` or `secure_path`.
+
+### Finding 4 — stale installer transaction state was hidden by idempotence
+
+The installer used one fixed transaction directory. A cleanup failure left it
+behind, and on a later run — with both targets already correct — the installer
+returned success before examining it. "Installation succeeded but cleanup
+failed" became "verified; nothing changed", with the previous sudoers policy
+still on disk.
+
+`/run/mgo-validate-install` is now a **parent**: root-owned, `0700`, refused if
+it is a symlink or the wrong type, owner or mode. Each run creates its own
+uniquely named workspace inside it while holding the deployment lock, and
+removes only that workspace — no pattern, no wildcard, nothing that could reach
+another run's directory.
+
+Anything found in the parent at entry is a bounded refusal naming the
+condition, exit **65**, and it is checked **before** the idempotent-success
+return, so "both targets are correct" can no longer answer "a previous run did
+not finish". The leftovers are preserved for inspection rather than destroyed,
+and every subsequent run keeps refusing until they are removed deliberately. A
+dry run reports the same condition and removes nothing.
 
 ## Boundaries
 

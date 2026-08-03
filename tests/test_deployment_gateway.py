@@ -5056,12 +5056,12 @@ def test_the_remediation_record_states_the_review_corrections_truthfully() -> No
     )
     text = _read(record)
 
-    assert "Final-review corrections implemented" in text
+    assert "Final-confirmation corrections implemented" in text
     assert "awaiting final confirmation" in text
-    assert "Final confirmation | **Not performed**" in text
+    assert "Final confirmation (re-run) | **Not performed**" in text
     assert "Installation on the Raspberry Pi | **Not performed**" in text
     assert "Raspberry Pi validation of the gateway | **Not performed**" in text
-    assert "production\ngateway is unchanged" in text
+    assert "production gateway is unchanged" in text
     assert "Physical camera acceptance remains pending" in text
 
 
@@ -5077,10 +5077,14 @@ def test_the_remediation_record_states_the_review_corrections_truthfully() -> No
         "Finding 2 — the status document was pattern-matched, not parsed",
         "Finding 3 — curl obeyed configuration",
         "Finding 4 — the caller's environment was inherited",
+        "Finding 1 — the implementation had not passed the complete mutation set",
+        "Finding 2 — the root temporary directory was not secured",
+        "Finding 3 — environment isolation did not begin at process entry",
+        "Finding 4 — stale installer transaction state was hidden by idempotence",
     ],
 )
 def test_every_re_review_finding_is_recorded(finding: str) -> None:
-    """Every round-2 and final-review finding is written down."""
+    """Every round-2, final-review and final-confirmation finding is written down."""
     record = (
         PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
     )
@@ -5103,6 +5107,18 @@ def test_every_re_review_finding_is_recorded(finding: str) -> None:
         "--disable",
         "env -i",
         "/run/mgo-validate-tmp",
+        # Final-confirmation corrections.
+        "#!/bin/bash",
+        "MGO_ENVIRONMENT_CONSTRUCTED=1",
+        "allowlist over the whole environment",
+        "every other exported variable",
+        "env_reset",
+        "mktemp --tmpdir=",
+        "Stale transaction state is a refusal",
+        "uniquely named workspace",
+        "preserved",
+        "`NaN`, `Infinity` and `-Infinity` are refused",
+        "isolated mode",
     ],
 )
 def test_the_deployment_document_covers_the_round_two_corrections(

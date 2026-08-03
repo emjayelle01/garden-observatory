@@ -1280,6 +1280,15 @@ pattern-matched rather than parsed, `curl` obeying configuration files, and the
 caller's environment being inherited by root-invoked commands. Those four are
 corrected too.
 
+Final confirmation then found four more — a mutation set that had never been
+run in full against the current implementation, an unsecured root temporary
+directory whose `-d` check followed symlinks, environment isolation that began
+after process entry rather than at it, and stale installer transaction state
+that an idempotent run reported as a clean host. Those four are corrected too,
+and the mutation set is now a register in the repository
+(`tests/mutation_register.py`) that is re-run in full against the current tip
+rather than a historical result carried forward.
+
 It is **awaiting final confirmation**, has **not** been installed on the
 Raspberry Pi and has **not** been validated there. The gateway running in production is still the
 Task 10 one described above, and nothing about the production host changed. A

@@ -173,7 +173,50 @@ share a verb.**
 ## 5a. The caller's environment is an input surface
 
 Everything this gateway runs gets an environment it **constructed**, not one it
-inherited.
+inherited — starting at process entry, before the first statement runs.
+
+### The interpreter, and the process it runs in
+
+The shebang is `#!/bin/bash`, not `#!/usr/bin/env bash`. The second form asks
+the kernel to run `env`, which searches an inherited `PATH` for something called
+`bash` — so the choice of interpreter would be made by the caller's environment
+before a single line of the script could sanitise anything.
+
+The first thing `main` does is require a **constructed environment**. If the
+process is not already in one, it replaces itself:
+
+```bash
+exec /usr/bin/env -i PATH=<fixed> HOME=/root LC_ALL=C \
+    SUDO_USER=<caller> MGO_ENVIRONMENT_CONSTRUCTED=1 /bin/bash "$0" "$@"
+```
+
+That re-execution is not decoration. `BASH_ENV` and `ENV` are read by the
+interpreter at startup, and `LD_PRELOAD` and `LD_LIBRARY_PATH` by the loader
+before that: they have already acted by the time any script statement runs, and
+nothing the script does could undo them. A fresh interpreter started from an
+empty environment never sees them.
+
+The second process then asserts the three fixed values itself and **removes
+every other exported variable**, because `env -i` is a request rather than a
+guarantee — a platform runtime can inject its own variables, and a caller can
+present the marker with an environment of their choosing. The marker therefore
+buys nothing except a guard against re-executing twice.
+
+The check is an **allowlist over the whole environment**, not a list of
+variables to unset. "Nothing else is here" is not a statement a denylist can
+make: it says nothing about the variable nobody thought of. The named `unset`
+list is still there, as a reviewable register of what is known to steer Git,
+uv, Python, curl, SSH and the loader — but it is defence in depth, not the
+mechanism.
+
+Only two things cross the boundary: the action word and `SUDO_USER`. An empty
+`SUDO_USER` survives as empty and is refused by the privilege check.
+
+The installer does the same thing, for the same reasons. Neither script relies
+on sudo's `env_reset` or `secure_path` being configured — those are optional,
+and correctness is not.
+
+### Inside the constructed environment
 
 Commands run as `claude` or `mgo` go through `env -i`, which empties the
 environment first — so `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
@@ -189,11 +232,6 @@ database and proven absolute** (never the caller's), `USER`, `LOGNAME`, a fixed
 `MGO_CONFIG_PATH`. SSH to the expected repository still works, because the
 deployment key lives in the account's own fixed home.
 
-The root side sets `HOME=/root`, the fixed safe `PATH`, `LC_ALL=C` and a fixed
-root-owned `TMPDIR` (`/run/mgo-validate-tmp`, `0700`), and explicitly unsets the
-whole list above. `TMPDIR` matters more than it looks: it decides where response
-bodies and staging files are written.
-
 `curl` is invoked with `--disable` as its **first** option, so no `.curlrc`
 belonging to root or anyone else can add `--location`, change the proxy or alter
 the timeout behind the gateway's back — plus `--no-location` and
@@ -201,6 +239,52 @@ the timeout behind the gateway's back — plus `--no-location` and
 
 Request validation happens before any of this: an unsupported action is refused
 before the process so much as creates a directory.
+
+### 5b. The root temporary directory
+
+Response bodies and staging files go to `/run/mgo-validate-tmp`, which must be
+a **root-owned `0700` directory** reached through a `/run` that resolves to its
+own physical path. The requirements are:
+
+- not a symlink — checked with `-L` **first**, because `-d` follows one, and
+  the previous code proved "it is a directory" with `-d` and then applied
+  `chmod` to whatever the link pointed at;
+- absent, or a real directory — a regular file, FIFO, socket or device is
+  refused;
+- numeric owner and group `0:0`, and mode exactly `0700` — a value, not a
+  range;
+- created, when absent, under `umask 0077`, so it is private from the moment it
+  exists rather than briefly wider.
+
+Nothing repairs an unsafe object. There is no `chmod`, no `chown` and no
+replacement: adopting a directory something else created is a decision for an
+operator with the context to make it.
+
+Every temporary file names the directory explicitly —
+`mktemp --tmpdir=/run/mgo-validate-tmp …` — so its location is a property of
+this program rather than of whatever `TMPDIR` happens to say.
+
+The directory is prepared **per action**, and only for the two that mutate
+anything. `show-approval` reads one file and prints one line: it takes no lock,
+creates no directory, writes no temporary file and changes nothing on the host.
+
+### 5c. The status document is parsed, strictly
+
+The preview status response is handed to `/usr/bin/python3` **by path**, so
+arbitrary remote bytes never pass through the shell, and the interpreter is
+started with `env -i` and `-I` (isolated mode) so `PYTHONINSPECT`,
+`PYTHONSTARTUP`, `PYTHONWARNINGS`, `PYTHONPATH` and the user site directory
+cannot reach it. The application is not imported: parsing a response must not
+depend on the code being deployed.
+
+A document is refused unless it is valid UTF-8, free of NUL, a top-level JSON
+object with no leading or trailing data, carrying exactly one top-level `state`
+key with a string value. Duplicates are refused even when they agree. Nested
+keys never substitute for the top-level field.
+
+`NaN`, `Infinity` and `-Infinity` are refused as well. Python's `json` accepts
+all three by default, but they are not JSON — and a gateway does not get to
+decide what a non-standard token was supposed to mean.
 
 ## 6. Why Git and `uv` run as `claude`
 
@@ -420,6 +504,30 @@ the *installed* policy is re-validated with `visudo -cf` before success —
 validating what was about to be written is not the same as validating what
 landed.
 
+### The transaction workspace
+
+Backups live under `/run/mgo-validate-install` — never in `/etc/sudoers.d`,
+where a backup would be a second policy file in a directory `sudo` reads. That
+directory is the **parent**: it must be a root-owned `0700` real directory, and
+each run creates its own uniquely named workspace inside it while holding the
+deployment lock.
+
+A run removes only its own workspace. Never a pattern, never a wildcard, never
+another run's directory.
+
+**Stale transaction state is a refusal, not a curiosity.** If anything is left
+in the parent when a run starts, the installer names the condition and exits
+**65** — even when both installed targets are already correct. This closes a
+real hole: a run whose cleanup failed left its workspace behind, and the next
+run reached its idempotent-success return before looking, reporting
+"verified; nothing changed" over an unfinished transaction with the previous
+sudoers policy still on disk.
+
+The leftovers are **preserved**. Destroying them would destroy the evidence an
+operator needs to understand what the interrupted run did, and every subsequent
+run keeps refusing until they are removed deliberately, under separate operator
+control. A dry run reports the same condition and removes nothing.
+
 The transaction records **both** previous states before the first mutation,
 and "absent" is a recorded state whose restoration is removal. Any failure
 after that point — a temporary file, a copy, a rename, either checksum, either
@@ -433,10 +541,11 @@ unchecked failure there would fall through to the rename and publish a
 truncated file that `sudo` would happily execute.
 
 The installer is idempotent in the strict sense: when both files are already
-correct in content **and** owner **and** mode, and the installed policy is
-valid, it verifies and exits before creating a temporary file — same inode,
-same modification time, nothing written. Matching content with the wrong owner
-or mode is *not* current; it is a defect, and it is repaired transactionally.
+correct in content **and** owner **and** mode, the installed policy is valid,
+**and no stale transaction state exists**, it verifies and exits before creating
+a temporary file — same inode, same modification time, nothing written.
+Matching content with the wrong owner or mode is *not* current; it is a defect,
+and it is repaired transactionally.
 
 It never touches the approval file, the repository or the service. It
 provisions the deployment control plane and nothing else.
@@ -483,7 +592,7 @@ adds nothing but a friendlier name and a clear error when the gateway is absent.
 | Exit | Meaning | What to do |
 | ---- | ------- | ---------- |
 | 64 | Bad request, or the approval file is missing, malformed or unsafely permissioned | Fix the approval file; the message says which property failed |
-| 65 | A precondition failed — dirty tree, wrong branch, stash, operation in progress, wrong remote, service down, remote SHA does not match the approval, or not a fast-forward | Resolve the named condition. Nothing was deployed |
+| 65 | A precondition failed — dirty tree, wrong branch, stash, operation in progress, wrong remote, service down, remote SHA does not match the approval, not a fast-forward, or an unsafe lock or temporary directory. From the **installer**, also: stale transaction state from a run that did not finish | Resolve the named condition. Nothing was deployed. For stale transaction state, inspect `/run/mgo-validate-install` and remove the leftover workspace deliberately |
 | 70 | The deployment failed and production was restored | Read the reason, fix it, deploy again. Production is where it started |
 | 78 | The deployment failed **and** the rollback failed | **Stop.** The message names the stage that failed. Do not re-run the gateway; inspect the checkout, the service and the journal by hand |
 
