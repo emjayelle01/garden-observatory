@@ -177,24 +177,54 @@ inherited — starting at process entry, before the first statement runs.
 
 ### The interpreter, and the process it runs in
 
-The shebang is `#!/bin/bash`, not `#!/usr/bin/env bash`. The second form asks
-the kernel to run `env`, which searches an inherited `PATH` for something called
-`bash` — so the choice of interpreter would be made by the caller's environment
-before a single line of the script could sanitise anything.
+The shebang is `#!/bin/bash -p`, not `#!/usr/bin/env bash`. Both halves matter.
 
-The first thing `main` does is require a **constructed environment**. If the
-process is not already in one, it replaces itself:
+**`/bin/bash`, not `env bash`.** The second form asks the kernel to run `env`,
+which searches an inherited `PATH` for something called `bash` — so the choice
+of interpreter would be made by the caller's environment before a single line
+of the script could sanitise anything.
+
+**`-p` is privileged mode**, and it is the only thing that closes the window
+*before* the script's first statement. While Bash is starting up it reads
+`$BASH_ENV` and `$ENV`, imports exported shell functions, and honours
+`SHELLOPTS`, `BASHOPTS`, `CDPATH` and `GLOBIGNORE`. All of that has happened by
+the time line one runs, so no amount of re-execution afterwards can undo it — a
+`BASH_ENV` script would already have executed, and an exported function named
+`stat` or `curl` would already be shadowing the command. In privileged mode
+Bash does none of it.
+
+An exported function is worth spelling out: functions take precedence over
+executables, so `export -f stat` replaces `stat` for the whole script, and no
+`PATH` discipline helps.
+
+Because the shebang carries the mode, the script must be **executed**, not
+handed to an interpreter on the command line. `sudo bash install-mgo-validate.sh`
+discards the shebang and with it the mode; `sudo ./install-mgo-validate.sh`
+does not. Every documented invocation uses the direct form.
+
+The first thing `main` then does is require a **constructed environment**. If
+the process is not already in one, it replaces itself:
 
 ```bash
 exec /usr/bin/env -i PATH=<fixed> HOME=/root LC_ALL=C \
-    SUDO_USER=<caller> MGO_ENVIRONMENT_CONSTRUCTED=1 /bin/bash "$0" "$@"
+    SUDO_USER=<caller> MGO_ENVIRONMENT_CONSTRUCTED=1 /bin/bash -p "$0" "$@"
 ```
 
-That re-execution is not decoration. `BASH_ENV` and `ENV` are read by the
-interpreter at startup, and `LD_PRELOAD` and `LD_LIBRARY_PATH` by the loader
-before that: they have already acted by the time any script statement runs, and
-nothing the script does could undo them. A fresh interpreter started from an
-empty environment never sees them.
+The re-executed interpreter is privileged too. If it were not, the boundary
+would only be as strong as whichever of the two processes happened to be
+weaker.
+
+### What a shell script cannot do
+
+`LD_PRELOAD` and `LD_LIBRARY_PATH` are honoured by the dynamic loader *before
+the interpreter exists*. No shebang, no shell option and no re-execution can
+speak for what ran before Bash started, and this gateway does not claim to.
+
+That part of the boundary belongs to the operating system and to `sudo`, which
+is why the sudoers policy resets and deletes environment for this command as
+well (§14). The layers are deliberate: sudo cuts the environment down before
+the process starts, `-p` stops Bash acting on what is left during startup, and
+`env -i` constructs what the operational work runs in.
 
 The second process then asserts the three fixed values itself and **removes
 every other exported variable**, because `env -i` is a request rather than a
@@ -488,21 +518,57 @@ is safe.
 ## 13. Installation
 
 ```bash
-sudo bash scripts/deploy/install-mgo-validate.sh --dry-run   # report only
-sudo bash scripts/deploy/install-mgo-validate.sh             # install
+sudo ./scripts/deploy/install-mgo-validate.sh --dry-run   # report only
+sudo ./scripts/deploy/install-mgo-validate.sh             # install
 ```
 
-The installer validates the gateway with `bash -n` and the policy with
-`visudo -cf` **before** installing either — an invalid file under
-`/etc/sudoers.d` can lock every account out of `sudo` on the host. **A dry run
-validates too**: it promises to validate everything, so a host without `visudo`
-fails in both modes rather than reporting a success it did not earn.
+**Run it directly.** Naming the interpreter — `sudo bash …` — discards the
+shebang, and with it the privileged mode that stops Bash reading `BASH_ENV` and
+importing exported shell functions before the script's first statement.
+
+### The locked source snapshot
+
+The order matters, and it used to be wrong. The installer validated the
+repository sources, checksummed them, and only then took the deployment lock —
+so a concurrent `deploy-main` could fast-forward the checkout between the
+syntax check and the checksum, or between the checksum and the rename. The host
+would then be running bytes nothing had looked at, with a clean report.
+
+A real installation now runs in this order:
+
+1. privileged entry boundary, then the constructed environment;
+2. arguments and caller;
+3. **acquire the shared deployment lock**;
+4. validate the transaction-parent state;
+5. create the unique root-owned `0700` workspace, and verify it;
+6. prove both repository sources are regular non-symlink files;
+7. **copy both into the workspace** — the snapshot;
+8. verify the staged copies are root-owned `0600` regular files inside it;
+9. `/bin/bash -p -n` the staged gateway;
+10. `visudo -cf` the staged policy;
+11. checksum the staged copies;
+12. back up both installed targets;
+13. install **from the staged copies**;
+14. verify installed checksum, owner and mode;
+15. `/bin/bash -p -n` the installed gateway;
+16. `visudo -cf` the installed policy;
+17. remove only this run's workspace;
+18. report success.
+
+No byte used for installation is read outside that snapshot. A source that
+changes *before* the lock is harmless, because the snapshot is what gets
+validated. A source that changes *after* it is harmless, because installation
+reads the snapshot, not the checkout.
+
+An invalid file under `/etc/sudoers.d` can lock every account out of `sudo`, so
+both validations happen before either target is touched — and both are repeated
+against what actually landed. The checksum says the bytes match; steps 15 and
+16 say the bytes still *work*, under the interpreter and the parser that will
+read them. A published gateway Bash cannot parse is a control plane nobody can
+invoke, and the sudoers rule pointing at it is the only way in.
 
 Both files are written atomically, `root:root`, `0755` for the gateway and
-`0440` for the policy, then verified on disk by checksum, owner and mode, and
-the *installed* policy is re-validated with `visudo -cf` before success —
-validating what was about to be written is not the same as validating what
-landed.
+`0440` for the policy.
 
 ### The transaction workspace
 
@@ -512,8 +578,17 @@ directory is the **parent**: it must be a root-owned `0700` real directory, and
 each run creates its own uniquely named workspace inside it while holding the
 deployment lock.
 
+The workspace is verified after `mktemp` creates it — a real directory, not a
+symlink, numeric `0:0`, mode exactly `0700`, and **inside the fixed parent**.
+What `mktemp` reports is a claim about what it did, not about what is on disk,
+and a copy of the sudoers policy is about to go in there. The staged copies are
+checked the same way: root-owned `0600` regular files inside that workspace.
+
 A run removes only its own workspace. Never a pattern, never a wildcard, never
-another run's directory.
+another run's directory. Cleanup that finds the tracked path still present — as
+a regular file, a symlink or anything else — reports failure rather than
+success: this run left something behind, and the next run would find it
+attributed to nobody unless this one says so now.
 
 **Stale transaction state is a refusal, not a curiosity.** If anything is left
 in the parent when a run starts, the installer names the condition and exits
@@ -526,7 +601,25 @@ sudoers policy still on disk.
 The leftovers are **preserved**. Destroying them would destroy the evidence an
 operator needs to understand what the interrupted run did, and every subsequent
 run keeps refusing until they are removed deliberately, under separate operator
-control. A dry run reports the same condition and removes nothing.
+control.
+
+Inspecting the parent is itself checked. `find` on an unreadable directory
+exits non-zero with no output, and reading that as "nothing is here" would turn
+the one condition this check exists to detect into a clean answer — so a failed
+inspection refuses.
+
+### What a dry run promises
+
+A dry run is read-only, takes no lock, and creates no workspace. It therefore
+validates a **point-in-time view** of the sources and claims no exclusion
+against a concurrent deployment — it says so in its first line of output.
+
+Its exit status agrees with its report. A validation command that answers
+"fine" and then refuses when run for real has told the operator nothing, so
+every state the real installation would refuse exits non-zero here too — and
+stale transaction state exits with the same **65**, so a wrapper reading the
+status learns the same thing from either mode. Nothing is created, removed or
+rewritten in any outcome.
 
 The transaction records **both** previous states before the first mutation,
 and "absent" is a recorded state whose restoration is removal. Any failure
@@ -553,7 +646,14 @@ provisions the deployment control plane and nothing else.
 ## 14. Sudoers boundary
 
 ```text
-claude ALL=(root) NOPASSWD: /usr/local/sbin/mgo-validate
+Cmnd_Alias MGO_VALIDATE = /usr/local/sbin/mgo-validate
+
+Defaults!MGO_VALIDATE env_reset
+Defaults!MGO_VALIDATE env_delete += "BASH_ENV ENV SHELLOPTS BASHOPTS"
+Defaults!MGO_VALIDATE env_delete += "LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT"
+…
+
+claude ALL=(root) NOPASSWD: MGO_VALIDATE
 ```
 
 One account, one absolute path. No shell, no arbitrary `systemctl`, no arbitrary
@@ -563,6 +663,23 @@ runtime account and nothing for any group.
 The rule carries no argument pattern on purpose. Sudo argument matching is
 textual and would have to be kept in step with the script forever. The gateway's
 own action parser is the command boundary: one word, from a closed set.
+
+**The environment boundary is scoped to this one command.** The gateway builds
+its own environment and runs under `bash -p`, but both of those happen after
+sudo has decided what to hand it — and neither can speak for the dynamic
+loader, which honours `LD_PRELOAD` and `LD_LIBRARY_PATH` before the interpreter
+exists. This is the earliest point at which the environment can be cut down,
+and the only one that covers that case.
+
+`env_reset` is sudo's default on Debian, but a default is a thing that can be
+changed elsewhere in the policy; stating it here means the gateway does not
+depend on the rest of the host's sudoers. The `env_delete` lines name the shell
+startup, loader, interpreter, Git, uv, curl, SSH, proxy and temporary-file
+variables explicitly, because `env_delete` wins over `env_keep` — they go even
+if something else adds them back.
+
+**There is deliberately no `SETENV`.** With it, `sudo BASH_ENV=/tmp/evil
+mgo-validate` would be permitted, and every reset above would be a suggestion.
 
 ## 15. Routine deployment
 

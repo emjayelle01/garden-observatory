@@ -5609,6 +5609,85 @@ def test_the_remote_access_document_no_longer_teaches_the_old_path() -> None:
 
 
 @pytest.mark.parametrize(
+    "document",
+    ["docs/Deployment-Gateway.md", "docs/Remote-Access.md"],
+)
+def test_no_document_teaches_the_interpreter_discarding_invocation(
+    document: str,
+) -> None:
+    """``sudo bash …`` discards the shebang, and with it privileged mode.
+
+    Not a style point: the mode is what stops Bash reading ``BASH_ENV`` and
+    importing exported shell functions before the script's first statement, and
+    it can only travel on the shebang. An operator following a documented
+    command that names the interpreter loses it silently.
+
+    Checked against the **runnable blocks**, as the old-path test is. Prose is
+    allowed to name the wrong form in order to warn against it; a fenced
+    command block is what someone copies.
+    """
+    commands = "\n".join(_shell_blocks(_read(PROJECT_ROOT / document)))
+
+    assert "sudo bash" not in commands
+    assert "bash scripts/deploy/install-mgo-validate.sh" not in commands
+    assert "bash /opt/garden-observatory/scripts/deploy/install-mgo" not in commands
+    assert "install-mgo-validate.sh" in commands
+
+
+@pytest.mark.parametrize(
+    "asset",
+    ["scripts/deploy/install-mgo-validate.sh", "scripts/deploy/update-main.sh"],
+)
+def test_no_shipped_script_prints_the_interpreter_discarding_invocation(
+    asset: str,
+) -> None:
+    """What an operator is told to run must be the direct form.
+
+    The installer's own ``--help`` and the wrapper's "it is not installed"
+    message are both places someone reads a command and then types it.
+    """
+    text = _read(PROJECT_ROOT / asset)
+    printed = "\n".join(
+        line for line in text.splitlines() if not line.strip().startswith("#")
+    )
+
+    assert "sudo bash" not in printed
+    assert "sudo ./" in printed or "sudo /opt" in printed
+
+
+def test_the_task_record_does_not_claim_the_production_gateway_changed() -> None:
+    """Implemented is not installed, and the record must not blur them."""
+    record = (
+        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Physical-Camera-Acceptance.md"
+    )
+    text = _read(record)
+    index = text.index("Remediation status")
+    section = text[index : index + 3600]
+
+    assert "awaiting final confirmation" in section
+    assert "not** been installed" in section
+    assert "not** been validated" in section
+    assert "still the" in section
+    assert "nothing about the production host changed" in section
+
+
+def test_the_remediation_record_states_the_review_corrections_truthfully() -> None:
+    """Corrected is not re-reviewed, and neither is installed or validated."""
+    record = (
+        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
+    )
+    text = _read(record)
+
+    assert "Entry-boundary corrections implemented" in text
+    assert "awaiting final confirmation" in text
+    assert "Final confirmation (re-run) | **Not performed**" in text
+    assert "Installation on the Raspberry Pi | **Not performed**" in text
+    assert "Raspberry Pi validation of the gateway | **Not performed**" in text
+    assert "production gateway is unchanged" in text
+    assert "Physical camera acceptance remains pending" in text
+
+
+@pytest.mark.parametrize(
     "finding",
     [
         "Finding 1 — no exclusive deployment transaction",
@@ -5624,6 +5703,9 @@ def test_the_remote_access_document_no_longer_teaches_the_old_path() -> None:
         "Finding 2 — the root temporary directory was not secured",
         "Finding 3 — environment isolation did not begin at process entry",
         "Finding 4 — stale installer transaction state was hidden by idempotence",
+        "Finding 1 — environment isolation started too late",
+        "Finding 2 — a dry run returned success for a refused installation",
+        "Finding 3 — source validation happened outside the lock",
     ],
 )
 def test_every_re_review_finding_is_recorded(finding: str) -> None:
@@ -5662,6 +5744,19 @@ def test_every_re_review_finding_is_recorded(finding: str) -> None:
         "preserved",
         "`NaN`, `Infinity` and `-Infinity` are refused",
         "isolated mode",
+        # Entry-boundary corrections.
+        "#!/bin/bash -p",
+        "privileged mode",
+        "exported shell functions",
+        "sudo ./scripts/deploy/install-mgo-validate.sh",
+        "What a shell script cannot do",
+        "the interpreter exists*",
+        "Defaults!MGO_VALIDATE env_reset",
+        "no `SETENV`",
+        "The locked source snapshot",
+        "No byte used for installation is read outside that snapshot",
+        "What a dry run promises",
+        "point-in-time",
     ],
 )
 def test_the_deployment_document_covers_the_round_two_corrections(

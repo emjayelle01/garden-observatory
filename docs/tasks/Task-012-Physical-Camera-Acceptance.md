@@ -1289,6 +1289,16 @@ and the mutation set is now a register in the repository
 (`tests/mutation_register.py`) that is re-run in full against the current tip
 rather than a historical result carried forward.
 
+A second final-confirmation round then found three more — environment isolation
+that still began after Bash had already processed `BASH_ENV`, a `--dry-run` that
+exited zero for an installation it had just said would refuse, and source
+validation that happened outside the deployment lock so the bytes installed
+need not have been the bytes validated. Those three are corrected too: both
+privileged scripts now run under `#!/bin/bash -p`, the sudoers policy carries a
+command-scoped environment reset, the dry-run exit status agrees with its
+report, and a real installation takes the lock first and installs from a
+validated snapshot.
+
 It is **awaiting final confirmation**, has **not** been installed on the
 Raspberry Pi and has **not** been validated there. The gateway running in production is still the
 Task 10 one described above, and nothing about the production host changed. A

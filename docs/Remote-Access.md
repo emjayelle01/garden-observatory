@@ -214,8 +214,13 @@ including the exit codes and what to do about each. If the gateway is not
 installed yet:
 
 ```bash
-sudo bash /opt/garden-observatory/scripts/deploy/install-mgo-validate.sh
+sudo /opt/garden-observatory/scripts/deploy/install-mgo-validate.sh
 ```
+
+Run it **directly**, as above. Naming the interpreter — `sudo bash …` —
+discards the script's `#!/bin/bash -p` shebang, and with it the privileged mode
+that stops Bash reading `BASH_ENV` and importing exported shell functions
+before the script's first statement.
 
 The **first** deployment onto the dedicated service identity has extra one-time
 steps (moving the checkout to `/opt`, provisioning the account and directories,

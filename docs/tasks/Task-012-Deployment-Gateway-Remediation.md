@@ -2,7 +2,7 @@
 
 ## Status
 
-**Final-confirmation corrections implemented; awaiting final confirmation. The
+**Entry-boundary corrections implemented; awaiting final confirmation. The
 gateway is not installed, there has been no Raspberry Pi validation, and the
 production gateway is unchanged. Physical camera acceptance remains pending.**
 
@@ -22,6 +22,8 @@ production gateway is unchanged. Physical camera acceptance remains pending.**
 | Final confirmation | **Round one complete** — four further blocking defects found |
 | Final-confirmation corrections | Complete — all four corrected |
 | Mutation register | Complete — checked in and re-run in full against the current tip |
+| Final confirmation (round two) | **Complete** — three further blocking defects found |
+| Entry-boundary corrections | Complete — all three corrected |
 | Final confirmation (re-run) | **Not performed** |
 | Installation on the Raspberry Pi | **Not performed** — requires re-review and a separately approved SHA |
 | Raspberry Pi validation of the gateway | **Not performed** |
@@ -525,6 +527,94 @@ return, so "both targets are correct" can no longer answer "a previous run did
 not finish". The leftovers are preserved for inspection rather than destroyed,
 and every subsequent run keeps refusing until they are removed deliberately. A
 dry run reports the same condition and removes nothing.
+
+## Entry-boundary corrections — three blocking defects corrected
+
+Final confirmation found three more. All are corrected; none reached the
+Raspberry Pi, because nothing here has ever been installed.
+
+### Finding 1 — environment isolation started too late
+
+The scripts used a fixed `/bin/bash` shebang and then re-executed through
+`env -i`. That does not stop the *first* interpreter processing `BASH_ENV` and
+`ENV`, importing exported shell functions, or honouring `SHELLOPTS`,
+`BASHOPTS`, `CDPATH` and `GLOBIGNORE` — all of which happen during Bash's own
+startup, before the script's first statement. Re-execution cannot undo commands
+that have already run.
+
+Both privileged scripts now begin `#!/bin/bash -p`, and the internal
+re-execution runs `/bin/bash -p` too, so neither process is the weaker of the
+two. The `env -i` boundary is retained as defence in depth.
+
+Because the shebang carries the mode, the script has to be **executed** rather
+than handed to an interpreter. Every documented invocation is now
+`sudo ./scripts/deploy/install-mgo-validate.sh`; the `sudo bash …` form is gone
+from the installer's own header and usage text, the wrapper's error message,
+`docs/Deployment-Gateway.md`, `docs/Remote-Access.md` and `scripts/README.md`.
+
+The sudoers policy gained a command-scoped environment boundary:
+`Defaults!MGO_VALIDATE env_reset`, plus `env_delete` lines naming the shell
+startup, loader, interpreter, Git, uv, curl, SSH, proxy and temporary-file
+variables. `env_delete` wins over `env_keep`, so they go even if something else
+adds them back. There is deliberately no `SETENV` — with it,
+`sudo BASH_ENV=/tmp/evil mgo-validate` would be permitted and every reset would
+be a suggestion. The grant is still one account, one absolute path, via a
+single `Cmnd_Alias`.
+
+**Recorded plainly:** `LD_PRELOAD` and `LD_LIBRARY_PATH` are honoured by the
+dynamic loader before the interpreter exists. No shebang, shell option or
+re-execution can speak for code that ran before Bash started. That boundary
+belongs to the operating system and to sudo — which is why the sudoers policy
+deletes them — and this gateway does not claim otherwise.
+
+### Finding 2 — a dry run returned success for a refused installation
+
+`--dry-run` reported unsafe or stale transaction state and then printed
+"nothing was changed" and exited zero. A validation command that answers "fine"
+and then refuses when run for real has told the operator nothing.
+
+The dry-run contract is now: clean state exits 0; an unsafe transaction parent,
+an invalid source, an invalid policy, a missing `visudo`, an unsupported target
+type or an unsafe lock object exit non-zero; and stale transaction state exits
+**65**, the same code the real installation uses, so a wrapper reading the
+status learns the same thing from either mode. Nothing is created, removed or
+rewritten in any outcome, and the run states in its first line that it holds no
+lock and is validating a point-in-time view.
+
+`transaction_parent_state` now also fails closed: `find` on an unreadable
+directory exits non-zero with no output, and treating that as an empty parent
+would turn the one condition the check exists to detect into a clean answer.
+
+### Finding 3 — source validation happened outside the lock
+
+The installer validated the repository gateway and policy, checksummed them,
+and only then acquired the shared deployment lock. A concurrent `deploy-main`
+could fast-forward the checkout between `bash -n`, `visudo -cf`, the checksum
+and the install — and the host would run bytes nothing had looked at, with a
+clean report.
+
+The lock is now taken **before any source is read for validation**. Under it,
+the run creates its uniquely named workspace, verifies it, copies both sources
+into it, and validates, checksums and installs from that snapshot. Nothing
+after the snapshot reads the live checkout. A source that changes before the
+lock is harmless because the snapshot is what is validated; a source that
+changes after it is harmless because the snapshot is what is installed.
+
+What landed is validated too — `/bin/bash -p -n` against the installed gateway
+and `visudo -cf` against the installed policy — because a checksum says the
+bytes match, not that they still work under the interpreter and parser that
+will read them. Either failure restores both targets transactionally.
+
+The workspace itself is verified after creation: a real directory, not a
+symlink, numeric `0:0`, mode exactly `0700`, and inside the fixed parent. The
+staged copies are checked the same way at `0600`. Cleanup no longer reports
+success while the tracked path survives as a regular file, a symlink or
+anything else.
+
+The currency decision moved into the transaction, because "current" now has to
+mean "matches the bytes this run validated". A fully current installation still
+touches no target: same inode, same modification time, no `install` and no
+rename against either target.
 
 ## Boundaries
 
