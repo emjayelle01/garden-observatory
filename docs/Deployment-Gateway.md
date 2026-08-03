@@ -32,6 +32,37 @@ happen to a system like this one:
 The gateway is also deliberately *boring* about privilege: root is used for one
 thing, and everything else is pushed back down to an unprivileged account.
 
+## 1a. One control plane, one lock
+
+Every mutating action — `deploy-main`, `restart-api` and the installer — takes
+one exclusive lock before it reads anything mutable:
+
+```text
+/run/lock/mgo-deployment.lock
+```
+
+They contend for the same three things: the checkout, the service and the
+camera. Without the lock, two `deploy-main` calls can both read the same old
+`HEAD`, both pass the same approval and ancestry proofs, both fast-forward,
+restart the service twice, race each other's preview restoration and then run
+two incompatible rollbacks over one repository. A `restart-api` arriving
+between the restart and the final verification is the same class of problem.
+
+- **Non-blocking.** A busy control plane exits **75** immediately. It is never
+  retried and never queued: the second caller cannot know what the first will
+  do to the checkout, so waiting would only make the collision later.
+- **Held for the whole action**, on a fixed descriptor nothing closes —
+  including through rollback and final verification. A lock released between
+  the restart and the final check is not a lock.
+- **No PID file, no staleness protocol.** `flock` is released by the kernel
+  when the holder exits, however it exits.
+- `show-approval` is read-only and is never blocked.
+
+**First installation is the exception.** The gateway currently on the Pi
+predates this lock and knows nothing about it, so the separately authorised
+first installation must happen with no deployment or restart in progress.
+After that, the gateway and the installer share the lock permanently.
+
 ## 2. The approval file is the authority
 
 ```text
@@ -87,7 +118,19 @@ repository.
 | ------ | ---- | ---------- |
 | `show-approval` | Prints the approved SHA on stdout, alone | Anything else |
 | `deploy-main` | Deploys `origin/main` at the approved SHA, transactionally | Deploys any other ref, merges, rebases, resets forward, pushes |
-| `restart-api` | Restarts the service at the already-deployed approved SHA | Fetches, merges, syncs, starts preview, captures |
+| `restart-api` | Restarts the service at the already-deployed approved SHA, on **whatever branch is checked out** | Fetches, merges, syncs, starts preview, captures |
+
+`restart-api` is deliberately **branch-aware** where `deploy-main` is
+main-only. It also serves separately authorised Pi validation of an approved
+feature SHA, and tying it to `origin/main` would push that work back to
+bespoke, hand-written restart instructions — the very thing this gateway
+exists to remove. It requires a named branch (not detached) whose `HEAD` is the
+approved SHA, tracking the **identically named** branch on the expected remote,
+also at the approved SHA, with a clean tree including untracked files, no
+stash, no operation in progress and exactly one worktree. For `main` that is
+precisely the old `origin/main` requirement. The branch is discovered from the
+checkout and is never accepted from the caller, and the action still fetches,
+merges and syncs nothing.
 
 Nothing else exists. An unsupported action exits 64 before any privilege is
 used.
@@ -199,6 +242,38 @@ The gateway **never** opens the preview stream, never inspects a frame and never
 calls the capture endpoint — deployment restores an operating state, it does not
 exercise the camera.
 
+## 10b. The preview baseline
+
+Before anything moves, the gateway establishes what the camera is actually
+doing — and refuses to proceed if it cannot.
+
+There is **no fallback state**. A missing, empty, duplicated, conflicting or
+unrecognised `state` field is a refusal, not an "unknown": inventing a state
+would make that invention the baseline an entire deployment measured itself
+against. Two occurrences are refused even when they agree, because nothing here
+can say which one the API meant.
+
+Only three states are settled enough to deploy against — `running`, `stopped`,
+`failed`. The transient pair, `starting` and `stopping`, stop the deployment
+before mutation: a camera mid-transition is not a baseline.
+
+The reported state is then reconciled against the running processes:
+
+| State | Required |
+| ----- | -------- |
+| `running` | exactly one `rpicam-vid`, zero `libcamera-vid` |
+| `stopped` | zero producers |
+| `failed` | zero producers |
+
+A disagreement is **refused, never repaired**. It means the camera is not in
+the state anyone thinks it is, and a deployment that later "restored" such a
+baseline would be restoring a fiction. Preflight observes only — it never
+starts or stops preview.
+
+The same vocabulary applies during restoration and final verification: a
+malformed status response is a failure there too, not a truthful non-running
+state.
+
 ## 10a. Final verification
 
 After preview restoration and **before anything claims success**, the gateway
@@ -226,10 +301,20 @@ The pre-deployment commit, preview state, service PID and activation timestamp
 are captured before the first mutation. Only those captured values are ever
 restored to. **A rollback target is never accepted from a caller.**
 
+**The transaction opens before the merge is invoked, not after it succeeds.** A
+non-zero exit from Git is not proof that nothing moved: the command can fail
+part-way through a checkout, on a permission or I/O error, or after the ref has
+already been updated. So a failed `merge --ff-only` enters the rollback path
+like any other failure. Immediately after a *successful* merge — and before the
+environment sync — the checkout is verified (branch, `HEAD`, local `main`,
+`origin/main`, clean including untracked, no operation in progress); that
+failing rolls back too.
+
 | When it fails | What happens | Exit |
 | ------------- | ------------ | ---- |
-| Before the checkout moves | Nothing to undo | 64 / 65 |
-| After the fast-forward, before the restart | Checkout and environment restored; the service is **not** restarted and the preview is **not** touched, because nothing disturbed them; the running PID and timestamp are verified unchanged | 70 |
+| Before the merge is invoked | Nothing to undo | 64 / 65 / 75 |
+| The merge itself, or the check straight after it | Checkout and environment restored; **no restart** | 70 |
+| After the fast-forward, before the restart | Checkout and environment restored; the service is **not** restarted and the preview is **not** touched, because nothing disturbed them | 70 |
 | At or after the restart | Checkout and environment restored, the service restarted **once**, health proven, preview returned to its recorded state | 70 |
 | The rollback itself | Evidence preserved, no loop, no repeated restart, the failed stage named, and no claim that production was restored | 78 |
 
@@ -237,10 +322,20 @@ A successful rollback still reports failure. `deployment failed; rollback
 succeeded` means production is where it started — not that the deployment
 worked.
 
+A pre-restart rollback proves rather more than that the commit came back. The
+service was never restarted, so it should still be the *same* process, still
+serving, with the camera exactly as it was found — and a PID and a timestamp do
+not say that. It therefore verifies branch, `HEAD`, local branch, a clean tree
+including untracked files, no stash, no operation in progress, the unchanged
+PID and activation timestamp, an active service, an exact-200 health response,
+the preview state matching the captured baseline, and the producer count
+matching it. Any one of those failing means the rollback is incomplete: **78**.
+
 Exit codes: **64** bad request or unusable approval, **65** precondition
-failure, **70** deployment failed and production was restored, **78** deployment
-failed **and** restoration failed — production state is not known to be good and
-needs a person.
+failure, **75** another control-plane action holds the lock, **70** deployment
+failed and production was restored, **78** deployment failed **and**
+restoration failed — production state is not known to be good and needs a
+person.
 
 ## 12. Already current
 

@@ -2,9 +2,9 @@
 
 ## Status
 
-**Repository review corrections implemented; not yet re-reviewed. The gateway
-is not installed, there has been no Raspberry Pi validation, and the production
-gateway is unchanged.**
+**Re-review round 2 findings corrected; not yet final-reviewed. The gateway is
+not installed, there has been no Raspberry Pi validation, and the production
+gateway is unchanged. Physical camera acceptance remains pending.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -15,7 +15,9 @@ gateway is unchanged.**
 | Documentation | Complete |
 | Repository review | **Round 1 complete** — seven blocking defects found |
 | Review corrections | Complete — all seven corrected |
-| Re-review | **Not performed** |
+| Re-review | **Round 2 complete** — five further blocking defects found |
+| Re-review corrections | Complete — all five corrected |
+| Final review | **Not performed** |
 | Installation on the Raspberry Pi | **Not performed** — requires re-review and a separately approved SHA |
 | Raspberry Pi validation of the gateway | **Not performed** |
 
@@ -251,6 +253,104 @@ takes the rollback path, and `deployed` is never printed before it passes.
 - **Dry run fails closed.** The help says it validates everything, so a host
   without `visudo` now fails in dry-run mode too rather than reporting a
   success it did not earn.
+
+## Re-review round 2 — five blocking defects corrected
+
+Re-review found five further defects. All are corrected; none reached the
+Raspberry Pi, because nothing here has ever been installed.
+
+### Finding 1 — no exclusive deployment transaction
+
+Nothing stopped two mutating invocations running at once. Two `deploy-main`
+calls could both read the same old `HEAD`, both pass the same approval and
+ancestry proofs, both fast-forward, restart the service twice, race each
+other's preview restoration and then run two incompatible rollbacks over one
+repository. A `restart-api` arriving between the restart and the final
+verification was the same problem.
+
+All three mutating entry points — `deploy-main`, `restart-api` and the
+installer — now take one non-blocking `flock` on
+`/run/lock/mgo-deployment.lock`, on a fixed descriptor held for the whole
+action **including rollback**, exiting **75** when it is busy. No retry, no PID
+file, no staleness protocol: the kernel releases it when the holder exits.
+`show-approval` is read-only and is not blocked.
+
+The first installation is the exception, and is documented as such: the gateway
+currently on the Pi predates this lock, so that separately authorised run must
+happen with no deployment or restart in progress.
+
+### Finding 2 — the pre-deployment preview state was not proven
+
+`preview_state_from_status` returned `unknown` when the field was missing, and
+that invented state became the baseline the whole deployment measured itself
+against. Nothing reconciled the reported state against the running producers.
+
+There is now no fallback: missing, empty, duplicated, conflicting, malformed or
+unrecognised all refuse before mutation. Only `running`, `stopped` and `failed`
+are settled enough to be a baseline; `starting` and `stopping` stop the
+deployment. The state is then reconciled against the processes — one
+`rpicam-vid` for running, none for stopped or failed, never a `libcamera-vid` —
+and a disagreement is refused rather than repaired. Preflight starts and stops
+nothing. The same vocabulary now applies during restoration and final
+verification.
+
+### Finding 3 — a failed fast-forward bypassed the rollback
+
+`git merge --ff-only` exiting non-zero was treated as "nothing happened" and
+exited directly. It is not: the command can fail part-way through a checkout,
+on a permission or I/O error, or after the ref has already been updated.
+
+The transaction now opens **before** the merge is invoked. A failed merge takes
+the pre-restart rollback path, and immediately after a successful merge — before
+the environment sync — the checkout is verified (branch, `HEAD`, local `main`,
+`origin/main`, clean including untracked files, no operation in progress), with
+that failing rolling back too.
+
+The pre-restart rollback itself was also strengthened. A PID and a timestamp do
+not say production is healthy, so it now proves branch, `HEAD`, local branch, a
+clean tree including untracked files, no stash, no operation in progress, the
+unchanged PID and activation timestamp, an active service, an exact-200 health
+response, the preview state matching the captured baseline and the producer
+count matching it. It still never restarts the service, because nothing
+disturbed it.
+
+### Finding 4 — the installer followed unsafe target types
+
+Regular-file tests, checksums, `stat` and `cp` all followed symlinks, so a link
+to matching content could be read as a current installation, its target copied
+instead of the link recorded, the link replaced on installation and an ordinary
+file restored where a link had been. A directory, FIFO, socket or device could
+be misclassified as absent.
+
+Sources must now be regular non-symlink files; targets must be absent or
+regular non-symlink files, and any other type is refused rather than repaired.
+Ownership is compared numerically instead of by rendered name. Backups moved
+out of `/etc/sudoers.d` — a backup there is a second policy file in a directory
+sudo includes — into a root-owned `0700` transaction directory under `/run`,
+preserving content, numeric owner, numeric group and mode. Every artefact is
+removed after success and after successful rollback, and a cleanup failure is a
+non-zero result, never reported as success.
+
+### Finding 5 — restart-api lost branch-aware validation
+
+`restart-api` had been folded onto the main-only deployment precondition, which
+would have pushed future Pi validation of an approved feature SHA back to
+bespoke restart instructions — the very thing this gateway exists to remove.
+
+It now has its own read-only precondition: a named branch (not detached) whose
+`HEAD` is the approved SHA, tracking the identically named branch on the
+expected remote at the approved SHA, with a clean tree including untracked
+files, no stash, no operation in progress and exactly one worktree. The branch
+is discovered from the checkout, never accepted from the caller. For `main`
+that is exactly the previous `origin/main` requirement. `deploy-main` remains
+strictly main-only.
+
+### Also corrected
+
+Every temporary file the gateway creates is now removed through one tracked
+helper whose failure is checked: an HTTP helper that leaked its own response
+body no longer reports success. The removal is scoped to a single path — never
+a pattern, never a directory.
 
 ## Boundaries
 

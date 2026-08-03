@@ -1269,8 +1269,13 @@ rewrote already-correct files, `curl -f` standing in for an exact HTTP 200,
 a non-running preview that was skipped rather than preserved, and no final
 verification stage. All seven are corrected on that branch.
 
-It has **not** been re-reviewed, **not** been installed on the Raspberry Pi and
-**not** been validated there. The gateway running in production is still the
+A second review round then found five more — no exclusive transaction lock, an
+invented preview baseline, a failed fast-forward bypassing rollback, an
+installer that followed unsafe file types, and a `restart-api` that had lost
+branch-aware validation. Those five are corrected too.
+
+It has **not** been final-reviewed, **not** been installed on the Raspberry Pi
+and **not** been validated there. The gateway running in production is still the
 Task 10 one described above, and nothing about the production host changed. A
 future deployment cannot use the new gateway until it is re-reviewed and
 installed under separate authorisation.
