@@ -2,8 +2,8 @@
 
 ## Status
 
-**Re-review round 2 findings corrected; not yet final-reviewed. The gateway is
-not installed, there has been no Raspberry Pi validation, and the production
+**Final-review corrections implemented; awaiting final confirmation. The gateway
+is not installed, there has been no Raspberry Pi validation, and the production
 gateway is unchanged. Physical camera acceptance remains pending.**
 
 | Gate | Outcome |
@@ -17,7 +17,9 @@ gateway is unchanged. Physical camera acceptance remains pending.**
 | Review corrections | Complete — all seven corrected |
 | Re-review | **Round 2 complete** — five further blocking defects found |
 | Re-review corrections | Complete — all five corrected |
-| Final review | **Not performed** |
+| Final review | **Complete** — four further blocking defects found |
+| Final-review corrections | Complete — all four corrected |
+| Final confirmation | **Not performed** |
 | Installation on the Raspberry Pi | **Not performed** — requires re-review and a separately approved SHA |
 | Raspberry Pi validation of the gateway | **Not performed** |
 
@@ -351,6 +353,64 @@ Every temporary file the gateway creates is now removed through one tracked
 helper whose failure is checked: an HTTP helper that leaked its own response
 body no longer reports success. The removal is scoped to a single path — never
 a pattern, never a directory.
+
+## Final review — four blocking defects corrected
+
+Final review found four more. All are corrected; none reached the Raspberry Pi,
+because nothing here has ever been installed.
+
+### Finding 1 — the lock object was not secured
+
+The lock was opened with append redirection, with no check on what it was or
+what mode it had. A readable lock file is a denial-of-deployment primitive: any
+unprivileged process that can open it read-only can hold an exclusive `flock`
+on it and block every deployment and restart indefinitely.
+
+The lock must now be a **root-owned `0600` regular file** reached through a real
+directory, verified before the lock is taken. When absent it is created under
+`umask 0077` with `noclobber`, so it is private from the moment it exists and a
+simultaneous first-run caller never replaces the winner's inode. A symlink,
+directory, FIFO, socket, device or wrongly owned file is refused, never followed
+and never replaced — replacing it would drop a legitimate holder's lock. The
+installer may tighten the mode of an existing root-owned regular lock file
+during first installation, and may never touch its inode.
+
+### Finding 2 — the status document was pattern-matched, not parsed
+
+`grep` could find `"state":"running"` inside a truncated or garbage-padded
+response and return it as a deployment baseline, and could not distinguish a
+top-level field from one nested inside `camera`.
+
+The system interpreter now parses the response file as JSON: valid UTF-8, no
+NUL, a top-level object with no leading or trailing data, exactly one top-level
+`state` key — duplicates refused even when they agree — and a string value.
+Nested keys never substitute. The response is handed over **by path**, so
+arbitrary remote bytes never pass through the shell, and the application is not
+imported to do it: parsing a response must not depend on the code being
+deployed.
+
+### Finding 3 — curl obeyed configuration
+
+`curl` read `~/.curlrc`, so a configuration file belonging to root could add
+`--location`, change the proxy or alter timeouts behind the gateway's back —
+at root. Every invocation now begins with `--disable`, and carries
+`--no-location` and `--max-redirs 0` alongside the existing exact-200
+comparison and literal loopback address.
+
+### Finding 4 — the caller's environment was inherited
+
+`GIT_DIR`, `GIT_WORK_TREE`, `UV_PROJECT`, `PYTHONPATH`, `VIRTUAL_ENV`,
+`CURL_HOME`, `TMPDIR` and the proxy variables could each redirect a
+root-invoked deployment at a different repository, index, configuration,
+interpreter or remote.
+
+Commands run as `claude` and `mgo` now go through `env -i` and receive only what
+they need, with `HOME` read from the account database and proven absolute rather
+than taken from the caller. The root side fixes `HOME`, `PATH`, `LC_ALL` and a
+root-owned `TMPDIR`, and explicitly unsets the whole list. Request validation
+was also moved ahead of all of it, so an unsupported action is refused before
+the process creates anything. The canonical-path proof, previously only in
+deployment, now also guards `restart-api`.
 
 ## Boundaries
 

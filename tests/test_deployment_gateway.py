@@ -3956,9 +3956,9 @@ def test_the_task_record_does_not_claim_the_production_gateway_changed() -> None
     )
     text = _read(record)
     index = text.index("Remediation status")
-    section = text[index : index + 1600]
+    section = text[index : index + 2600]
 
-    assert "not** been final-reviewed" in section
+    assert "awaiting final confirmation" in section
     assert "not** been installed" in section
     assert "not** been validated" in section
     assert "still the" in section
@@ -3972,9 +3972,9 @@ def test_the_remediation_record_states_the_review_corrections_truthfully() -> No
     )
     text = _read(record)
 
-    assert "Re-review round 2 findings corrected" in text
-    assert "not yet final-reviewed" in text
-    assert "Final review | **Not performed**" in text
+    assert "Final-review corrections implemented" in text
+    assert "awaiting final confirmation" in text
+    assert "Final confirmation | **Not performed**" in text
     assert "Installation on the Raspberry Pi | **Not performed**" in text
     assert "Raspberry Pi validation of the gateway | **Not performed**" in text
     assert "production\ngateway is unchanged" in text
@@ -3989,10 +3989,14 @@ def test_the_remediation_record_states_the_review_corrections_truthfully() -> No
         "Finding 3 — a failed fast-forward bypassed the rollback",
         "Finding 4 — the installer followed unsafe target types",
         "Finding 5 — restart-api lost branch-aware validation",
+        "Finding 1 — the lock object was not secured",
+        "Finding 2 — the status document was pattern-matched, not parsed",
+        "Finding 3 — curl obeyed configuration",
+        "Finding 4 — the caller's environment was inherited",
     ],
 )
 def test_every_re_review_finding_is_recorded(finding: str) -> None:
-    """All five round-2 findings and their corrections are written down."""
+    """Every round-2 and final-review finding is written down."""
     record = (
         PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
     )
@@ -4009,6 +4013,12 @@ def test_every_re_review_finding_is_recorded(finding: str) -> None:
         "starting",
         "transaction opens before the merge is invoked",
         "branch-aware",
+        "root-owned `0600`",
+        "umask 0077",
+        "parsed as JSON",
+        "--disable",
+        "env -i",
+        "/run/mgo-validate-tmp",
     ],
 )
 def test_the_deployment_document_covers_the_round_two_corrections(

@@ -1274,8 +1274,14 @@ invented preview baseline, a failed fast-forward bypassing rollback, an
 installer that followed unsafe file types, and a `restart-api` that had lost
 branch-aware validation. Those five are corrected too.
 
-It has **not** been final-reviewed, **not** been installed on the Raspberry Pi
-and **not** been validated there. The gateway running in production is still the
+A final review then found four more — an unsecured lock object that an
+unprivileged process could hold to deny all deployment, a status document
+pattern-matched rather than parsed, `curl` obeying configuration files, and the
+caller's environment being inherited by root-invoked commands. Those four are
+corrected too.
+
+It is **awaiting final confirmation**, has **not** been installed on the
+Raspberry Pi and has **not** been validated there. The gateway running in production is still the
 Task 10 one described above, and nothing about the production host changed. A
 future deployment cannot use the new gateway until it is re-reviewed and
 installed under separate authorisation.

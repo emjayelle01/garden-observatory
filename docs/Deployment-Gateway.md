@@ -58,6 +58,21 @@ between the restart and the final verification is the same class of problem.
   when the holder exits, however it exits.
 - `show-approval` is read-only and is never blocked.
 
+**The lock file is itself a security boundary.** Any unprivileged process that
+can open it read-only can hold an exclusive `flock` on it and deny every
+deployment and restart indefinitely. So it must be a **root-owned `0600`
+regular file** reached through a real directory — never a symlink, directory,
+FIFO, socket or device, and never group- or world-readable. That is verified
+*before* the lock is taken.
+
+When absent it is created under `umask 0077` with `noclobber`, so it is `0600`
+from the moment it exists and two simultaneous first-run callers cannot both
+create it — the loser validates the winner's file rather than replacing it. An
+unsafe object is **refused, never followed and never replaced**: replacing it
+would silently drop whatever lock a legitimate holder has on the old inode. The
+installer may tighten the mode of an existing root-owned regular lock file
+during the first installation, and may never touch its inode.
+
 **First installation is the exception.** The gateway currently on the Pi
 predates this lock and knows nothing about it, so the separately authorised
 first installation must happen with no deployment or restart in progress.
@@ -155,6 +170,38 @@ fails with a message naming `deploy-main` for application code and
 code and provisioning service identity are different operations and no longer
 share a verb.**
 
+## 5a. The caller's environment is an input surface
+
+Everything this gateway runs gets an environment it **constructed**, not one it
+inherited.
+
+Commands run as `claude` or `mgo` go through `env -i`, which empties the
+environment first — so `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
+`GIT_CONFIG*`, `GIT_SSH*`, `UV_PROJECT`, `UV_CONFIG_FILE`, `VIRTUAL_ENV`,
+`PYTHONPATH`, `PYTHONHOME`, `CURL_HOME`, `TMPDIR` and every proxy variable are
+gone by construction rather than by remembering to remove them. Any one of them
+could point a root-invoked deployment at a different repository, index,
+configuration, interpreter or remote.
+
+Each account gets exactly what it needs: `HOME` **read from the account
+database and proven absolute** (never the caller's), `USER`, `LOGNAME`, a fixed
+`PATH` and `LC_ALL=C`; the runtime probe additionally gets
+`MGO_CONFIG_PATH`. SSH to the expected repository still works, because the
+deployment key lives in the account's own fixed home.
+
+The root side sets `HOME=/root`, the fixed safe `PATH`, `LC_ALL=C` and a fixed
+root-owned `TMPDIR` (`/run/mgo-validate-tmp`, `0700`), and explicitly unsets the
+whole list above. `TMPDIR` matters more than it looks: it decides where response
+bodies and staging files are written.
+
+`curl` is invoked with `--disable` as its **first** option, so no `.curlrc`
+belonging to root or anyone else can add `--location`, change the proxy or alter
+the timeout behind the gateway's back — plus `--no-location` and
+`--max-redirs 0` for good measure.
+
+Request validation happens before any of this: an unsupported action is refused
+before the process so much as creates a directory.
+
 ## 6. Why Git and `uv` run as `claude`
 
 The production checkout is owned by `claude:mgo`. Running Git or `uv` as root
@@ -247,11 +294,21 @@ exercise the camera.
 Before anything moves, the gateway establishes what the camera is actually
 doing — and refuses to proceed if it cannot.
 
+The status document is **parsed as JSON** by the system interpreter
+(`/usr/bin/python3`), reading the response file directly. Pattern matching is
+gone: a `grep` could find `"state":"running"` inside a truncated or
+garbage-padded response and hand it back as a deployment baseline, and it could
+not tell a top-level field from one nested inside `camera`. The parser requires
+valid UTF-8, no NUL, a JSON **object** at the top level with no leading or
+trailing data, exactly one top-level `state` key — duplicates are refused even
+when they agree — and a string value. Nested `state` keys never substitute for
+the real one. The application is deliberately not imported to do this: parsing
+a response must not depend on the code being deployed.
+
 There is **no fallback state**. A missing, empty, duplicated, conflicting or
 unrecognised `state` field is a refusal, not an "unknown": inventing a state
 would make that invention the baseline an entire deployment measured itself
-against. Two occurrences are refused even when they agree, because nothing here
-can say which one the API meant.
+against.
 
 Only three states are settled enough to deploy against — `running`, `stopped`,
 `failed`. The transient pair, `starting` and `stopping`, stop the deployment
