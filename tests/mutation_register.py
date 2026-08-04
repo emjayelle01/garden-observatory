@@ -47,6 +47,17 @@ INSTALLER = "scripts/deploy/install-mgo-validate.sh"
 SUDOERS = "scripts/deploy/mgo-validate.sudoers"
 WRAPPER = "scripts/deploy/update-main.sh"
 
+#: The suite itself is a shipped asset for this purpose. A test module that
+#: executes entry points is a program that runs on the host under test, and the
+#: isolation that keeps it off the control plane is code like any other: it can
+#: be weakened, and nothing would notice unless something fails when it is.
+#:
+#: Every mutation of this asset is targeted at a test that fails *before* the
+#: weakened isolation could be used — either a static audit of the module's own
+#: AST, or a harness guard that refuses to start a child process. None of them
+#: reaches a real sudo or an installed path, which is the whole point.
+TESTS = "tests/test_deployment_gateway.py"
+
 
 MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
@@ -1587,5 +1598,92 @@ MUTATIONS: tuple[Mutation, ...] = (
         'Cmnd_Alias MGO_VALIDATE = /usr/local/sbin/\n',
         'grants_one_account_one_path or grants_nothing_else',
         'A directory prefix grants every executable inside it.',
+    ),
+    # --- the wrapper's delegation contract, executed -------------------------
+    #
+    # Both are caught only by the isolated execution test. The static
+    # `"exec sudo" in body` check that used to stand for this contract passes
+    # against either of them.
+    Mutation(
+        'wrapper-delegates-a-different-action',
+        WRAPPER,
+        'exec sudo -n "$GATEWAY" deploy-main',
+        'exec sudo -n "$GATEWAY" restart-api',
+        'wrapper_hands_the_gateway_its_exit_code',
+        'The exact argument vector stops being the argument vector.',
+    ),
+    Mutation(
+        'wrapper-discards-the-gateway-exit-code',
+        WRAPPER,
+        'exec sudo -n "$GATEWAY" deploy-main',
+        'sudo -n "$GATEWAY" deploy-main || true',
+        'wrapper_hands_the_gateway_its_exit_code',
+        'A summarising wrapper reports a success the gateway did not.',
+    ),
+    # --- the suite's own host boundary --------------------------------------
+    #
+    # These mutate the test module. Each is detected by a test that fails
+    # before the weakened isolation is used: the first is a static audit of the
+    # module's AST, and the rest trip a harness guard that runs before any
+    # child process is started. None of them can reach a real sudo.
+    Mutation(
+        'harness-executes-the-tracked-wrapper',
+        TESTS,
+        '        [_bash(), _posix(harness.wrapper)],',
+        '        [_bash(), str(UPDATE_MAIN)],',
+        'no_test_can_reach_the_host_control_plane',
+        'The harness executes the tracked wrapper, not its disposable copy.',
+    ),
+    Mutation(
+        'harness-keeps-the-production-gateway-constant',
+        TESTS,
+        '    text = source.replace(PRODUCTION_GATEWAY_CONSTANT, replacement)',
+        '    text = source',
+        'wrapper_reports_a_missing_gateway or wrapper_hands_the_gateway_its_exit_code',
+        'The disposable copy still names the installed gateway.',
+    ),
+    Mutation(
+        'harness-drops-the-fake-sudo-path-isolation',
+        TESTS,
+        '    environment["PATH"] = (\n'
+        '        _posix(harness.binaries) + os.pathsep + environment.get("PATH", "")\n'
+        '    )',
+        '    environment["PATH"] = environment.get("PATH", "")',
+        'wrapper_reports_a_missing_gateway or wrapper_hands_the_gateway_its_exit_code',
+        "The fake sudo stops being ahead of the host's real one.",
+    ),
+    Mutation(
+        'missing-gateway-case-lets-sudo-run',
+        TESTS,
+        '    harness = _disposable_wrapper(tmp_path, gateway_present=False)',
+        '    harness = _disposable_wrapper(tmp_path, gateway_present=True)',
+        'wrapper_reports_a_missing_gateway',
+        'The missing-gateway case stops being the case with no gateway.',
+    ),
+    Mutation(
+        'host-escape-audit-registers-no-executor',
+        TESTS,
+        '        "run_bash",\n'
+        '        "call_gateway_function",\n'
+        '        "run_isolated_wrapper",\n',
+        '',
+        'host_escape_audit_is_looking_at_something',
+        'The audit stops watching the callables this suite executes through.',
+    ),
+    Mutation(
+        'host-escape-audit-permits-the-tracked-wrapper',
+        TESTS,
+        'UNEXECUTABLE_NAMES = frozenset({"UPDATE_MAIN"})',
+        'UNEXECUTABLE_NAMES = frozenset()',
+        'host_escape_audit_is_looking_at_something',
+        'Direct subprocess execution of UPDATE_MAIN stops being a finding.',
+    ),
+    Mutation(
+        'host-escape-audit-permits-the-installed-gateway',
+        TESTS,
+        '    "/usr/local/sbin/mgo-validate",\n    "/etc/sudoers.d",',
+        '    "/etc/sudoers.d",',
+        'host_escape_audit_is_looking_at_something',
+        'An executed /usr/local/sbin/mgo-validate command stops being a finding.',
     ),
 )

@@ -6,20 +6,33 @@ test sources ``scripts/deploy/mgo-validate`` in a real Bash process and calls
 the real function against temporary directories, temporary Git repositories and
 recorded command doubles.
 
-Nothing here touches a production path, a real ``sudo``, a real ``systemd``, the
-network or the Raspberry Pi. Where a boundary genuinely cannot be executed
-safely — the root and systemd calls, and the symlink refusal on a filesystem
-that will not create symlinks — the shipped text is asserted instead, and the
-test says so.
+Nothing here executes a production path, a real ``sudo``, a real ``systemd``,
+the network or the Raspberry Pi. That claim is not a promise any more: it is
+enforced by ``test_no_test_can_reach_the_host_control_plane``, which parses this
+module and fails on the shapes that would break it. The claim used to be false.
+``test_the_wrapper_reports_a_missing_gateway_and_stops`` executed the tracked
+``scripts/deploy/update-main.sh`` directly, and that script names
+``/usr/local/sbin/mgo-validate``; on a workstation the path is absent so the
+test reached the missing-gateway branch and looked correct, but on the
+Raspberry Pi the path exists and the same test ran
+``sudo -n /usr/local/sbin/mgo-validate deploy-main`` against the real control
+plane. Wrapper entry points now run as a disposable copy behind a fake ``sudo``.
+
+Where a boundary genuinely cannot be executed safely — the root and systemd
+calls, and the symlink refusal on a filesystem that will not create symlinks —
+the shipped text is asserted instead, and the test says so.
 """
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -4545,8 +4558,6 @@ def _entry_probe(tmp_path: Path, asset: Path, *, marker: str = "") -> Path:
 def _run_probe(
     probe: Path, *, extra: dict[str, str] | None = None, argument: str = "show-approval"
 ) -> subprocess.CompletedProcess[str]:
-    import os
-
     environment = dict(os.environ)
     environment.update(HOSTILE_PROCESS_ENVIRONMENT)
     environment["PATH"] = "/tmp/evil-bin:" + environment.get("PATH", "")
@@ -5505,24 +5516,568 @@ def test_the_wrapper_refuses_to_run_as_root() -> None:
     assert "exit 1" in body
 
 
-def test_the_wrapper_reports_a_missing_gateway_and_stops(tmp_path: Path) -> None:
-    """Executed, not described: the real script on a host with no gateway."""
-    result = subprocess.run(
-        [_bash(), str(UPDATE_MAIN)],
+# --------------------------------------------------------------------------
+# the isolated wrapper harness
+# --------------------------------------------------------------------------
+#
+# The wrapper is the one shipped entry point whose whole job is to hand control
+# to something the host owns. Executing the tracked file to test that makes the
+# result depend on whether the host has a gateway installed — which is how a
+# Raspberry Pi staging run ended up invoking the real control plane through
+# sudo. Everything below executes a *copy* whose gateway constant points inside
+# a temporary directory, with a fake ``sudo`` in front of the real one.
+
+
+PRODUCTION_GATEWAY_CONSTANT = 'readonly GATEWAY="/usr/local/sbin/mgo-validate"'
+
+# The tripwire's exit code. Distinctive on purpose: 0 and 1 are both codes the
+# wrapper can produce by itself, so neither would prove the code came through.
+FAKE_SUDO_EXIT = 42
+
+# One line per invocation, written before the arguments, so "exactly once" is a
+# count rather than an inference from how many arguments were logged.
+FAKE_SUDO_MARKER = "--"
+
+
+class IsolatedWrapper(NamedTuple):
+    """A disposable wrapper and the boundary that contains it."""
+
+    wrapper: Path
+    gateway: Path
+    binaries: Path
+    sudo_log: Path
+
+
+def _make_executable(path: Path) -> None:
+    """Best effort: Windows has no execute bit, and Git Bash infers one."""
+    os.chmod(path, 0o755)
+
+
+def _disposable_wrapper(root: Path, *, gateway_present: bool) -> IsolatedWrapper:
+    """Build a copy of the tracked wrapper that cannot reach the host.
+
+    This function reads ``UPDATE_MAIN`` and executes nothing — the split is
+    deliberate, because it is what lets the suite's own audit state a rule with
+    no exceptions: no function that executes anything may so much as name the
+    tracked wrapper.
+    """
+    source = _read(UPDATE_MAIN)
+    assert source.count(PRODUCTION_GATEWAY_CONSTANT) == 1, (
+        "the wrapper's production gateway constant is not where this harness "
+        "expects it; re-point the harness before it can isolate anything"
+    )
+
+    binaries = root / "bin"
+    binaries.mkdir()
+    gateway = root / "sbin" / "mgo-validate"
+    gateway.parent.mkdir()
+    sudo_log = root / "sudo.log"
+
+    replacement = f'readonly GATEWAY="{_posix(gateway)}"'
+    text = source.replace(PRODUCTION_GATEWAY_CONSTANT, replacement)
+    executable_lines = "\n".join(
+        line for line in text.splitlines() if not line.strip().startswith("#")
+    )
+    assert "/usr/local/sbin" not in executable_lines, (
+        "the disposable copy can still name the installed gateway"
+    )
+
+    # Bytes, not ``write_text``: the wrapper is LF-only and a CRLF copy would
+    # make the kernel — and Git Bash — hunt for an interpreter called ``bash\r``.
+    wrapper = root / "update-main.sh"
+    wrapper.write_bytes(text.encode("utf-8"))
+    _make_executable(wrapper)
+
+    fake_sudo = binaries / "sudo"
+    fake_sudo.write_bytes(
+        (
+            "#!/bin/sh\n"
+            "# The tripwire. It records what it was asked to do and never does\n"
+            "# it: nothing here executes $1, and the real sudo is not on PATH\n"
+            "# ahead of this file.\n"
+            f"printf '%s\\n' '{FAKE_SUDO_MARKER}' >> \"{_posix(sudo_log)}\"\n"
+            'for argument in "$@"; do\n'
+            f"    printf '%s\\n' \"$argument\" >> \"{_posix(sudo_log)}\"\n"
+            "done\n"
+            f"exit {FAKE_SUDO_EXIT}\n"
+        ).encode()
+    )
+    _make_executable(fake_sudo)
+
+    if gateway_present:
+        # Harmless and never run: the tripwire exits before it could be.
+        gateway.write_bytes(b"#!/bin/sh\nprintf 'the gateway ran\\n'\nexit 0\n")
+        _make_executable(gateway)
+
+    return IsolatedWrapper(
+        wrapper=wrapper, gateway=gateway, binaries=binaries, sudo_log=sudo_log
+    )
+
+
+def run_isolated_wrapper(
+    harness: IsolatedWrapper,
+) -> subprocess.CompletedProcess[str]:
+    """Execute the disposable wrapper with the fake ``sudo`` in front.
+
+    Never names the tracked wrapper, never names an installed path, and refuses
+    to start the child at all unless the isolation it depends on is in place.
+    """
+    environment = dict(os.environ)
+    environment["PATH"] = (
+        _posix(harness.binaries) + os.pathsep + environment.get("PATH", "")
+    )
+
+    # Guards, not decoration. Each one is a way this harness could stop being a
+    # boundary without a single assertion below noticing.
+    assert environment["PATH"].split(os.pathsep)[0] == _posix(harness.binaries), (
+        "the fake sudo is not first on the child's PATH"
+    )
+    assert (harness.binaries / "sudo").is_file(), "the sudo tripwire is missing"
+    executable_lines = "\n".join(
+        line
+        for line in _read(harness.wrapper).splitlines()
+        if not line.strip().startswith("#")
+    )
+    assert "/usr/local/sbin" not in executable_lines, (
+        "refusing to execute a wrapper that names the installed gateway"
+    )
+
+    return subprocess.run(
+        [_bash(), _posix(harness.wrapper)],
         capture_output=True,
         text=True,
-        cwd=str(tmp_path),
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        cwd=str(harness.wrapper.parent),
         check=False,
     )
 
-    assert result.returncode == 1
+
+def test_the_wrapper_reports_a_missing_gateway_and_stops(tmp_path: Path) -> None:
+    """Executed, not described — and against a copy, not against this host.
+
+    This test used to run ``scripts/deploy/update-main.sh`` itself. On a
+    workstation with nothing installed it reached the missing-gateway branch and
+    looked correct; on the Raspberry Pi ``/usr/local/sbin/mgo-validate`` exists,
+    so the same test executed ``sudo -n /usr/local/sbin/mgo-validate
+    deploy-main`` against the live control plane. What it asserted therefore
+    depended on the host rather than on the wrapper. It no longer can.
+    """
+    harness = _disposable_wrapper(tmp_path, gateway_present=False)
+
+    result = run_isolated_wrapper(harness)
+
+    assert not harness.gateway.exists(), "the gateway was meant to be absent"
+    assert result.returncode == 1, result.stdout + result.stderr
     assert "not installed" in result.stderr
     assert "install-mgo-validate.sh" in result.stderr
+    assert "sudo ./scripts/deploy/install-mgo-validate.sh" in result.stderr
+    # The message names the temporary gateway, which is the proof that the copy
+    # under test was the redirected one.
+    assert _posix(harness.gateway) in result.stderr
+    assert "/usr/local/sbin" not in result.stderr
+    # The tripwire. If the wrapper reached for sudo with no gateway installed,
+    # this is what says so — and on a host that has one, it is the difference
+    # between a test and an incident.
+    assert not harness.sudo_log.exists() or not _read(harness.sudo_log).strip(), (
+        f"the wrapper invoked sudo with no gateway present: "
+        f"{_read(harness.sudo_log) if harness.sudo_log.exists() else ''!r}"
+    )
 
 
-def test_the_wrapper_preserves_the_gateway_exit_code_by_execing() -> None:
-    """A wrapper that summarised the result could report a false success."""
-    assert "exec sudo" in _wrapper_body()
+def test_the_wrapper_hands_the_gateway_its_exit_code_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """The delegation contract, executed rather than asserted about.
+
+    ``exec sudo -n "$GATEWAY" deploy-main`` makes three promises at once: the
+    exact command, exactly once, and the gateway's own exit code. A static
+    ``"exec sudo" in body`` check proves none of them.
+    """
+    harness = _disposable_wrapper(tmp_path, gateway_present=True)
+
+    result = run_isolated_wrapper(harness)
+
+    assert result.returncode == FAKE_SUDO_EXIT, result.stdout + result.stderr
+    assert harness.sudo_log.is_file(), "the wrapper never delegated"
+
+    recorded = _read(harness.sudo_log).splitlines()
+    assert recorded.count(FAKE_SUDO_MARKER) == 1, recorded
+    assert recorded[1:] == ["-n", _posix(harness.gateway), "deploy-main"], recorded
+
+    # The gateway copy prints when it runs; the tripwire exits before that, so
+    # an empty stdout is what proves nothing behind sudo was executed.
+    assert result.stdout == "", result.stdout
+    assert "/usr/local/sbin" not in _read(harness.sudo_log)
+
+
+# --------------------------------------------------------------------------
+# the suite's own boundary
+# --------------------------------------------------------------------------
+#
+# A test module that executes shipped entry points is a program that runs on
+# the host it is testing. The docstring at the top of this file claimed for
+# months that nothing here touches a real sudo or a production path, and the
+# claim was wrong the whole time, because nothing checked it. These registers
+# and the audit below are the check. They are ordinary data and ordinary AST
+# inspection deliberately: a comment cannot fail, and a substring search whose
+# own assertion contains the substring passes against anything.
+
+
+#: Every callable in this module that starts a process. A shape not named here
+#: is not audited, which is why removing an entry is itself a registered
+#: mutation.
+EXECUTING_CALLABLES = frozenset(
+    {
+        "subprocess.run",
+        "subprocess.Popen",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "os.system",
+        "os.popen",
+        "os.execv",
+        "os.execvp",
+        "run_bash",
+        "call_gateway_function",
+        "run_isolated_wrapper",
+    }
+)
+
+#: Assets this module may read but must never execute. The wrapper is here
+#: because it is the only shipped script that resolves a host path and hands
+#: control to it; the gateway and the installer both refuse an unprivileged
+#: caller before they touch anything, so executing the repository copies of
+#: those is a bounded thing to do.
+UNEXECUTABLE_NAMES = frozenset({"UPDATE_MAIN"})
+
+#: Installed paths. Naming one in a string is fine — half this suite asserts
+#: that the shipped text contains them. Putting one in command position inside
+#: something this module then runs is not.
+HOST_CONTROL_PLANE_PATHS = (
+    "/usr/local/sbin/mgo-validate",
+    "/etc/sudoers.d",
+    "/etc/garden-observatory",
+    "/opt/garden-observatory",
+    "/var/lib/garden-observatory",
+    "/run/lock/mgo-deployment.lock",
+    "/run/mgo-validate-tmp",
+    "/run/mgo-validate-install",
+)
+
+#: Programs that change the host rather than report on it. Every one of these
+#: appears in this suite only as a shell-function double, never as a command.
+REAL_PRIVILEGE_COMMANDS = frozenset(
+    {"sudo", "systemctl", "runuser", "flock", "visudo", "curl"}
+)
+
+_COMMAND_SEPARATORS = (";", "&", "|", "(", ")", "`", "$(", "{", "}", "\n")
+_COMMAND_INTRODUCERS = (
+    "exec",
+    "sudo",
+    "command",
+    "eval",
+    "source",
+    "then",
+    "else",
+    "do",
+)
+
+
+def _dotted_name(node: ast.expr) -> str:
+    """``subprocess.run`` from the call's ``func``, or "" for anything else."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{_dotted_name(node.value)}.{node.attr}"
+    return ""
+
+
+def _referenced_names(node: ast.AST) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _string_constants(node: ast.AST) -> list[str]:
+    return [
+        n.value
+        for n in ast.walk(node)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    ]
+
+
+def _in_command_position(text: str, index: int) -> bool:
+    """Would a shell read ``text[index:]`` as the start of a command?
+
+    A path or program name that appears as an *argument* — inside quotes, after
+    another word — is data. The same token at the start of a line, after a
+    separator, or after ``exec``/``sudo`` is something that runs.
+    """
+    prefix = text[:index]
+    if prefix.endswith(('"', "'")):
+        prefix = prefix[:-1]
+    prefix = prefix.rstrip(" \t")
+    if not prefix:
+        return True
+    if any(prefix.endswith(separator) for separator in _COMMAND_SEPARATORS):
+        return True
+    for introducer in _COMMAND_INTRODUCERS:
+        if prefix == introducer:
+            return True
+        if prefix.endswith(introducer) and prefix[-len(introducer) - 1] in " \t\n;|&(":
+            return True
+    return False
+
+
+def _local_assignments(function: ast.AST) -> dict[str, ast.expr]:
+    """``name -> value`` for the plain assignments inside one function."""
+    found: dict[str, ast.expr] = {}
+    for node in ast.walk(function):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    found[target.id] = node.value
+    return found
+
+
+def _executed_program(argv: ast.expr) -> ast.expr | None:
+    """The element of an argv list that names what will actually run.
+
+    When the interpreter is ``_bash()`` the program is the first element after
+    it that is not an option, so ``[_bash(), "-n", str(asset)]`` and
+    ``[_bash(), _posix(script)]`` both resolve to the thing being run.
+    """
+    if not isinstance(argv, ast.List) or not argv.elts:
+        return None
+    head = argv.elts[0]
+    if isinstance(head, ast.Call) and _dotted_name(head.func) == "_bash":
+        for element in argv.elts[1:]:
+            constants = _string_constants(element)
+            if len(constants) == 1 and constants[0].startswith("-"):
+                continue
+            return element
+        return None
+    return head
+
+
+def _parametrised_aliases(function: ast.FunctionDef, unsafe: set[str]) -> set[str]:
+    """Parameters bound by ``parametrize`` to a collection holding an asset.
+
+    ``SHELL_ASSETS`` contains the wrapper, so a test parametrised over it holds
+    the wrapper in a variable that is never spelled ``UPDATE_MAIN``.
+    """
+    aliases: set[str] = set()
+    for decorator in function.decorator_list:
+        if not isinstance(decorator, ast.Call):
+            continue
+        if not _dotted_name(decorator.func).endswith("parametrize"):
+            continue
+        if len(decorator.args) < 2:
+            continue
+        argnames, argvalues = decorator.args[0], decorator.args[1]
+        if not (isinstance(argnames, ast.Constant) and isinstance(argnames.value, str)):
+            continue
+        if _referenced_names(argvalues) & unsafe:
+            aliases.update(part.strip() for part in argnames.value.split(","))
+    return aliases
+
+
+def _is_syntax_check(call: ast.Call) -> bool:
+    """``bash -n`` parses a script; it never runs a statement of it."""
+    return "-n" in _string_constants(call)
+
+
+def test_no_test_can_reach_the_host_control_plane() -> None:
+    """The suite's no-real-sudo claim, enforced against the suite's own AST.
+
+    Four rules, each corresponding to a way the boundary has broken or could:
+
+    1. a function that executes anything may not name the tracked wrapper —
+       which is exactly what the Raspberry Pi staging failure was;
+    2. what an executing call actually runs may not resolve to the wrapper,
+       including through a ``parametrize`` alias or a local variable;
+    3. nothing this module runs may put an installed path in command position;
+    4. nothing this module runs may invoke a real privileged command.
+
+    Deliberately structural. An earlier version of this promise was a sentence
+    in the module docstring, and a substring search for ``sudo`` would have been
+    satisfied by its own assertion.
+    """
+    source = _read(Path(__file__))
+    tree = ast.parse(source)
+
+    module_level = {
+        target.id: node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    # A collection is unsafe to execute if it holds something unsafe to execute.
+    unsafe_collections = {
+        name
+        for name, value in module_level.items()
+        if _referenced_names(value) & UNEXECUTABLE_NAMES
+    }
+
+    failures: list[str] = []
+    for function in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        calls = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and _dotted_name(node.func) in EXECUTING_CALLABLES
+        ]
+        operational = [call for call in calls if not _is_syntax_check(call)]
+        where = f"{function.name} (line {function.lineno})"
+
+        # 1 — naming and executing, in one function.
+        named = _referenced_names(function) & UNEXECUTABLE_NAMES
+        if operational and named:
+            failures.append(f"{where} executes and also names {sorted(named)}")
+
+        # 2 — what is actually run.
+        assignments = _local_assignments(function)
+        aliases = _parametrised_aliases(
+            function, unsafe_collections | UNEXECUTABLE_NAMES
+        )
+        for call in operational:
+            if not call.args:
+                continue
+            argv = call.args[0]
+            if isinstance(argv, ast.Name) and argv.id in assignments:
+                argv = assignments[argv.id]
+            program = _executed_program(argv)
+            if program is None:
+                continue
+            reached = _referenced_names(program) & (UNEXECUTABLE_NAMES | aliases)
+            if reached:
+                failures.append(
+                    f"{where} executes {sorted(reached)} at line {call.lineno}"
+                )
+
+        # 3 and 4 — what the executed text says. Arguments passed by name are
+        # resolved one level, so a command built into a variable is still read.
+        for call in calls:
+            reachable = list(_string_constants(call))
+            for node in ast.walk(call):
+                if isinstance(node, ast.Name):
+                    bound = assignments.get(node.id) or module_level.get(node.id)
+                    if bound is not None:
+                        reachable.extend(_string_constants(bound))
+
+            for text in reachable:
+                for path in HOST_CONTROL_PLANE_PATHS:
+                    index = text.find(path)
+                    while index != -1:
+                        if _in_command_position(text, index):
+                            failures.append(
+                                f"{where} runs the installed path {path} "
+                                f"(line {call.lineno})"
+                            )
+                        index = text.find(path, index + 1)
+                for program_name in sorted(REAL_PRIVILEGE_COMMANDS):
+                    if text.strip() == program_name:
+                        failures.append(
+                            f"{where} passes {program_name} as a program "
+                            f"(line {call.lineno})"
+                        )
+                    index = text.find(program_name)
+                    while index != -1:
+                        end = index + len(program_name)
+                        after = text[end : end + 1]
+                        if after in (" ", "\t") and _in_command_position(text, index):
+                            failures.append(
+                                f"{where} invokes the real {program_name} "
+                                f"(line {call.lineno})"
+                            )
+                        index = text.find(program_name, index + 1)
+
+    assert not failures, "the suite can reach the host:\n  " + "\n  ".join(failures)
+
+
+def test_the_host_escape_audit_is_looking_at_something() -> None:
+    """The audit passes vacuously if its registers are emptied.
+
+    Every rule above is a lookup in a frozenset or a tuple, so the cheapest way
+    to delete this boundary is not to touch the audit at all — it is to remove
+    the entry it depends on. These are the entries that were the difference
+    between a safe suite and a Raspberry Pi incident.
+    """
+    assert "subprocess.run" in EXECUTING_CALLABLES
+    assert "run_bash" in EXECUTING_CALLABLES
+    assert "call_gateway_function" in EXECUTING_CALLABLES
+    assert "run_isolated_wrapper" in EXECUTING_CALLABLES
+
+    assert "UPDATE_MAIN" in UNEXECUTABLE_NAMES
+
+    assert "/usr/local/sbin/mgo-validate" in HOST_CONTROL_PLANE_PATHS
+    assert "/etc/sudoers.d" in HOST_CONTROL_PLANE_PATHS
+    assert "/opt/garden-observatory" in HOST_CONTROL_PLANE_PATHS
+
+    assert "sudo" in REAL_PRIVILEGE_COMMANDS
+    assert "systemctl" in REAL_PRIVILEGE_COMMANDS
+    assert "runuser" in REAL_PRIVILEGE_COMMANDS
+
+    # And the audit itself has to still be here to use them.
+    module = ast.parse(_read(Path(__file__)))
+    defined = {
+        node.name for node in ast.walk(module) if isinstance(node, ast.FunctionDef)
+    }
+    assert "test_no_test_can_reach_the_host_control_plane" in defined
+    assert "_disposable_wrapper" in defined
+    assert "run_isolated_wrapper" in defined
+
+
+def test_the_audit_rejects_the_shapes_it_exists_to_reject() -> None:
+    """A boundary nobody has watched fail is a boundary nobody has tested.
+
+    The rules are checked against synthetic modules rather than by breaking
+    this one, so the evidence that they bite does not depend on a mutation run.
+    """
+
+    def audit(snippet: str) -> list[str]:
+        tree = ast.parse(snippet)
+        problems: list[str] = []
+        for function in [
+            n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+        ]:
+            calls = [
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and _dotted_name(node.func) in EXECUTING_CALLABLES
+            ]
+            operational = [call for call in calls if not _is_syntax_check(call)]
+            if operational and (_referenced_names(function) & UNEXECUTABLE_NAMES):
+                problems.append("names the wrapper")
+            for call in calls:
+                for text in _string_constants(call):
+                    for path in HOST_CONTROL_PLANE_PATHS:
+                        index = text.find(path)
+                        if index != -1 and _in_command_position(text, index):
+                            problems.append("runs an installed path")
+                    for name in REAL_PRIVILEGE_COMMANDS:
+                        index = text.find(name)
+                        if (
+                            index != -1
+                            and text[index + len(name) : index + len(name) + 1] == " "
+                            and _in_command_position(text, index)
+                        ):
+                            problems.append("runs a real privileged command")
+        return problems
+
+    assert audit("def t():\n    subprocess.run([_bash(), str(UPDATE_MAIN)])\n")
+    assert audit('def t():\n    run_bash("exec /usr/local/sbin/mgo-validate x")\n')
+    assert audit('def t():\n    run_bash("sudo -n /usr/local/sbin/mgo-validate")\n')
+    # And the shapes it must not reject, or the suite could not test anything:
+    # a disposable copy, a production path passed as an argument to a doubled
+    # function, and a shell-function double named after a real command.
+    assert not audit("def t():\n    subprocess.run([_bash(), _posix(copy)])\n")
+    assert not audit(
+        'def t():\n    call_gateway_function(\'f "mgo" "/opt/garden-observatory"\')\n'
+    )
+    assert not audit('def t():\n    run_bash("visudo() { return 0; }\\n")\n')
 
 
 # --------------------------------------------------------------------------
@@ -5764,6 +6319,25 @@ def test_the_deployment_document_covers_the_round_two_corrections(
 ) -> None:
     """The operator-facing model keeps pace with the code."""
     assert topic in _read(DEPLOYMENT_DOC)
+
+
+def test_the_installer_header_distinguishes_the_two_dry_runs() -> None:
+    """The header is where an operator reads the command before typing it."""
+    header = "\n".join(
+        line for line in _read(INSTALLER).splitlines() if line.startswith("#")
+    )
+
+    assert "Unprivileged staging/source validation" in header
+    assert "Authoritative root pre-installation validation" in header
+    assert "./scripts/deploy/install-mgo-validate.sh --dry-run" in header
+    assert "sudo ./scripts/deploy/install-mgo-validate.sh --dry-run" in header
+    assert "sudo ./scripts/deploy/install-mgo-validate.sh\n" in header + "\n"
+    assert "is not a substitute for (2)" in header
+    assert "cannot fully inspect them" in header
+    # And the transaction summary says which bytes are validated against which.
+    assert (
+        "both staged source snapshots are validated before either installed" in header
+    )
 
 
 def test_the_mutation_register_is_part_of_the_repository() -> None:

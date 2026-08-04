@@ -9,10 +9,28 @@
 # SHELLOPTS, BASHOPTS, CDPATH and GLOBIGNORE during its own startup — none of
 # which any statement in this file could undo afterwards.
 #
-# Run as root on the Raspberry Pi, **executed directly** so the shebang above
-# is the interpreter that runs:
-#   sudo ./scripts/deploy/install-mgo-validate.sh
-#   ./scripts/deploy/install-mgo-validate.sh --dry-run
+# Always **executed directly**, so the shebang above is the interpreter that
+# runs. There are three distinct invocations and they do not mean the same
+# thing:
+#
+#   1. Unprivileged staging/source validation — checks the sources this
+#      checkout is about to install, on any host, without privilege:
+#        ./scripts/deploy/install-mgo-validate.sh --dry-run
+#
+#   2. Authoritative root pre-installation validation — the same checks with
+#      the privilege needed to see the installed targets as they really are:
+#        sudo ./scripts/deploy/install-mgo-validate.sh --dry-run
+#
+#   3. Installation, on the Raspberry Pi, as root:
+#        sudo ./scripts/deploy/install-mgo-validate.sh
+#
+# (1) is not a substitute for (2). The installed targets are root-owned, and
+# /etc/sudoers.d is not readable by an ordinary account: an unprivileged dry
+# run cannot fully inspect them, so it cannot tell a target that is already
+# current from one it merely could not read, and it cannot re-validate the
+# installed policy with visudo. It reports on the sources and on as much of the
+# host as the caller may see. Only the root dry run (2) is evidence about what
+# an installation would actually do here.
 #
 # Never `sudo bash scripts/deploy/install-mgo-validate.sh`: naming the
 # interpreter on the command line discards the shebang, and with it privileged
@@ -31,7 +49,8 @@
 #
 # Transaction shape:
 #
-#   * both sources are validated before either target is touched;
+#   * both staged source snapshots are validated before either installed
+#     target is touched;
 #   * a fully current installation is verified and exits before any temporary
 #     file is created — nothing correct is rewritten;
 #   * both previous states are recorded first, and "absent" is a state;
