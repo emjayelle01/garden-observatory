@@ -1305,6 +1305,22 @@ Task 10 one described above, and nothing about the production host changed. A
 future deployment cannot use the new gateway until it is re-reviewed and
 installed under separate authorisation.
 
+**Raspberry Pi staging validation is incomplete.** A first staging attempt ran
+the branch's tests on the Pi and was stopped: one gateway-focused test executed
+the tracked deployment wrapper directly, and because that wrapper names the
+fixed path `/usr/local/sbin/mgo-validate`, it invoked the Pi's installed
+production gateway through `sudo` instead of reaching the missing-gateway
+branch it was written for. The installed Task 10 gateway refused the request —
+it is pinned to `task-010-operations` and the checkout is on `main` — so
+production was untouched, but the boundary was breached and the attempt
+does not count as a pass. The repository test isolation has since been corrected:
+wrapper entry points execute a disposable copy behind a fake `sudo`, and an
+AST audit of the test module now fails on any further host-reaching execution.
+The full account, including the production non-interference evidence, is in
+[Task-012-Deployment-Gateway-Remediation.md](Task-012-Deployment-Gateway-Remediation.md).
+No gateway was installed, the production gateway is unchanged, and
+physical camera acceptance remains pending.
+
 ### Evidence
 
 | Check | Result |

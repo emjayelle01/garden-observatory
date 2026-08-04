@@ -6217,13 +6217,18 @@ def test_the_task_record_does_not_claim_the_production_gateway_changed() -> None
     )
     text = _read(record)
     index = text.index("Remediation status")
-    section = text[index : index + 3600]
+    section = text[index : index + 5400]
 
     assert "awaiting final confirmation" in section
     assert "not** been installed" in section
     assert "not** been validated" in section
     assert "still the" in section
     assert "nothing about the production host changed" in section
+    # And the staging attempt is recorded as incomplete, not as a pass.
+    assert "Raspberry Pi staging validation is incomplete" in section
+    assert "does not count as a pass" in section
+    assert "production was untouched" in section
+    assert "physical camera acceptance remains pending" in section
 
 
 def test_the_remediation_record_states_the_review_corrections_truthfully() -> None:
@@ -6240,6 +6245,71 @@ def test_the_remediation_record_states_the_review_corrections_truthfully() -> No
     assert "Raspberry Pi validation of the gateway | **Not performed**" in text
     assert "production gateway is unchanged" in text
     assert "Physical camera acceptance remains pending" in text
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        # The classification, stated as a classification.
+        "TASK 12 GATEWAY PI STAGING VALIDATION INCOMPLETE",
+        "Raspberry Pi staging validation | **Incomplete**",
+        "It is not a pass, and it",
+        # The breach itself, named exactly.
+        "test_the_wrapper_reports_a_missing_gateway_and_stops",
+        "sudo -n /usr/local/sbin/mgo-validate deploy-main",
+        # Why the installed gateway changed nothing.
+        "Why the installed gateway changed nothing",
+        "task-010-operations",
+        "A gateway that had accepted the request would have",
+        # Production non-interference.
+        "1aec2245010a1bd971d028be235c1864af6b46b3",
+        "70709",
+        "71087",
+        "8346e732c2545ff369f6c4f0e3fc2e415d10993d8fe6b4b1b2c67600555183da",
+        "Empty and unchanged",
+        # What the attempt did and did not establish.
+        "/usr/sbin/visudo -cf",
+        "/bin/bash -p -n",
+        "596 of 597 focused tests passed",
+        "the mutation register;",
+        "the unprivileged installer dry run.",
+        # The correction.
+        "The isolated wrapper harness",
+        "disposable copy",
+        "test_no_test_can_reach_the_host_control_plane",
+        "The module docstring was rewritten only after that enforcement existed.",
+        # And what is still true.
+        "No gateway was installed. The production gateway is unchanged.",
+    ],
+)
+def test_the_incomplete_pi_staging_attempt_is_recorded(statement: str) -> None:
+    """An incident recorded as an outcome cannot be reviewed.
+
+    Every fact here was established on the Raspberry Pi and cannot be recovered
+    from this repository: what ran, what refused it, and what the host looked
+    like before and after.
+    """
+    record = (
+        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
+    )
+
+    assert statement in _read(record)
+
+
+def test_the_staging_attempt_is_never_described_as_passed() -> None:
+    """The one summary that would make the record useless."""
+    record = (
+        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
+    )
+    text = _read(record)
+
+    for claim in (
+        "staging validation passed",
+        "staging validation complete",
+        "Raspberry Pi validation passed",
+        "PI STAGING VALIDATION PASSED",
+    ):
+        assert claim not in text, claim
 
 
 @pytest.mark.parametrize(
@@ -6319,6 +6389,39 @@ def test_the_deployment_document_covers_the_round_two_corrections(
 ) -> None:
     """The operator-facing model keeps pace with the code."""
     assert topic in _read(DEPLOYMENT_DOC)
+
+
+@pytest.mark.parametrize(
+    "topic",
+    [
+        "Testing this gateway without deploying through it",
+        "disposable copy",
+        "tripwire",
+        "test_no_test_can_reach_the_host_control_plane",
+        "The tracked wrapper is unchanged by any of this",
+        "enforced rather than promised",
+        # The two dry runs, told apart.
+        "The two dry runs are not the same command",
+        "./scripts/deploy/install-mgo-validate.sh --dry-run        # staging",
+        "sudo ./scripts/deploy/install-mgo-validate.sh --dry-run   # authoritative",
+        "It is *not* a substitute for the root form",
+    ],
+)
+def test_the_deployment_document_covers_the_test_isolation_correction(
+    topic: str,
+) -> None:
+    """The operator-facing model keeps pace with the suite, too."""
+    assert topic in _read(DEPLOYMENT_DOC)
+
+
+def test_the_script_index_distinguishes_the_two_dry_runs() -> None:
+    """One of them is evidence about this host; the other is not."""
+    text = _read(PROJECT_ROOT / "scripts" / "README.md")
+
+    assert "./scripts/deploy/install-mgo-validate.sh --dry-run" in text
+    assert "sudo ./scripts/deploy/install-mgo-validate.sh --dry-run" in text
+    assert "authoritative pre-installation report" in text
+    assert "not** a substitute" in text
 
 
 def test_the_installer_header_distinguishes_the_two_dry_runs() -> None:

@@ -518,13 +518,24 @@ is safe.
 ## 13. Installation
 
 ```bash
-sudo ./scripts/deploy/install-mgo-validate.sh --dry-run   # report only
+./scripts/deploy/install-mgo-validate.sh --dry-run        # staging: sources only
+sudo ./scripts/deploy/install-mgo-validate.sh --dry-run   # authoritative report
 sudo ./scripts/deploy/install-mgo-validate.sh             # install
 ```
 
 **Run it directly.** Naming the interpreter — `sudo bash …` — discards the
 shebang, and with it the privileged mode that stops Bash reading `BASH_ENV` and
 importing exported shell functions before the script's first statement.
+
+**The two dry runs are not the same command.** The unprivileged form validates
+the sources this checkout is about to install and is the right thing to run
+during staging, on any host. It is *not* a substitute for the root form: the
+installed targets are root-owned and `/etc/sudoers.d` is not readable by an
+ordinary account, so the unprivileged run cannot tell a target that is already
+current from one it merely could not read, and it cannot re-validate the
+installed policy with `visudo`. Only
+`sudo ./scripts/deploy/install-mgo-validate.sh --dry-run` is evidence about
+what an installation would actually do on this host.
 
 ### The locked source snapshot
 
@@ -740,3 +751,42 @@ exposure, AWB, ROI and lens position are never touched.
 Deployment moves code and restores the operating state it found. Everything
 about what the camera can *see* belongs to physical acceptance, which is a
 separate, separately authorised activity.
+
+## 19. Testing this gateway without deploying through it
+
+The suite in `tests/test_deployment_gateway.py` executes the shipped shell
+rather than describing it: it sources `scripts/deploy/mgo-validate` in a real
+Bash process and calls the real functions against temporary directories,
+temporary Git repositories and recorded command doubles.
+
+`scripts/deploy/update-main.sh` is the one entry point where that approach is
+not safe on its own. The wrapper's whole job is to resolve a fixed host path
+and hand control to it, so executing the tracked file makes the outcome depend
+on the host: on a workstation `/usr/local/sbin/mgo-validate` is absent and the
+wrapper reaches its missing-gateway branch, but where the gateway *is*
+installed the same execution runs `sudo -n /usr/local/sbin/mgo-validate
+deploy-main` against the live control plane.
+
+Wrapper entry points therefore run as a **disposable copy**. The suite reads
+the tracked wrapper, requires its production constant to appear exactly once,
+rewrites only that constant to a path inside a private temporary directory,
+and runs the copy with a fake `sudo` first on `PATH` that records its argument
+vector, executes nothing and exits with a distinctive code. That is what proves
+the delegation contract — the exact command, exactly once, and the gateway's
+own exit status — without a real `sudo` ever being involved. When the temporary
+gateway is absent the same fake `sudo` is left in place as a tripwire: a
+non-empty log is the test failing.
+
+The tracked wrapper is unchanged by any of this. Its fixed production constant
+is part of the production contract and is asserted statically.
+
+The claim that this suite reaches no real `sudo`, no installed path and no
+Raspberry Pi is enforced rather than promised. `test_no_test_can_reach_the_host_control_plane`
+parses the test module's own AST and fails when a function that starts a
+process also names the tracked wrapper, when what an executing call actually
+runs resolves to the wrapper, when an installed path appears in command
+position inside something the suite runs, or when a real privileged command is
+invoked. The claim used to be a sentence in a docstring, and it was false: a
+Raspberry Pi staging run executed the tracked wrapper and reached the installed
+gateway through `sudo`. See
+`docs/tasks/Task-012-Deployment-Gateway-Remediation.md`.

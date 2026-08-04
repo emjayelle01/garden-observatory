@@ -3,8 +3,16 @@
 ## Status
 
 **Entry-boundary corrections implemented; awaiting final confirmation. The
-gateway is not installed, there has been no Raspberry Pi validation, and the
-production gateway is unchanged. Physical camera acceptance remains pending.**
+gateway is not installed, Raspberry Pi staging validation is incomplete, and the
+production gateway is unchanged.
+Physical camera acceptance remains pending.**
+
+**The first Raspberry Pi staging-validation attempt is recorded below as
+incomplete, not as passed.** One gateway-focused test escaped its temporary
+harness and invoked the Pi's installed production gateway through `sudo`.
+Production was unchanged by it, but the hard boundary was breached, the run was
+stopped, and the repository test isolation has been corrected. See
+[Raspberry Pi staging validation — incomplete](#raspberry-pi-staging-validation--incomplete).
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -24,12 +32,16 @@ production gateway is unchanged. Physical camera acceptance remains pending.**
 | Mutation register | Complete — checked in and re-run in full against the current tip |
 | Final confirmation (round two) | **Complete** — three further blocking defects found |
 | Entry-boundary corrections | Complete — all three corrected |
+| Raspberry Pi staging validation | **Incomplete** — stopped on a test-isolation boundary breach |
+| Test-isolation correction | Complete — wrapper entry points now run behind a disposable-copy harness |
 | Final confirmation (re-run) | **Not performed** |
 | Installation on the Raspberry Pi | **Not performed** — requires re-review and a separately approved SHA |
 | Raspberry Pi validation of the gateway | **Not performed** |
 
-Nothing here has run on the Raspberry Pi. The gateway installed there is still
-the Task 10 one, and physical camera acceptance remains pending in full.
+Nothing in this task has been installed on the Raspberry Pi. The gateway
+installed there is still the Task 10 one, and physical camera acceptance
+remains pending in full. One staging-validation attempt ran repository tests on
+the Pi; it is recorded below, it changed nothing, and it did not pass.
 
 Nothing in this task changes the gateway that is installed on the production
 Raspberry Pi. It changes what the *repository* ships. Installing it is a
@@ -616,14 +628,178 @@ mean "matches the bytes this run validated". A fully current installation still
 touches no target: same inode, same modification time, no `install` and no
 rename against either target.
 
+## Raspberry Pi staging validation — incomplete
+
+The first staging-validation attempt on the Raspberry Pi is recorded as
+**TASK 12 GATEWAY PI STAGING VALIDATION INCOMPLETE**. It is not a pass, and it
+must not be summarised as one.
+
+The run used the `claude` account on host `mgo-core` (`aarch64`), against a
+disposable clone at
+`290db535e1d25e1b4080c956b378e907c8b7bf54`. The clone was removed afterwards.
+
+### The boundary breach
+
+One gateway-focused test — `test_the_wrapper_reports_a_missing_gateway_and_stops`
+— executed the tracked `scripts/deploy/update-main.sh` directly. That wrapper
+contains the fixed production path `/usr/local/sbin/mgo-validate`, so on the Pi,
+where that path exists, the test did not reach the missing-gateway branch it was
+written for. It reached the wrapper's delegation, and ran:
+
+```text
+sudo -n /usr/local/sbin/mgo-validate deploy-main
+```
+
+against the real control plane. The run was stopped there.
+
+**Why the installed gateway changed nothing.** The path that exists on the Pi is
+still the **Task 10** gateway, which is pinned to the `task-010-operations`
+branch. Its `deploy-main` refused before it could mutate anything: the checkout
+is on `main`, not the branch it is pinned to, so it failed its own
+preconditions. Nothing was fetched, nothing was merged, no `uv sync` ran, no
+service was restarted and no preview transition occurred. That is a property of
+the *installed* gateway's own refusal, not of the test — the test had already
+crossed the boundary. A gateway that had accepted the request would have
+deployed.
+
+### Production non-interference — the evidence
+
+Recorded from the Pi at the time of the run:
+
+| Fact | Value |
+| ---- | ----- |
+| Production commit | `1aec2245010a1bd971d028be235c1864af6b46b3`, unchanged |
+| Production branch and working tree | Unchanged |
+| `mgo.service` `MainPID` | `70709`, unchanged |
+| `mgo.service` `NRestarts` | `0` |
+| Preview PID | `71087`, unchanged |
+| Preview `started_at` | Unchanged |
+| Configuration checksum | `8346e732c2545ff369f6c4f0e3fc2e415d10993d8fe6b4b1b2c67600555183da`, unchanged |
+| Archive/database records | 8 |
+| Physical capture files | 5 |
+| Database and camera health | Healthy |
+| Captures taken | None |
+| Stream accessed | No |
+| Images opened or decoded | None |
+| Installed files changed | None |
+| Approval file | Empty and unchanged |
+| Disposable clone | Removed |
+
+No file under `/usr/local/sbin`, `/etc/sudoers.d`, `/etc/garden-observatory`,
+`/opt/garden-observatory` or `/var/lib/garden-observatory` was modified.
+
+### What the attempt did establish
+
+These results are real and are worth keeping:
+
+* the tracked sudoers source passed the Pi's real `/usr/sbin/visudo -cf`;
+* both privileged scripts passed `/bin/bash -p -n` on the Pi;
+* privileged Bash on the Pi blocked `BASH_ENV`, `ENV` and exported shell
+  functions;
+* `uv sync --frozen`, Ruff and mypy passed on `aarch64`;
+* 596 of 597 focused tests passed.
+
+### What the attempt did not establish
+
+* the remaining focused test;
+* the full suite;
+* the acceptance-document suite;
+* the mutation register;
+* the unprivileged installer dry run.
+
+No gateway was installed. The production gateway is unchanged. Physical camera
+acceptance remains pending.
+
+## The unsafe test, and the correction
+
+### Root cause
+
+The suite's design is to execute the shipped shell rather than describe it, and
+that is right for every function the gateway exposes: they can be sourced and
+called against temporary directories. The wrapper is the exception. Its entire
+job is to resolve one fixed host path and hand control to whatever is there, so
+executing the tracked file makes the *host* decide what the test does.
+
+On a workstation with no gateway installed, that reaches the expected
+missing-file branch and the test passes for the wrong reason. On the Pi the path
+exists, so the same test invokes the real control plane through `sudo`. The
+module docstring's claim that nothing in the suite touched a real `sudo` or the
+Raspberry Pi was false for as long as that path existed, and nothing checked it.
+
+### The isolated wrapper harness
+
+Wrapper entry points now execute a **disposable copy**. The harness reads the
+tracked wrapper, requires
+`readonly GATEWAY="/usr/local/sbin/mgo-validate"` to appear exactly once,
+rewrites only that constant to a path inside a private temporary root, keeps LF
+line endings, and refuses to run a copy whose executable lines still name
+`/usr/local/sbin`. A controlled fake `sudo` is placed first on the child's
+`PATH`; it records its complete argument vector to a temporary log, executes
+nothing, and exits `42`. No host file is removed and the tracked wrapper is
+unchanged — its production constant remains part of the production contract and
+is still asserted statically.
+
+The two entry-point tests are now:
+
+* **missing gateway** — the temporary gateway is absent and the fake `sudo` is
+  present as a tripwire. The wrapper must exit `1`, name the temporary path and
+  the direct installer command, and the fake-sudo log must not exist or be
+  empty. If the wrapper reaches for `sudo` with no gateway installed, that is
+  the test failing rather than an incident.
+* **delegation** — a harmless executable exists at the temporary gateway path.
+  The wrapper must exit exactly `42`, the fake `sudo` must be invoked exactly
+  once, and its arguments must be exactly `-n`, the temporary gateway path,
+  `deploy-main`. The old static `"exec sudo" in body` check proved none of that.
+
+### The suite-wide audit
+
+The whole module was audited, not just the failed test, for anything that
+executes `update-main.sh`, `mgo-validate`, `install-mgo-validate.sh`, `sudo`,
+`systemctl`, `runuser`, `curl`, `flock`, a network Git remote, or a production
+path. The wrapper execution was the only unsafe host-reaching case. The
+remaining executions are `bash -n` syntax checks, sourced functions with
+explicit doubles, temporary repositories and paths, and direct executions of the
+*repository copies* of the gateway and installer, which refuse an unprivileged
+caller before they touch anything.
+
+`test_no_test_can_reach_the_host_control_plane` now enforces this structurally,
+by parsing the test module's own AST. It fails when a function that starts a
+process also names the tracked wrapper, when what an executing call actually
+runs resolves to the wrapper — including through a `parametrize` alias or a
+local variable — when an installed path appears in command position inside
+something the suite runs, or when a real privileged command is invoked. It is
+deliberately not a substring search: the previous version of this promise was a
+sentence in a docstring, and a search for `sudo` would have been satisfied by
+its own assertion. A companion test asserts the audit's registers are not empty,
+because the cheapest way to delete a rule is to empty the table it reads.
+
+The module docstring was rewritten only after that enforcement existed.
+
+### Mutations
+
+Nine mutations were added and all are detected: executing the tracked wrapper
+instead of its copy; leaving the production constant in the copy; removing the
+fake-sudo `PATH` isolation; letting fake `sudo` run in the missing-gateway case;
+changing the delegated action so the exact argument vector matters; discarding
+the gateway's exit code; emptying the audit's executor register; permitting
+`UPDATE_MAIN` to be executed; and permitting an executed
+`/usr/local/sbin/mgo-validate`. Every one is caught by a static audit or by a
+harness guard that refuses before a child process starts, so no mutation can
+invoke a real `sudo` or reach a host control-plane path.
+
 ## Boundaries
 
 This task changes no application runtime, API, schema, camera, preview, capture,
 motion, notification or database behaviour. It does not touch `src/mgo/`,
 `config/`, `migrations/`, `pyproject.toml` or `uv.lock`.
 
-It does not access the Raspberry Pi, install the gateway, alter sudoers, alter
-the approval file, deploy anything, restart any service, or begin physical
-camera acceptance. Those require repository review and separate authorisation.
+It installs no gateway, alters no sudoers file, alters no approval file, deploys
+nothing, restarts no service and begins no physical camera acceptance. Those
+require repository review and separate authorisation.
+
+One separately authorised staging-validation attempt ran repository tests on the
+Raspberry Pi and is recorded above; it is incomplete, it changed nothing on the
+host, and the test-isolation correction that followed it was made entirely in
+this repository with no Raspberry Pi access.
 
 Task 13 is not begun.
