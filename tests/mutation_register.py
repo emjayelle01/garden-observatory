@@ -58,6 +58,15 @@ WRAPPER = "scripts/deploy/update-main.sh"
 #: reaches a real sudo or an installed path, which is the whole point.
 TESTS = "tests/test_deployment_gateway.py"
 
+#: The two records that carry the staging-incident facts. A record is mutated
+#: here for one narrow reason: the 2026-08-01 `install` failure and the
+#: 2026-08-04 test escape both ended with production untouched, for different
+#: reasons, and the first version of these documents borrowed the first event's
+#: explanation for the second. A distinction a document merely states is a
+#: distinction nothing keeps.
+REMEDIATION_RECORD = "docs/tasks/Task-012-Deployment-Gateway-Remediation.md"
+ACCEPTANCE_RECORD = "docs/tasks/Task-012-Physical-Camera-Acceptance.md"
+
 
 MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
@@ -1685,5 +1694,34 @@ MUTATIONS: tuple[Mutation, ...] = (
         '    "/etc/sudoers.d",',
         'host_escape_audit_is_looking_at_something',
         'An executed /usr/local/sbin/mgo-validate command stops being a finding.',
+    ),
+    # --- the two staging incidents stay apart -------------------------------
+    #
+    # Each mutation restores the explanation the record originally gave: that
+    # the escaped deploy-main request was refused by the task-010 branch pin.
+    # It was not — the installed gateway had no such action. Both events end
+    # with production untouched, which is what made the wrong reason readable
+    # as the right one.
+    Mutation(
+        'record-borrows-the-install-failure-mechanism',
+        REMEDIATION_RECORD,
+        # Single-line anchors: these records are CRLF in a Windows working
+        # tree and LF elsewhere, and a multi-line `old` would match on one host
+        # and go stale on the other.
+        'still the **legacy Task 10 gateway**, whose supported actions are',
+        'still the **Task 10** gateway, which is pinned to `task-010-operations`,'
+        ' and the checkout is on `main`, so its `deploy-main` failed its own'
+        ' precondition. Its supported actions are',
+        'two_gateway_events_are_not_conflated or staging_escape_is_recorded',
+        "Event B is explained by Event A's branch precondition again.",
+    ),
+    Mutation(
+        'acceptance-record-borrows-the-install-failure-mechanism',
+        ACCEPTANCE_RECORD,
+        'request because it does not implement `deploy-main` at all ',
+        'request because it is pinned to `task-010-operations` and the checkout'
+        ' is on `main` ',
+        'camera_record_does_not_conflate or task_record_does_not_claim',
+        'The acceptance summary reverts to the branch-precondition explanation.',
     ),
 )

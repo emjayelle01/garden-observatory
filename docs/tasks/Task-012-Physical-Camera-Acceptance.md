@@ -1310,9 +1310,14 @@ the branch's tests on the Pi and was stopped: one gateway-focused test executed
 the tracked deployment wrapper directly, and because that wrapper names the
 fixed path `/usr/local/sbin/mgo-validate`, it invoked the Pi's installed
 production gateway through `sudo` instead of reaching the missing-gateway
-branch it was written for. The installed Task 10 gateway refused the request —
-it is pinned to `task-010-operations` and the checkout is on `main` — so
-production was untouched, but the boundary was breached and the attempt
+branch it was written for. The installed legacy Task 10 gateway refused the
+request because it does not implement `deploy-main` at all — its actions are
+`show-approval`, `install` and `restart-api` — so the request met the
+unsupported-action refusal; the approval file was also empty. That is a
+different failure from the 2026-08-01 `install` attempt described above, which
+did fail on the `task-010-operations` branch precondition; the branch pin is not
+what stopped the escaped request. Production was untouched, but the boundary was
+breached and the attempt
 does not count as a pass. The repository test isolation has since been corrected:
 wrapper entry points execute a disposable copy behind a fake `sudo`, and an
 AST audit of the test module now fails on any further host-reaching execution.

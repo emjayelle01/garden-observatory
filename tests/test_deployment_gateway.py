@@ -6217,7 +6217,7 @@ def test_the_task_record_does_not_claim_the_production_gateway_changed() -> None
     )
     text = _read(record)
     index = text.index("Remediation status")
-    section = text[index : index + 5400]
+    section = text[index : index + 6000]
 
     assert "awaiting final confirmation" in section
     assert "not** been installed" in section
@@ -6227,8 +6227,14 @@ def test_the_task_record_does_not_claim_the_production_gateway_changed() -> None
     # And the staging attempt is recorded as incomplete, not as a pass.
     assert "Raspberry Pi staging validation is incomplete" in section
     assert "does not count as a pass" in section
-    assert "production was untouched" in section
+    assert "Production was untouched" in section
     assert "physical camera acceptance remains pending" in section
+    # The escaped request was refused as an unsupported action, and this record
+    # must not borrow the 2026-08-01 install failure's explanation for it.
+    assert "does not implement `deploy-main` at all" in section
+    assert "unsupported-action refusal" in section
+    assert "the approval file was also empty" in section
+    assert "the branch pin is not" in section
 
 
 def test_the_remediation_record_states_the_review_corrections_truthfully() -> None:
@@ -6247,6 +6253,23 @@ def test_the_remediation_record_states_the_review_corrections_truthfully() -> No
     assert "Physical camera acceptance remains pending" in text
 
 
+REMEDIATION_RECORD = (
+    PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
+)
+
+
+def _event_b_section() -> str:
+    """The 2026-08-04 escape's own subsection, and nothing around it.
+
+    Sliced rather than searched whole-file, because the point of these
+    assertions is that Event A's mechanism does not appear *here*. It appears
+    correctly several times elsewhere in the same document.
+    """
+    text = _read(REMEDIATION_RECORD)
+    start = text.index("### Event B")
+    return text[start : text.index("### Production non-interference", start)]
+
+
 @pytest.mark.parametrize(
     "statement",
     [
@@ -6254,13 +6277,6 @@ def test_the_remediation_record_states_the_review_corrections_truthfully() -> No
         "TASK 12 GATEWAY PI STAGING VALIDATION INCOMPLETE",
         "Raspberry Pi staging validation | **Incomplete**",
         "It is not a pass, and it",
-        # The breach itself, named exactly.
-        "test_the_wrapper_reports_a_missing_gateway_and_stops",
-        "sudo -n /usr/local/sbin/mgo-validate deploy-main",
-        # Why the installed gateway changed nothing.
-        "Why the installed gateway changed nothing",
-        "task-010-operations",
-        "A gateway that had accepted the request would have",
         # Production non-interference.
         "1aec2245010a1bd971d028be235c1864af6b46b3",
         "70709",
@@ -6289,11 +6305,115 @@ def test_the_incomplete_pi_staging_attempt_is_recorded(statement: str) -> None:
     from this repository: what ran, what refused it, and what the host looked
     like before and after.
     """
-    record = (
-        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
-    )
+    assert statement in _read(REMEDIATION_RECORD)
 
-    assert statement in _read(record)
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "2026-08-01",
+        "`mgo-validate install`",
+        "task-010-operations",
+        "origin/task-010-operations",
+        "128",
+        "install-service-identity.sh",
+        "service-identity\nand systemd provisioner",
+        "Production remained untouched",
+        "Event A — the 2026-08-01 install-action failure",
+    ],
+)
+def test_the_2026_08_01_install_failure_is_recorded(statement: str) -> None:
+    """Event A: the authorised deployment attempt that exited 128.
+
+    The `install` action was pinned to a branch, required a ref that no longer
+    existed, and provisioned service identity rather than deploying code. That
+    is the correct explanation of *that* failure and it stays.
+    """
+    assert statement in _read(REMEDIATION_RECORD)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "2026-08-04",
+        "sudo -n /usr/local/sbin/mgo-validate deploy-main",
+        "Event B — the 2026-08-04 staging test escape",
+        # The refusal mechanism, stated as the mechanism.
+        "does not implement\n`deploy-main` at all",
+        "unsupported-action refusal",
+        "`show-approval`, `install` and `restart-api`",
+        "The approval file was\nalso empty",
+        # What did not happen.
+        "Nothing was fetched, nothing was merged, no `uv sync` ran, no service was"
+        "\nrestarted and no preview transition occurred",
+        "no installed file changed",
+        # And the honest reading of the refusal.
+        "A gateway that accepted\n`deploy-main` could have changed production",
+        "not evidence that the boundary\nheld",
+    ],
+)
+def test_the_2026_08_04_staging_escape_is_recorded(statement: str) -> None:
+    """Event B: the escaped test invocation and why it changed nothing.
+
+    The installed gateway had no ``deploy-main``, so the request met the
+    unsupported-action refusal. That is a fact about which gateway was
+    installed, not about the boundary this branch exists to build.
+    """
+    assert statement in _read(REMEDIATION_RECORD)
+
+
+def test_the_record_carries_the_staging_mechanism_correction() -> None:
+    """The first version of this record gave the wrong reason, and says so."""
+    text = _read(REMEDIATION_RECORD)
+
+    assert "Correction to the initial staging record" in text
+    assert (
+        "did\nnot fail a main-versus-`task-010-operations` branch precondition" in text
+    )
+    assert "refused the action as\nunsupported" in text
+    assert "applied to the separate 2026-08-01 `install`-action failure" in text
+    # Superseding is stated, not implied — the commit message stays as written.
+    assert "6b27891" in text
+
+
+def test_the_two_gateway_events_are_not_conflated() -> None:
+    """Event A's mechanism must not appear inside Event B's subsection.
+
+    Both events involve the same installed legacy gateway and both ended with
+    production untouched, which is exactly why the wrong explanation was
+    plausible enough to be written down. The branch pin, the missing ref and
+    the checkout's branch belong to the 2026-08-01 `install` failure alone.
+    """
+    section = _event_b_section()
+
+    for borrowed in (
+        "task-010-operations",
+        "checkout is on",
+        "checkout was on",
+        "precondition",
+        "pinned",
+        "FEATURE_BRANCH",
+        "128",
+    ):
+        assert borrowed not in section, borrowed
+
+    # And the document as a whole still records Event A's mechanism correctly,
+    # so this is a scoping rule rather than a deletion.
+    assert "task-010-operations" in _read(REMEDIATION_RECORD)
+
+
+def test_the_camera_record_does_not_conflate_the_two_events_either() -> None:
+    """The summary in the acceptance record carries the same distinction."""
+    text = _read(
+        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Physical-Camera-Acceptance.md"
+    )
+    start = text.index("**Raspberry Pi staging validation is incomplete.**")
+    section = text[start : text.index("### Evidence", start)]
+
+    assert "does not implement `deploy-main` at all" in section
+    assert "unsupported-action refusal" in section
+    assert "the approval file was also empty" in section
+    assert "the branch pin is not\nwhat stopped the escaped request" in section
 
 
 def test_the_staging_attempt_is_never_described_as_passed() -> None:
@@ -6473,8 +6593,14 @@ def test_the_mutation_register_is_part_of_the_repository() -> None:
     # Every entry still applies to the current tip, exactly once. An entry that
     # no longer matches is a stale mutation, which is precisely the silent
     # failure this file exists to make loud.
+    #
+    # Read the way the runner reads — bytes decoded, not ``read_text``. The two
+    # disagree: ``read_text`` translates CRLF to LF, so a multi-line ``old``
+    # against a document that is CRLF in a Windows working tree passes here and
+    # then goes stale in the runner. A staleness check that only holds on one
+    # host is the thing this test exists to prevent.
     for mutation in mutations:
-        asset = _read(PROJECT_ROOT / mutation.asset)
+        asset = (PROJECT_ROOT / mutation.asset).read_bytes().decode("utf-8")
         assert asset.count(mutation.old) == 1, mutation.identifier
         assert mutation.tests, mutation.identifier
         assert mutation.note.endswith("."), mutation.identifier

@@ -64,8 +64,14 @@ needed another one.
 
 ### The installed gateway cannot deploy application code
 
+This section describes **Event A**, the 2026-08-01 `install`-action failure. It
+is not the mechanism that refused the 2026-08-04 staging test escape; that was a
+different action and a different refusal, recorded under
+[Event B](#event-b--the-2026-08-04-staging-test-escape).
+
 `/usr/local/sbin/mgo-validate` on the Pi is not repository-managed — no copy of
-it is tracked here — and it is pinned to Task 10:
+it is tracked here — and its supported actions are `show-approval`, `install`
+and `restart-api`. There is no `deploy-main`. It is pinned to Task 10:
 
 ```bash
 readonly FEATURE_BRANCH="task-010-operations"
@@ -638,7 +644,41 @@ The run used the `claude` account on host `mgo-core` (`aarch64`), against a
 disposable clone at
 `290db535e1d25e1b4080c956b378e907c8b7bf54`. The clone was removed afterwards.
 
-### The boundary breach
+**Correction to the initial staging record.** The escaped 2026-08-04 request did
+not fail a main-versus-`task-010-operations` branch precondition. The installed
+legacy gateway did not implement `deploy-main`, so it refused the action as
+unsupported. The approval file was also empty. The `task-010-operations` branch
+precondition applied to the separate 2026-08-01 `install`-action failure. This
+supersedes the explanation first written in this section and repeated in the
+message of commit `6b27891`, which is left in history as it was written.
+
+### Two separate gateway events
+
+They are easy to conflate — both involve the same installed legacy gateway, and
+both ended with production untouched — but the reason each one changed nothing
+is different, and only one of them involves the branch pin.
+
+| | Event A | Event B |
+| --- | ------- | ------- |
+| When | 2026-08-01 | 2026-08-04 |
+| What ran | `mgo-validate install` | `sudo -n /usr/local/sbin/mgo-validate deploy-main` |
+| Who ran it | The authorised production deployment | An unsafe test that escaped its harness |
+| Why nothing changed | The action required `origin/task-010-operations`, which was unavailable, so it exited **128** inside its own precondition check | The action was **not supported** by the installed gateway, so it reached the unsupported-action refusal |
+| Branch pin involved | Yes — `FEATURE_BRANCH="task-010-operations"` | **No** |
+
+### Event A — the 2026-08-01 install-action failure
+
+The authorised Task 12 production deployment first tried the gateway's `install`
+action. That action was hardcoded to `task-010-operations`, required
+`origin/task-010-operations` to exist, and invoked Task 10's service-identity
+and systemd provisioner (`scripts/deploy/install-service-identity.sh`) rather
+than deploying application code at all. The ref was unavailable in the
+production checkout, so the action exited **128** inside its own precondition
+check. Production remained untouched. This is described in full under
+[The confirmed defect](#the-confirmed-defect), and it remains the correct
+explanation of that failure.
+
+### Event B — the 2026-08-04 staging test escape
 
 One gateway-focused test — `test_the_wrapper_reports_a_missing_gateway_and_stops`
 — executed the tracked `scripts/deploy/update-main.sh` directly. That wrapper
@@ -653,14 +693,26 @@ sudo -n /usr/local/sbin/mgo-validate deploy-main
 against the real control plane. The run was stopped there.
 
 **Why the installed gateway changed nothing.** The path that exists on the Pi is
-still the **Task 10** gateway, which is pinned to the `task-010-operations`
-branch. Its `deploy-main` refused before it could mutate anything: the checkout
-is on `main`, not the branch it is pinned to, so it failed its own
-preconditions. Nothing was fetched, nothing was merged, no `uv sync` ran, no
-service was restarted and no preview transition occurred. That is a property of
-the *installed* gateway's own refusal, not of the test — the test had already
-crossed the boundary. A gateway that had accepted the request would have
-deployed.
+still the **legacy Task 10 gateway**, whose supported actions are
+`show-approval`, `install` and `restart-api`. It does not implement
+`deploy-main` at all, so the request reached its unsupported-action refusal —
+the same refusal any unrecognised word would have met. The approval file was
+also empty, so no valid approved SHA existed for any action that needed one.
+Nothing was fetched, nothing was merged, no `uv sync` ran, no service was
+restarted and no preview transition occurred, and no installed file changed.
+
+That is a property of the *installed* gateway's own refusal, not of the test —
+the test had already crossed the boundary. **A gateway that accepted
+`deploy-main` could have changed production**, which is precisely what the
+gateway this branch ships is for. The refusal is not evidence that the boundary
+held; it is evidence about which gateway happened to be installed that day.
+
+**Neither of Event A's mechanisms explains this.** The branch pin and the
+missing ref both belong to the `install` action. This gateway had no
+`deploy-main` to run at all, so the refusal happened where an unrecognised
+action word is refused — at the action parser, before anything about the
+repository was examined. Nothing in this subsection may be explained by which
+branch production happened to be on; that belongs to Event A alone.
 
 ### Production non-interference — the evidence
 
