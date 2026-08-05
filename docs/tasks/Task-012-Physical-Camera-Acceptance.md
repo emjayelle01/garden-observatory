@@ -48,9 +48,11 @@ builds the *gate*; passing the gate is a separate, authorised hardware activity.
 
 The software rows above were written as `In progress` / `Pending` in the first
 commit and updated at closeout; the Raspberry Pi and merge rows were updated by
-their own separately authorised runs. The deployment, physical-acceptance,
-sign-off and gate rows have never changed and must not be changed by anything
-other than an authorised deployment and hardware run.
+their own separately authorised runs. The software and deployment-gateway rows
+above were updated only after their separately authorised repository, Raspberry
+Pi installation and live-validation runs. The physical-camera acceptance run,
+Matthew's visual sign-off, 24-hour gate and 48-hour gate remain unchanged, and
+may be updated only by a separately authorised hardware acceptance run.
 
 ## Purpose
 

@@ -7060,13 +7060,15 @@ def test_current_status_does_not_overclaim_rollback_or_physical_acceptance() -> 
     assert "Deployment-gateway prerequisites | **Complete**" in acceptance_status
 
 
-def test_no_current_status_claims_deployment_or_acceptance_completed() -> None:
-    """The four claims that would make this record dangerous.
+def test_no_current_status_claims_physical_acceptance_completed() -> None:
+    """Live gateway validation must not be mistaken for hardware acceptance.
 
-    Nothing has been deployed through the installed gateway and no hardware
-    gate has begun. A status table is read faster than prose, so the rows that
-    say so are asserted positively as well as the phrasings that would say the
-    opposite.
+    Both public mutating gateway actions have passed in production. This test
+    now guards only the still-pending physical-camera run, Matthew's visual
+    sign-off, and the 24-hour and 48-hour hardware gates.
+
+    A status table is read faster than prose, so the rows that say so are
+    asserted positively as well as the phrasings that would say the opposite.
     """
     remediation = _read(REMEDIATION_RECORD)
     acceptance = _read(ACCEPTANCE_RECORD_PATH)
@@ -7075,8 +7077,9 @@ def test_no_current_status_claims_deployment_or_acceptance_completed() -> None:
 
     # The deploy-main and restart-api bans this list once carried have been
     # removed: both actions have since passed in production, so banning a
-    # "passed" row for them would now forbid the truth. What stays banned is
-    # the hardware, which has not moved at all.
+    # "passed" row for them would now forbid the truth. Their "Passed" rows are
+    # required below as positive assertions. What stays banned is the hardware,
+    # which has not moved at all.
     for banned in (
         "Physical camera acceptance | **Complete**",
         "Physical camera acceptance | **Passed**",
@@ -7109,6 +7112,34 @@ def test_no_current_status_claims_deployment_or_acceptance_completed() -> None:
     assert "Matthew's visual sign-off | **Not given**" in acceptance_status
     assert "24-hour gate | **Not started**" in acceptance_status
     assert "48-hour gate | **Not started**" in acceptance_status
+
+    # The history sentence beneath the table must draw the same line the table
+    # does. It previously said the deployment rows had *never* changed, which
+    # stopped being true the moment the gateway was installed and then used —
+    # and a false claim of immutability is worse than none, because it invites
+    # a reader to trust the rows without asking what moved them.
+    assert "The software and deployment-gateway rows" in acceptance_status
+    assert "above were updated only after their separately authorised" in (
+        acceptance_status
+    )
+    assert "Pi installation and live-validation runs." in acceptance_status
+    assert "The physical-camera acceptance run," in acceptance_status
+    assert "Matthew's visual sign-off, 24-hour gate and 48-hour gate remain" in (
+        acceptance_status
+    )
+    assert (
+        "may be updated only by a separately authorised hardware acceptance run."
+        in acceptance_status
+    )
+
+    # Scoped to the current status block: an earlier dated section elsewhere in
+    # the file may legitimately describe a state in which nothing had yet been
+    # deployed, and banning that text globally would delete true history.
+    for stale in (
+        "sign-off and gate rows have never changed",
+        "Nothing has been deployed through the installed gateway",
+    ):
+        assert stale not in acceptance_status, stale
 
 
 @pytest.mark.parametrize(
