@@ -686,11 +686,34 @@ Evidence retained under `/root`, pending a separately reviewed closeout:
 /root/mgo-legacy-sudoers-retirement-71d3755
 ```
 
-**`deploy-main` and `restart-api` have not yet been exercised against the
-installed gateway.** The control plane is in place and refuses correctly —
-`show-approval` and the removed `install` action both exit `64` with bounded
-messages, and `sudo` refuses everything else — but no live deployment has run
-through it. Section 15 describes what the first one will look like.
+### Production validation
+
+Both public mutating actions are **proven on their production forward paths**.
+
+| Action | Result |
+| ------ | ------ |
+| `deploy-main` | **Passed 2026-08-05** — strict fast-forward `1aec224…` → `938134d…` (21 commits), `uv sync --frozen`, service recovered in **1 second** |
+| `restart-api` | **Passed 2026-08-05** — restarted at `938134d…`, recovered in **1 second**, repository untouched |
+
+Across both actions: preview was `stopped` and the camera producer count was
+zero before and after; the capture catalogue held the same eight records; the
+configuration and gateway checksums were unchanged; and Matthew withdrew the
+approval after each action, leaving the file empty.
+
+`restart-api` was verified to have updated nothing, by more than an unchanged
+SHA: the Git reflog gained no entry, `FETCH_HEAD` still carried the earlier
+deployment's mtime, and `.venv` was untouched — no fetch, no merge, no
+dependency sync, no checkout movement.
+
+**Rollback has not been deliberately triggered in production, and should not
+be induced solely to demonstrate it.** Both live actions succeeded on their
+forward paths, so the transaction's failure handling remains covered by the
+automated tests in `tests/test_deployment_gateway.py`.
+
+The stable eight-record figure above is the **capture catalogue**. The
+`observations` table is continuously growing operational telemetry — recurring
+health and camera-status rows — and is not an invariant count; it must not be
+expected to hold steady across a restart.
 
 ## 14. Sudoers boundary
 

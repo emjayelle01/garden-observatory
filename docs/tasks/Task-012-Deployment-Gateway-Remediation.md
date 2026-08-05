@@ -2,13 +2,17 @@
 
 ## Status
 
-**Implementation and repository review complete. The second Raspberry Pi
-staging validation passed, the legacy wildcard sudoers policy is retired, and
-the reviewed gateway and its replacement policy are installed on the production
-Raspberry Pi. Installed-policy boundary validation passed.
-Application deployment through `deploy-main` has not been exercised,
-`restart-api` has not been exercised, and physical camera acceptance remains
-pending.**
+**Deployment-gateway remediation is complete.** Implementation and repository
+review are complete, the second Raspberry Pi staging validation passed, the
+legacy wildcard sudoers policy is retired, the reviewed gateway and its
+replacement policy are installed on the production Raspberry Pi, and
+installed-policy boundary validation passed. **Both public mutating actions
+have now been validated live in production: `deploy-main` passed on 2026-08-05
+and `restart-api` passed on 2026-08-05.**
+
+**Physical camera acceptance remains pending, and is now the remaining Task 12
+gate.** Rollback has not been deliberately triggered in production and should
+not be induced merely to demonstrate it.
 
 **The first Raspberry Pi staging-validation attempt is recorded below as
 incomplete, not as passed.** One gateway-focused test escaped its temporary
@@ -44,18 +48,25 @@ stopped, and the repository test isolation has been corrected. See
 | Installation review | **Passed** |
 | Installed-policy boundary validation | **Passed** — bounded refusals and refused negative sudo probes |
 | Windows mutation validation | **Passed** — 170/170 detected, zero stale |
-| Application deployment through `deploy-main` | **Not exercised** |
-| `restart-api` through the installed gateway | **Not exercised** |
+| Live `deploy-main` validation | **Passed** — 2026-08-05, `1aec224` → `938134d` |
+| Live `restart-api` validation | **Passed** — 2026-08-05, at `938134d` |
+| Deployment-gateway remediation | **Complete** |
+| Production rollback | **Not deliberately triggered** — covered by automated tests |
 | Physical camera acceptance | **Pending** |
 
 The reviewed gateway and its replacement sudoers policy are installed on the
-production Raspberry Pi, and the legacy wildcard policy that stood beside them
-has been retired and archived. What that proves is bounded: the control plane
-is in place and refuses what it is supposed to refuse. **No application code
-has been deployed through it.** `deploy-main` and `restart-api` have never run
-against the installed gateway, so the deployment transaction itself is still
-unexercised in production, and physical camera acceptance remains pending in
-full.
+production Raspberry Pi, the legacy wildcard policy that stood beside them has
+been retired and archived, and both public mutating actions have now moved
+production for real. `deploy-main` fast-forwarded 21 commits and restarted the
+service; `restart-api` restarted the service without touching the repository at
+all. The control plane this task exists to build is therefore proven on its
+forward paths, not merely installed.
+
+What that still does not cover: **rollback has never been deliberately
+triggered in production.** Both live actions succeeded, so the transaction's
+failure handling remains covered by the automated tests alone, and inducing a
+production failure purely to demonstrate it is not warranted. Physical camera
+acceptance remains pending in full.
 
 The first staging-validation attempt ran repository tests on the Pi, changed
 nothing, and did not pass; it is recorded below as incomplete and stays that
@@ -741,7 +752,7 @@ Recorded from the Pi at the time of the run:
 | Preview PID | `71087`, unchanged |
 | Preview `started_at` | Unchanged |
 | Configuration checksum | `8346e732c2545ff369f6c4f0e3fc2e415d10993d8fe6b4b1b2c67600555183da`, unchanged |
-| Archive/database records | 8 |
+| Capture catalogue records | 8 |
 | Physical capture files | 5 |
 | Database and camera health | Healthy |
 | Captures taken | None |
@@ -913,7 +924,7 @@ The post-boot baseline used for the installation was:
 | Production SHA | `1aec2245010a1bd971d028be235c1864af6b46b3` |
 | Production tree | Clean |
 | Configuration checksum | `8346e732c2545ff369f6c4f0e3fc2e415d10993d8fe6b4b1b2c67600555183da` |
-| Archive/database records | 8 |
+| Capture catalogue records | 8 |
 | Physical capture files | 5 |
 | Approval file | Empty |
 
@@ -1048,7 +1059,7 @@ After installation:
 | Preview | Stopped |
 | Camera producers | None appeared |
 | Configuration checksum | `8346e732c2545ff369f6c4f0e3fc2e415d10993d8fe6b4b1b2c67600555183da`, unchanged |
-| Archive/database records | 8 |
+| Capture catalogue records | 8 |
 | Physical capture files | 5 |
 | Approval file | Empty and unchanged |
 
@@ -1071,22 +1082,27 @@ remain under `/tmp`. **None of this is cleaned by the record that documents it**
 — root-evidence cleanup and `/tmp` helper cleanup require their own reviewed
 instruction.
 
-What is still not established:
+**What was not established as at 2026-08-05 08:32, immediately after
+installation.** This list describes the state at that moment and is kept
+because it is what the installation review was asked to accept. The first two
+entries have since been discharged — see
+[First live deploy-main validation](#first-live-deploy-main-validation) and
+[First live restart-api validation](#first-live-restart-api-validation).
 
-* `deploy-main` has **not** been invoked through the new installed gateway;
-* `restart-api` has **not** been invoked through the new installed gateway;
-* no live application deployment has yet proved the installed transaction path;
-* the approval file remains empty;
-* physical camera acceptance remains pending;
-* Matthew has **not** given visual camera sign-off;
-* the 24-hour and 48-hour physical camera gates have **not** started;
-* retained root evidence has not yet been cleaned;
+* `deploy-main` had **not** been invoked through the newly installed gateway;
+* `restart-api` had **not** been invoked through the newly installed gateway;
+* no live application deployment had yet proved the installed transaction path;
+* the approval file was empty;
+* physical camera acceptance remained pending;
+* Matthew had **not** given visual camera sign-off;
+* the 24-hour and 48-hour physical camera gates had **not** started;
+* retained root evidence had not been cleaned;
 * `retirement-evidence.txt` and `preinstall-evidence.txt` were created by
   successful root blocks but were not subsequently read.
 
-An installed control plane is not a proven one. Everything above says the
-gateway is in place and refuses correctly; the first authorised `deploy-main` is
-what will say whether it deploys correctly.
+An installed control plane is not a proven one. Everything above said the
+gateway was in place and refused correctly; the first authorised `deploy-main`
+was what would say whether it deployed correctly. It has since been run.
 
 ## Windows mutation-validation correction
 
@@ -1133,6 +1149,181 @@ checkout artefact wearing the costume of a real finding.
 **The complete Windows mutation result after this correction is 170/170, zero
 stale.** The Pi's earlier 166/166 is unchanged and remains valid.
 
+## First live deploy-main validation
+
+**Passed on 2026-08-05.** Preflight began 15:04:39 SAST, the deployment ran at
+15:10:05, and verification completed at approximately 15:13. Host `mgo-core`,
+`aarch64`, boot ID `dcfa3c77-6536-46e0-aab9-a20a78c98ddf` — unchanged
+throughout, so every service transition below is a restart and not a reboot.
+
+**Target.** Production moved from `1aec2245010a1bd971d028be235c1864af6b46b3` to
+`938134d4f4963256cd74b5bbf59123abe49e1d5d`. The target was confirmed a strict
+fast-forward descendant before anything was approved: **21 commits ahead, zero
+behind**, `git merge-base --is-ancestor` exit 0. The gateway performed
+`Updating 1aec224..938134d` / `Fast-forward`.
+
+**Before.** Branch `main`; tree clean including untracked files; stash empty;
+one worktree; no Git operation in progress; remote `main` exactly the approved
+target; `mgo.service` active with **MainPID 1494**, **NRestarts 0**, activation
+`Tue 2026-08-04 14:35:10 SAST`; health 200 and healthy; database healthy at
+schema version 2, current, WAL, integrity ok; camera available with IMX708
+detected; **preview stopped**; zero `rpicam-vid`; zero `libcamera-vid`; capture
+catalogue **8** records; physical JPEG count **5**; approval file empty.
+Configuration checksum
+`8346e732c2545ff369f6c4f0e3fc2e415d10993d8fe6b4b1b2c67600555183da`; installed
+gateway checksum
+`3e26a7cea23d15944f8f0b8c9949e3bb79ce555c95c64a4b45a174e038f0bf3e`.
+
+**Approval.** Matthew installed the exact target SHA atomically into
+`/etc/garden-observatory/claude-approved-sha` — `root:root`, mode 0644, 41
+bytes, one lowercase 40-character SHA plus LF. `show-approval` was verified to
+return exactly that SHA before the action.
+
+**The command was invoked exactly once** and exited **0**:
+
+```bash
+sudo -n /usr/local/sbin/mgo-validate deploy-main
+```
+
+The gateway read and reported the approved SHA, reported the prior production
+commit, captured the preview state as `stopped`, fetched only `origin/main`,
+performed a strict fast-forward, ran `uv sync --frozen`, restarted
+`mgo.service`, **recovered in 1 second**, proved preview was still stopped,
+then reported the deployed SHA, the new process and the new activation time.
+
+The single `curl: (7) Failed to connect to 127.0.0.1 port 8080` line occurred
+inside the gateway's own bounded readiness poll while the service was
+restarting, and was immediately followed by `recovered in 1s`. **It is a probe,
+not a deployment failure.**
+
+**After.** Branch still `main`; HEAD, `main` and `origin/main` all
+`938134d4f4963256cd74b5bbf59123abe49e1d5d`; tree clean; stash empty; one
+worktree; service active; **MainPID 1494 → 16531**; **NRestarts still 0**;
+activation `Wed 2026-08-05 15:10:08 SAST`; health 200 and healthy; `/version`
+200 with version `0.1.0` and `commit: null`; database healthy, schema 2,
+current, WAL and integrity good; camera available; **preview still stopped**;
+**producer count still zero**; capture catalogue **still the same eight
+records**; physical JPEG count **still five**; configuration checksum
+unchanged; installed gateway checksum unchanged; and the approval file
+unchanged by the gateway.
+
+Matthew then cleared the approval atomically, and `show-approval` was confirmed
+to exit **64** with empty stdout — the authorisation window closed.
+
+### Accepted execution deviation
+
+The gateway command was launched under `setsid` and `nohup` rather than staying
+attached to the interactive SSH session. This is an **accepted operational
+safeguard, not a gateway defect**: it protected an in-progress transaction from
+a SIGHUP delivered by a dropped SSH connection. The command, its caller and the
+single-invocation limit were unchanged, marker files prevented a duplicate
+launch, the command ran exactly once, and its output and exit status were
+preserved.
+
+## First live restart-api validation
+
+**Passed on 2026-08-05.** Preflight began 15:30:53 SAST, the restart ran at
+15:34:45, and verification completed at approximately 15:38. Host `mgo-core`,
+`aarch64`, boot ID `dcfa3c77-6536-46e0-aab9-a20a78c98ddf` — unchanged.
+
+**Repository preconditions.** Branch `main`; HEAD
+`938134d4f4963256cd74b5bbf59123abe49e1d5d`; upstream `origin/main` with the
+same SHA; remote `main` the same; tree clean; stash empty; one worktree; no Git
+operation in progress. **No fetch was run during preflight.**
+
+**Service and camera baseline.** Active, **MainPID 16531**, **NRestarts 0**,
+activation `Wed 2026-08-05 15:10:08 SAST`; health 200 and healthy; database
+healthy at schema version 2, current, WAL, foreign keys enabled, integrity ok;
+camera 200 and available with IMX708 unchanged; **preview stopped**; zero
+`rpicam-vid`; zero `libcamera-vid`; capture catalogue **8**; physical JPEG
+count **5**; configuration and gateway checksums unchanged; approval file
+empty.
+
+**Approval.** Matthew installed the exact already-deployed SHA atomically, and
+`show-approval` was verified to return exactly it.
+
+**The command was invoked exactly once** and exited **0**:
+
+```bash
+sudo -n /usr/local/sbin/mgo-validate restart-api
+```
+
+```text
+mgo-validate: restarting mgo.service at 938134d4f4963256cd74b5bbf59123abe49e1d5d
+mgo-validate: recovered in 1s
+mgo-validate: MainPID 17702
+mgo-validate: activated Wed 2026-08-05 15:34:45 SAST
+```
+
+A temporary curl connection refusal occurred inside the restart window and was
+immediately followed by successful recovery. **Recovery time: 1 second.**
+
+**After.** Service active; **MainPID 16531 → 17702**; **NRestarts still 0**;
+activation timestamps advanced; boot ID unchanged; production SHA **still**
+`938134d4f4963256cd74b5bbf59123abe49e1d5d`; branch still `main`; `main` and
+`origin/main` still identical; tree clean; stash empty; one worktree; health
+200 and healthy; `/version` 200, version `0.1.0`, `commit: null`; database
+healthy and current; camera available; **preview still stopped**; **zero camera
+producers**; capture catalogue **still the same eight records**; physical JPEG
+count **still five**; configuration checksum unchanged; gateway checksum
+unchanged; approval file not modified by the gateway.
+
+**`restart-api` provably updated nothing.** An unchanged SHA alone would not
+show this — a fetch that found nothing new looks identical. Three artefacts a
+repository operation would have disturbed were checked instead:
+
+* the Git reflog received **no new entry**;
+* `FETCH_HEAD` mtime remained `2026-08-05 15:10:07`, from the earlier
+  deployment;
+* `.venv` mtime remained `2026-07-27 09:32:45`.
+
+So **no fetch, no merge, no dependency sync and no checkout movement** — which
+is exactly the distinction between this action and `deploy-main`.
+
+Matthew cleared the approval atomically, and `show-approval` was confirmed to
+exit **64** with empty stdout.
+
+### Accepted execution deviation
+
+The restart command was likewise launched under `setsid` and `nohup`, for the
+same reason: it protected the restart and its recovery verification from an SSH
+disconnect. The command was invoked once, no duplicate invocation occurred, and
+the action and privilege boundary were unchanged.
+
+## Capture-catalogue baseline correction
+
+Earlier records in this repository described a stable baseline of "8 records"
+without naming the table, and one operator instruction rendered it as an
+`observations` count. Those are two different things, and conflating them would
+have aborted a valid deployment or reported a false failure after one.
+
+**The stable eight-record baseline is the capture catalogue.** It is the
+database table and API catalogue representing stored captures. It held exactly
+**eight records** throughout both live validations — the *same* eight before
+and after each action, not merely the same count: four `rpicam-still` and four
+`mock`, with identical capture identifiers, timestamps, filenames, dimensions
+and byte sizes. The corresponding physical JPEG count is **five**; four of the
+mock records have no file and one file predates the catalogue.
+
+**`observations` is continuously growing operational telemetry.** It carries
+recurring `health_snapshot` and `camera_status` entries written while the
+service runs — roughly one health row per minute — and stood at approximately
+**18,828 rows** during the deployment preflight. It continued growing after
+both the deployment and the restart.
+
+It follows that:
+
+* `observations` **must not** be asserted equal before and after a service
+  action. A restart necessarily spans at least one collection interval, so an
+  equality check is guaranteed to fail on a healthy system;
+* `observations` **must not** be described as the stable eight-record baseline;
+* the exact telemetry count is **not** a permanent invariant and must not be
+  recorded as one.
+
+Its continued growth is still useful evidence, and a stronger check than
+equality would have been: it shows the health monitor actually resumed under
+the new code, rather than merely that nothing was deleted.
+
 ## Boundaries
 
 This task changes no application runtime, API, schema, camera, preview, capture,
@@ -1143,14 +1334,23 @@ Nothing in this repository installs itself. The gateway and sudoers changes
 recorded above were made on the Raspberry Pi by separately authorised root
 operator blocks, run by Matthew, and this record documents them after the fact.
 
-The branch alters no approval file, deploys no application code, restarts no
-service and begins no physical camera acceptance. The approval file is still
-empty, `deploy-main` and `restart-api` have never run against the installed
-gateway, and physical acceptance requires its own authorisation.
+The branch itself alters no approval file, deploys no application code,
+restarts no service and begins no physical camera acceptance. The two live
+gateway actions recorded above were separately authorised operations on the
+host, each preceded by Matthew installing an approval and followed by Matthew
+clearing it; **the approval file is empty again**, and physical acceptance
+requires its own authorisation.
 
-Two separately authorised staging-validation runs and two root operator phases
-are recorded above. The first staging attempt is incomplete, it changed nothing
-on the host, and the test-isolation correction that followed it was made
-entirely in this repository with no Raspberry Pi access.
+Two separately authorised staging-validation runs, two root operator phases and
+two live gateway actions are recorded above. The first staging attempt is
+incomplete, it changed nothing on the host, and the test-isolation correction
+that followed it was made entirely in this repository with no Raspberry Pi
+access.
+
+The live validations did **not** directly inspect the retained root evidence
+directories: `/root` is mode 0700 and an unprivileged existence test there
+cannot distinguish absent from unreadable. They are recorded as retained
+because nothing in those tasks removed or modified them, not because they were
+listed.
 
 Task 13 is not begun.

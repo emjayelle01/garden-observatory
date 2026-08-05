@@ -1776,4 +1776,44 @@ MUTATIONS: tuple[Mutation, ...] = (
         'power_failure_not_the_installation_explains_the_baseline_change',
         'A reboot\'s MainPID and preview change is blamed on the installation.',
     ),
+    # --- the live validations cannot regress -------------------------------
+    #
+    # Both actions have now moved production for real, once each. The evidence
+    # exists nowhere but this record, so a status that quietly reverts to
+    # "pending" would erase a completed production validation, and a baseline
+    # relabelled onto the telemetry table would reinstate exactly the
+    # conflation that nearly aborted the deployment.
+    # Anchored inside each live section rather than on its gate-table row: the
+    # tests that own these facts slice the section, so a row-only mutation
+    # would go undetected by them and the register would be measuring the
+    # wrong thing.
+    Mutation(
+        'live-deploy-main-unexercised',
+        REMEDIATION_RECORD,
+        '**Passed on 2026-08-05.** Preflight began 15:04:39 SAST,'
+        ' the deployment ran at',
+        '**Not yet exercised.** Preflight began 15:04:39 SAST,'
+        ' the deployment ran at',
+        'live_deploy_main_validation_is_recorded',
+        'A completed production deployment reverts to pending.',
+    ),
+    Mutation(
+        'live-restart-api-unexercised',
+        REMEDIATION_RECORD,
+        '**Passed on 2026-08-05.** Preflight began 15:30:53 SAST,'
+        ' the restart ran at',
+        '**Not yet exercised.** Preflight began 15:30:53 SAST,'
+        ' the restart ran at',
+        'live_restart_api_validation_is_recorded',
+        'A completed production restart reverts to pending.',
+    ),
+    Mutation(
+        'capture-baseline-labelled-observations',
+        REMEDIATION_RECORD,
+        '**The stable eight-record baseline is the capture catalogue.**',
+        '**The stable eight-record baseline is the `observations` table, which'
+        ' holds eight rows and stays there.**',
+        'capture_catalogue_is_the_stable_eight_record_baseline',
+        'The stable baseline is relabelled onto the growing telemetry table.',
+    ),
 )

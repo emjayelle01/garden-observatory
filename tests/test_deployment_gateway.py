@@ -6279,7 +6279,8 @@ def test_the_deployment_document_covers_the_contract(topic: str) -> None:
         "/root/mgo-gateway-install-71d3755",
         "/root/mgo-gateway-preinstall-backup-71d3755",
         "/root/mgo-legacy-sudoers-retirement-71d3755",
-        "have not yet been exercised against the\ninstalled gateway",
+        "### Production validation",
+        "**proven on their production forward paths**",
     ],
 )
 def test_the_deployment_document_records_the_production_installation(
@@ -6418,11 +6419,15 @@ def test_the_task_record_states_the_installation_without_overclaiming() -> None:
     assert "3e26a7ce" in section
     assert "a34191d5" in section
     assert "retired and archived" in section
-    # And the boundary that installation does not cross.
-    assert "**Installed is not exercised.**" in section
-    assert "have never been\nrun against the installed gateway" in section
-    assert "no live application deployment" in section
-    assert "The approval file remains empty." in section
+    # The boundary installation did not cross, dated to when that was true,
+    # followed by the live actions that have since crossed it.
+    assert "**As at installation, installed was not yet exercised.**" in section
+    assert "**Both actions have since passed in production.**" in section
+    assert "`MainPID` 1494 → 16531" in section
+    assert "`MainPID` 16531 → 17702" in section
+    assert "the repository provably untouched" in section
+    assert "the approval file is empty" in section
+    assert "Rollback has **not** been deliberately triggered in production" in section
     # The first staging attempt keeps its classification.
     assert "first Raspberry Pi staging attempt (2026-08-04) was incomplete" in section
     assert "does not count as a pass" in section
@@ -6437,22 +6442,63 @@ def test_the_task_record_states_the_installation_without_overclaiming() -> None:
 
 
 def test_the_remediation_record_states_the_installation_truthfully() -> None:
-    """Reviewed, staged, installed — and stopping short of deployed."""
+    """Reviewed, staged, installed, and now exercised for real.
+
+    This test previously asserted the opposite of its last three lines — that
+    neither action had run. That was true when written. What has to survive the
+    change is the shape of the claim: each stage is stated at the strength the
+    evidence supports, and the one stage with no production evidence at all
+    still says so.
+    """
     text = _read(REMEDIATION_RECORD)
 
-    assert "Implementation and repository review complete" in text
+    assert "**Deployment-gateway remediation is complete.**" in text
     assert "staging validation passed" in text
     assert "legacy wildcard sudoers policy is retired" in text
-    assert "Installed-policy boundary validation passed" in text
+    assert "installed-policy boundary validation passed" in text
     assert "Raspberry Pi staging validation (first attempt) | **Incomplete**" in text
     assert "Raspberry Pi staging validation (second run) | **Passed**" in text
     assert "Legacy wildcard sudoers policy | **Retired**" in text
     assert "Installation on the Raspberry Pi | **Passed**" in text
     assert "Installation review | **Passed**" in text
-    assert "Application deployment through `deploy-main` | **Not exercised**" in text
-    assert "`restart-api` through the installed gateway | **Not exercised**" in text
+    assert "Installed-policy boundary validation | **Passed**" in text
+    # The two live actions, now passed.
+    assert "Live `deploy-main` validation | **Passed**" in text
+    assert "Live `restart-api` validation | **Passed**" in text
+    assert "Deployment-gateway remediation | **Complete**" in text
+    assert "`deploy-main` passed on 2026-08-05" in text
+    assert "`restart-api` passed on 2026-08-05" in text
+    # And the stages that still have no production evidence.
+    assert "Production rollback | **Not deliberately triggered**" in text
     assert "Physical camera acceptance | **Pending**" in text
-    assert "**No application code\nhas been deployed through it.**" in text
+
+
+def test_the_gateway_document_no_longer_says_the_actions_are_unexercised() -> None:
+    """The operator-facing document must not describe a proven action as pending.
+
+    Scoped to the production installation and validation record — the section
+    an operator reads to learn what the host can do — rather than banned across
+    the whole file, so a dated historical statement elsewhere stays legal.
+    """
+    text = _read(DEPLOYMENT_DOC)
+    start = text.index("### 13a. Production installation record")
+    section = text[start : text.index("## 14. Sudoers boundary", start)]
+
+    for stale in (
+        "have not yet been exercised",
+        "not yet been exercised",
+        "no live deployment has run",
+    ):
+        assert stale not in section, stale
+
+    assert "### Production validation" in section
+    assert "**proven on their production forward paths**" in section
+    assert "**Passed 2026-08-05**" in section
+    assert "recovered in **1 second**" in section
+    assert "repository untouched" in section
+    assert "Matthew withdrew the\napproval after each action" in section
+    # And the limitation that survives two green forward paths.
+    assert "**Rollback has not been deliberately triggered in production" in section
 
 
 REMEDIATION_RECORD = (
@@ -6793,7 +6839,7 @@ def test_the_probe_count_is_stated_exactly() -> None:
         "| Production SHA | `1aec2245010a1bd971d028be235c1864af6b46b3`, unchanged |",
         "| `MainPID` | `1494`, unchanged |",
         "| `NRestarts` | `0`, unchanged |",
-        "| Archive/database records | 8 |",
+        "| Capture catalogue records | 8 |",
         "| Physical capture files | 5 |",
         "| Approval file | Empty and unchanged |",
         "No `deploy-main`, no `restart-api`, no application-code deployment",
@@ -6816,19 +6862,202 @@ def test_the_installation_changed_nothing_in_production(statement: str) -> None:
         "/root/mgo-legacy-sudoers-retirement-71d3755",
         "pending a separately reviewed closeout",
         "**None of this is cleaned by the record that documents it**",
-        "`deploy-main` has **not** been invoked through the new installed gateway",
-        "`restart-api` has **not** been invoked through the new installed gateway",
-        "no live application deployment has yet proved the installed transaction",
-        "the approval file remains empty",
-        "physical camera acceptance remains pending",
-        "the 24-hour and 48-hour physical camera gates have **not** started",
+        # The limitation list is now dated to the moment it described, because
+        # the first two entries have since been discharged by the live actions.
+        # It is kept, not deleted: it is what the installation review accepted.
+        "**What was not established as at 2026-08-05 08:32",
+        "`deploy-main` had **not** been invoked through the newly installed gateway",
+        "`restart-api` had **not** been invoked through the newly installed gateway",
+        "no live application deployment had yet proved the installed transaction",
+        "physical camera acceptance remained pending",
+        "the 24-hour and 48-hour physical camera gates had **not** started",
         "were not subsequently read",
         "An installed control plane is not a proven one.",
+        "It has since been run.",
     ],
 )
 def test_the_retained_evidence_and_limitations_are_recorded(statement: str) -> None:
     """What is kept, and what is still unproven."""
     assert statement in _read(REMEDIATION_RECORD)
+
+
+def _live_section(title: str, following: str) -> str:
+    """One live-validation section of the remediation record."""
+    text = _read(REMEDIATION_RECORD)
+    start = text.index(title)
+    return text[start : text.index(following, start)]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "**Passed on 2026-08-05.**",
+        # Where production came from and went to, and that the move was legal.
+        "`1aec2245010a1bd971d028be235c1864af6b46b3`",
+        "`938134d4f4963256cd74b5bbf59123abe49e1d5d`",
+        "**21 commits ahead, zero\nbehind**",
+        "`git merge-base --is-ancestor` exit 0",
+        "`Updating 1aec224..938134d` / `Fast-forward`",
+        # What the gateway did.
+        "`uv sync --frozen`",
+        "**recovered in 1 second**",
+        "sudo -n /usr/local/sbin/mgo-validate deploy-main",
+        "invoked exactly once** and exited **0**",
+        # The service transition.
+        "**MainPID 1494 → 16531**",
+        "**NRestarts still 0**",
+        "`Wed 2026-08-05 15:10:08 SAST`",
+        # Preservation, before and after.
+        "**preview stopped**",
+        "**preview still stopped**",
+        "**producer count still zero**",
+        "**still the same eight\nrecords**",
+        # The readiness probe is not a failure.
+        "**It is a probe,\nnot a deployment failure.**",
+        # And the window was closed afterwards.
+        "cleared the approval atomically",
+        "exit **64** with empty stdout",
+        # The setsid deviation is recorded as a safeguard, not a defect.
+        "accepted operational\nsafeguard, not a gateway defect**",
+    ],
+)
+def test_live_deploy_main_validation_is_recorded(statement: str) -> None:
+    """The first real production deployment through the gateway.
+
+    None of this can be re-derived from the repository: it happened on the
+    Raspberry Pi, once, and the record is the only place it survives.
+    """
+    assert statement in _live_section(
+        "## First live deploy-main validation",
+        "## First live restart-api validation",
+    )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "**Passed on 2026-08-05.**",
+        "sudo -n /usr/local/sbin/mgo-validate restart-api",
+        "invoked exactly once** and exited **0**",
+        "**Recovery time: 1 second.**",
+        "**MainPID 16531 → 17702**",
+        "**NRestarts still 0**",
+        # Production did not move.
+        "production SHA **still**\n`938134d4f4963256cd74b5bbf59123abe49e1d5d`",
+        "**No fetch was run during preflight.**",
+        # And the proof that it did not, which an unchanged SHA alone is not.
+        "**`restart-api` provably updated nothing.**",
+        "a fetch that found nothing new looks identical",
+        "the Git reflog received **no new entry**",
+        "`FETCH_HEAD` mtime remained `2026-08-05 15:10:07`",
+        "`.venv` mtime remained `2026-07-27 09:32:45`",
+        "**no fetch, no merge, no dependency sync and no checkout movement**",
+        # Preservation and closure.
+        "**preview still stopped**",
+        "**zero camera\nproducers**",
+        "**still the same eight records**",
+        "cleared the approval atomically",
+        "exit **64** with empty stdout",
+    ],
+)
+def test_live_restart_api_validation_is_recorded(statement: str) -> None:
+    """The first real production restart through the gateway.
+
+    The load-bearing part is not that the SHA was unchanged but that nothing
+    was fetched, merged or synced — which is what separates this action from
+    ``deploy-main``.
+    """
+    assert statement in _live_section(
+        "## First live restart-api validation",
+        "## Capture-catalogue baseline correction",
+    )
+
+
+def test_capture_catalogue_is_the_stable_eight_record_baseline() -> None:
+    """Eight is a catalogue count, not a telemetry count.
+
+    One operator instruction read the stable eight as an ``observations``
+    count. Asserting that would have aborted a valid deployment; asserting it
+    unchanged afterwards would have reported a false failure, because a restart
+    necessarily spans a health-collection interval.
+    """
+    section = _live_section(
+        "## Capture-catalogue baseline correction", "## Boundaries"
+    )
+
+    assert "**The stable eight-record baseline is the capture catalogue.**" in section
+    assert "four `rpicam-still` and four\n`mock`" in section
+    assert "not merely the same count" in section
+    assert "physical JPEG count is **five**" in section
+
+    # And the telemetry table is named as what it is.
+    assert (
+        "**`observations` is continuously growing operational telemetry.**" in section
+    )
+    assert "`health_snapshot` and `camera_status`" in section
+    assert "**18,828 rows**" in section
+    assert "**must not** be asserted equal before and after a service\n  action" in (
+        section
+    )
+    assert "**must not** be described as the stable eight-record baseline" in section
+    assert "is **not** a permanent invariant" in section
+
+    # The operational document carries the same distinction.
+    gateway_document = _read(DEPLOYMENT_DOC)
+    assert "is the **capture catalogue**" in gateway_document
+    assert "is not an invariant count" in gateway_document
+
+
+def test_current_status_does_not_overclaim_rollback_or_physical_acceptance() -> None:
+    """What two green forward paths do not entitle the record to say.
+
+    Both live actions succeeded, which makes it tempting to describe the
+    transaction as proven. It is not: the rollback branch has never run in
+    production, and no hardware gate has begun.
+    """
+    remediation = _read(REMEDIATION_RECORD)
+    acceptance = _read(ACCEPTANCE_RECORD_PATH)
+    gateway_document = _read(DEPLOYMENT_DOC)
+    remediation_status = remediation[: remediation.index("## Why this task exists")]
+    acceptance_status = acceptance[: acceptance.index("## Purpose")]
+
+    for banned in (
+        "rollback passed",
+        "rollback validated",
+        "rollback proven",
+        "Production rollback | **Passed**",
+        "Physical camera acceptance | **Complete**",
+        "Physical camera acceptance | **Passed**",
+        "Physical camera acceptance run | **Passed**",
+        "Matthew's visual sign-off | **Given**",
+        "24-hour gate | **Started**",
+        "48-hour gate | **Started**",
+    ):
+        assert banned not in remediation_status, banned
+        assert banned not in acceptance_status, banned
+
+    # Rollback is stated as untriggered, in both records that mention it.
+    assert "Production rollback | **Not deliberately triggered**" in remediation_status
+    assert "rollback has never been deliberately\ntriggered in production" in (
+        remediation_status
+    )
+    assert "be induced solely to demonstrate it" in gateway_document
+
+    # The hardware gates are still open.
+    assert "Physical camera acceptance | **Pending**" in remediation_status
+    assert "Physical camera acceptance run | **Not performed**" in acceptance_status
+    assert "Matthew's visual sign-off | **Not given**" in acceptance_status
+    assert "24-hour gate | **Not started**" in acceptance_status
+    assert "48-hour gate | **Not started**" in acceptance_status
+    assert "remaining\nTask 12 gate" in acceptance_status
+
+    # Root-only evidence was not inspected during the live actions, and the
+    # record must not imply otherwise.
+    assert "did **not** directly inspect the retained root evidence" in remediation
+    assert "cannot distinguish absent from unreadable" in remediation
+
+    # The gateway prerequisites are complete while acceptance is not.
+    assert "Deployment-gateway prerequisites | **Complete**" in acceptance_status
 
 
 def test_no_current_status_claims_deployment_or_acceptance_completed() -> None:
@@ -6844,11 +7073,11 @@ def test_no_current_status_claims_deployment_or_acceptance_completed() -> None:
     remediation_status = remediation[: remediation.index("## Why this task exists")]
     acceptance_status = acceptance[: acceptance.index("## Purpose")]
 
+    # The deploy-main and restart-api bans this list once carried have been
+    # removed: both actions have since passed in production, so banning a
+    # "passed" row for them would now forbid the truth. What stays banned is
+    # the hardware, which has not moved at all.
     for banned in (
-        "deploy-main` | **Passed**",
-        "deploy-main` | **Complete**",
-        "restart-api` | **Passed**",
-        "restart-api` | **Complete**",
         "Physical camera acceptance | **Complete**",
         "Physical camera acceptance | **Passed**",
         "Physical camera acceptance run | **Passed**",
@@ -6856,24 +7085,24 @@ def test_no_current_status_claims_deployment_or_acceptance_completed() -> None:
         "Matthew's visual sign-off | **Given**",
         "24-hour gate | **Started**",
         "48-hour gate | **Started**",
-        "application deployment complete",
-        "deployed through the installed gateway",
+        # Deliberately not a bare "camera has been accepted": that phrase also
+        # occurs inside the record's own denial of it, and a ban that fires on
+        # the negation of the claim it polices is worse than no ban.
+        "physical acceptance complete",
+        "physical camera acceptance is complete",
     ):
         assert banned not in remediation_status, banned
         assert banned not in acceptance_status, banned
 
-    # And the rows that state the true position are present.
-    assert "Application deployment through `deploy-main` | **Not exercised**" in (
-        remediation_status
-    )
-    assert "`restart-api` through the installed gateway | **Not exercised**" in (
-        remediation_status
-    )
+    # And the rows that state the true position are present. The two live
+    # actions have since passed; the hardware gates have not.
+    assert "Live `deploy-main` validation | **Passed**" in remediation_status
+    assert "Live `restart-api` validation | **Passed**" in remediation_status
     assert "Physical camera acceptance | **Pending**" in remediation_status
-    assert "Live `deploy-main` through the installed gateway | **Not exercised**" in (
+    assert "Live `deploy-main` through the installed gateway | **Passed**" in (
         acceptance_status
     )
-    assert "Live `restart-api` through the installed gateway | **Not exercised**" in (
+    assert "Live `restart-api` through the installed gateway | **Passed**" in (
         acceptance_status
     )
     assert "Physical camera acceptance run | **Not performed**" in acceptance_status

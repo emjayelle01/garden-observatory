@@ -4,12 +4,13 @@
 
 **Implementation, narrow Raspberry Pi validation, merge and production
 deployment complete.
-Deployment-gateway remediation is complete and the reviewed gateway is installed
-on the Raspberry Pi; installed-policy validation passed.
-Live `deploy-main` and `restart-api` remain unexercised.
-Managed preview remains disabled in production, and preview is currently stopped
-after a recorded power failure because `auto_start` is `false`.
-Physical camera acceptance has not been performed.
+Deployment-gateway remediation is complete: the reviewed gateway is installed,
+installed-policy validation passed, and both live gateway actions have now
+passed in production — `deploy-main` on 2026-08-05 and `restart-api` on
+2026-08-05. The approval is withdrawn and production is at `938134d…`.
+Managed preview remains disabled and preview remains stopped.
+Physical camera acceptance has not been performed, and is now the remaining
+Task 12 gate.
 Awaiting separately authorised physical acceptance.**
 
 | Gate | Outcome |
@@ -31,8 +32,10 @@ Awaiting separately authorised physical acceptance.**
 | Deployment-gateway remediation | **Complete** — reviewed, staged and installed |
 | Reviewed gateway installed on the Raspberry Pi | **Passed** — 2026-08-05, from `71d3755` |
 | Installed-policy validation | **Passed** — bounded refusals and refused negative sudo probes |
-| Live `deploy-main` through the installed gateway | **Not exercised** |
-| Live `restart-api` through the installed gateway | **Not exercised** |
+| Live `deploy-main` through the installed gateway | **Passed** — 2026-08-05, `1aec224` → `938134d` |
+| Live `restart-api` through the installed gateway | **Passed** — 2026-08-05, at `938134d` |
+| Deployment-gateway prerequisites | **Complete** |
+| Approval file | **Withdrawn** — empty after both actions |
 | Managed preview production policies | **Disabled** — `auto_start` and `restore_after_capture` remain `false` |
 | Preview state | **Stopped** — after the 2026-08-04 power failure, because `auto_start` is `false` |
 | Physical camera acceptance run | **Not performed** — requires separate authorisation |
@@ -1318,14 +1321,26 @@ retired and archived in the same authorised sequence, so the effective privilege
 is now a single `NOPASSWD` grant for the exact gateway path — no wildcard, no
 `SETENV`.
 
-**Installed is not exercised.** `deploy-main` and `restart-api` have never been
-run against the installed gateway, so no live application deployment has yet
-proved the installed transaction path. The approval file remains empty. The
-installation itself changed nothing about the running application: production
-stayed on `main` at `1aec2245010a1bd971d028be235c1864af6b46b3`, `MainPID`
-remained `1494`, `NRestarts` remained `0`, the configuration checksum was
-unchanged, and preview remained stopped. The full account is in
+**As at installation, installed was not yet exercised.** The installation
+itself changed nothing about the running application: production stayed on
+`main` at `1aec2245010a1bd971d028be235c1864af6b46b3`, `MainPID` remained
+`1494`, `NRestarts` remained `0`, the configuration checksum was unchanged, and
+preview remained stopped.
+
+**Both actions have since passed in production.** On 2026-08-05 `deploy-main`
+fast-forwarded production from `1aec224…` to `938134d…` — 21 commits, frozen
+dependency sync, service recovered in one second, `MainPID` 1494 → 16531 — and
+`restart-api` then restarted the service at `938134d…`, recovering in one
+second with `MainPID` 16531 → 17702 and the repository provably untouched.
+Preview stayed `stopped` and the producer count stayed zero across both.
+Matthew withdrew the approval after each action, so the approval file is empty.
+Rollback has **not** been deliberately triggered in production and should not
+be induced merely to demonstrate it. The full account is in
 [Task-012-Deployment-Gateway-Remediation.md](Task-012-Deployment-Gateway-Remediation.md).
+
+**Physical camera acceptance is now the remaining Task 12 gate.** Every
+software and deployment prerequisite is complete; what is left is hardware,
+and it requires its own authorisation.
 
 **Preview is currently stopped because of a power failure, not because of the
 installation.** The Pi lost power and rebooted at 2026-08-04 14:34:59 SAST, and
