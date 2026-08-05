@@ -4,10 +4,13 @@
 
 **Implementation, narrow Raspberry Pi validation, merge and production
 deployment complete.
-Managed preview remains disabled in production.
+Deployment-gateway remediation is complete and the reviewed gateway is installed
+on the Raspberry Pi; installed-policy validation passed.
+Live `deploy-main` and `restart-api` remain unexercised.
+Managed preview remains disabled in production, and preview is currently stopped
+after a recorded power failure because `auto_start` is `false`.
 Physical camera acceptance has not been performed.
-Awaiting deployment-gateway remediation and separately authorised physical
-acceptance.**
+Awaiting separately authorised physical acceptance.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -25,7 +28,13 @@ acceptance.**
 | Raspberry Pi validation of this branch | **Passed** — narrow ARM64 validation, 2026-07-31 |
 | Merge into `main` | **Passed** — fast-forward merge, 2026-08-01 |
 | Production deployment | **Passed** — controlled direct fast-forward, 2026-08-01 |
+| Deployment-gateway remediation | **Complete** — reviewed, staged and installed |
+| Reviewed gateway installed on the Raspberry Pi | **Passed** — 2026-08-05, from `71d3755` |
+| Installed-policy validation | **Passed** — bounded refusals and refused negative sudo probes |
+| Live `deploy-main` through the installed gateway | **Not exercised** |
+| Live `restart-api` through the installed gateway | **Not exercised** |
 | Managed preview production policies | **Disabled** — `auto_start` and `restore_after_capture` remain `false` |
+| Preview state | **Stopped** — after the 2026-08-04 power failure, because `auto_start` is `false` |
 | Physical camera acceptance run | **Not performed** — requires separate authorisation |
 | Matthew's visual sign-off | **Not given** |
 | 24-hour gate | **Not started** |
@@ -1299,13 +1308,34 @@ command-scoped environment reset, the dry-run exit status agrees with its
 report, and a real installation takes the lock first and installs from a
 validated snapshot.
 
-It is **awaiting final confirmation**, has **not** been installed on the
-Raspberry Pi and has **not** been validated there. The gateway running in production is still the
-Task 10 one described above, and nothing about the production host changed. A
-future deployment cannot use the new gateway until it is re-reviewed and
-installed under separate authorisation.
+It has since passed installation review, and on **2026-08-05** the reviewed
+gateway and its replacement sudoers policy were **installed** on the Raspberry
+Pi under separate authorisation, from source SHA `71d3755`. The legacy Task 10
+gateway described above is no longer what runs there: `/usr/local/sbin/mgo-validate`
+is now `3e26a7ce…0bf3e` and `/etc/sudoers.d/mgo-validate` is `a34191d5…cbebc`.
+The legacy wildcard sudoers policy `/etc/sudoers.d/mgo-claude-validation` was
+retired and archived in the same authorised sequence, so the effective privilege
+is now a single `NOPASSWD` grant for the exact gateway path — no wildcard, no
+`SETENV`.
 
-**Raspberry Pi staging validation is incomplete.** A first staging attempt ran
+**Installed is not exercised.** `deploy-main` and `restart-api` have never been
+run against the installed gateway, so no live application deployment has yet
+proved the installed transaction path. The approval file remains empty. The
+installation itself changed nothing about the running application: production
+stayed on `main` at `1aec2245010a1bd971d028be235c1864af6b46b3`, `MainPID`
+remained `1494`, `NRestarts` remained `0`, the configuration checksum was
+unchanged, and preview remained stopped. The full account is in
+[Task-012-Deployment-Gateway-Remediation.md](Task-012-Deployment-Gateway-Remediation.md).
+
+**Preview is currently stopped because of a power failure, not because of the
+installation.** The Pi lost power and rebooted at 2026-08-04 14:34:59 SAST, and
+the service restarted at 14:35:10 SAST as `MainPID` `1494`. The pre-failure
+`MainPID` `70709` and preview process `71087` recorded elsewhere in this
+document belong to the earlier service. Because `preview.auto_start` remains
+`false`, preview correctly did not return — which is the same inertness the
+deployment proved, observed again after an unplanned restart.
+
+**The first Raspberry Pi staging attempt (2026-08-04) was incomplete.** It ran
 the branch's tests on the Pi and was stopped: one gateway-focused test executed
 the tracked deployment wrapper directly, and because that wrapper names the
 fixed path `/usr/local/sbin/mgo-validate`, it invoked the Pi's installed
@@ -1323,8 +1353,20 @@ wrapper entry points execute a disposable copy behind a fake `sudo`, and an
 AST audit of the test module now fails on any further host-reaching execution.
 The full account, including the production non-interference evidence, is in
 [Task-012-Deployment-Gateway-Remediation.md](Task-012-Deployment-Gateway-Remediation.md).
-No gateway was installed, the production gateway is unchanged, and
-physical camera acceptance remains pending.
+No gateway was installed by that attempt and the production gateway was
+unchanged by it.
+
+**A second staging validation, after the test-isolation correction, passed** on
+2026-08-04 at `71d3755`: 2333 passed and 1 skipped on the Pi, 654 in the
+gateway-focused suite, 28 in the acceptance-document suite, mypy over 50 source
+files, all 166 mutations detected with no stale mutation, a clean outer tripwire
+and clean exec tracing, and an unprivileged installer dry run that exited zero.
+Production was unchanged and the disposable clone was removed. That run is what
+the installation above was authorised from; the first attempt stays classified
+as incomplete.
+
+Physical camera acceptance remains pending, Matthew's visual sign-off has not
+been given, and the 24-hour and 48-hour gates have not started.
 
 ### Evidence
 

@@ -654,6 +654,44 @@ and it is repaired transactionally.
 It never touches the approval file, the repository or the service. It
 provisions the deployment control plane and nothing else.
 
+### 13a. Production installation record
+
+The gateway described by this document is installed on `mgo-core`. This is the
+operational record of that installation; the full narrative, including the
+staging runs that preceded it, is in
+`docs/tasks/Task-012-Deployment-Gateway-Remediation.md`.
+
+| Fact | Value |
+| ---- | ----- |
+| Installed | 2026-08-05 |
+| Installed from source SHA | `71d3755cd3807acffa09173fe743c9ef109faa9f` |
+| `/usr/local/sbin/mgo-validate` | `3e26a7cea23d15944f8f0b8c9949e3bb79ce555c95c64a4b45a174e038f0bf3e`, `root:root`, `0755` |
+| `/etc/sudoers.d/mgo-validate` | `a34191d54a7139f107834861c53e6fa4db96501bfbea67ba457adc09055cbebc`, `root:root`, `0440` |
+
+**The legacy wildcard policy was retired in the same authorised sequence.**
+`/etc/sudoers.d/mgo-claude-validation` granted both
+`/usr/local/sbin/mgo-validate` and `/usr/local/sbin/mgo-validate *` — the second
+is a wildcard grant, and it could not remain active beside the policy in
+section 14. It was archived and removed, and it must not be restored.
+
+The active policy is now the shape section 14 describes: one `NOPASSWD` grant
+for the exact gateway path, no wildcard, no `SETENV`, a command-scoped
+`env_reset` and eleven command-scoped `env_delete` groups.
+
+Evidence retained under `/root`, pending a separately reviewed closeout:
+
+```text
+/root/mgo-gateway-install-71d3755
+/root/mgo-gateway-preinstall-backup-71d3755
+/root/mgo-legacy-sudoers-retirement-71d3755
+```
+
+**`deploy-main` and `restart-api` have not yet been exercised against the
+installed gateway.** The control plane is in place and refuses correctly —
+`show-approval` and the removed `install` action both exit `64` with bounded
+messages, and `sudo` refuses everything else — but no live deployment has run
+through it. Section 15 describes what the first one will look like.
+
 ## 14. Sudoers boundary
 
 ```text

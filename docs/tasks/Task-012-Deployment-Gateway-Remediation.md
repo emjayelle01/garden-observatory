@@ -2,10 +2,13 @@
 
 ## Status
 
-**Entry-boundary corrections implemented; awaiting final confirmation. The
-gateway is not installed, Raspberry Pi staging validation is incomplete, and the
-production gateway is unchanged.
-Physical camera acceptance remains pending.**
+**Implementation and repository review complete. The second Raspberry Pi
+staging validation passed, the legacy wildcard sudoers policy is retired, and
+the reviewed gateway and its replacement policy are installed on the production
+Raspberry Pi. Installed-policy boundary validation passed.
+Application deployment through `deploy-main` has not been exercised,
+`restart-api` has not been exercised, and physical camera acceptance remains
+pending.**
 
 **The first Raspberry Pi staging-validation attempt is recorded below as
 incomplete, not as passed.** One gateway-focused test escaped its temporary
@@ -32,20 +35,30 @@ stopped, and the repository test isolation has been corrected. See
 | Mutation register | Complete — checked in and re-run in full against the current tip |
 | Final confirmation (round two) | **Complete** — three further blocking defects found |
 | Entry-boundary corrections | Complete — all three corrected |
-| Raspberry Pi staging validation | **Incomplete** — stopped on a test-isolation boundary breach |
+| Raspberry Pi staging validation (first attempt) | **Incomplete** — stopped on a test-isolation boundary breach |
 | Test-isolation correction | Complete — wrapper entry points now run behind a disposable-copy harness |
-| Final confirmation (re-run) | **Not performed** |
-| Installation on the Raspberry Pi | **Not performed** — requires re-review and a separately approved SHA |
-| Raspberry Pi validation of the gateway | **Not performed** |
+| Final confirmation (re-run) | **Complete** |
+| Raspberry Pi staging validation (second run) | **Passed** — 2026-08-04, at `71d3755` |
+| Legacy wildcard sudoers policy | **Retired** — 2026-08-05, archived under `/root` |
+| Installation on the Raspberry Pi | **Passed** — 2026-08-05, from `71d3755` |
+| Installation review | **Passed** |
+| Installed-policy boundary validation | **Passed** — bounded refusals and refused negative sudo probes |
+| Application deployment through `deploy-main` | **Not exercised** |
+| `restart-api` through the installed gateway | **Not exercised** |
+| Physical camera acceptance | **Pending** |
 
-Nothing in this task has been installed on the Raspberry Pi. The gateway
-installed there is still the Task 10 one, and physical camera acceptance
-remains pending in full. One staging-validation attempt ran repository tests on
-the Pi; it is recorded below, it changed nothing, and it did not pass.
+The reviewed gateway and its replacement sudoers policy are installed on the
+production Raspberry Pi, and the legacy wildcard policy that stood beside them
+has been retired and archived. What that proves is bounded: the control plane
+is in place and refuses what it is supposed to refuse. **No application code
+has been deployed through it.** `deploy-main` and `restart-api` have never run
+against the installed gateway, so the deployment transaction itself is still
+unexercised in production, and physical camera acceptance remains pending in
+full.
 
-Nothing in this task changes the gateway that is installed on the production
-Raspberry Pi. It changes what the *repository* ships. Installing it is a
-separate, separately authorised act.
+The first staging-validation attempt ran repository tests on the Pi, changed
+nothing, and did not pass; it is recorded below as incomplete and stays that
+way. The second run is a separate, later event.
 
 ## Why this task exists
 
@@ -759,8 +772,10 @@ These results are real and are worth keeping:
 * the mutation register;
 * the unprivileged installer dry run.
 
-No gateway was installed. The production gateway is unchanged. Physical camera
-acceptance remains pending.
+No gateway was installed by that attempt, and the production gateway was
+unchanged by it. Physical camera acceptance remained pending. The installation
+that did eventually happen was a separate, later, separately authorised act and
+is recorded under [Root installation](#root-installation).
 
 ## The unsafe test, and the correction
 
@@ -839,19 +854,257 @@ the gateway's exit code; emptying the audit's executor register; permitting
 harness guard that refuses before a child process starts, so no mutation can
 invoke a real `sudo` or reach a host control-plane path.
 
+## Raspberry Pi staging validation — the successful second run
+
+A second staging validation ran on 2026-08-04, after the test-isolation
+correction, and **passed**. It is a separate, later event from the incomplete
+first attempt recorded above, which stays classified as incomplete.
+
+The run used the `claude` account on host `mgo-core` (`aarch64`) against a
+disposable clone at `71d3755cd3807acffa09173fe743c9ef109faa9f`. The clone was
+removed afterwards.
+
+| Check | Result |
+| ----- | ------ |
+| Ruff | Passed |
+| mypy | Passed — 50 source files |
+| Gateway-focused suite | **654 passed** |
+| Acceptance-document suite | **28 passed** |
+| Full Pi suite | **2333 passed, 1 skipped** |
+| The one skip | The intentionally single-branch disposable clone has no local `main` ref |
+| Mutation register | **All 166 mutations detected** |
+| Stale mutations | **Zero** |
+| Outer command tripwire | Clean |
+| Exec tracing | Clean |
+| Real `sudo` executed | **None** |
+| Installed gateway invoked | **Never** |
+| `systemctl`, `runuser`, `flock`, `curl`, remote Git | None executed during guarded test phases |
+| Unprivileged installer dry run | Exited zero |
+| Production | Unchanged |
+| Disposable clone | Removed |
+
+The run was instrumented from outside the suite, because a suite cannot be the
+only witness to its own isolation: a `PATH` directory of tripwire shims caught
+`PATH`-resolved calls and `strace -f -e trace=execve` caught absolute-path
+bypasses. Both were needed, and both were self-tested before the run.
+
+## Power-failure baseline transition
+
+A power failure rebooted the Pi at **2026-08-04 14:34:59 SAST**. Normal
+filesystem journal recovery completed and the service started successfully at
+**2026-08-04 14:35:10 SAST**.
+
+The post-boot baseline used for the installation was:
+
+| Fact | Value |
+| ---- | ----- |
+| `mgo.service` | Active |
+| `MainPID` | `1494` |
+| `NRestarts` | `0` |
+| Database | Healthy, schema version 2, current, integrity ok |
+| Camera | IMX708 available |
+| Preview | Stopped |
+| Preview PID | None |
+| `rpicam-vid` | Zero |
+| `libcamera-vid` | Zero |
+| `preview.auto_start` | Remained `false` |
+| Production branch | `main` |
+| Production SHA | `1aec2245010a1bd971d028be235c1864af6b46b3` |
+| Production tree | Clean |
+| Configuration checksum | `8346e732c2545ff369f6c4f0e3fc2e415d10993d8fe6b4b1b2c67600555183da` |
+| Archive/database records | 8 |
+| Physical capture files | 5 |
+| Approval file | Empty |
+
+**The power failure, not the gateway installation, is what changed the
+baseline.** The earlier records in this repository show `MainPID` `70709` and a
+running preview process `71087`; both belong to the pre-power-failure service.
+The reboot ended that process and, because `preview.auto_start` remains `false`,
+the preview correctly did not come back. Attributing either change to the
+installation would be wrong, and it would also be the more comfortable story,
+which is exactly why it is written down here.
+
+The installation preserved the post-power baseline: `MainPID` `1494` remained
+`1494`, `NRestarts` remained `0`, stopped preview remained stopped, and zero
+camera producers remained zero.
+
+## Legacy sudoers retirement
+
+On **2026-08-05** the legacy policy `/etc/sudoers.d/mgo-claude-validation` was
+retired by an authorised root operator block. Its checksum was
+`dd3f71c2f69c1c7dfbfd602aafd3ad9d9bf02d7686f9b656078ba99d9186333e` and it held
+three directives:
+
+```text
+Defaults:claude !requiretty
+claude ALL=(root) NOPASSWD: /usr/local/sbin/mgo-validate
+claude ALL=(root) NOPASSWD: /usr/local/sbin/mgo-validate *
+```
+
+The third is a **wildcard grant**, which is why the policy could not remain
+active beside the reviewed replacement.
+
+Established by the retirement:
+
+* the active legacy file was a regular, root-owned, mode `0440` file;
+* the archived copy is byte-for-byte identical and passes `visudo` validation;
+* the archive at `/root/mgo-legacy-sudoers-retirement-71d3755` is `root:root`
+  `0700`;
+* the active legacy file was removed;
+* the complete active sudoers configuration remained valid;
+* no other Claude or gateway sudoers reference remained immediately after
+  retirement;
+* the wildcard grant was **not** restored.
+
+**The first retirement attempt stopped before any mutation.** The operator block
+asserted two active directives; the file held three, because
+`Defaults:claude !requiretty` was absent from the record the block was written
+against. Under `set -Eeuo pipefail` the assertion ended the run before the
+archive was created and before anything was removed. That is a **safe stopped
+attempt, not a failed retirement transaction** — nothing was half-done, and the
+host was exactly as it had been. The corrected block asserted all three
+directives in order and completed.
+
+## Root installation
+
+On **2026-08-05**, from source SHA
+`71d3755cd3807acffa09173fe743c9ef109faa9f`, an authorised root operator block
+installed the reviewed gateway and its policy.
+
+| Target | Checksum | Metadata |
+| ------ | -------- | -------- |
+| `/usr/local/sbin/mgo-validate` | `3e26a7cea23d15944f8f0b8c9949e3bb79ce555c95c64a4b45a174e038f0bf3e` | Regular non-symlink file, `root:root`, mode `0755`, shell syntax valid |
+| `/etc/sudoers.d/mgo-validate` | `a34191d54a7139f107834861c53e6fa4db96501bfbea67ba457adc09055cbebc` | Regular non-symlink file, `root:root`, mode `0440`, passes `visudo -cf` |
+
+The complete active configuration passes `visudo -c`.
+
+Effective Claude privilege after installation:
+
+* one `NOPASSWD` grant, for the exact gateway path;
+* **no legacy wildcard rule**;
+* **no `SETENV`**;
+* command-scoped `env_reset`;
+* eleven command-scoped `env_delete` groups;
+* no arbitrary shell, no arbitrary `systemctl`, no arbitrary Git, no arbitrary
+  `uv`, and no installer permission.
+
+Installed state:
+
+* `/run/lock/mgo-deployment.lock` is a root-owned `0600` regular file, and it
+  can be acquired non-blockingly when idle;
+* `/run/mgo-validate-install` is a root-owned `0700` directory, and the
+  transaction parent is empty;
+* the post-install root dry run reported both installed targets current, and
+  inode, mtime, size, ownership and mode were unchanged across it;
+* the approval file remained empty and unchanged.
+
+## Bounded installed-gateway validation
+
+The installed gateway was exercised only at its refusal boundary.
+
+**`show-approval`** — exit `64`, stdout empty, no SHA printed, and a bounded
+refusal for an empty or malformed approval file.
+
+**The removed legacy `install` action** — exit `64`, stdout empty, and a bounded
+message that distinguishes application deployment from service-identity
+provisioning. No Git, service or preview action occurred.
+
+**Negative sudo probes** — `/bin/true`, `/bin/bash -c true` and
+`systemctl restart mgo.service` were each refused, and each exited non-zero. The
+effective policy listing independently confirmed that the gateway path is the
+only command grant.
+
+**Five gateway or sudo probes were executed in total** — `show-approval`, the
+legacy `install` action, and the three negative probes — together with **one
+additional `sudo -n -l` policy-listing command**, run separately to establish
+the effective policy from the unprivileged account. Six invocations, not four:
+the count is written out because a probe count is the kind of number that gets
+rounded in a summary and then cited as evidence.
+
+That listing was needed because `/etc/sudoers.d` is mode `0750` and unreadable
+to `claude`, so `test -e` on any path inside it is always false — it fails with
+`EACCES`, not `ENOENT`, and a shell cannot tell the two apart. Absence inside
+that directory can only be established from a privileged context or from the
+effective policy, never from an unprivileged existence test.
+
+## Production non-interference — the installation
+
+After installation:
+
+| Fact | Value |
+| ---- | ----- |
+| Production branch | `main`, unchanged |
+| Production SHA | `1aec2245010a1bd971d028be235c1864af6b46b3`, unchanged |
+| Production tree | Clean |
+| Stash | Empty |
+| Production worktrees | One |
+| `mgo.service` | Active |
+| `MainPID` | `1494`, unchanged |
+| `NRestarts` | `0`, unchanged |
+| Service activation timestamps | Unchanged |
+| Database | Healthy and unchanged |
+| Camera | Available |
+| Preview | Stopped |
+| Camera producers | None appeared |
+| Configuration checksum | `8346e732c2545ff369f6c4f0e3fc2e415d10993d8fe6b4b1b2c67600555183da`, unchanged |
+| Archive/database records | 8 |
+| Physical capture files | 5 |
+| Approval file | Empty and unchanged |
+
+No `deploy-main`, no `restart-api`, no application-code deployment, no
+production fetch, merge or `uv sync`, no service operation, no preview
+transition, no capture, no stream access, and no image opened or decoded.
+
+## Retained evidence and remaining limitations
+
+Retained on the Raspberry Pi pending a separately reviewed closeout:
+
+```text
+/root/mgo-gateway-install-71d3755
+/root/mgo-gateway-preinstall-backup-71d3755
+/root/mgo-legacy-sudoers-retirement-71d3755
+```
+
+The unprivileged source clone was removed. Several unprivileged helper scripts
+remain under `/tmp`. **None of this is cleaned by the record that documents it**
+— root-evidence cleanup and `/tmp` helper cleanup require their own reviewed
+instruction.
+
+What is still not established:
+
+* `deploy-main` has **not** been invoked through the new installed gateway;
+* `restart-api` has **not** been invoked through the new installed gateway;
+* no live application deployment has yet proved the installed transaction path;
+* the approval file remains empty;
+* physical camera acceptance remains pending;
+* Matthew has **not** given visual camera sign-off;
+* the 24-hour and 48-hour physical camera gates have **not** started;
+* retained root evidence has not yet been cleaned;
+* `retirement-evidence.txt` and `preinstall-evidence.txt` were created by
+  successful root blocks but were not subsequently read.
+
+An installed control plane is not a proven one. Everything above says the
+gateway is in place and refuses correctly; the first authorised `deploy-main` is
+what will say whether it deploys correctly.
+
 ## Boundaries
 
 This task changes no application runtime, API, schema, camera, preview, capture,
 motion, notification or database behaviour. It does not touch `src/mgo/`,
 `config/`, `migrations/`, `pyproject.toml` or `uv.lock`.
 
-It installs no gateway, alters no sudoers file, alters no approval file, deploys
-nothing, restarts no service and begins no physical camera acceptance. Those
-require repository review and separate authorisation.
+Nothing in this repository installs itself. The gateway and sudoers changes
+recorded above were made on the Raspberry Pi by separately authorised root
+operator blocks, run by Matthew, and this record documents them after the fact.
 
-One separately authorised staging-validation attempt ran repository tests on the
-Raspberry Pi and is recorded above; it is incomplete, it changed nothing on the
-host, and the test-isolation correction that followed it was made entirely in
-this repository with no Raspberry Pi access.
+The branch alters no approval file, deploys no application code, restarts no
+service and begins no physical camera acceptance. The approval file is still
+empty, `deploy-main` and `restart-api` have never run against the installed
+gateway, and physical acceptance requires its own authorisation.
+
+Two separately authorised staging-validation runs and two root operator phases
+are recorded above. The first staging attempt is incomplete, it changed nothing
+on the host, and the test-isolation correction that followed it was made
+entirely in this repository with no Raspberry Pi access.
 
 Task 13 is not begun.

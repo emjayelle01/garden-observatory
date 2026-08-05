@@ -6120,6 +6120,37 @@ def test_the_deployment_document_covers_the_contract(topic: str) -> None:
     assert topic in _read(DEPLOYMENT_DOC)
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "### 13a. Production installation record",
+        "| Installed | 2026-08-05 |",
+        "71d3755cd3807acffa09173fe743c9ef109faa9f",
+        "3e26a7cea23d15944f8f0b8c9949e3bb79ce555c95c64a4b45a174e038f0bf3e",
+        "a34191d54a7139f107834861c53e6fa4db96501bfbea67ba457adc09055cbebc",
+        "**The legacy wildcard policy was retired in the same authorised sequence.**",
+        "/usr/local/sbin/mgo-validate *",
+        "it must not be restored",
+        "no wildcard, no `SETENV`",
+        "/root/mgo-gateway-install-71d3755",
+        "/root/mgo-gateway-preinstall-backup-71d3755",
+        "/root/mgo-legacy-sudoers-retirement-71d3755",
+        "have not yet been exercised against the\ninstalled gateway",
+    ],
+)
+def test_the_deployment_document_records_the_production_installation(
+    statement: str,
+) -> None:
+    """An operator reading the gateway doc must learn what is actually on the host.
+
+    Kept to the operational facts — what is installed, what the policy now
+    permits, what evidence is retained, and what has not been run through it.
+    The narrative belongs in the task record, and duplicating it here would
+    give the project two accounts to keep in step.
+    """
+    assert statement in _read(DEPLOYMENT_DOC)
+
+
 def test_the_deployment_document_records_the_incident() -> None:
     """The reason the gateway exists is part of the gateway's documentation."""
     text = _read(DEPLOYMENT_DOC)
@@ -6210,25 +6241,49 @@ def test_no_shipped_script_prints_the_interpreter_discarding_invocation(
     assert "sudo ./" in printed or "sudo /opt" in printed
 
 
-def test_the_task_record_does_not_claim_the_production_gateway_changed() -> None:
-    """Implemented is not installed, and the record must not blur them."""
-    record = (
-        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Physical-Camera-Acceptance.md"
-    )
-    text = _read(record)
-    index = text.index("Remediation status")
-    section = text[index : index + 6000]
+ACCEPTANCE_RECORD_PATH = (
+    PROJECT_ROOT / "docs" / "tasks" / "Task-012-Physical-Camera-Acceptance.md"
+)
 
-    assert "awaiting final confirmation" in section
-    assert "not** been installed" in section
-    assert "not** been validated" in section
-    assert "still the" in section
-    assert "nothing about the production host changed" in section
-    # And the staging attempt is recorded as incomplete, not as a pass.
-    assert "Raspberry Pi staging validation is incomplete" in section
+
+def _remediation_status_section() -> str:
+    """The acceptance record's remediation-status prose, up to its evidence table.
+
+    Sliced by its own end marker rather than a character count: the section has
+    grown twice now, and a fixed-width window silently stops covering the text
+    it was written to police.
+    """
+    text = _read(ACCEPTANCE_RECORD_PATH)
+    index = text.index("Remediation status")
+    return text[index : text.index("### Evidence", index)]
+
+
+def test_the_task_record_states_the_installation_without_overclaiming() -> None:
+    """Installed is not exercised, and the record must not blur them.
+
+    This test used to assert the opposite — that nothing had been installed.
+    That was true when it was written and is not true now. What has to survive
+    the change is the distinction it existed for: a control plane that is in
+    place is not a control plane that has deployed anything.
+    """
+    section = _remediation_status_section()
+
+    # Installed, with the identity of what was installed.
+    assert "passed installation review" in section
+    assert "**installed** on the Raspberry" in section
+    assert "3e26a7ce" in section
+    assert "a34191d5" in section
+    assert "retired and archived" in section
+    # And the boundary that installation does not cross.
+    assert "**Installed is not exercised.**" in section
+    assert "have never been\nrun against the installed gateway" in section
+    assert "no live application deployment" in section
+    assert "The approval file remains empty." in section
+    # The first staging attempt keeps its classification.
+    assert "first Raspberry Pi staging attempt (2026-08-04) was incomplete" in section
     assert "does not count as a pass" in section
     assert "Production was untouched" in section
-    assert "physical camera acceptance remains pending" in section
+    assert "Physical camera acceptance remains pending" in section
     # The escaped request was refused as an unsupported action, and this record
     # must not borrow the 2026-08-01 install failure's explanation for it.
     assert "does not implement `deploy-main` at all" in section
@@ -6237,20 +6292,23 @@ def test_the_task_record_does_not_claim_the_production_gateway_changed() -> None
     assert "the branch pin is not" in section
 
 
-def test_the_remediation_record_states_the_review_corrections_truthfully() -> None:
-    """Corrected is not re-reviewed, and neither is installed or validated."""
-    record = (
-        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
-    )
-    text = _read(record)
+def test_the_remediation_record_states_the_installation_truthfully() -> None:
+    """Reviewed, staged, installed — and stopping short of deployed."""
+    text = _read(REMEDIATION_RECORD)
 
-    assert "Entry-boundary corrections implemented" in text
-    assert "awaiting final confirmation" in text
-    assert "Final confirmation (re-run) | **Not performed**" in text
-    assert "Installation on the Raspberry Pi | **Not performed**" in text
-    assert "Raspberry Pi validation of the gateway | **Not performed**" in text
-    assert "production gateway is unchanged" in text
-    assert "Physical camera acceptance remains pending" in text
+    assert "Implementation and repository review complete" in text
+    assert "staging validation passed" in text
+    assert "legacy wildcard sudoers policy is retired" in text
+    assert "Installed-policy boundary validation passed" in text
+    assert "Raspberry Pi staging validation (first attempt) | **Incomplete**" in text
+    assert "Raspberry Pi staging validation (second run) | **Passed**" in text
+    assert "Legacy wildcard sudoers policy | **Retired**" in text
+    assert "Installation on the Raspberry Pi | **Passed**" in text
+    assert "Installation review | **Passed**" in text
+    assert "Application deployment through `deploy-main` | **Not exercised**" in text
+    assert "`restart-api` through the installed gateway | **Not exercised**" in text
+    assert "Physical camera acceptance | **Pending**" in text
+    assert "**No application code\nhas been deployed through it.**" in text
 
 
 REMEDIATION_RECORD = (
@@ -6275,7 +6333,7 @@ def _event_b_section() -> str:
     [
         # The classification, stated as a classification.
         "TASK 12 GATEWAY PI STAGING VALIDATION INCOMPLETE",
-        "Raspberry Pi staging validation | **Incomplete**",
+        "Raspberry Pi staging validation (first attempt) | **Incomplete**",
         "It is not a pass, and it",
         # Production non-interference.
         "1aec2245010a1bd971d028be235c1864af6b46b3",
@@ -6294,8 +6352,11 @@ def _event_b_section() -> str:
         "disposable copy",
         "test_no_test_can_reach_the_host_control_plane",
         "The module docstring was rewritten only after that enforcement existed.",
-        # And what is still true.
-        "No gateway was installed. The production gateway is unchanged.",
+        # And what that attempt left behind. Scoped to the attempt in the past
+        # tense: a gateway *was* installed later, by a separately authorised
+        # act, and this section is not about that one.
+        "No gateway was installed by that attempt, and the production gateway was\n"
+        "unchanged by it.",
     ],
 )
 def test_the_incomplete_pi_staging_attempt_is_recorded(statement: str) -> None:
@@ -6407,7 +6468,7 @@ def test_the_camera_record_does_not_conflate_the_two_events_either() -> None:
     text = _read(
         PROJECT_ROOT / "docs" / "tasks" / "Task-012-Physical-Camera-Acceptance.md"
     )
-    start = text.index("**Raspberry Pi staging validation is incomplete.**")
+    start = text.index("**The first Raspberry Pi staging attempt (2026-08-04) was")
     section = text[start : text.index("### Evidence", start)]
 
     assert "does not implement `deploy-main` at all" in section
@@ -6416,12 +6477,23 @@ def test_the_camera_record_does_not_conflate_the_two_events_either() -> None:
     assert "the branch pin is not\nwhat stopped the escaped request" in section
 
 
-def test_the_staging_attempt_is_never_described_as_passed() -> None:
-    """The one summary that would make the record useless."""
-    record = (
-        PROJECT_ROOT / "docs" / "tasks" / "Task-012-Deployment-Gateway-Remediation.md"
-    )
-    text = _read(record)
+def _first_staging_attempt_section() -> str:
+    """The incomplete first attempt's own section, and nothing after it."""
+    text = _read(REMEDIATION_RECORD)
+    start = text.index("## Raspberry Pi staging validation — incomplete")
+    return text[start : text.index("## The unsafe test, and the correction", start)]
+
+
+def test_the_first_staging_attempt_is_never_described_as_passed() -> None:
+    """The one summary that would make the record useless.
+
+    Scoped to the first attempt's own section rather than the whole document,
+    because a *second* staging run did later pass and the record now says so.
+    An unscoped ban would force the record to omit a true later result in order
+    to keep an earlier one honest, which is how documents start lying by
+    subtraction.
+    """
+    section = _first_staging_attempt_section()
 
     for claim in (
         "staging validation passed",
@@ -6429,7 +6501,241 @@ def test_the_staging_attempt_is_never_described_as_passed() -> None:
         "Raspberry Pi validation passed",
         "PI STAGING VALIDATION PASSED",
     ):
-        assert claim not in text, claim
+        assert claim not in section, claim
+
+    # The classification itself still has to be in there.
+    assert "TASK 12 GATEWAY PI STAGING VALIDATION INCOMPLETE" in section
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "## Raspberry Pi staging validation — the successful second run",
+        "a separate, later event from the incomplete",
+        "| Ruff | Passed |",
+        "| mypy | Passed — 50 source files |",
+        "| Gateway-focused suite | **654 passed** |",
+        "| Acceptance-document suite | **28 passed** |",
+        "| Full Pi suite | **2333 passed, 1 skipped** |",
+        "single-branch disposable clone has no local `main` ref",
+        "| Mutation register | **All 166 mutations detected** |",
+        "| Stale mutations | **Zero** |",
+        "| Outer command tripwire | Clean |",
+        "| Exec tracing | Clean |",
+        "| Real `sudo` executed | **None** |",
+        "| Installed gateway invoked | **Never** |",
+        "| Unprivileged installer dry run | Exited zero |",
+        "| Production | Unchanged |",
+        "| Disposable clone | Removed |",
+    ],
+)
+def test_the_successful_second_staging_run_is_recorded(statement: str) -> None:
+    """The run the installation was authorised from.
+
+    Every number here was established on the Raspberry Pi and cannot be
+    recovered from this repository, which is the whole reason it is written
+    down rather than re-derived.
+    """
+    assert statement in _read(REMEDIATION_RECORD)
+
+
+def test_the_power_failure_not_the_installation_explains_the_baseline_change() -> None:
+    """A reboot moved the PID and stopped preview. The installation did not.
+
+    Both stories end with a different ``MainPID`` and a stopped preview, and
+    only one of them is true. The comfortable version — that the gateway work
+    is what changed the running service — is the one this test exists to keep
+    out, because it would turn an untouched production host into an apparently
+    modified one.
+    """
+    text = _read(REMEDIATION_RECORD)
+    start = text.index("## Power-failure baseline transition")
+    section = text[start : text.index("## Legacy sudoers retirement", start)]
+
+    assert "power failure rebooted the Pi at **2026-08-04 14:34:59 SAST**" in section
+    assert "started successfully at\n**2026-08-04 14:35:10 SAST**" in section
+    assert "| `MainPID` | `1494` |" in section
+    assert (
+        "**The power failure, not the gateway installation, is what changed the\n"
+        "baseline.**" in section
+    )
+    # The superseded figures are named, so a reader meeting them elsewhere in
+    # the repository knows which service they belong to.
+    assert "`70709`" in section
+    assert "`71087`" in section
+    assert "both belong to the pre-power-failure service" in section
+    assert "`preview.auto_start` remains `false`" in section
+    assert "the preview correctly did not come back" in section
+    # And the installation is recorded as having preserved that baseline,
+    # rather than as having produced it.
+    assert "The installation preserved the post-power baseline" in section
+
+    # The acceptance record carries the same attribution.
+    acceptance = _remediation_status_section()
+    assert (
+        "**Preview is currently stopped because of a power failure, not because of "
+        "the\ninstallation.**" in acceptance
+    )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "dd3f71c2f69c1c7dfbfd602aafd3ad9d9bf02d7686f9b656078ba99d9186333e",
+        "Defaults:claude !requiretty",
+        "claude ALL=(root) NOPASSWD: /usr/local/sbin/mgo-validate *",
+        "The third is a **wildcard grant**",
+        "byte-for-byte identical and passes `visudo` validation",
+        "/root/mgo-legacy-sudoers-retirement-71d3755",
+        "the wildcard grant was **not** restored",
+        # The stopped first attempt is a stopped attempt, not a failed one.
+        "**The first retirement attempt stopped before any mutation.**",
+        "the file held three",
+        "attempt, not a failed retirement transaction",
+    ],
+)
+def test_the_legacy_policy_retirement_is_recorded(statement: str) -> None:
+    """Three directives, archived, removed, and never put back."""
+    assert statement in _read(REMEDIATION_RECORD)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "3e26a7cea23d15944f8f0b8c9949e3bb79ce555c95c64a4b45a174e038f0bf3e",
+        "a34191d54a7139f107834861c53e6fa4db96501bfbea67ba457adc09055cbebc",
+        "`root:root`, mode `0755`",
+        "`root:root`, mode `0440`",
+        "The complete active configuration passes `visudo -c`.",
+        "one `NOPASSWD` grant, for the exact gateway path",
+        "**no legacy wildcard rule**",
+        "**no `SETENV`**",
+        "eleven command-scoped `env_delete` groups",
+        # Root lock and transaction state, and an idempotent dry run.
+        "`/run/lock/mgo-deployment.lock` is a root-owned `0600` regular file",
+        "`/run/mgo-validate-install` is a root-owned `0700` directory",
+        "the\n  transaction parent is empty",
+        "reported both installed targets current",
+        "inode, mtime, size, ownership and mode were unchanged across it",
+        "the approval file remained empty and unchanged",
+    ],
+)
+def test_the_installation_facts_are_recorded(statement: str) -> None:
+    """What was installed, what it is allowed to do, and what it left behind."""
+    assert statement in _read(REMEDIATION_RECORD)
+
+
+def test_the_probe_count_is_stated_exactly() -> None:
+    """Five probes plus one listing, written out rather than rounded.
+
+    An earlier completion report called these "four authorised sudo probes".
+    A probe count is exactly the kind of number that gets approximated in a
+    summary and then cited back as evidence of what was exercised.
+    """
+    text = _read(REMEDIATION_RECORD)
+
+    assert "**Five gateway or sudo probes were executed in total**" in text
+    assert "additional `sudo -n -l` policy-listing command" in text
+    assert "Six invocations, not four" in text
+    assert "four authorised sudo probes" not in text
+    # And why the extra listing was needed at all.
+    assert "`/etc/sudoers.d` is mode `0750`" in text
+    assert "`EACCES`, not `ENOENT`" in text
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "| Production SHA | `1aec2245010a1bd971d028be235c1864af6b46b3`, unchanged |",
+        "| `MainPID` | `1494`, unchanged |",
+        "| `NRestarts` | `0`, unchanged |",
+        "| Archive/database records | 8 |",
+        "| Physical capture files | 5 |",
+        "| Approval file | Empty and unchanged |",
+        "No `deploy-main`, no `restart-api`, no application-code deployment",
+    ],
+)
+def test_the_installation_changed_nothing_in_production(statement: str) -> None:
+    """The installed control plane did not move the application."""
+    text = _read(REMEDIATION_RECORD)
+    start = text.index("## Production non-interference — the installation")
+    section = text[start : text.index("## Retained evidence", start)]
+
+    assert statement in section
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "/root/mgo-gateway-install-71d3755",
+        "/root/mgo-gateway-preinstall-backup-71d3755",
+        "/root/mgo-legacy-sudoers-retirement-71d3755",
+        "pending a separately reviewed closeout",
+        "**None of this is cleaned by the record that documents it**",
+        "`deploy-main` has **not** been invoked through the new installed gateway",
+        "`restart-api` has **not** been invoked through the new installed gateway",
+        "no live application deployment has yet proved the installed transaction",
+        "the approval file remains empty",
+        "physical camera acceptance remains pending",
+        "the 24-hour and 48-hour physical camera gates have **not** started",
+        "were not subsequently read",
+        "An installed control plane is not a proven one.",
+    ],
+)
+def test_the_retained_evidence_and_limitations_are_recorded(statement: str) -> None:
+    """What is kept, and what is still unproven."""
+    assert statement in _read(REMEDIATION_RECORD)
+
+
+def test_no_current_status_claims_deployment_or_acceptance_completed() -> None:
+    """The four claims that would make this record dangerous.
+
+    Nothing has been deployed through the installed gateway and no hardware
+    gate has begun. A status table is read faster than prose, so the rows that
+    say so are asserted positively as well as the phrasings that would say the
+    opposite.
+    """
+    remediation = _read(REMEDIATION_RECORD)
+    acceptance = _read(ACCEPTANCE_RECORD_PATH)
+    remediation_status = remediation[: remediation.index("## Why this task exists")]
+    acceptance_status = acceptance[: acceptance.index("## Purpose")]
+
+    for banned in (
+        "deploy-main` | **Passed**",
+        "deploy-main` | **Complete**",
+        "restart-api` | **Passed**",
+        "restart-api` | **Complete**",
+        "Physical camera acceptance | **Complete**",
+        "Physical camera acceptance | **Passed**",
+        "Physical camera acceptance run | **Passed**",
+        "Physical camera acceptance run | **Complete**",
+        "Matthew's visual sign-off | **Given**",
+        "24-hour gate | **Started**",
+        "48-hour gate | **Started**",
+        "application deployment complete",
+        "deployed through the installed gateway",
+    ):
+        assert banned not in remediation_status, banned
+        assert banned not in acceptance_status, banned
+
+    # And the rows that state the true position are present.
+    assert "Application deployment through `deploy-main` | **Not exercised**" in (
+        remediation_status
+    )
+    assert "`restart-api` through the installed gateway | **Not exercised**" in (
+        remediation_status
+    )
+    assert "Physical camera acceptance | **Pending**" in remediation_status
+    assert "Live `deploy-main` through the installed gateway | **Not exercised**" in (
+        acceptance_status
+    )
+    assert "Live `restart-api` through the installed gateway | **Not exercised**" in (
+        acceptance_status
+    )
+    assert "Physical camera acceptance run | **Not performed**" in acceptance_status
+    assert "Matthew's visual sign-off | **Not given**" in acceptance_status
+    assert "24-hour gate | **Not started**" in acceptance_status
+    assert "48-hour gate | **Not started**" in acceptance_status
 
 
 @pytest.mark.parametrize(

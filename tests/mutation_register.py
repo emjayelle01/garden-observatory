@@ -67,6 +67,11 @@ TESTS = "tests/test_deployment_gateway.py"
 REMEDIATION_RECORD = "docs/tasks/Task-012-Deployment-Gateway-Remediation.md"
 ACCEPTANCE_RECORD = "docs/tasks/Task-012-Physical-Camera-Acceptance.md"
 
+#: The operator-facing gateway document. It now carries a production
+#: installation record, and the one claim in it that must never soften is that
+#: the retired wildcard policy stays retired.
+DEPLOYMENT_DOC = "docs/Deployment-Gateway.md"
+
 
 MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
@@ -1721,7 +1726,49 @@ MUTATIONS: tuple[Mutation, ...] = (
         'request because it does not implement `deploy-main` at all ',
         'request because it is pinned to `task-010-operations` and the checkout'
         ' is on `main` ',
-        'camera_record_does_not_conflate or task_record_does_not_claim',
+        'camera_record_does_not_conflate or task_record_states_the_installation',
         'The acceptance summary reverts to the branch-precondition explanation.',
+    ),
+    # --- the installation record cannot drift ------------------------------
+    #
+    # These three records are now the only account of what happened on the
+    # Raspberry Pi on 2026-08-04 and 2026-08-05. Nothing in this repository can
+    # re-derive them, so each mutation restores a plausible earlier or easier
+    # version of the story and must be caught.
+    #
+    # Single-line anchors throughout: these records are CRLF in a Windows
+    # working tree and LF elsewhere, and a multi-line `old` would match on one
+    # host and go stale on the other.
+    Mutation(
+        'installation-status-reverts-to-not-performed',
+        REMEDIATION_RECORD,
+        '| Installation on the Raspberry Pi | **Passed**',
+        '| Installation on the Raspberry Pi | **Not performed**',
+        'remediation_record_states_the_installation_truthfully',
+        'The installed gateway silently becomes an uninstalled one again.',
+    ),
+    Mutation(
+        'retired-wildcard-described-as-still-active',
+        REMEDIATION_RECORD,
+        'the wildcard grant was **not** restored',
+        'the wildcard grant is still active',
+        'legacy_policy_retirement_is_recorded',
+        'The retired wildcard grant is described as active on the host.',
+    ),
+    Mutation(
+        'gateway-doc-permits-restoring-the-wildcard-policy',
+        DEPLOYMENT_DOC,
+        'it must not be restored',
+        'it may be restored if a deployment needs it',
+        'deployment_document_records_the_production_installation',
+        'The operator document stops forbidding the wildcard policy revival.',
+    ),
+    Mutation(
+        'baseline-change-attributed-to-the-installation',
+        REMEDIATION_RECORD,
+        '**The power failure, not the gateway installation, is what changed the',
+        '**The gateway installation is what changed the',
+        'power_failure_not_the_installation_explains_the_baseline_change',
+        'A reboot\'s MainPID and preview change is blamed on the installation.',
     ),
 )
