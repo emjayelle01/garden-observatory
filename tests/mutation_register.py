@@ -296,7 +296,12 @@ MUTATIONS: tuple[Mutation, ...] = (
         '            *) return 1 ;;\n'
         '        esac',
         '        :',
-        'looks_constructed',
+        # Deliberately the direct post-startup test, not the entry-path one.
+        # The entry path hands PATH in through the process environment, and a
+        # host that rewrites it makes the function return at its first guard --
+        # so on Windows the entry-path test passes with the allowlist removed.
+        # This selector names the test that reaches the loop on every platform.
+        'environment_allowlist_rejects_an_unknown_variable_after_shell_startup',
         'Any variable at all counts as a constructed environment.',
     ),
     Mutation(

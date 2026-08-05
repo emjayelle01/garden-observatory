@@ -43,6 +43,7 @@ stopped, and the repository test isolation has been corrected. See
 | Installation on the Raspberry Pi | **Passed** — 2026-08-05, from `71d3755` |
 | Installation review | **Passed** |
 | Installed-policy boundary validation | **Passed** — bounded refusals and refused negative sudo probes |
+| Windows mutation validation | **Passed** — 170/170 detected, zero stale |
 | Application deployment through `deploy-main` | **Not exercised** |
 | `restart-api` through the installed gateway | **Not exercised** |
 | Physical camera acceptance | **Pending** |
@@ -1086,6 +1087,51 @@ What is still not established:
 An installed control plane is not a proven one. Everything above says the
 gateway is in place and refuses correctly; the first authorised `deploy-main` is
 what will say whether it deploys correctly.
+
+## Windows mutation-validation correction
+
+Commit `9658164`, which recorded the installation evidence above, produced
+**169/170** on Windows. One mutation — `env-allowlist-open` — was not detected.
+
+**The miss pre-dated that commit's content.** It reproduced at the untouched
+starting SHA and had nothing to do with the evidence being recorded; the
+evidence itself is unchanged by this correction.
+
+The cause is a host difference, not a gateway defect. `env-allowlist-open`
+removes the allowlist loop inside `environment_is_constructed()`, but that
+function checks `PATH`, `HOME` and `LC_ALL` before it reaches the loop, and
+**Git Bash prepends its own directories to an inherited `PATH` before the child
+process sees it**. The existing entry-path test hands `PATH` in through the
+process environment, so on Windows the first guard failed, *both* the real
+function and the mutant took the reconstruction path, the witness variable
+disappeared either way, and the test passed with the allowlist deleted. On the
+Raspberry Pi, Bash leaves that `PATH` alone, the loop is reached, and the
+2026-08-04 register detected the mutation — which is why the Pi's 166/166
+stands and remains valid.
+
+**The installed gateway implementation was not changed.** The fix is a test
+that reaches the branch on every platform:
+`test_environment_allowlist_rejects_an_unknown_variable_after_shell_startup`
+calls `environment_is_constructed()` directly from inside a Bash that has
+already started. It removes the platform's injected variables using the
+gateway's own `purge_environment`, assigns the three fixed values in-process
+where nothing can rewrite them, and then asserts a **positive control** — the
+prepared environment *is* constructed — before asserting that adding one
+variable outside the permitted set makes it not. Without that control, a
+preparation failure would look like a detected mutation.
+
+The entry-path test is kept. It still proves the entry path ends in a clean
+environment; it is simply no longer the witness for the allowlist branch.
+
+The two files the mutation register matches byte-exactly —
+`tests/test_deployment_gateway.py` and `tests/mutation_register.py` — are now
+pinned to LF in `.gitattributes` by exact path. Under `core.autocrlf=true` a
+Windows checkout produced CRLF, every multi-line `old` anchor stopped matching,
+and the register reported stale mutations for code that had not changed: a
+checkout artefact wearing the costume of a real finding.
+
+**The complete Windows mutation result after this correction is 170/170, zero
+stale.** The Pi's earlier 166/166 is unchanged and remains valid.
 
 ## Boundaries
 

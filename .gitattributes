@@ -26,3 +26,12 @@ scripts/deploy/mgo-validate text eol=lf
 # path in the rule, so the gateway would never match and deployment would be
 # refused for the one account that is supposed to have it.
 *.sudoers text eol=lf
+
+# The mutation register and the suite it drives are matched by byte-exact
+# anchors, several of which span lines. Under core.autocrlf=true these files
+# check out as CRLF on Windows, every multi-line `old` stops matching, and the
+# register reports stale mutations for code that never changed -- a checkout
+# artefact wearing the costume of a real finding. Named exactly rather than by
+# a repository-wide *.py rule, so no unrelated Python file is renormalised.
+tests/test_deployment_gateway.py text eol=lf
+tests/mutation_register.py text eol=lf

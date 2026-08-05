@@ -4652,6 +4652,96 @@ def test_presenting_the_marker_does_not_skip_construction(
     assert "HOME=/root" in result.stdout
 
 
+#: Reaching ``environment_is_constructed``'s allowlist from inside a Bash that
+#: has already started.
+#:
+#: The entry-path test below hands PATH in through the *process* environment,
+#: and Git Bash prepends its own directories to PATH before the child sees it.
+#: The function's first guard therefore fails on that host, it returns before
+#: the allowlist loop, and the entry-path test passes whether or not the
+#: allowlist works. This preparation removes the platform's variables with the
+#: gateway's own ``purge_environment`` and then assigns the three fixed values
+#: in-process, where nothing is left to rewrite them.
+#:
+#: Sourcing the gateway turns on ``errexit``; a function returning non-zero is
+#: the point of this test, so it goes back off first.
+ALLOWLIST_PREPARATION = "\n".join(
+    (
+        "set +e",
+        "purge_environment",
+        "purge_status=$?",
+        'export PATH="$MGO_SAFE_PATH"',
+        'export HOME="$MGO_ROOT_HOME"',
+        "export LC_ALL=C",
+    )
+)
+
+#: Builtins only. PATH has just been replaced with a set of directories that do
+#: not exist on a Windows workstation, so anything needing an external binary
+#: would fail for a reason that has nothing to do with what is being tested.
+ALLOWLIST_REPORT = "\n".join(
+    (
+        "environment_is_constructed",
+        'printf "constructed=%s\\n" "$?"',
+        'printf "purge=%s\\n" "$purge_status"',
+        'if [[ "$PATH" == "$MGO_SAFE_PATH" ]]; then',
+        '    printf "path=exact\\n"',
+        "else",
+        '    printf "path=rewritten\\n"',
+        "fi",
+    )
+)
+
+
+def _reported(result: subprocess.CompletedProcess[str], key: str) -> str:
+    """One ``key=value`` line from the probe's output."""
+    for line in result.stdout.splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1]
+    raise AssertionError(f"no {key}= line in:\n{result.stdout}\n{result.stderr}")
+
+
+def test_environment_allowlist_rejects_an_unknown_variable_after_shell_startup() -> (
+    None
+):
+    """The allowlist branch itself, reached on every platform.
+
+    ``environment_is_constructed`` checks PATH, HOME and LC_ALL before it walks
+    the allowlist. Any host that rewrites an inherited PATH makes the first
+    guard fail, and a test entering through a fresh process then never reaches
+    the loop — so removing the loop entirely changes nothing it can observe.
+    That is not a hypothetical: it is why the ``env-allowlist-open`` mutation
+    went undetected on Windows while the Raspberry Pi register caught it.
+
+    The positive control is what makes the negative result mean something. If
+    preparation or the purge failed, the environment would not be constructed
+    for a reason unrelated to the allowlist, and a mutation would look detected
+    when it was not.
+    """
+    baseline = call_gateway_function(ALLOWLIST_REPORT, preamble=ALLOWLIST_PREPARATION)
+
+    assert baseline.returncode == 0, baseline.stderr
+    assert _reported(baseline, "purge") == "0", baseline.stdout
+    assert _reported(baseline, "path") == "exact", (
+        "the fixed PATH did not survive into the shell, so the allowlist was "
+        f"never reached:\n{baseline.stdout}"
+    )
+    assert _reported(baseline, "constructed") == "0", baseline.stdout
+
+    witness = call_gateway_function(
+        ALLOWLIST_REPORT,
+        preamble=ALLOWLIST_PREPARATION + "\nexport MGO_EVIL=1",
+    )
+
+    assert witness.returncode == 0, witness.stderr
+    assert _reported(witness, "purge") == "0", witness.stdout
+    assert _reported(witness, "path") == "exact", witness.stdout
+    assert _reported(witness, "constructed") != "0", (
+        "an exported variable outside the permitted set was accepted as a "
+        f"constructed environment:\n{witness.stdout}"
+    )
+
+
 @pytest.mark.parametrize(
     ("asset", "argument"),
     [(GATEWAY, "show-approval"), (INSTALLER, "--dry-run")],
@@ -4672,6 +4762,14 @@ def test_an_environment_that_looks_constructed_is_still_verified(
     prove nothing here: it is in the explicit unset register, so it would go
     whether or not the allowlist worked. What an allowlist buys is the variable
     nobody thought of.
+
+    This is the **entry path**, and it is not the cross-platform witness for
+    the allowlist branch. On a host that rewrites an inherited PATH — Git Bash
+    prepends its own directories — the first guard fails, both the real and a
+    mutated function take the reconstruction path, and MGO_EVIL disappears
+    either way. What this test proves everywhere is that the entry path ends
+    in a clean environment. That the allowlist is what decides it is proved by
+    ``test_environment_allowlist_rejects_an_unknown_variable_after_shell_startup``.
     """
     probe = _entry_probe(tmp_path, asset)
     result = _run_probe(
@@ -6083,6 +6181,52 @@ def test_the_audit_rejects_the_shapes_it_exists_to_reject() -> None:
 # --------------------------------------------------------------------------
 # documentation
 # --------------------------------------------------------------------------
+
+
+#: The two files whose contents are matched byte-exactly by the mutation
+#: register. Several ``old`` anchors span lines, so a CRLF checkout silently
+#: turns every one of them stale.
+MUTATION_CRITICAL_ASSETS = (
+    "tests/test_deployment_gateway.py",
+    "tests/mutation_register.py",
+)
+
+
+def test_mutation_critical_python_assets_are_forced_to_lf() -> None:
+    """A checkout artefact must not be able to fake a stale mutation.
+
+    ``core.autocrlf=true`` is the Windows default and this repository has no
+    repository-wide Python rule, so before these lines existed a fresh clone
+    checked both files out as CRLF and the register's multi-line anchors
+    stopped matching code that had not changed.
+
+    Asserting the current bytes are LF is not enough: the working copy is LF
+    right now precisely *because* someone noticed. What has to hold is that
+    the next checkout is instructed to keep it that way, which is why the
+    attribute Git actually resolves is asserted rather than the file it was
+    read from.
+    """
+    attributes = _read(PROJECT_ROOT / ".gitattributes")
+    for asset in MUTATION_CRITICAL_ASSETS:
+        assert f"{asset} text eol=lf" in attributes, asset
+
+    for asset in MUTATION_CRITICAL_ASSETS:
+        assert b"\r\n" not in (PROJECT_ROOT / asset).read_bytes(), asset
+
+    resolved = subprocess.run(
+        ["git", "check-attr", "text", "eol", "--", *MUTATION_CRITICAL_ASSETS],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert resolved.returncode == 0, resolved.stderr
+    for asset in MUTATION_CRITICAL_ASSETS:
+        assert f"{asset}: text: set" in resolved.stdout, resolved.stdout
+        assert f"{asset}: eol: lf" in resolved.stdout, resolved.stdout
 
 
 DEPLOYMENT_DOC = PROJECT_ROOT / "docs" / "Deployment-Gateway.md"
