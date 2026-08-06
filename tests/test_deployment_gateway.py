@@ -6470,7 +6470,19 @@ def test_the_remediation_record_states_the_installation_truthfully() -> None:
     assert "`restart-api` passed on 2026-08-05" in text
     # And the stages that still have no production evidence.
     assert "Production rollback | **Not deliberately triggered**" in text
-    assert "Physical camera acceptance | **Pending**" in text
+
+    # The camera rows moved once Matthew accepted the prototype. They are five
+    # rows rather than one because "physical camera acceptance" stopped being a
+    # single verdict: one part of it passed and the rest was deferred, and a
+    # single row cannot say both without saying neither.
+    assert (
+        "Functional prototype camera acceptance | **Passed** — Matthew, 2026-08-06"
+        in text
+    )
+    assert "Production hardware hardening | **Deferred**" in text
+    assert "24-hour observation | **Deferred** — not passed" in text
+    assert "48-hour stability observation | **Deferred** — not passed" in text
+    assert "Production camera stability | **Not claimed**" in text
 
 
 def test_the_gateway_document_no_longer_says_the_actions_are_unexercised() -> None:
@@ -7066,7 +7078,33 @@ def test_current_status_does_not_overclaim_rollback_or_physical_acceptance() -> 
 
     # Task 12 closed at prototype scope; the hardening gates did not close at
     # all. Each one names itself so the deferral cannot be read as a sweep.
-    assert "Physical camera acceptance | **Pending**" in remediation_status
+    # Both records now say so -- the remediation record said "Pending" until
+    # 2026-08-06, which was true when written and became a contradiction of the
+    # acceptance record the moment Matthew signed.
+    assert (
+        "Functional prototype camera acceptance | **Passed** — Matthew, 2026-08-06"
+        in remediation_status
+    )
+    assert "Production hardware hardening | **Deferred**" in remediation_status
+    assert "24-hour observation | **Deferred** — not passed" in remediation_status
+    assert "48-hour stability observation | **Deferred** — not passed" in (
+        remediation_status
+    )
+    assert "Production camera stability | **Not claimed**" in remediation_status
+
+    # Scoped to the remediation record's own current status and gate table: the
+    # three phrasings that were true until 2026-08-06 and are now contradictions
+    # of the acceptance record. Dated historical sections elsewhere in that file
+    # legitimately say acceptance *remained* pending at the time they describe,
+    # and banning that globally would delete true history.
+    for stale in (
+        "Physical camera acceptance remains pending",
+        "is now the remaining Task 12",
+        "Physical camera acceptance remains pending in full",
+        "Physical camera acceptance | **Pending**",
+    ):
+        assert stale not in remediation_status, stale
+
     assert "Functional prototype acceptance | **Passed**" in acceptance_status
     assert "Task 12 functional scope | **Complete**" in acceptance_status
     assert "Production hardware hardening | **Deferred**" in acceptance_status
@@ -7129,7 +7167,11 @@ def test_no_current_status_claims_physical_acceptance_completed() -> None:
     # And the rows that state the true position are present.
     assert "Live `deploy-main` validation | **Passed**" in remediation_status
     assert "Live `restart-api` validation | **Passed**" in remediation_status
-    assert "Physical camera acceptance | **Pending**" in remediation_status
+    assert (
+        "Functional prototype camera acceptance | **Passed** — Matthew, 2026-08-06"
+        in remediation_status
+    )
+    assert "Production camera stability | **Not claimed**" in remediation_status
     assert "Live `deploy-main` through the installed gateway | **Passed**" in (
         acceptance_status
     )

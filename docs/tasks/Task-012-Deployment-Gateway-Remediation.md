@@ -10,9 +10,11 @@ installed-policy boundary validation passed. **Both public mutating actions
 have now been validated live in production: `deploy-main` passed on 2026-08-05
 and `restart-api` passed on 2026-08-05.**
 
-**Physical camera acceptance remains pending, and is now the remaining Task 12
-gate.** Rollback has not been deliberately triggered in production and should
-not be induced merely to demonstrate it.
+**Functional prototype camera acceptance passed on 2026-08-06 and Task 12 is
+complete at functional prototype scope.** Production hardware hardening —
+including the 24-hour and 48-hour observations — remains deferred and is not
+claimed as passed. Rollback has not been deliberately triggered in production
+and should not be induced merely to demonstrate it.
 
 **The first Raspberry Pi staging-validation attempt is recorded below as
 incomplete, not as passed.** One gateway-focused test escaped its temporary
@@ -52,7 +54,11 @@ stopped, and the repository test isolation has been corrected. See
 | Live `restart-api` validation | **Passed** — 2026-08-05, at `938134d` |
 | Deployment-gateway remediation | **Complete** |
 | Production rollback | **Not deliberately triggered** — covered by automated tests |
-| Physical camera acceptance | **Pending** |
+| Functional prototype camera acceptance | **Passed** — Matthew, 2026-08-06 |
+| Production hardware hardening | **Deferred** — non-blocking follow-up |
+| 24-hour observation | **Deferred** — not passed |
+| 48-hour stability observation | **Deferred** — not passed |
+| Production camera stability | **Not claimed** |
 
 The reviewed gateway and its replacement sudoers policy are installed on the
 production Raspberry Pi, the legacy wildcard policy that stood beside them has
@@ -65,8 +71,14 @@ forward paths, not merely installed.
 What that still does not cover: **rollback has never been deliberately
 triggered in production.** Both live actions succeeded, so the transaction's
 failure handling remains covered by the automated tests alone, and inducing a
-production failure purely to demonstrate it is not warranted. Physical camera
-acceptance remains pending in full.
+production failure purely to demonstrate it is not warranted.
+
+Functional prototype camera acceptance is complete. The later production
+hardware hardening — permanent mounting, mechanical stability, the optical
+matrices, the camera-disconnect check and the 24-hour and 48-hour observations —
+sits outside this deployment-gateway remediation result entirely: none of it was
+performed here, none of it is claimed here, and the authoritative account of it
+is `docs/acceptance/Initial-Camera-Acceptance.md`.
 
 The first staging-validation attempt ran repository tests on the Pi, changed
 nothing, and did not pass; it is recorded below as incomplete and stays that
