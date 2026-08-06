@@ -5,18 +5,24 @@ repository can verify a claim about focus or feeder coverage, so what these test
 protect is the one property that can be checked mechanically: the record must not
 say a gate passed unless a human run actually filled it in.
 
-The record is no longer wholly pending. An authorised acceptance run began on
-2026-08-05, closed the objective lifecycle, restart and reboot-recovery gates,
-started the continuous soak and recorded the zero-hour checkpoint. That makes the
-failure mode sharper rather than softer: a record with real passes in it reads as
-authoritative, so the gates that are still open have to be defended individually.
+The contract is now two-level. An authorised run on 2026-08-05/06 closed the
+objective lifecycle, restart and reboot-recovery gates, and on 2026-08-06 Matthew
+accepted the installation as a **functional prototype** and deferred production
+hardware hardening. Task 12 closes at Level 1; Level 2 blocks nothing.
 
-These tests therefore fail if the in-progress record claims either time gate, if
-a checkpoint that has not happened is filled in, if the 48-hour stability claim
-is made from the 24-hour gate, if the sign-off is filled in on Matthew's behalf,
-if a populated hardware fact carries no attribution, or if image evidence,
-credentials, configuration contents or production filesystem paths reach the
-committed record.
+That split is exactly where a record gets quietly overstated. A document that
+says PASSED at the top, whose nine deferred rows were unperformed rather than
+satisfied, and whose accepted mount fails two of its own nine mounting checks,
+reads as a stronger result than it is. So these tests defend the scope of the
+pass, not merely its existence.
+
+They fail if the record claims production hardening or either time gate, if a
+deferred check is recorded as passed, if `CAMERA PIPELINE STABLE` appears as an
+outcome, if either mounting `NO` is promoted to `YES`, if Matthew's decision is
+recorded at a scope he did not give or in someone else's name, if a checkpoint
+that has not happened is filled in, if a populated hardware fact carries no
+attribution, or if image evidence, credentials, configuration contents or
+production filesystem paths reach the committed record.
 """
 
 from __future__ import annotations
@@ -29,6 +35,9 @@ import pytest
 _DOCS = Path(__file__).resolve().parents[1] / "docs"
 _GUIDE = _DOCS / "Camera-Acceptance.md"
 _RECORD = _DOCS / "acceptance" / "Initial-Camera-Acceptance.md"
+
+#: The two claims that may only ever appear withheld, never as an outcome.
+TIME_GATE_PHRASES = ("CAMERA BRING-UP PASSED", "CAMERA PIPELINE STABLE")
 
 
 def _text(path: Path) -> str:
@@ -72,6 +81,132 @@ def test_the_guide_distinguishes_the_24_and_48_hour_gates() -> None:
     assert "CAMERA PIPELINE STABLE" in flat
     assert (
         "A 24-hour result must never be extrapolated into this claim." in flat
+    )
+
+
+def test_guide_separates_prototype_acceptance_from_hardware_hardening() -> None:
+    """Two questions, two levels, and Task 12 only answers the first.
+
+    Collapsing them is what made a working camera wait on a 48-hour soak. The
+    fix is a named boundary, not a quietly relaxed checklist -- so the guide has
+    to say which level each phrase belongs to.
+    """
+    flat = _flat(_GUIDE)
+
+    assert "## Two acceptance levels" in flat
+    assert "Level 1 — functional prototype acceptance" in flat
+    assert "Level 2 — production hardware hardening" in flat
+    assert "**Task 12 closes when Level 1 passes.**" in flat
+    assert "without blocking application development" in flat
+    assert "FUNCTIONAL PROTOTYPE CAMERA ACCEPTED" in flat
+    assert "PRODUCTION CAMERA INSTALLATION HARDENED" in flat
+    assert "Level 1 never implies Level 2." in flat
+
+
+def test_functional_prototype_acceptance_does_not_require_the_deferred_checks() -> None:
+    """Each deferred section says so in its own text, not only in a summary.
+
+    A reader arrives at section 10 or section 18 directly. A single list at the
+    top of the document would leave every one of those arrivals still believing
+    the section is a blocker.
+    """
+    flat = _flat(_GUIDE)
+
+    for deferred in (
+        "## 6. Bird-sized subject scale **Level 2 — deferred hardening.**",
+        "## 7. Autofocus **Level 2 — deferred hardening.**",
+        "## 8. Exposure and colour **Level 2 — deferred hardening.**",
+        "## 9. Window reflections **Level 2 — deferred hardening.**",
+        "## 10. Mechanical stability **Level 2 — deferred hardening.**",
+        "## 16. Camera-disconnect failure check **Level 2 — deferred hardening.**",
+    ):
+        assert deferred in flat, deferred
+
+    assert (
+        "**Level 2 — recommended commissioning evidence. Not required for "
+        "functional prototype completion.**" in flat
+    )
+    assert (
+        "**Level 2 — production stability and hardening gate. Not required "
+        "before continuing prototype application development.**" in flat
+    )
+
+    # Deferring the section does not defer the safety rule inside it.
+    assert (
+        "The prohibition on impact testing below is **not** deferred" in flat
+    )
+
+
+def test_the_guide_keeps_its_safety_rules_undeferrable() -> None:
+    """Scheduling relief is not safety relief.
+
+    "Deferred" is a licence to do a check later. Applied to the electrical and
+    privacy rules it would be a licence to skip them, so the guide states
+    explicitly which rules survive the split.
+    """
+    flat = _flat(_GUIDE)
+
+    assert "### What stays mandatory at both levels" in flat
+    assert "Deferring a check is not permission to be unsafe." in flat
+    assert "**no CSI hot-plugging** — ever, at either level" in flat
+    assert (
+        "**power down and disconnect power before any cable work**" in flat
+    )
+    assert "**no deliberate impact testing**" in flat
+    assert "**no exposed electrical contact hazard**" in flat
+    assert "at immediate risk of falling" in flat
+    assert (
+        "**privacy requires Matthew's explicit decision**" in flat
+    )
+
+    # A temporary mount is acceptable only with its limitations written down.
+    assert (
+        "A temporary mount is acceptable at Level 1 only when Matthew has seen "
+        "its limitations written down" in flat
+    )
+    assert (
+        "a mounting decision with its failures edited out is worth nothing"
+        in flat
+    )
+
+
+def test_the_guide_still_reserves_the_stability_claim_for_48_hours() -> None:
+    """The phrase must not be redefined to mean prototype acceptance."""
+    flat = _flat(_GUIDE)
+
+    assert (
+        "`CAMERA PIPELINE STABLE` stays reserved for a successful 48-hour run "
+        "and is not a synonym for either level." in flat
+    )
+    assert "Only a completed run may support `CAMERA PIPELINE STABLE`." in flat
+    assert (
+        "Do not reconstruct or back-fill a checkpoint that was missed" in flat
+    )
+
+
+def test_the_guide_lets_the_next_phase_proceed_after_prototype_acceptance() -> None:
+    """The next phase waits on Level 1, and on nothing in Level 2."""
+    flat = _flat(_GUIDE)
+
+    assert (
+        "**That phase may begin once functional prototype acceptance (Level 1) "
+        "is recorded as passed**" in flat
+    )
+    assert (
+        "It does not wait for the 24-hour or 48-hour observation" in flat
+    )
+    assert "open parallel workstream" in flat
+
+    # Permission to build on it is not permission to describe it as finished.
+    assert (
+        "describing that camera as hardened, stable or optically characterised "
+        "would be a false one." in flat
+    )
+
+    # The stale gate on the next phase is gone.
+    assert (
+        "should begin only once the 48-hour gate and Matthew's sign-off are "
+        "recorded as passed" not in flat
     )
 
 
@@ -186,60 +321,183 @@ def test_the_guide_keeps_its_checks_read_only_by_default() -> None:
 # --- the in-progress record -------------------------------------------------
 
 
-def test_the_initial_record_is_in_progress() -> None:
-    """The record must announce itself as started and unfinished."""
+def test_functional_prototype_acceptance_is_recorded() -> None:
+    """The record passes, and says exactly what it passed at."""
     flat = _flat(_RECORD)
 
     assert (
-        "**Status: IN PROGRESS — immediate physical and lifecycle gates "
-        "performed; continuous soak started; 24-hour and 48-hour gates "
-        "pending.**" in flat
+        "**Status: PASSED — functional prototype camera accepted by Matthew; "
+        "production hardware hardening deferred.**" in flat
     )
-
-
-def test_the_final_gate_status_is_in_progress() -> None:
-    """The overall verdict may not be a pass while the soak is still running."""
-    flat = _flat(_RECORD)
-
     assert (
-        "**Overall: IN PROGRESS — zero-hour checkpoint recorded; awaiting "
-        "timed checkpoints and final Matthew sign-off.**" in flat
+        "**Overall: PASSED AT FUNCTIONAL PROTOTYPE SCOPE — production hardware "
+        "hardening remains deferred.**" in flat
     )
+    assert "| Functional prototype acceptance | PASSED — Matthew, 2026-08-06 |" in flat
 
-    # The two phrasings that would announce a finished run.
-    for banned in ("Status: PASSED", "Overall: PASSED", "Overall: COMPLETE"):
-        assert banned not in flat, banned
+    # A bare "PASSED" with no scope attached is the failure mode: it is the
+    # reading a hurried reader takes from the top line.
+    assert "What `PASSED` means here." in flat
+    assert "It does **not** mean the installation is production-hardened." in flat
 
 
-def test_neither_time_gate_is_claimed() -> None:
-    """Running is not passing: both time gates stay open while the soak runs."""
+def test_deferred_hardening_is_not_recorded_as_passed() -> None:
+    """Deferring is a decision about when, not a verdict about whether.
+
+    Nine gates moved from PENDING to DEFERRED in one edit. That is exactly the
+    edit in which an unperformed check quietly becomes a satisfied one.
+    """
     flat = _flat(_RECORD)
 
-    assert "| 24-hour camera bring-up | IN PROGRESS |" in flat
-    assert "| 48-hour camera pipeline stability | IN PROGRESS |" in flat
+    for deferred in (
+        "| Permanent mounting hardening | DEFERRED |",
+        "| Mechanical stability | DEFERRED — NOT PERFORMED |",
+        "| Complete feeder coverage | DEFERRED |",
+        "| Subject scale | DEFERRED |",
+        "| Complete autofocus assessment | DEFERRED |",
+        "| Exposure and colour assessment | DEFERRED |",
+        "| Reflection assessment | DEFERRED |",
+        "| Camera disconnect | DEFERRED — NOT PERFORMED |",
+        "| 24-hour commissioning observation | DEFERRED — NOT PASSED |",
+        "| 48-hour stability observation | DEFERRED — NOT PASSED |",
+    ):
+        assert deferred in flat, deferred
 
     for banned in (
-        "| 24-hour camera bring-up | PASS |",
-        "| 24-hour camera bring-up | PASSED |",
-        "| 48-hour camera pipeline stability | PASS |",
-        "| 48-hour camera pipeline stability | PASSED |",
+        "| Permanent mounting hardening | PASSED |",
+        "| Mechanical stability | PASSED |",
+        "| Complete feeder coverage | PASSED |",
+        "| Subject scale | PASSED |",
+        "| Complete autofocus assessment | PASSED |",
+        "| Exposure and colour assessment | PASSED |",
+        "| Reflection assessment | PASSED |",
+        "| Camera disconnect | PASSED |",
+        "| 24-hour commissioning observation | PASSED |",
+        "| 48-hour stability observation | PASSED |",
+        "| Production-hardened camera installation | PASSED |",
+        "production hardening passed",
+        "hardware hardening passed",
+        "PRODUCTION CAMERA INSTALLATION HARDENED",
     ):
         assert banned not in flat, banned
 
-    # Neither claim may appear as a recorded outcome; the only mention of each
-    # is the explicit statement of the condition under which it could be made.
-    bring_up_mentions = re.findall(r"CAMERA BRING-UP PASSED", _text(_RECORD))
-    assert len(bring_up_mentions) == 1, bring_up_mentions
-    stability_mentions = re.findall(r"CAMERA PIPELINE STABLE", _text(_RECORD))
-    assert len(stability_mentions) == 1, stability_mentions
+    assert "| Production-hardened camera installation | NOT CLAIMED |" in flat
     assert (
-        "`CAMERA PIPELINE STABLE` must not be claimed from the 24-hour result."
+        "`DEFERRED` is a decision about *when*, not a verdict about *whether*"
         in flat
     )
+
+    # The underlying facts survive the reclassification.
+    assert "**Matthew's mechanical-stability decision:** **DEFERRED" in flat
+    assert "NOT PERFORMED.**" in flat
     assert (
-        "`CAMERA BRING-UP PASSED` may be recorded only when this gate actually "
-        "passes." in flat
+        "**The mount's behaviour under ordinary disturbance is therefore "
+        "unknown**" in flat
     )
+    assert "that remains true however long the camera happens to stay in place" in flat
+
+
+def test_camera_pipeline_stable_remains_unclaimed() -> None:
+    """Neither time gate passed, and neither phrase may appear as an outcome."""
+    flat = _flat(_RECORD)
+
+    assert (
+        "**24-hour commissioning observation:** **DEFERRED — NOT REQUIRED FOR "
+        "FUNCTIONAL PROTOTYPE ACCEPTANCE.** Not passed." in flat
+    )
+    assert (
+        "**48-hour stability observation:** **DEFERRED — NOT REQUIRED FOR "
+        "FUNCTIONAL PROTOTYPE ACCEPTANCE.** Not passed." in flat
+    )
+
+    # Every occurrence of either phrase must sit in a sentence that withholds
+    # it. A bare count stopped being the right guard once the record began
+    # denying the claim in several places -- what matters is not how often the
+    # phrase appears but that it never appears as a result.
+    withholding = (
+        "may be recorded only",
+        "must not be claimed",
+        "not claimed",
+        "does not establish",
+        "nor",
+        "reserved",
+    )
+    lines = _text(_RECORD).splitlines()
+    occurrences = 0
+    for index, line in enumerate(lines):
+        if not any(phrase in line for phrase in TIME_GATE_PHRASES):
+            continue
+        occurrences += 1
+        context = " ".join(lines[max(0, index - 1) : index + 2])
+        assert any(marker in context for marker in withholding), context
+    assert occurrences >= 2, occurrences
+
+    # And neither phrase is anywhere in the verdict table.
+    gate_table = flat.split("## 30. Final gate status", 1)[1]
+    assert "CAMERA BRING-UP PASSED" not in gate_table
+    assert "CAMERA PIPELINE STABLE" not in gate_table
+
+
+def test_matthews_prototype_decision_is_recorded() -> None:
+    """His decision, in his name, at the scope he actually gave it.
+
+    The previous rule was that this block must stay empty. It is filled in now
+    -- so the property worth protecting moves from "nobody signed" to "what was
+    signed is what he agreed to".
+    """
+    flat = _flat(_RECORD)
+    text = _text(_RECORD)
+
+    assert "Accepted by: Matthew" in flat
+    assert "Acceptance date: 2026-08-06" in flat
+    assert "Decision: PASS FOR FUNCTIONAL PROTOTYPE" in flat
+    assert "are accepted for prototype use only." in flat
+    assert "Production hardware hardening is deferred and tracked as" in flat
+
+    # Signed by Matthew, not by the operator who collected the evidence.
+    assert "Accepted by: Claude" not in flat
+    assert "It must not be filled in on his behalf." in flat
+
+    # And the boundary of what he agreed to.
+    assert (
+        "**Matthew did not accept a production-hardened installation.**" in flat
+    )
+    assert "He accepted a\nworking prototype" in text
+
+    # The scope decision itself is attributed and dated, not presented as a
+    # finding that the deferred checks turned out fine.
+    assert "**Scope decision, in Matthew's terms:**" in flat
+    assert "are not blockers for continuing application\ndevelopment." in text
+
+
+def test_mounting_limitations_remain_visible() -> None:
+    """The two NO answers are the price of the PASS and must stay legible.
+
+    This is the single most losable fact in the record: a mount accepted as
+    adequate, whose own checklist says the PCB is unsupported and the lens
+    housing bears the load.
+    """
+    flat = _flat(_RECORD)
+
+    assert "| Camera PCB mechanically supported | NO |" in flat
+    assert "| Lens housing not used as the mounting point | NO |" in flat
+    assert (
+        "**Matthew's mounting decision: PASS — accepted for prototype use**"
+        in flat
+    )
+
+    # Neither NO may be quietly promoted.
+    assert "| Camera PCB mechanically supported | YES |" not in flat
+    assert "| Lens housing not used as the mounting point | YES |" not in flat
+
+    # And the interpretation says what the acceptance does and does not cover.
+    assert "known temporary prototype\nlimitations" in _text(_RECORD)
+    assert "would block a production-hardened installation claim" in flat
+    assert (
+        "**The mount is not\nproduction-ready and is not recorded as such.**"
+        in _text(_RECORD)
+    )
+    assert "the mount is temporary" in flat.lower()
 
 
 def test_only_the_zero_hour_checkpoint_is_populated() -> None:
@@ -349,32 +607,19 @@ def test_the_runtime_and_evidence_shas_are_distinguished() -> None:
     assert "was **not** installed on the Pi" in flat
 
 
-def test_the_human_sign_off_is_not_filled_in() -> None:
-    """Matthew's decision may never be signed on his behalf."""
-    flat = _flat(_RECORD)
-
-    assert "Accepted by: NOT RECORDED" in flat
-    assert "Decision: PENDING" in flat
-    assert "| Matthew's sign-off | NOT GIVEN |" in flat
-    assert (
-        "It must not be filled in on his behalf." in flat
-    )
-
-
 def test_optional_gates_are_recorded_as_not_performed() -> None:
     """A deferred test is recorded as not performed, never as passed."""
     flat = _flat(_RECORD)
 
-    assert "## 20. Camera-disconnect test **Status: NOT PERFORMED.**" in flat
+    assert (
+        "## 20. Camera-disconnect test **Status: DEFERRED — PRODUCTION "
+        "HARDENING; NOT PERFORMED.**" in flat
+    )
     assert (
         "**No partial file after a controlled failure: NOT PERFORMED.**" in flat
     )
     assert "It is not described as passed." in flat
-
-    # The mechanical-stability gate was skipped by an explicit human decision,
-    # which is a reason to record it, not a reason to treat it as satisfied.
-    assert "**Matthew's mechanical-stability decision:** PENDING" in flat
-    assert "It is not recorded as passed" in flat
+    assert "It is not recorded as passed." in flat
 
 
 def test_every_populated_hardware_fact_carries_attribution() -> None:

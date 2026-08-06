@@ -8,14 +8,19 @@ Deployment-gateway remediation is complete: the reviewed gateway is installed,
 installed-policy validation passed, and both live gateway actions have now
 passed in production — `deploy-main` on 2026-08-05 and `restart-api` on
 2026-08-05. The approval is withdrawn and production is at `938134d…`.
-Managed preview is now enabled in the external production configuration and
-preview is running.
-Physical camera acceptance is now **in progress** and is still the remaining
-Task 12 gate: the immediate lifecycle, restart and reboot-recovery gates have
-passed, the continuous soak started on 2026-08-06 and the zero-hour checkpoint
-is recorded.
-The 24-hour and 48-hour gates are running, Matthew's final sign-off has not been
-given, and Task 12 is not complete.**
+Managed preview is enabled in the external production configuration and preview
+is running.
+**Task 12 is complete at functional prototype scope.** Preview auto-start,
+capture, capture-to-preview restoration, application restart and Raspberry Pi
+reboot recovery all passed, privacy passed, and Matthew accepted the installation
+as a functional prototype on 2026-08-06.
+The present mount is a known temporary prototype limitation. Production hardware
+hardening — permanent mounting, mechanical stability, complete feeder coverage,
+subject scale, autofocus, exposure, reflections, camera disconnect and the
+24-hour and 48-hour observations — is **deferred and is not a Task 12 blocker**.
+The 24-hour and 48-hour results are not passed and `CAMERA PIPELINE STABLE` is
+not claimed.
+The next application phase may proceed after repository review and merge.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -42,37 +47,80 @@ given, and Task 12 is not complete.**
 | Approval file | **Withdrawn** — empty after every action |
 | Managed preview production policies | **Enabled** — `auto_start` and `restore_after_capture` inserted and set `true`, 2026-08-05 |
 | Preview state | **Running** — auto-started from configuration after the restart and again after the reboot |
-| Physical camera acceptance run | **In progress** — started 2026-08-05, soak running |
+| Physical camera acceptance run | **Performed** — 2026-08-05 to 2026-08-06 |
 | Managed-preview enablement gate | **Passed** — two keys inserted, no other table changed |
 | Application restart gate | **Passed** — one gateway `restart-api`, preview auto-started |
 | Preview lifecycle gates | **Passed** — idempotent start, shared stream, clean stop, start after stop |
 | Capture and restoration gates | **Passed** — three captures, archive consistent, restoration correct |
 | Reboot recovery gate | **Passed** — 2026-08-06, preview auto-started with no API request |
 | Zero-hour checkpoint | **Recorded** — 2026-08-06T06:35:36Z |
-| Matthew's mounting decision | **Pass** — recorded with two `NO` sub-answers he confirmed |
+| Matthew's mounting decision | **Pass for prototype use** — recorded with two `NO` sub-answers he confirmed |
 | Matthew's privacy decision | **Pass** |
-| Feeder coverage, subject scale, autofocus, exposure, reflections | **Pending** |
-| Mechanical stability | **Not performed** |
-| Matthew's visual sign-off | **Not given** |
-| 24-hour gate | **In progress** |
-| 48-hour gate | **In progress** |
-| Camera disconnect | **Not performed** |
-| Task 12 | **Not complete** |
+| Functional prototype acceptance | **Passed** — Matthew, 2026-08-06 |
+| Production hardware hardening | **Deferred** — non-blocking follow-up workstream |
+| Permanent mounting hardening | **Deferred** — present mount is a temporary prototype arrangement |
+| Mechanical stability | **Deferred** — not performed |
+| Feeder coverage, subject scale, autofocus, exposure, reflections | **Deferred** — not assessed |
+| Camera disconnect | **Deferred** — not performed |
+| 24-hour observation | **Deferred** — not passed |
+| 48-hour stability | **Deferred** — not passed |
+| Production camera stability | **Not claimed** |
+| Task 12 functional scope | **Complete** |
 
-Nothing in this task claims that the physical camera has been accepted. Task 12
-builds the *gate*; passing the gate is a separate, authorised hardware activity,
-and that activity is now under way rather than finished.
+Task 12 builds the *gate*; passing it was a separate, authorised hardware
+activity. That activity ran, and Matthew accepted its result at functional
+prototype scope. **The camera is accepted as a working prototype, not as a
+hardened production installation** — the two are different claims and only the
+first is made here.
 
 The software rows above were written as `In progress` / `Pending` in the first
 commit and updated at closeout; the Raspberry Pi and merge rows were updated by
 their own separately authorised runs. The software and deployment-gateway rows
 above were updated only after their separately authorised repository, Raspberry
 Pi installation and live-validation runs. The physical-camera acceptance rows
-were updated by the separately authorised hardware acceptance run that began on
-2026-08-05, and record only what that run actually observed or what Matthew
-actually decided. Matthew's visual sign-off, the 24-hour gate and the 48-hour
-gate have not been completed by it, and may be updated only when those gates
-actually finish.
+were updated by the separately authorised hardware acceptance run of 2026-08-05
+to 2026-08-06, and record only what that run actually observed or what Matthew
+actually decided. Every `Deferred` row is deferred work, not a passed check, and
+may be marked passed only by a later hardening run that actually performs it.
+
+## Scope decision — 2026-08-06
+
+The original Task 12 procedure deliberately treated the detailed physical checks
+and the two time gates as **blockers**: the record could not be closed until the
+mounting matrix, feeder coverage, subject scale, autofocus, exposure, reflection
+and mechanical-stability sections were decided, and until 24 and then 48
+continuous hours had been observed. That was the right shape for commissioning a
+permanent installation, and it is preserved in full in
+`docs/Camera-Acceptance.md`.
+
+Matthew reviewed the working prototype on 2026-08-06 and decided this was
+creating unnecessary delay. The camera works: it is detected, preview auto-starts
+and survives both a service restart and a reboot, full-resolution capture and
+archiving are correct, and capture-to-preview restoration behaves as designed.
+Holding application development behind a 48-hour soak and an optical
+characterisation of a temporary mount was buying nothing the next phase needs.
+
+The acceptance contract was therefore **split into two levels** rather than
+relaxed:
+
+- **Level 1 — functional prototype acceptance.** Does the camera work and is the
+  pipeline sound? This closes Task 12.
+- **Level 2 — production hardware hardening.** Is the installation permanent,
+  optically characterised and proven over time? This is deferred and blocks
+  nothing in application development.
+
+Three things this decision is not. It is **not** a finding that the deferred
+checks passed — none of them was performed, and each still reads `DEFERRED` or
+`NOT PERFORMED` in the record. It is **not** a claim that the mount is
+production-ready; the camera PCB is unsupported and the lens housing is the
+mounting point, both recorded as `NO` and both accepted by Matthew explicitly for
+prototype use. It is **not** an inferred test result: no test was made to pass by
+this change, and the objective evidence is unchanged from the run that produced
+it.
+
+This is a deliberate owner and project-priority decision, recorded as such. The
+original stricter design is kept above and in the procedure document, not
+rewritten as though it had always been non-blocking.
 
 ## Purpose
 

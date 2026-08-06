@@ -1,16 +1,25 @@
 # Initial camera acceptance record
 
-**Status: IN PROGRESS — immediate physical and lifecycle gates performed;
-continuous soak started; 24-hour and 48-hour gates pending.**
+**Status: PASSED — functional prototype camera accepted by Matthew; production
+hardware hardening deferred.**
 
 This is a structured evidence record, not a narrative. It is completed by an
 authorised Raspberry Pi acceptance run following `docs/Camera-Acceptance.md`.
 
-Every unverified result below remains `PENDING`, `NOT PERFORMED` or
-`NOT RECORDED`. Nothing here may be changed to a pass without the corresponding
-evidence, and no gate may be inferred from another gate. A result recorded here
-was either measured by a command whose output was read, or decided by Matthew in
-his own words.
+This record is accepted at **functional prototype** scope only. Every check that
+was not performed still says so, and deferring a check does not convert it into a
+pass. Nothing here may be changed to a pass without the corresponding evidence,
+and no gate may be inferred from another gate. A result recorded here was either
+measured by a command whose output was read, or decided by Matthew in his own
+words.
+
+**What `PASSED` means here.** The camera works and the application pipeline is
+sound: detection, managed preview, capture, archiving, restoration, restart and
+reboot recovery are all evidenced below. It does **not** mean the installation is
+production-hardened. The mount is temporary, the optical characterisation is
+incomplete and no time gate has been met. Those are recorded as
+`DEFERRED — PRODUCTION HARDENING`, which is a scheduling decision by Matthew, not
+a result.
 
 ---
 
@@ -25,12 +34,14 @@ his own words.
 | Created | 2026-07-30 |
 | Run started (UTC) | 2026-08-05T16:56:04+00:00 |
 | Run started (SAST) | 2026-08-05T18:56:04+02:00 |
-| Run completed (UTC) | NOT RECORDED — soak in progress |
+| Run completed (UTC) | 2026-08-06 — functional prototype scope |
 | Operator | Claude, for objective evidence collection only |
 | Acceptance authority | Matthew |
 
 Claude collected and described evidence. Claude decided no human gate. Every
-decision in sections 7, 8, 9, 10, 11, 12, 13, 14 and 29 is Matthew's.
+decision in sections 7, 8, 9, 10, 11, 12, 13, 14 and 29 is Matthew's, including
+the 2026-08-06 decision to accept the installation at functional prototype scope
+and defer hardware hardening.
 
 ## 2. Scope
 
@@ -49,7 +60,7 @@ decision in sections 7, 8, 9, 10, 11, 12, 13, 14 and 29 is Matthew's.
 | Still capture and archiving | Yes |
 | Capture-to-preview restoration | Yes |
 | Application restart and reboot recovery | Yes |
-| 24-hour and 48-hour gates | Yes |
+| 24-hour and 48-hour gates | Deferred — production hardening |
 | Motion-triggered capture, events, detection | **No** — later phase |
 | Region-of-interest configuration | **No** — not implemented |
 | Camera tuning flags (autofocus/exposure/AWB) | **No** — defaults assessed first |
@@ -173,7 +184,7 @@ All nine answers below are Matthew's.
 | Ventilation unobstructed | YES |
 | Lens not under continuous pressure from the glass | YES |
 
-**Matthew's mounting decision: PASS**
+**Matthew's mounting decision: PASS — accepted for prototype use**
 
 Two of the nine answers are `NO`: the camera PCB is not supported by the mount,
 and the lens housing is being used as the mounting point. Claude raised the
@@ -182,6 +193,14 @@ was requested. Matthew reviewed it and confirmed that `PASS` stands as recorded,
 that both `NO` answers are accurate, and that he accepts the residual risk for
 the soak. The two `NO` answers are retained here rather than smoothed away,
 because a reader of the overall decision needs to see what it was made against.
+
+**Interpretation.** The two `NO` answers are known temporary prototype
+limitations. Matthew accepts the current arrangement for prototype use. They
+would block a production-hardened installation claim, and they do not block
+functional prototype acceptance under the revised scope. **The mount is not
+production-ready and is not recorded as such.** Independent PCB support and a
+mount that does not bear on the lens housing are deferred to the hardware-
+hardening phase.
 
 ## 8. Privacy
 
@@ -215,7 +234,7 @@ committed.
 | 4 | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED |
 
 **Gate:** all four feeders visible, or a written rationale accepted by Matthew for
-each exclusion. — PENDING
+each exclusion. — **DEFERRED — PRODUCTION HARDENING**
 
 **Matthew's statement, verbatim:** "All feeders re visible and are all in a line
 so background clutter is similar"
@@ -223,7 +242,9 @@ so background clutter is similar"
 Matthew states that all four feeders are visible. Per-feeder decisions were given
 for feeder 1 only, and the position and approach-direction questions were
 answered "not sure how to answer" — recorded as `NOT RECORDED`, not as a pass.
-The gate stays `PENDING` until per-feeder decisions exist for feeders 2, 3 and 4.
+Complete per-feeder assessment is deferred to the hardware-hardening phase. The
+framing Matthew accepted is sufficient for prototype use; it is not a completed
+feeder-coverage assessment and is not recorded as one.
 
 ## 10. Subject pixel scale
 
@@ -236,8 +257,9 @@ Capture resolution used for measurement: `4608 x 2592`.
 | 3 | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
 | 4 | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
 
-**Matthew's subject-scale decision:** PENDING — no calibration object or bird was
-measured during this session.
+**Matthew's subject-scale decision:** **DEFERRED — PRODUCTION HARDENING.** No
+calibration object or bird was measured. Nothing is known about resolvable
+subject detail at any feeder plane.
 
 No universal minimum pixel threshold is asserted. The measurements exist so a
 later model-selection task can derive thresholds from evidence.
@@ -272,7 +294,9 @@ cannot query the sensor directly, so the per-test metadata columns stay
 `NOT RECORDED`. Matthew's one observation — focus after the restart — is recorded
 as his, and visible lens movement was not treated as acceptance.
 
-**Matthew's autofocus decision:** PENDING
+**Matthew's autofocus decision:** **DEFERRED — PRODUCTION HARDENING.** One
+observation exists (focus after restart, GOOD); the other seven checks were not
+assessed and the matrix is not passed.
 
 ## 12. Exposure and colour
 
@@ -289,7 +313,8 @@ lighting condition: `NOT RECORDED`.
 | Office lights on | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
 | Late afternoon / low light | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
 
-**Matthew's exposure and colour decision:** PENDING
+**Matthew's exposure and colour decision:** **DEFERRED — PRODUCTION HARDENING.**
+No condition in the matrix was assessed.
 
 ## 13. Reflections
 
@@ -306,7 +331,8 @@ Matthew returned this section unanswered.
 
 **Final mitigation selected:** NOT RECORDED
 
-**Matthew's reflection decision:** PENDING
+**Matthew's reflection decision:** **DEFERRED — PRODUCTION HARDENING.** No
+condition was assessed and no mitigation was tested.
 
 Region-of-interest exclusion of reflective frame edges is **not implemented** and
 must not be recorded as a mitigation in place.
@@ -322,12 +348,14 @@ must not be recorded as a mitigation in place.
 | Minor vibration | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT PERFORMED |
 | Ordinary cleaning access | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT RECORDED | NOT PERFORMED |
 
-**Matthew's mechanical-stability decision:** PENDING
+**Matthew's mechanical-stability decision:** **DEFERRED — PRODUCTION HARDENING;
+NOT PERFORMED.**
 
 Claude asked whether to perform this section before the soak began, since it is
 one of the two gates that guard an unattended run. Matthew chose to record it
-`NOT PERFORMED` and proceed. It is not recorded as passed, and it must be
-completed before final sign-off.
+`NOT PERFORMED` and proceed. It is not recorded as passed. **The mount's
+behaviour under ordinary disturbance is therefore unknown**, and that remains
+true however long the camera happens to stay in place.
 
 No deliberate impact testing was or will be performed.
 
@@ -427,7 +455,7 @@ account.
 
 ## 20. Camera-disconnect test
 
-**Status: NOT PERFORMED.**
+**Status: DEFERRED — PRODUCTION HARDENING; NOT PERFORMED.**
 
 Requires separate authorisation from Matthew and a planned hardware window. It
 was not performed during Task 12 implementation, was not performed during this
@@ -451,7 +479,14 @@ out.
 ## 21. Twenty-four-hour checkpoints
 
 The continuous clock started after the reboot-recovery gate and the post-reboot
-capture had both passed.
+capture had both passed. The zero-hour checkpoint below is real evidence and is
+retained.
+
+**This observation period is no longer a Task 12 completion dependency.** It may
+continue as optional operational observation. Missed checkpoints must not be
+reconstructed or back-filled — an absent checkpoint stays absent. No 24-hour or
+48-hour result is claimed, and the run as it stands does not establish
+`CAMERA PIPELINE STABLE`.
 
 | Item | Start | 1 h | 6 h | 12 h | 24 h |
 | ---- | ----- | --- | --- | ---- | ---- |
@@ -490,7 +525,8 @@ capture had both passed.
 history):** NOT RECORDED — only the zero-hour point exists, and one point is not
 continuity.
 
-**24-hour gate:** IN PROGRESS — `CAMERA BRING-UP PASSED` may be recorded only
+**24-hour commissioning observation:** **DEFERRED — NOT REQUIRED FOR FUNCTIONAL
+PROTOTYPE ACCEPTANCE.** Not passed. `CAMERA BRING-UP PASSED` may be recorded only
 when this gate actually passes.
 
 ## 22. Forty-eight-hour checkpoint
@@ -516,8 +552,9 @@ when this gate actually passes.
 | Preview-restoration failures | NOT RECORDED |
 | Post-soak capture | NOT PERFORMED |
 
-**48-hour stability gate:** IN PROGRESS — `CAMERA PIPELINE STABLE` must not be
-claimed from the 24-hour result.
+**48-hour stability observation:** **DEFERRED — NOT REQUIRED FOR FUNCTIONAL
+PROTOTYPE ACCEPTANCE.** Not passed. `CAMERA PIPELINE STABLE` must not be claimed
+from the 24-hour result, and is not claimed here at all.
 
 ## 23. Temperature and resources
 
@@ -574,28 +611,42 @@ unrecorded rather than borrowing a capture that was taken for another purpose.
 | Data baseline file written during the resumed preflight | The original preflight stopped at the configuration check before it wrote the capture and backup baseline file. The values were re-read from scratch when the run resumed, and the file was written then. | Recorded fact |
 | `rpicam-hello --list-cameras` unavailable to the evidence account | The `claude` account is not in the `video` group and cannot open the camera device nodes. Sensor identity came from the application's own status endpoint instead. | Recorded fact |
 | No pull request and no merge | The evidence branch stays open for later additive checkpoint commits. | Task instruction |
+| **Acceptance scope split into two levels on 2026-08-06** | The original procedure treated the detailed mounting, optical and time-gate checks as blockers on Task 12. Matthew reviewed the working prototype and decided that was delaying application development for checks not material to a prototype. The contract was split: functional prototype acceptance closes Task 12; production hardware hardening is deferred and non-blocking. This is a deliberate owner decision about priority, not a weakened result and not an inferred test outcome. | Matthew |
 
 ## 27. Known limitations
 
+The prototype acceptance below rests on the objective evidence in sections 15-19
+and on Matthew's decisions in sections 7 and 8. Everything in this list is
+outside that basis.
+
 - This record covers one fixed camera at one office window. It says nothing
   about any other position, room or camera.
-- No numerical subject-scale threshold is asserted; measurements are recorded so
-  a later model-selection task can derive one from evidence.
-- Measured preview frame rate is only recorded if it was actually measured; the
-  configured `15` is a request, not a measurement.
+- **The mount is temporary and is not production-ready.** The camera PCB is not
+  independently supported and the lens housing is the mounting point. Matthew
+  accepted this for prototype use; it would fail a hardening assessment.
+- **Mechanical stability was never tested**, so the mount's behaviour under
+  ordinary disturbance is unknown. Time in place is not evidence of stability.
+- No numerical subject-scale threshold is asserted, and no subject scale was
+  measured at all, so nothing is known about resolvable bird detail.
+- Measured preview frame rate was never taken; the configured `15` is a request,
+  not a measurement.
+- Feeder coverage is decided for feeder 1 only. Autofocus has one observation of
+  eight. Exposure, colour and reflections have none.
 - The camera-disconnect gate is optional and requires Matthew's authorisation.
 - Reflection mitigation by region-of-interest exclusion is not available: ROI is
   not implemented.
 - Motion coexistence is unproven because motion is disabled; enabling it is a
   separate authorised change.
-- The mechanical-stability gate has not been performed, so the mount's behaviour
-  under ordinary disturbance is unknown for the duration of the soak.
-- Feeder coverage is decided for feeder 1 only; subject scale, autofocus,
-  exposure and reflections are decided for none.
-- Passing every gate here does not imply readiness for motion-triggered capture,
-  event capture or species identification.
+- **No time gate was met.** The observation period holds one checkpoint. Neither
+  `CAMERA BRING-UP PASSED` nor `CAMERA PIPELINE STABLE` may be claimed.
+- Passing at functional prototype scope does not imply readiness for
+  motion-triggered capture, event capture or species identification; it means
+  the pipeline those features would build on is proven to work.
 
 ## 28. Outstanding actions
+
+Nothing in this table blocks the next application phase. It is the
+hardware-hardening backlog.
 
 | Action | Owner | Status |
 | ------ | ----- | ------ |
@@ -603,52 +654,73 @@ unrecorded rather than borrowing a capture that was taken for another purpose.
 | Validate the branch on ARM64 | Claude | PERFORMED — narrow validation, 2026-07-31 |
 | Enable managed preview in the external production configuration | Matthew | PERFORMED |
 | Execute the immediate physical acceptance checklist | Claude | PERFORMED |
-| Record which view Matthew used for the privacy and framing decisions | Matthew | NOT PERFORMED |
-| Complete feeder coverage for feeders 2, 3 and 4 | Matthew | NOT PERFORMED |
-| Measure subject pixel scale at each feeder plane | Matthew | NOT PERFORMED |
-| Complete the autofocus assessment | Matthew | NOT PERFORMED |
-| Complete exposure, colour and reflection assessment | Matthew | NOT PERFORMED |
-| Perform the mechanical-stability checks | Matthew | NOT PERFORMED |
-| Run the 24-hour gate | Claude | IN PROGRESS |
-| Run the 48-hour gate | Claude | IN PROGRESS |
-| Collect Matthew's final sign-off | Matthew | NOT PERFORMED |
+| Record Matthew's functional-prototype decision | Matthew | PERFORMED — 2026-08-06 |
+| Replace the temporary mount with independent PCB support | Matthew | DEFERRED — PRODUCTION HARDENING |
+| Stop using the lens housing as the mounting point | Matthew | DEFERRED — PRODUCTION HARDENING |
+| Perform the mechanical-stability checks | Matthew | DEFERRED — PRODUCTION HARDENING |
+| Record which view Matthew used for the privacy and framing decisions | Matthew | DEFERRED — PRODUCTION HARDENING |
+| Complete feeder coverage for feeders 2, 3 and 4 | Matthew | DEFERRED — PRODUCTION HARDENING |
+| Measure subject pixel scale at each feeder plane | Matthew | DEFERRED — PRODUCTION HARDENING |
+| Complete the autofocus assessment | Matthew | DEFERRED — PRODUCTION HARDENING |
+| Complete exposure, colour and reflection assessment | Matthew | DEFERRED — PRODUCTION HARDENING |
+| Perform the camera-disconnect check | Matthew | DEFERRED — PRODUCTION HARDENING |
+| Run the 24-hour commissioning observation | Claude | DEFERRED — PRODUCTION HARDENING |
+| Run the 48-hour stability observation | Claude | DEFERRED — PRODUCTION HARDENING |
 
 ## 29. Matthew's decision
 
 ```text
-Accepted by:        NOT RECORDED
-Acceptance date:    NOT RECORDED
-Decision:           PENDING
-Conditions:         NOT RECORDED
-Outstanding actions: see section 28
+Accepted by:        Matthew
+Acceptance date:    2026-08-06
+Decision:           PASS FOR FUNCTIONAL PROTOTYPE
+Conditions:         Current mounting and incomplete hardware-hardening checks
+                    are accepted for prototype use only.
+Outstanding actions: Production hardware hardening is deferred and tracked as
+                    non-blocking follow-up work. See section 28.
 ```
 
-This section is completed by Matthew. It must not be filled in on his behalf.
-Individual sections above carry his interim decisions; this final one stays
-pending until the 48-hour gate is complete.
+This section is completed by Matthew and records the decision he gave on
+2026-08-06. It must not be filled in on his behalf.
+
+**Matthew did not accept a production-hardened installation.** He accepted a
+working prototype, on the stated condition that the temporary mounting and the
+incomplete hardening checks are for prototype use only.
+
+**Scope decision, in Matthew's terms:** he accepts the current camera
+installation and application pipeline as a functional prototype. The remaining
+detailed mounting, mechanical-stability, feeder-scale, autofocus, exposure,
+reflection, disconnect and long-duration soak checks are deferred to a later
+hardware-hardening phase, and are not blockers for continuing application
+development.
 
 ## 30. Final gate status
 
 | Gate | Status |
 | ---- | ------ |
-| Automated software checks (hardware-free) | Passed on the development machine; narrow ARM64 validation passed 2026-07-31 |
-| Operator-observed physical checks | PARTIAL — mounting and privacy decided; stability not performed |
-| Privacy | PASS |
-| Feeder coverage | PENDING |
-| Subject scale | PENDING |
-| Autofocus | PENDING |
-| Exposure and colour | PENDING |
-| Reflections | PENDING |
-| Mechanical stability | PENDING |
-| Preview | PASS |
-| Capture | PASS |
-| Capture-to-preview restoration | PASS |
-| Application restart | PASS |
-| Reboot recovery | PASS |
-| Camera disconnect | NOT PERFORMED |
-| 24-hour camera bring-up | IN PROGRESS |
-| 48-hour camera pipeline stability | IN PROGRESS |
-| Matthew's sign-off | NOT GIVEN |
+| Automated software checks (hardware-free) | PASSED on the development machine; narrow ARM64 validation passed 2026-07-31 |
+| Functional camera pipeline | PASSED |
+| Preview lifecycle | PASSED |
+| Capture and archiving | PASSED |
+| Capture-to-preview restoration | PASSED |
+| Application restart | PASSED |
+| Reboot recovery | PASSED |
+| Privacy | PASSED — Matthew |
+| Functional prototype acceptance | PASSED — Matthew, 2026-08-06 |
+| Permanent mounting hardening | DEFERRED |
+| Mechanical stability | DEFERRED — NOT PERFORMED |
+| Complete feeder coverage | DEFERRED |
+| Subject scale | DEFERRED |
+| Complete autofocus assessment | DEFERRED |
+| Exposure and colour assessment | DEFERRED |
+| Reflection assessment | DEFERRED |
+| Camera disconnect | DEFERRED — NOT PERFORMED |
+| 24-hour commissioning observation | DEFERRED — NOT PASSED |
+| 48-hour stability observation | DEFERRED — NOT PASSED |
+| Production-hardened camera installation | NOT CLAIMED |
 
-**Overall: IN PROGRESS — zero-hour checkpoint recorded; awaiting timed
-checkpoints and final Matthew sign-off.**
+`DEFERRED` is a decision about *when*, not a verdict about *whether*. Nine rows
+above are deferred and none of them is passed; a later hardening phase has to do
+the work, and until it does, no claim may rest on them.
+
+**Overall: PASSED AT FUNCTIONAL PROTOTYPE SCOPE — production hardware hardening
+remains deferred.**

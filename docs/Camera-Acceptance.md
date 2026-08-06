@@ -12,6 +12,97 @@ plane, that the exposure is usable, that reflections are tolerable, or that the
 framing respects the neighbours. Those are decided by a person, at the machine,
 looking at the picture.
 
+## Two acceptance levels
+
+This procedure serves two different questions, and conflating them was costing
+real time. **Does the camera work well enough to build on?** is not the same
+question as **is this installation ready to be left alone indefinitely?**
+
+| Level | Question | Closes | Blocks |
+| ----- | -------- | ------ | ------ |
+| **1 — Functional prototype acceptance** | Does the camera work, and is the pipeline sound? | **Task 12** | Application development, until it passes |
+| **2 — Production hardware hardening** | Is the installation permanent, optically characterised and proven over time? | A later hardening phase | Nothing in application development |
+
+**Task 12 closes when Level 1 passes.** Level 2 checks may be completed later,
+in any order, without blocking application development — they are a parallel
+workstream, not a gate in front of the next phase.
+
+### Level 1 — functional prototype acceptance
+
+Every item is objective except the last two, which are Matthew's:
+
+- the camera is available through the application;
+- the physical `rpicam` backend is in use;
+- preview starts automatically from configuration;
+- exactly one preview producer exists;
+- multiple clients share that one producer;
+- a repeated start creates no duplicate;
+- full-resolution physical capture succeeds;
+- the capture decodes completely;
+- archive metadata matches the file;
+- preview is restored after a capture that began with preview running;
+- a capture begun with preview stopped leaves preview stopped;
+- application restart recovery succeeds;
+- Raspberry Pi reboot recovery succeeds;
+- the database remains healthy and the backup timer remains active;
+- no unresolved functional camera fault is present;
+- **Matthew accepts the privacy framing**;
+- **Matthew explicitly accepts any temporary mounting limitations** for
+  prototype use.
+
+Passing all of them may be recorded as:
+
+```text
+FUNCTIONAL PROTOTYPE CAMERA ACCEPTED
+```
+
+That phrase means the pipeline works. It says nothing about the mount, the
+optics or the passage of time.
+
+### Level 2 — production hardware hardening
+
+- independent PCB support;
+- a mount that does not use the lens housing as its mounting point;
+- permanent rather than temporary mounting;
+- the full mechanical-stability matrix (§10);
+- feeder coverage assessed for every intended feeder (§5);
+- measured subject scale at each feeder plane (§6);
+- the complete autofocus matrix (§7);
+- representative exposure and colour testing (§8);
+- reflection testing and any mitigation (§9);
+- measured preview frame rate where useful (§11);
+- the camera-disconnect check (§16);
+- the 24-hour commissioning observation (§17);
+- the 48-hour stability observation (§18).
+
+Only a complete Level 2 result may be recorded as:
+
+```text
+PRODUCTION CAMERA INSTALLATION HARDENED
+```
+
+`CAMERA PIPELINE STABLE` stays reserved for a successful 48-hour run and is not
+a synonym for either level. **Neither Level 2 phrase may be recorded while any
+of its checks is outstanding**, and Level 1 never implies Level 2.
+
+### What stays mandatory at both levels
+
+Deferring a check is not permission to be unsafe. These are not deferrable:
+
+- **no CSI hot-plugging** — ever, at either level;
+- **power down and disconnect power before any cable work** (§2);
+- **no deliberate impact testing** (§10);
+- **no exposed electrical contact hazard** (§2, §3);
+- **no cable or mount arrangement that leaves the camera at immediate risk of
+  falling, or that pulls on the CSI connector** (§3);
+- **privacy requires Matthew's explicit decision** (§4) and can never be
+  auto-approved.
+
+A temporary mount is acceptable at Level 1 only when Matthew has seen its
+limitations written down and accepted them for prototype use. Recording the
+limitation is what makes the acceptance meaningful; a mounting decision with its
+failures edited out is worth nothing.
+
 ## The four categories, and why they never substitute for one another
 
 | Category | Who decides | Evidence |
@@ -130,6 +221,12 @@ in software from an absent camera.
 
 ## 3. Mounting
 
+**Level 1** requires that the mount is electrically and mechanically safe, and
+that any point below which is not satisfied is written down and explicitly
+accepted by Matthew for prototype use. **Level 2** requires every point to be
+satisfied outright, with independent PCB support and a mount that does not bear
+on the lens housing.
+
 Confirm every point before powering on:
 
 - the camera PCB is mechanically supported by the mount;
@@ -146,6 +243,11 @@ A lens positioned very close to the glass is acceptable — it is the best
 reflection mitigation available — **provided the mount, not the lens, carries any
 contact load.** Do not press the lens barrel against the glass to hold the
 camera in place.
+
+The two points most often unmet by a temporary mount are independent PCB support
+and not using the lens housing as the mounting point. Neither may be silently
+downgraded: record the actual answer, and if it is `NO`, record Matthew's
+explicit acceptance of it beside the answer rather than in place of it.
 
 ---
 
@@ -174,6 +276,11 @@ and filename.
 
 ## 5. Field of view and feeder coverage
 
+**Level 1** requires only that the framing is useful and that Matthew has
+accepted it. **Level 2** requires a separate, complete assessment for every
+intended feeder; a partial assessment is recorded per feeder, never averaged
+into a single verdict.
+
 Assess each feeder **separately**. For feeders 1–4 record:
 
 | Field | Values |
@@ -196,6 +303,10 @@ from the camera being available.
 ---
 
 ## 6. Bird-sized subject scale
+
+**Level 2 — deferred hardening.** Measured subject scale is not required for
+functional prototype acceptance. It is required before any claim about what the
+camera can resolve at a feeder plane.
 
 Place a bird-sized calibration object (roughly 12–18 cm, e.g. a printed target or
 a tennis-ball-sized object with markings) at each practical feeder plane, or
@@ -221,6 +332,9 @@ thresholds from evidence.
 ---
 
 ## 7. Autofocus
+
+**Level 2 — deferred hardening.** The complete focus matrix below is not
+required for functional prototype acceptance.
 
 The Camera Module 3 has powered autofocus. **Check the installed command's own
 help and version before relying on any option**, and treat that output as
@@ -265,6 +379,10 @@ that the lens motor moves.
 
 ## 8. Exposure and colour
 
+**Level 2 — deferred hardening.** The condition matrix below spans times of day
+and weather that no single session can cover, and it is not required for
+functional prototype acceptance.
+
 Test at minimum: normal daylight; bright sky behind or near the feeders; a darker
 bird-sized object; mixed sun and shade; office lights off; office lights on; and
 late-afternoon or lower-light conditions when practical.
@@ -281,6 +399,9 @@ conditions**. Do not introduce custom camera tuning files in Task 12.
 ---
 
 ## 9. Window reflections
+
+**Level 2 — deferred hardening.** Not required for functional prototype
+acceptance.
 
 Test: camera close to the glass; office lights off; office lights on; bright
 indoor objects behind the camera; daylight at multiple angles; and a temporary
@@ -303,6 +424,10 @@ Possible physical mitigations:
 
 ## 10. Mechanical stability
 
+**Level 2 — deferred hardening.** Not required for functional prototype
+acceptance. The prohibition on impact testing below is **not** deferred: it
+applies whenever this section is performed, at either level.
+
 With preview running, gently and safely test: opening and closing the office
 door; normal desk contact; normal window-frame contact; cable movement; minor
 vibration; and ordinary cleaning access.
@@ -312,8 +437,10 @@ connection, or causes a preview interruption.
 
 **Do not deliberately strike the camera, the glass, the Pi or the ribbon cable.**
 
-Acceptance requires framing to remain materially unchanged under ordinary
-disturbance.
+Level 2 acceptance requires framing to remain materially unchanged under
+ordinary disturbance. Until this section is performed, the mount's behaviour
+under ordinary disturbance is simply unknown, and must be recorded as unknown
+rather than assumed from the fact that nothing has moved so far.
 
 ---
 
@@ -444,6 +571,9 @@ it reports as a failure rather than as "preview is running".
 
 ## 16. Camera-disconnect failure check
 
+**Level 2 — deferred hardening.** Not required for functional prototype
+acceptance.
+
 Separately authorised, and only in a planned hardware window:
 
 1. stop preview;
@@ -464,7 +594,11 @@ disconnection, record this gate as `NOT PERFORMED` — never as passed.
 
 ---
 
-## 17. Twenty-four-hour minimum gate
+## 17. Twenty-four-hour commissioning observation
+
+**Level 2 — recommended commissioning evidence. Not required for functional
+prototype completion.** It remains required before the 24-hour bring-up result
+itself may be claimed: the gate is deferred, not weakened.
 
 The camera bring-up minimum is **at least 24 continuous hours**. Record
 checkpoints at approximately: start, 1 hour, 6 hours, 12 hours, 24 hours.
@@ -503,9 +637,17 @@ Passing this gate may be recorded as:
 CAMERA BRING-UP PASSED
 ```
 
+A run that was started and then left unobserved has not passed it. **Do not
+reconstruct or back-fill a checkpoint that was missed** — an absent checkpoint
+is recorded as absent, and the gate stays unclaimed.
+
 ---
 
-## 18. Forty-eight-hour stability gate
+## 18. Forty-eight-hour stability observation
+
+**Level 2 — production stability and hardening gate. Not required before
+continuing prototype application development.** Only a completed run may support
+`CAMERA PIPELINE STABLE`.
 
 The project test standard requires **at least 48 continuous hours** before
 declaring the camera pipeline stable. The record must include:
@@ -582,5 +724,14 @@ Record the digest; not the file.
 Motion-triggered capture, event lifecycle, pre/post-event buffers, media
 retention, regions of interest, bird detection, species identification and
 notification transports are all **out of scope**. They belong to the
-event-capture phase, which should begin only once the 48-hour gate and Matthew's
-sign-off are recorded as passed.
+event-capture phase.
+
+**That phase may begin once functional prototype acceptance (Level 1) is
+recorded as passed** — including Matthew's privacy decision and his explicit
+acceptance of any temporary mounting limitations. It does not wait for the
+24-hour or 48-hour observation, nor for the rest of Level 2, which remain an
+open parallel workstream.
+
+What Level 1 does *not* license is a claim about the installation. Building the
+next phase on a prototype camera is a project decision; describing that camera
+as hardened, stable or optically characterised would be a false one.

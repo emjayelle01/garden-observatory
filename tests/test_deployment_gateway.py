@@ -7013,11 +7013,11 @@ def test_current_status_does_not_overclaim_rollback_or_physical_acceptance() -> 
 
     Both live actions succeeded, which makes it tempting to describe the
     transaction as proven. It is not: the rollback branch has never run in
-    production, and the hardware gates have begun without finishing.
+    production, and the hardware hardening gates were deferred rather than met.
 
-    "In progress" is the narrow claim this record is now entitled to make, and
-    it is the easiest one to inflate: a run that has started reads, at a glance,
-    like a run that has worked.
+    Task 12 now closes at functional prototype scope, which is the easiest claim
+    in this repository to inflate. "Accepted" reads as "finished" unless the
+    scope travels with it.
     """
     remediation = _read(REMEDIATION_RECORD)
     acceptance = _read(ACCEPTANCE_RECORD_PATH)
@@ -7034,16 +7034,28 @@ def test_current_status_does_not_overclaim_rollback_or_physical_acceptance() -> 
         "Physical camera acceptance | **Passed**",
         "Physical camera acceptance run | **Passed**",
         "Physical camera acceptance run | **Complete**",
-        "Matthew's visual sign-off | **Given**",
-        "24-hour gate | **Passed**",
-        "24-hour gate | **Complete**",
-        "48-hour gate | **Passed**",
-        "48-hour gate | **Complete**",
-        "CAMERA BRING-UP PASSED",
-        "CAMERA PIPELINE STABLE",
+        "24-hour observation | **Passed**",
+        "48-hour stability | **Passed**",
+        "Production camera stability | **Passed**",
+        "Production camera stability | **Claimed**",
+        "Production hardware hardening | **Complete**",
+        "Production hardware hardening | **Passed**",
+        "PRODUCTION CAMERA INSTALLATION HARDENED",
     ):
         assert banned not in remediation_status, banned
         assert banned not in acceptance_status, banned
+
+    # The two time-gate phrases are not banned outright -- the status block now
+    # denies them by name, and a ban that fires on the denial of a claim is
+    # worse than no ban. Each occurrence must sit in a sentence that withholds
+    # it instead.
+    for line in acceptance_status.splitlines():
+        if not any(
+            phrase in line
+            for phrase in ("CAMERA BRING-UP PASSED", "CAMERA PIPELINE STABLE")
+        ):
+            continue
+        assert "not claimed" in line or "not passed" in line, line
 
     # Rollback is stated as untriggered, in both records that mention it.
     assert "Production rollback | **Not deliberately triggered**" in remediation_status
@@ -7052,15 +7064,17 @@ def test_current_status_does_not_overclaim_rollback_or_physical_acceptance() -> 
     )
     assert "be induced solely to demonstrate it" in gateway_document
 
-    # The hardware run has begun; the gates that close it have not.
+    # Task 12 closed at prototype scope; the hardening gates did not close at
+    # all. Each one names itself so the deferral cannot be read as a sweep.
     assert "Physical camera acceptance | **Pending**" in remediation_status
-    assert "Physical camera acceptance run | **In progress**" in acceptance_status
-    assert "Matthew's visual sign-off | **Not given**" in acceptance_status
-    assert "24-hour gate | **In progress**" in acceptance_status
-    assert "48-hour gate | **In progress**" in acceptance_status
-    assert "Camera disconnect | **Not performed**" in acceptance_status
-    assert "Task 12 | **Not complete**" in acceptance_status
-    assert "remaining\nTask 12 gate" in acceptance_status
+    assert "Functional prototype acceptance | **Passed**" in acceptance_status
+    assert "Task 12 functional scope | **Complete**" in acceptance_status
+    assert "Production hardware hardening | **Deferred**" in acceptance_status
+    assert "Mechanical stability | **Deferred** — not performed" in acceptance_status
+    assert "Camera disconnect | **Deferred** — not performed" in acceptance_status
+    assert "24-hour observation | **Deferred** — not passed" in acceptance_status
+    assert "48-hour stability | **Deferred** — not passed" in acceptance_status
+    assert "Production camera stability | **Not claimed**" in acceptance_status
 
     # Root-only evidence was not inspected during the live actions, and the
     # record must not imply otherwise.
@@ -7074,10 +7088,10 @@ def test_current_status_does_not_overclaim_rollback_or_physical_acceptance() -> 
 def test_no_current_status_claims_physical_acceptance_completed() -> None:
     """Live gateway validation must not be mistaken for hardware acceptance.
 
-    Both public mutating gateway actions have passed in production, and the
-    hardware run has since begun. This test guards the distinction between a
-    started run and a finished one: Matthew's visual sign-off and the two time
-    gates are still open.
+    Both public mutating gateway actions have passed in production, and Task 12
+    has since closed at functional prototype scope. This test guards the one
+    distinction that closure blurs: a camera accepted as a working prototype is
+    not a camera whose installation has been hardened.
 
     A status table is read faster than prose, so the rows that say so are
     asserted positively as well as the phrasings that would say the opposite.
@@ -7089,19 +7103,20 @@ def test_no_current_status_claims_physical_acceptance_completed() -> None:
 
     # The deploy-main and restart-api bans this list once carried have been
     # removed: both actions have since passed in production, so banning a
-    # "passed" row for them would now forbid the truth. Their "Passed" rows are
-    # required below as positive assertions. What stays banned is the hardware
-    # verdict, which the run has not reached.
+    # "passed" row for them would now forbid the truth. The same has happened to
+    # the acceptance run itself -- it ran, and Matthew accepted its result. What
+    # stays banned is the scope that acceptance did not cover.
     for banned in (
-        "Physical camera acceptance | **Complete**",
-        "Physical camera acceptance | **Passed**",
-        "Physical camera acceptance run | **Passed**",
-        "Physical camera acceptance run | **Complete**",
-        "Matthew's visual sign-off | **Given**",
-        "24-hour gate | **Passed**",
-        "24-hour gate | **Complete**",
-        "48-hour gate | **Passed**",
-        "48-hour gate | **Complete**",
+        "Production hardware hardening | **Complete**",
+        "Production hardware hardening | **Passed**",
+        "Permanent mounting hardening | **Passed**",
+        "Mechanical stability | **Passed**",
+        "Camera disconnect | **Passed**",
+        "24-hour observation | **Passed**",
+        "48-hour stability | **Passed**",
+        "Production camera stability | **Passed**",
+        "Production camera stability | **Claimed**",
+        "PRODUCTION CAMERA INSTALLATION HARDENED",
         # Deliberately not a bare "camera has been accepted": that phrase also
         # occurs inside the record's own denial of it, and a ban that fires on
         # the negation of the claim it polices is worse than no ban.
@@ -7111,8 +7126,7 @@ def test_no_current_status_claims_physical_acceptance_completed() -> None:
         assert banned not in remediation_status, banned
         assert banned not in acceptance_status, banned
 
-    # And the rows that state the true position are present. The two live
-    # actions have since passed; the hardware gates have not.
+    # And the rows that state the true position are present.
     assert "Live `deploy-main` validation | **Passed**" in remediation_status
     assert "Live `restart-api` validation | **Passed**" in remediation_status
     assert "Physical camera acceptance | **Pending**" in remediation_status
@@ -7122,18 +7136,35 @@ def test_no_current_status_claims_physical_acceptance_completed() -> None:
     assert "Live `restart-api` through the installed gateway | **Passed**" in (
         acceptance_status
     )
-    assert "Physical camera acceptance run | **In progress**" in acceptance_status
-    assert "Matthew's visual sign-off | **Not given**" in acceptance_status
-    assert "24-hour gate | **In progress**" in acceptance_status
-    assert "48-hour gate | **In progress**" in acceptance_status
 
-    # The gates the run did close say so, so that "in progress" is not read as
-    # "nothing has happened" either. Overclaiming and underclaiming are the same
-    # defect pointed in opposite directions.
+    # Task 12 closed, at a named scope, on the strength of gates that really ran.
+    assert "Functional prototype acceptance | **Passed**" in acceptance_status
+    assert "Task 12 functional scope | **Complete**" in acceptance_status
     assert "Application restart gate | **Passed**" in acceptance_status
     assert "Reboot recovery gate | **Passed**" in acceptance_status
     assert "Zero-hour checkpoint | **Recorded**" in acceptance_status
-    assert "Mechanical stability | **Not performed**" in acceptance_status
+
+    # Everything the acceptance did not cover names itself as deferred, so the
+    # closure cannot be read as a sweep across the whole checklist.
+    assert "Production hardware hardening | **Deferred**" in acceptance_status
+    assert "Permanent mounting hardening | **Deferred**" in acceptance_status
+    assert "Mechanical stability | **Deferred** — not performed" in acceptance_status
+    assert "Camera disconnect | **Deferred** — not performed" in acceptance_status
+    assert "24-hour observation | **Deferred** — not passed" in acceptance_status
+    assert "48-hour stability | **Deferred** — not passed" in acceptance_status
+    assert "Production camera stability | **Not claimed**" in acceptance_status
+
+    # The scope decision is attributed and dated, not left as an unexplained
+    # softening of a contract that used to block.
+    assert "## Scope decision — 2026-08-06" in acceptance
+    assert "deliberate owner and project-priority decision" in acceptance
+    assert "It is **not** an inferred test result" in acceptance
+
+    # The next phase is unblocked, and unblocking is not the same as starting.
+    assert (
+        "The next application phase may proceed after repository review and merge."
+        in acceptance_status
+    )
 
     # The history sentence beneath the table must draw the same line the table
     # does. It previously said the deployment rows had *never* changed, which
@@ -7152,10 +7183,14 @@ def test_no_current_status_claims_physical_acceptance_completed() -> None:
         acceptance_status
     )
     assert (
-        "Matthew's visual sign-off, the 24-hour gate and the 48-hour\ngate have not "
-        "been completed by it" in acceptance_status
+        "Every `Deferred` row is deferred work, not a passed check, and\nmay be "
+        "marked passed only by a later hardening run that actually performs it."
+        in acceptance_status
     )
-    assert "may be updated only when those gates\nactually finish." in acceptance_status
+    assert (
+        "**The camera is accepted as a working prototype, not as a\nhardened "
+        "production installation**" in acceptance_status
+    )
 
     # Scoped to the current status block: an earlier dated section elsewhere in
     # the file may legitimately describe a state in which nothing had yet been
@@ -7167,6 +7202,9 @@ def test_no_current_status_claims_physical_acceptance_completed() -> None:
         "Physical camera acceptance has not been performed",
         "acceptance run, Matthew's visual sign-off, 24-hour gate and 48-hour "
         "gate remain unchanged",
+        # Went false when Matthew accepted the prototype on 2026-08-06.
+        "Physical camera acceptance is now **in progress**",
+        "Task 12 is not complete",
     ):
         assert stale not in acceptance_status, stale
 
