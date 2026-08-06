@@ -7013,7 +7013,11 @@ def test_current_status_does_not_overclaim_rollback_or_physical_acceptance() -> 
 
     Both live actions succeeded, which makes it tempting to describe the
     transaction as proven. It is not: the rollback branch has never run in
-    production, and no hardware gate has begun.
+    production, and the hardware gates have begun without finishing.
+
+    "In progress" is the narrow claim this record is now entitled to make, and
+    it is the easiest one to inflate: a run that has started reads, at a glance,
+    like a run that has worked.
     """
     remediation = _read(REMEDIATION_RECORD)
     acceptance = _read(ACCEPTANCE_RECORD_PATH)
@@ -7029,9 +7033,14 @@ def test_current_status_does_not_overclaim_rollback_or_physical_acceptance() -> 
         "Physical camera acceptance | **Complete**",
         "Physical camera acceptance | **Passed**",
         "Physical camera acceptance run | **Passed**",
+        "Physical camera acceptance run | **Complete**",
         "Matthew's visual sign-off | **Given**",
-        "24-hour gate | **Started**",
-        "48-hour gate | **Started**",
+        "24-hour gate | **Passed**",
+        "24-hour gate | **Complete**",
+        "48-hour gate | **Passed**",
+        "48-hour gate | **Complete**",
+        "CAMERA BRING-UP PASSED",
+        "CAMERA PIPELINE STABLE",
     ):
         assert banned not in remediation_status, banned
         assert banned not in acceptance_status, banned
@@ -7043,12 +7052,14 @@ def test_current_status_does_not_overclaim_rollback_or_physical_acceptance() -> 
     )
     assert "be induced solely to demonstrate it" in gateway_document
 
-    # The hardware gates are still open.
+    # The hardware run has begun; the gates that close it have not.
     assert "Physical camera acceptance | **Pending**" in remediation_status
-    assert "Physical camera acceptance run | **Not performed**" in acceptance_status
+    assert "Physical camera acceptance run | **In progress**" in acceptance_status
     assert "Matthew's visual sign-off | **Not given**" in acceptance_status
-    assert "24-hour gate | **Not started**" in acceptance_status
-    assert "48-hour gate | **Not started**" in acceptance_status
+    assert "24-hour gate | **In progress**" in acceptance_status
+    assert "48-hour gate | **In progress**" in acceptance_status
+    assert "Camera disconnect | **Not performed**" in acceptance_status
+    assert "Task 12 | **Not complete**" in acceptance_status
     assert "remaining\nTask 12 gate" in acceptance_status
 
     # Root-only evidence was not inspected during the live actions, and the
@@ -7063,9 +7074,10 @@ def test_current_status_does_not_overclaim_rollback_or_physical_acceptance() -> 
 def test_no_current_status_claims_physical_acceptance_completed() -> None:
     """Live gateway validation must not be mistaken for hardware acceptance.
 
-    Both public mutating gateway actions have passed in production. This test
-    now guards only the still-pending physical-camera run, Matthew's visual
-    sign-off, and the 24-hour and 48-hour hardware gates.
+    Both public mutating gateway actions have passed in production, and the
+    hardware run has since begun. This test guards the distinction between a
+    started run and a finished one: Matthew's visual sign-off and the two time
+    gates are still open.
 
     A status table is read faster than prose, so the rows that say so are
     asserted positively as well as the phrasings that would say the opposite.
@@ -7078,16 +7090,18 @@ def test_no_current_status_claims_physical_acceptance_completed() -> None:
     # The deploy-main and restart-api bans this list once carried have been
     # removed: both actions have since passed in production, so banning a
     # "passed" row for them would now forbid the truth. Their "Passed" rows are
-    # required below as positive assertions. What stays banned is the hardware,
-    # which has not moved at all.
+    # required below as positive assertions. What stays banned is the hardware
+    # verdict, which the run has not reached.
     for banned in (
         "Physical camera acceptance | **Complete**",
         "Physical camera acceptance | **Passed**",
         "Physical camera acceptance run | **Passed**",
         "Physical camera acceptance run | **Complete**",
         "Matthew's visual sign-off | **Given**",
-        "24-hour gate | **Started**",
-        "48-hour gate | **Started**",
+        "24-hour gate | **Passed**",
+        "24-hour gate | **Complete**",
+        "48-hour gate | **Passed**",
+        "48-hour gate | **Complete**",
         # Deliberately not a bare "camera has been accepted": that phrase also
         # occurs inside the record's own denial of it, and a ban that fires on
         # the negation of the claim it polices is worse than no ban.
@@ -7108,29 +7122,40 @@ def test_no_current_status_claims_physical_acceptance_completed() -> None:
     assert "Live `restart-api` through the installed gateway | **Passed**" in (
         acceptance_status
     )
-    assert "Physical camera acceptance run | **Not performed**" in acceptance_status
+    assert "Physical camera acceptance run | **In progress**" in acceptance_status
     assert "Matthew's visual sign-off | **Not given**" in acceptance_status
-    assert "24-hour gate | **Not started**" in acceptance_status
-    assert "48-hour gate | **Not started**" in acceptance_status
+    assert "24-hour gate | **In progress**" in acceptance_status
+    assert "48-hour gate | **In progress**" in acceptance_status
+
+    # The gates the run did close say so, so that "in progress" is not read as
+    # "nothing has happened" either. Overclaiming and underclaiming are the same
+    # defect pointed in opposite directions.
+    assert "Application restart gate | **Passed**" in acceptance_status
+    assert "Reboot recovery gate | **Passed**" in acceptance_status
+    assert "Zero-hour checkpoint | **Recorded**" in acceptance_status
+    assert "Mechanical stability | **Not performed**" in acceptance_status
 
     # The history sentence beneath the table must draw the same line the table
     # does. It previously said the deployment rows had *never* changed, which
     # stopped being true the moment the gateway was installed and then used —
     # and a false claim of immutability is worse than none, because it invites
-    # a reader to trust the rows without asking what moved them.
+    # a reader to trust the rows without asking what moved them. The same trap
+    # reopened when the acceptance run began: a sentence saying those rows
+    # "remain unchanged" went false the moment the run recorded its first gate.
     assert "The software and deployment-gateway rows" in acceptance_status
     assert "above were updated only after their separately authorised" in (
         acceptance_status
     )
     assert "Pi installation and live-validation runs." in acceptance_status
-    assert "The physical-camera acceptance run," in acceptance_status
-    assert "Matthew's visual sign-off, 24-hour gate and 48-hour gate remain" in (
+    assert "The physical-camera acceptance rows" in acceptance_status
+    assert "were updated by the separately authorised hardware acceptance run" in (
         acceptance_status
     )
     assert (
-        "may be updated only by a separately authorised hardware acceptance run."
-        in acceptance_status
+        "Matthew's visual sign-off, the 24-hour gate and the 48-hour\ngate have not "
+        "been completed by it" in acceptance_status
     )
+    assert "may be updated only when those gates\nactually finish." in acceptance_status
 
     # Scoped to the current status block: an earlier dated section elsewhere in
     # the file may legitimately describe a state in which nothing had yet been
@@ -7138,6 +7163,10 @@ def test_no_current_status_claims_physical_acceptance_completed() -> None:
     for stale in (
         "sign-off and gate rows have never changed",
         "Nothing has been deployed through the installed gateway",
+        # Went false when the acceptance run started recording gates.
+        "Physical camera acceptance has not been performed",
+        "acceptance run, Matthew's visual sign-off, 24-hour gate and 48-hour "
+        "gate remain unchanged",
     ):
         assert stale not in acceptance_status, stale
 

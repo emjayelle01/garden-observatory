@@ -8,10 +8,14 @@ Deployment-gateway remediation is complete: the reviewed gateway is installed,
 installed-policy validation passed, and both live gateway actions have now
 passed in production — `deploy-main` on 2026-08-05 and `restart-api` on
 2026-08-05. The approval is withdrawn and production is at `938134d…`.
-Managed preview remains disabled and preview remains stopped.
-Physical camera acceptance has not been performed, and is now the remaining
-Task 12 gate.
-Awaiting separately authorised physical acceptance.**
+Managed preview is now enabled in the external production configuration and
+preview is running.
+Physical camera acceptance is now **in progress** and is still the remaining
+Task 12 gate: the immediate lifecycle, restart and reboot-recovery gates have
+passed, the continuous soak started on 2026-08-06 and the zero-hour checkpoint
+is recorded.
+The 24-hour and 48-hour gates are running, Matthew's final sign-off has not been
+given, and Task 12 is not complete.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -35,24 +39,40 @@ Awaiting separately authorised physical acceptance.**
 | Live `deploy-main` through the installed gateway | **Passed** — 2026-08-05, `1aec224` → `938134d` |
 | Live `restart-api` through the installed gateway | **Passed** — 2026-08-05, at `938134d` |
 | Deployment-gateway prerequisites | **Complete** |
-| Approval file | **Withdrawn** — empty after both actions |
-| Managed preview production policies | **Disabled** — `auto_start` and `restore_after_capture` remain `false` |
-| Preview state | **Stopped** — after the 2026-08-04 power failure, because `auto_start` is `false` |
-| Physical camera acceptance run | **Not performed** — requires separate authorisation |
+| Approval file | **Withdrawn** — empty after every action |
+| Managed preview production policies | **Enabled** — `auto_start` and `restore_after_capture` inserted and set `true`, 2026-08-05 |
+| Preview state | **Running** — auto-started from configuration after the restart and again after the reboot |
+| Physical camera acceptance run | **In progress** — started 2026-08-05, soak running |
+| Managed-preview enablement gate | **Passed** — two keys inserted, no other table changed |
+| Application restart gate | **Passed** — one gateway `restart-api`, preview auto-started |
+| Preview lifecycle gates | **Passed** — idempotent start, shared stream, clean stop, start after stop |
+| Capture and restoration gates | **Passed** — three captures, archive consistent, restoration correct |
+| Reboot recovery gate | **Passed** — 2026-08-06, preview auto-started with no API request |
+| Zero-hour checkpoint | **Recorded** — 2026-08-06T06:35:36Z |
+| Matthew's mounting decision | **Pass** — recorded with two `NO` sub-answers he confirmed |
+| Matthew's privacy decision | **Pass** |
+| Feeder coverage, subject scale, autofocus, exposure, reflections | **Pending** |
+| Mechanical stability | **Not performed** |
 | Matthew's visual sign-off | **Not given** |
-| 24-hour gate | **Not started** |
-| 48-hour gate | **Not started** |
+| 24-hour gate | **In progress** |
+| 48-hour gate | **In progress** |
+| Camera disconnect | **Not performed** |
+| Task 12 | **Not complete** |
 
 Nothing in this task claims that the physical camera has been accepted. Task 12
-builds the *gate*; passing the gate is a separate, authorised hardware activity.
+builds the *gate*; passing the gate is a separate, authorised hardware activity,
+and that activity is now under way rather than finished.
 
 The software rows above were written as `In progress` / `Pending` in the first
 commit and updated at closeout; the Raspberry Pi and merge rows were updated by
 their own separately authorised runs. The software and deployment-gateway rows
 above were updated only after their separately authorised repository, Raspberry
-Pi installation and live-validation runs. The physical-camera acceptance run,
-Matthew's visual sign-off, 24-hour gate and 48-hour gate remain unchanged, and
-may be updated only by a separately authorised hardware acceptance run.
+Pi installation and live-validation runs. The physical-camera acceptance rows
+were updated by the separately authorised hardware acceptance run that began on
+2026-08-05, and record only what that run actually observed or what Matthew
+actually decided. Matthew's visual sign-off, the 24-hour gate and the 48-hour
+gate have not been completed by it, and may be updated only when those gates
+actually finish.
 
 ## Purpose
 
