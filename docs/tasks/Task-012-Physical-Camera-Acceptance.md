@@ -20,7 +20,8 @@ subject scale, autofocus, exposure, reflections, camera disconnect and the
 24-hour and 48-hour observations — is **deferred and is not a Task 12 blocker**.
 The 24-hour and 48-hour results are not passed and `CAMERA PIPELINE STABLE` is
 not claimed.
-The next application phase may proceed after repository review and merge.**
+The next application phase may proceed after repository review and merge.
+Task 13 has not started.**
 
 | Gate | Outcome |
 | ---- | ------- |
@@ -575,12 +576,17 @@ the ARM64 build, the full suite and the managed preview lifecycle on the
 simulator backend, and it deliberately did *not* touch production configuration,
 the physical camera or the acceptance checklist. Its results are recorded under
 [Raspberry Pi narrow validation](#raspberry-pi-narrow-validation--performed).
-Every remaining step in the paragraph above is still outstanding.
+
+At the conclusion of the narrow Raspberry Pi validation on 2026-07-31, every
+physical-acceptance and production-enablement step in the paragraph above
+remained outstanding. Those steps were performed or reclassified later, as
+recorded in the current status and scope-decision sections above.
 
 ## Rollback
 
-**Before merge.** Switch back to `main`. No production behaviour changes; the
-physical acceptance record remains pending.
+**Before merge.** Before the original Task 12 implementation merge, switching
+back to `main` would have left the physical acceptance record pending, with no
+production behaviour change.
 
 **After a future merge, before production enablement.** Revert the complete
 Task 12 change set and redeploy `main`. No production configuration rollback is
@@ -1277,14 +1283,15 @@ Task 12 was merged into `main` on **2026-08-01** under separate authorisation.
 History stayed linear: the eleven Task 12 commits sit directly on top of the
 previous `main`, and no merge commit exists between them.
 
-The merge moves code only. It changed nothing on the Raspberry Pi:
+The merge moves code only. As at the merge on 2026-08-01, it had changed nothing
+on the Raspberry Pi:
 
 - No deployment was performed.
 - No Raspberry Pi was accessed during the merge.
-- Production configuration was not changed; both managed-preview policies remain
-  `false` wherever they are deployed.
+- Production configuration was not changed; both managed-preview policies were
+  then `false` or absent wherever they were deployed.
 - `mgo.service` was not restarted and the production preview was not touched.
-- Physical acceptance remains pending in full.
+- Physical acceptance had not begun.
 
 Deploying the merged commit, enabling either managed-preview policy, and running
 the physical acceptance checklist each require their own explicit authorisation.
@@ -1408,17 +1415,23 @@ Rollback has **not** been deliberately triggered in production and should not
 be induced merely to demonstrate it. The full account is in
 [Task-012-Deployment-Gateway-Remediation.md](Task-012-Deployment-Gateway-Remediation.md).
 
-**Physical camera acceptance is now the remaining Task 12 gate.** Every
-software and deployment prerequisite is complete; what is left is hardware,
-and it requires its own authorisation.
+**The deployment-gateway remediation and all software prerequisites are
+complete.** Functional prototype camera acceptance subsequently passed on
+2026-08-06. Production hardware hardening remains deferred and is not a Task 12
+blocker.
 
-**Preview is currently stopped because of a power failure, not because of the
-installation.** The Pi lost power and rebooted at 2026-08-04 14:34:59 SAST, and
-the service restarted at 14:35:10 SAST as `MainPID` `1494`. The pre-failure
-`MainPID` `70709` and preview process `71087` recorded elsewhere in this
-document belong to the earlier service. Because `preview.auto_start` remains
+**After the 2026-08-04 power failure, preview remained stopped because managed
+auto-start was not yet enabled — not because of the installation.** The Pi lost
+power and rebooted at 2026-08-04 14:34:59 SAST, and the service restarted at
+14:35:10 SAST as `MainPID` `1494`. The pre-failure `MainPID` `70709` and preview
+process `71087` recorded elsewhere in this document belong to the earlier
+service. Because `preview.auto_start` was then absent and therefore effectively
 `false`, preview correctly did not return — which is the same inertness the
 deployment proved, observed again after an unplanned restart.
+
+That historical state was later superseded: managed preview was enabled during
+the authorised acceptance run, and preview successfully auto-started after both
+the application restart and the 2026-08-06 reboot. Preview is running.
 
 **The first Raspberry Pi staging attempt (2026-08-04) was incomplete.** It ran
 the branch's tests on the Pi and was stopped: one gateway-focused test executed
@@ -1450,10 +1463,17 @@ Production was unchanged and the disposable clone was removed. That run is what
 the installation above was authorised from; the first attempt stays classified
 as incomplete.
 
-Physical camera acceptance remains pending, Matthew's visual sign-off has not
-been given, and the 24-hour and 48-hour gates have not started.
+At the conclusion of the second staging validation on 2026-08-04, physical
+camera acceptance remained pending, Matthew had not yet given a decision, and
+the observation periods had not begun. Functional prototype acceptance was
+subsequently completed on 2026-08-06; the 24-hour and 48-hour observations were
+later deferred and were not passed.
 
 ### Evidence
+
+The following table records the state observed in the 2026-08-01 deployment
+window. It is historical evidence and does not describe the later
+managed-preview enablement or the functional-prototype acceptance run.
 
 | Check | Result |
 | ----- | ------ |
@@ -1468,7 +1488,7 @@ been given, and the 24-hour and 48-hour gates have not started.
 | `NRestarts` | Remained `0` |
 | Database | Remained healthy and schema-current |
 | Camera | Remained available — IMX708 through `rpicam` |
-| Preview immediately after restart | Correctly **stopped**, because `auto_start` remains `false` |
+| Preview immediately after restart | Correctly **stopped**, because `auto_start` was then effectively `false` |
 | Old preview process `42175` | Fully reaped — no orphan |
 | Manual preview start | One request, succeeded |
 | Restored preview PID | `71087` |
@@ -1659,5 +1679,10 @@ Task 12 ends at a camera pipeline that can stay up unattended and an acceptance
 gate that says, with evidence, whether the physical installation is good enough
 to build on. The event-capture phase — motion-triggered capture, event lifecycle,
 pre/post buffers, retention and detection — has **not** started and is not begun
-here. It should begin only once the 48-hour stability gate and Matthew's sign-off
-are recorded as passed.
+here. **Task 13 has not started.**
+
+It may begin once functional prototype acceptance is recorded as passed, which
+Matthew gave on 2026-08-06, and after this record is reviewed and merged. It
+does not wait for the 24-hour or 48-hour observation, nor for the rest of the
+deferred hardware hardening. Building the next phase on a prototype camera is a
+project decision; describing that camera as hardened or stable would not be.

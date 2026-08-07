@@ -7251,6 +7251,107 @@ def test_no_current_status_claims_physical_acceptance_completed() -> None:
         assert stale not in acceptance_status, stale
 
 
+
+def _physical_record_section(start: str, end: str) -> str:
+    """Slice one section of the physical-camera task record, whitespace-flat.
+
+    Flattened because every assertion here is about a *sentence*, and markdown
+    decides where those wrap. A test that pins the wrap point fails on a reflow
+    that changed nothing.
+    """
+    text = _read(ACCEPTANCE_RECORD_PATH)
+    index = text.index(start)
+    section = text[index : text.index(end, index + len(start))]
+    return " ".join(section.split())
+
+
+def test_physical_camera_task_record_separates_historical_and_current_status() -> None:
+    """A long record accretes status sentences that were true when written.
+
+    This document now spans an implementation, a merge, a deployment, a power
+    failure, two staging runs, an acceptance run and a scope decision. Every one
+    of those left prose behind in the present tense. The danger is not that the
+    history is wrong -- it is that a reader cannot tell which paragraph is
+    describing today.
+
+    So: the current status block must state today, and each dated section must
+    carry its own date rather than relying on the reader assuming that the
+    newest thing they read is the current one.
+    """
+    text = _read(ACCEPTANCE_RECORD_PATH)
+    flat = " ".join(text.split())
+    status = " ".join(text[: text.index("## Purpose")].split())
+
+    # 1. The current status block says where the project actually is.
+    for current in (
+        "Task 12 is complete at functional prototype scope.",
+        "Matthew accepted the installation as a functional prototype on 2026-08-06",
+        "Managed preview is enabled in the external production configuration",
+        "and preview is running.",
+        "deferred and is not a Task 12 blocker",
+        "The 24-hour and 48-hour results are not passed",
+        "`CAMERA PIPELINE STABLE` is not claimed",
+        "The next application phase may proceed after repository review and merge.",
+        "Task 13 has not started.",
+    ):
+        assert current in status, current
+
+    # 2. The 2026-08-01 deployment evidence stays tied to its own window. Its
+    #    stopped preview and false policies were the deployment's central proof,
+    #    and they are the most misreadable rows in the file now that both have
+    #    since changed.
+    deployment = _physical_record_section(
+        "## Production deployment — performed", "## Deviations"
+    )
+    assert (
+        "The following table records the state observed in the 2026-08-01 "
+        "deployment window." in deployment
+    )
+    assert "It is historical evidence and does not describe the later" in deployment
+    assert "`auto_start` was then effectively `false`" in deployment
+    assert "| `preview.auto_start` | Remained `false` |" in deployment
+    assert "Physical acceptance was not begun." in deployment
+
+    # 3. The narrow validation's outstanding-step list is dated to when it was
+    #    taken, not left standing as a claim about what is still undone.
+    boundary = _physical_record_section(
+        "## Raspberry Pi validation boundary", "## Rollback"
+    )
+    assert (
+        "At the conclusion of the narrow Raspberry Pi validation on 2026-07-31"
+        in boundary
+    )
+    assert "remained outstanding" in boundary
+    assert "Those steps were performed or reclassified later" in boundary
+
+    # 4. And the unscoped present-tense claims are gone from the whole record.
+    #    Each was true on the day it was written and is false today.
+    for stale in (
+        "Physical camera acceptance is now the remaining Task 12 gate",
+        "Preview is currently stopped",
+        "Physical camera acceptance remains pending, Matthew's visual sign-off",
+        "Every remaining step in the paragraph above is still outstanding",
+        "physical acceptance record remains pending",
+        "Physical acceptance remains pending in full",
+        "both managed-preview policies remain `false`",
+        "It should begin only once the 48-hour stability gate",
+    ):
+        assert stale not in flat, stale
+
+    # 5. Their historically scoped replacements are present, so this is temporal
+    #    scoping rather than deletion of the record's own history.
+    for preserved in (
+        "At the conclusion of the second staging validation on 2026-08-04",
+        "physical camera acceptance remained pending",
+        "Before the original Task 12 implementation merge",
+        "would have left the physical acceptance record pending",
+        "After the 2026-08-04 power failure, preview remained stopped",
+        "That historical state was later superseded",
+        "the first attempt stays classified as incomplete",
+    ):
+        assert preserved in flat, preserved
+
+
 @pytest.mark.parametrize(
     "finding",
     [
