@@ -12,7 +12,13 @@ Scope of this foundation:
   recognition, classification, tracking or inference of any kind;
 * it consumes JPEG frames from the *existing* preview stream (via the shared
   streaming broker) and never launches a second camera process;
-* it never triggers a production still capture automatically.
+* it never takes a still image, and imports nothing that can: no camera
+  coordinator, no capture workflow, no capture archive. A material transition is
+  announced through the monitor's transition-listener callback, and *what*
+  listens -- notifications, and since Task 13.1 the optional motion-triggered
+  capture feature -- is decided by the application composition layer, not here.
+  ``motion_detected`` still means the scene changed, never that a bird is
+  present, whatever a listener chooses to do about it.
 
 Responsibilities are split across:
 

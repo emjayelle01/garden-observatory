@@ -43,6 +43,7 @@ from mgo.camera.streaming import STREAM_IDLE_TIMEOUT_SECONDS
 from mgo.captures import (
     CaptureArchive,
     CaptureArchiveError,
+    CaptureWorkflow,
     capture_detail,
     capture_summary,
 )
@@ -61,6 +62,7 @@ from mgo.core.health import collect_health, worst_status
 from mgo.core.health_monitor import run_health_monitor
 from mgo.core.identity import build_identity, get_application_version
 from mgo.core.observations import list_observations, record_observation
+from mgo.event_capture import EventCaptureRuntimeState, EventCaptureService
 from mgo.motion import (
     BrokerFrameSource,
     FrameDifferenceDetector,
@@ -253,6 +255,29 @@ class MotionStatusResponse(BaseModel):
     evaluated_at: str
 
 
+class EventCaptureStatusResponse(BaseModel):
+    """Typed, read-only projection of the motion-triggered capture state.
+
+    Every field is either a counter this process has kept since it started, a
+    state name, a timestamp or the fixed public message for the last failure
+    category. There is deliberately no filesystem path, no capture directory, no
+    database location and no raw exception text: an operator learns *what
+    happened*, and nothing about where the application lives.
+    """
+
+    enabled: bool
+    state: str
+    pending_triggers: int
+    total_triggers_received: int
+    total_captures_succeeded: int
+    total_captures_failed: int
+    total_triggers_dropped: int
+    last_trigger_at: str | None
+    last_capture_id: str | None
+    last_capture_at: str | None
+    last_error: str | None
+
+
 def _capture_service(app: FastAPI) -> CaptureService:
     """Return the capture service, building a default if none was attached.
 
@@ -346,6 +371,44 @@ def _camera_coordinator(app: FastAPI) -> CameraCoordinator:
     return coordinator
 
 
+def _capture_workflow(app: FastAPI) -> CaptureWorkflow:
+    """Return the shared capture workflow, building one if none was attached.
+
+    Composes :func:`_camera_coordinator` and :func:`_capture_archive`, so a test
+    that attached its own mock-backed services gets a workflow over *those* and
+    never a production backend built behind its back -- the same rule the
+    coordinator fallback follows.
+
+    Both the manual capture endpoint and the event-capture worker resolve their
+    workflow through here, which is what stops the two capture paths from
+    drifting apart.
+    """
+    workflow: CaptureWorkflow | None = getattr(app.state, "capture_workflow", None)
+    if workflow is not None:
+        return workflow
+    workflow = CaptureWorkflow(_camera_coordinator(app), _capture_archive(app))
+    app.state.capture_workflow = workflow
+    return workflow
+
+
+def _event_capture_state(app: FastAPI) -> EventCaptureRuntimeState:
+    """Return the event-capture runtime state, building a default if absent.
+
+    The lifespan always attaches one -- enabled or not -- so the status endpoint
+    is truthful from the first request. The fallback mirrors the configured
+    enablement and creates no queue, no worker and no camera activity, which is
+    what keeps ``GET /event-capture/status`` a pure read.
+    """
+    state: EventCaptureRuntimeState | None = getattr(
+        app.state, "event_capture_state", None
+    )
+    if state is not None:
+        return state
+    state = EventCaptureRuntimeState(enabled=config.event_capture.enabled)
+    app.state.event_capture_state = state
+    return state
+
+
 def _attempt_preview_auto_start(coordinator: CameraCoordinator) -> None:
     """Make the single configured preview start attempt during startup.
 
@@ -377,23 +440,39 @@ async def _shutdown_lifespan(
     monitor_tasks: Sequence[asyncio.Task[None]],
     coordinator: CameraCoordinator,
     notification_manager: NotificationManager,
+    motion_task: asyncio.Task[None] | None = None,
+    event_capture: EventCaptureService | None = None,
 ) -> BaseException | None:
     """Run every shutdown stage and return the first failure, if any.
 
     Each stage is attempted even when an earlier one failed. That is the whole
-    point: the stages are independent obligations -- stop the monitors, release
-    the camera, announce the stop, record it -- and a failure in one is never a
-    reason to skip the rest. In particular, a monitor that raises on the way out
-    must not be able to strand a camera process.
+    point: the stages are independent obligations -- stop the producer, retire
+    the worker, stop the monitors, release the camera, announce the stop, record
+    it -- and a failure in one is never a reason to skip the rest. In
+    particular, a monitor that raises on the way out must not be able to strand
+    a camera process, and an event-capture worker that fails to retire must not
+    be able to skip camera shutdown.
 
-    Every supplied monitor task is driven to a terminal state before camera
-    shutdown begins, so the application can never return from its lifespan with
-    a monitor it created still running.
+    The first three stages are ordered, and the order is the guarantee:
+
+    1. **the motion producer stops first**, so no new trigger can be submitted;
+    2. **the event-capture worker is retired next** -- it stops accepting work,
+       discards anything queued that had not started, lets one in-flight capture
+       finish, and only then returns;
+    3. **the remaining monitors are drained**, and only after all of that is the
+       camera coordinator shut down.
+
+    Camera shutdown therefore cannot begin while an automatic capture still owns
+    -- or could still ask for -- the camera.
+
+    Every supplied task is driven to a terminal state before camera shutdown
+    begins, so the application can never return from its lifespan with a monitor
+    or worker it created still running.
 
     No failure is swallowed: every one is logged with its traceback, and the
-    *first* in ``monitor_tasks`` order is returned so the caller can decide
-    whether it is the failure worth raising or whether an earlier, more
-    informative one already exists.
+    first in stage order (and, within the monitor stage, in ``monitor_tasks``
+    order) is returned so the caller can decide whether it is the failure worth
+    raising or whether an earlier, more informative one already exists.
     """
     for event in stop_events:
         event.set()
@@ -405,6 +484,26 @@ async def _shutdown_lifespan(
         LOGGER.error("Lifespan cleanup stage %r failed", stage, exc_info=exc)
         if first_error is None:
             first_error = exc
+
+    if motion_task is not None:
+        # Drained before anything else: while the motion monitor is alive it can
+        # still publish a material transition, and a transition submitted after
+        # the worker had been retired would be silently dropped work that the
+        # counters would then have to explain.
+        (motion_result,) = await asyncio.gather(
+            motion_task, return_exceptions=True
+        )
+        if isinstance(motion_result, BaseException):
+            _record(f"motion-monitor[{motion_task.get_name()}]", motion_result)
+
+    if event_capture is not None:
+        try:
+            await event_capture.shutdown()
+        except BaseException as exc:
+            # Recorded, never re-raised here: the camera still has to be
+            # released, the stop event still has to be published and the stop
+            # observation still has to be written.
+            _record("event-capture-shutdown", exc)
 
     # ``return_exceptions=True`` is load-bearing, not a style choice. The
     # default propagates the first monitor exception the instant it happens and
@@ -477,7 +576,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 002) alongside the observation schema in the shared database. The archive
     # only needs the shared path; it opens bounded connections per operation and
     # never manages its own engine or schema.
-    app.state.capture_archive = CaptureArchive(config.storage.database_path)
+    capture_archive = CaptureArchive(config.storage.database_path)
+    app.state.capture_archive = capture_archive
 
     # Establish the initial database-health state before serving, so /health
     # and /database/status are truthful from the first request rather than
@@ -564,6 +664,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         restore_after_capture=config.preview.restore_after_capture,
     )
     app.state.camera_coordinator = camera_coordinator
+    # The one capture-and-catalogue path. Both the manual endpoint and the
+    # motion-triggered worker below run through this object, so a manual capture
+    # and an automatic capture can never be persisted by two different rules.
+    capture_workflow = CaptureWorkflow(camera_coordinator, capture_archive)
+    app.state.capture_workflow = capture_workflow
+    # Always attached, enabled or not, so GET /event-capture/status is truthful
+    # from the first request rather than reporting an absence as a disabled
+    # feature. Creating the holder starts nothing: the worker is created below,
+    # and only when the feature is enabled.
+    event_capture_state = EventCaptureRuntimeState(
+        enabled=config.event_capture.enabled
+    )
+    app.state.event_capture_state = event_capture_state
+    event_capture_service: EventCaptureService | None = None
+    if config.event_capture.enabled:
+        event_capture_service = EventCaptureService(
+            capture_workflow,
+            event_capture_state,
+            config.storage.database_path,
+        )
+    app.state.event_capture_service = event_capture_service
     camera_detector = build_detector(config.camera.backend)
 
     # Material camera readiness changes become notification events. The monitor
@@ -632,11 +753,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 _attempt_preview_auto_start, camera_coordinator
             )
 
+        # Started BEFORE the motion monitor, deliberately: the worker must be
+        # able to receive a trigger before anything can produce one. Starting it
+        # captures nothing -- it only parks the worker on an empty queue.
+        if event_capture_service is not None:
+            event_capture_service.start()
+
         if config.motion.enabled:
-            # Material motion transitions become notification events, mirroring
-            # the camera wiring above.
+            # One material motion transition, two independent consumers. Each is
+            # isolated from the other: a notification transport that fails must
+            # not cost an automatic capture, and a full trigger queue must not
+            # cost a notification. Neither may reach the motion monitor -- the
+            # motion subsystem stays transport- and capture-agnostic, and this
+            # composition layer is the only place the two are connected.
             def _publish_motion_transition(result: MotionResult) -> None:
-                notification_manager.publish(_motion_event(result))
+                try:
+                    notification_manager.publish(_motion_event(result))
+                except Exception:
+                    LOGGER.exception(
+                        "Motion notification publication failed; the "
+                        "transition is still offered to event capture"
+                    )
+                if event_capture_service is not None:
+                    try:
+                        event_capture_service.submit(result)
+                    except Exception:
+                        LOGGER.exception(
+                            "Motion trigger submission to event capture failed"
+                        )
 
             motion_task = asyncio.create_task(
                 run_motion_monitor(
@@ -658,9 +802,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         primary_error = exc
         primary_traceback = exc.__traceback__
     finally:
+        # The motion task is handed over separately rather than added to this
+        # list: it is the *producer* of event-capture work, so it has to reach a
+        # terminal state before the worker is retired, not alongside the other
+        # monitors.
         monitor_tasks = [health_task, database_task, camera_task]
-        if motion_task is not None:
-            monitor_tasks.append(motion_task)
         cleanup_error = await _shutdown_lifespan(
             stop_events=(
                 stop_event,
@@ -671,6 +817,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             monitor_tasks=monitor_tasks,
             coordinator=camera_coordinator,
             notification_manager=notification_manager,
+            motion_task=motion_task,
+            event_capture=event_capture_service,
         )
 
     if primary_error is not None:
@@ -867,10 +1015,21 @@ async def camera_capture(request: Request) -> dict[str, Any]:
     genuinely running beforehand -- restarts it afterwards. A restoration
     failure never changes this response: the capture's own outcome is the
     answer, and preview truth stays on the preview status endpoint.
+
+    The capture and its catalogue record are produced by the shared
+    :class:`~mgo.captures.workflow.CaptureWorkflow`, the same one the
+    motion-triggered worker uses, so the two capture paths cannot diverge. The
+    response, its fields and every failure mapping are unchanged. This route
+    supplies no ``extra_metadata``: a capture an operator asked for is an
+    ordinary manual capture and never acquires a motion origin.
     """
-    coordinator = _camera_coordinator(request.app)
+    workflow = _capture_workflow(request.app)
     try:
-        result = await asyncio.to_thread(coordinator.capture_image)
+        # One camera transaction, then one archive write, both off the event
+        # loop. A capture failure raises before anything is archived; an archive
+        # failure leaves the successfully captured JPEG on disk for a later
+        # reconciliation rather than deleting evidence that is still valid.
+        record = await asyncio.to_thread(workflow.capture)
     except CameraUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except CaptureTimeoutError as exc:
@@ -881,21 +1040,66 @@ async def camera_capture(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except CameraCaptureError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    # The capture is complete and verified on disk, and the camera-operation
-    # lock has already been released -- database work never holds the camera.
-    # Persist its metadata as the authoritative catalogue record. A persistence
-    # failure must NOT delete the JPEG: the capture itself remains valid, so we
-    # surface an error and leave the file in place for a later reconciliation.
-    archive = _capture_archive(request.app)
-    try:
-        record = archive.record_capture(result)
     except CaptureArchiveError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    response = result.as_dict()
-    response["capture_id"] = str(record.id)
-    return response
+    return {
+        # ``success`` is ``True`` by construction: a capture that did not
+        # succeed raised above and never reached the archive, so a persisted
+        # record is a successful capture by definition.
+        "success": True,
+        "filename": record.filename,
+        "absolute_path": record.absolute_path,
+        "timestamp": record.captured_at_utc.isoformat(),
+        "width": record.width,
+        "height": record.height,
+        "filesize_bytes": record.filesize_bytes,
+        "backend": record.camera_backend,
+        "capture_id": str(record.id),
+    }
+
+
+@app.get("/event-capture/status")
+def event_capture_status(request: Request) -> EventCaptureStatusResponse:
+    """Return the motion-triggered capture state and its lifetime counters.
+
+    Read-only in the strongest sense available: it reads one
+    application-managed holder and nothing else. It never touches the camera,
+    never starts or stops preview, never submits a trigger, never invokes the
+    capture workflow, never opens the database, never runs a migration, never
+    waits for the worker and never alters a counter. Requesting it is as cheap
+    and as safe as reading a variable.
+
+    Always HTTP 200 while the application is serving -- including ``disabled``
+    when the feature is off (every counter zero, every timestamp ``null``) and
+    including ``error`` after a failed automatic capture, which is reported in
+    ``state`` and ``last_error`` rather than as an HTTP error.
+
+    ``last_error`` is one of a fixed set of category messages. It never carries
+    an exception message, a traceback, a filesystem path or a command line.
+    """
+    snapshot = _event_capture_state(request.app).snapshot()
+    return EventCaptureStatusResponse(
+        enabled=snapshot.enabled,
+        state=snapshot.state.value,
+        pending_triggers=snapshot.pending_triggers,
+        total_triggers_received=snapshot.total_triggers_received,
+        total_captures_succeeded=snapshot.total_captures_succeeded,
+        total_captures_failed=snapshot.total_captures_failed,
+        total_triggers_dropped=snapshot.total_triggers_dropped,
+        last_trigger_at=(
+            snapshot.last_trigger_at.isoformat()
+            if snapshot.last_trigger_at is not None
+            else None
+        ),
+        last_capture_id=snapshot.last_capture_id,
+        last_capture_at=(
+            snapshot.last_capture_at.isoformat()
+            if snapshot.last_capture_at is not None
+            else None
+        ),
+        last_error=snapshot.last_error,
+    )
 
 
 @app.get("/camera/preview/status")

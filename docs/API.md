@@ -404,6 +404,74 @@ replaces a capture failure.
 only the capture response will not learn that preview did not return; poll
 preview status if that matters to it.
 
+## Motion-triggered capture (Task 13.1)
+
+Task 13.1 added one endpoint and changed none. `POST /camera/capture` now runs
+through the shared `CaptureWorkflow` that the motion-triggered worker also uses,
+so the manual and automatic paths cannot diverge. **Its path, method, response
+fields, `capture_id`, filename semantics, `absolute_path`, timestamp
+representation, width, height, filesize, backend and every error mapping are
+unchanged**, and it supplies no capture metadata — a manual capture never
+acquires `origin = motion`.
+
+### `GET /event-capture/status`
+
+Read-only, typed, and additive. It returns `200` whenever the application is
+serving — including when the feature is disabled, and including after a failed
+automatic capture, which is reported in `state` and `last_error` rather than as
+an HTTP error.
+
+```json
+{
+  "enabled": false,
+  "state": "disabled",
+  "pending_triggers": 0,
+  "total_triggers_received": 0,
+  "total_captures_succeeded": 0,
+  "total_captures_failed": 0,
+  "total_triggers_dropped": 0,
+  "last_trigger_at": null,
+  "last_capture_id": null,
+  "last_capture_at": null,
+  "last_error": null
+}
+```
+
+`state` is one of `disabled`, `idle`, `capturing`, `error`. Timestamps are
+ISO-8601 UTC or `null`. Counters are process-lifetime and are never persisted.
+
+**What a request to it does not do:** it does not touch the camera, start or stop
+preview, submit a trigger, invoke the capture workflow, open the database, run a
+migration, wait for the worker or alter a counter. It reads one
+application-managed holder and nothing else.
+
+**Privacy and information disclosure:** the response carries no filesystem path,
+no capture directory, no database location and no configuration path.
+`last_error` is one of six fixed category sentences and never contains an
+exception message, `repr`, traceback, subprocess command line or environment
+value — the raw exception goes to the application log only.
+
+### Which operations are coordinated (updated)
+
+| Endpoint / actor | Kind | Coordinated |
+| ---------------- | ---- | ----------- |
+| `POST /camera/preview/start` | mutation | Yes |
+| `POST /camera/preview/stop` | mutation | Yes |
+| `POST /camera/capture` | mutation | Yes |
+| **motion-triggered capture** | **mutation** | **Yes — same coordinator** |
+| `GET /camera/preview/status` | read | No |
+| `GET /camera/preview/stream` | read | No |
+| `GET /event-capture/status` | read | No |
+| `GET /health` | read | No |
+
+An automatic capture is an ordinary coordinated camera mutation: it releases
+preview, owns the camera exclusively and restores preview under the existing
+`preview.restore_after_capture` policy. There is no second camera owner and no
+second preview process.
+
+The feature is **disabled by default** and adds no schema migration and no
+dependency. See [`docs/Event-Capture.md`](Event-Capture.md).
+
 ## Compatibility promise
 
 - `/` keeps its exact three keys and their values. Only the *source* of
@@ -413,6 +481,9 @@ preview status if that matters to it.
   had before Task 8. Nothing was removed, renamed or restructured.
 - `/version` is additive: a new route with no persistent state, no schema
   change and no configuration change.
+- `/event-capture/status` is additive: a new read-only route with no schema
+  change, whose feature is off by default. `POST /camera/capture` keeps every
+  field, value and status code it had before Task 13.1.
 
 No client, script, probe or dashboard needs to change in either direction, and
 reverting the branch restores the previous behaviour exactly.

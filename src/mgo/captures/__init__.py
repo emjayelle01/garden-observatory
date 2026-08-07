@@ -11,7 +11,10 @@ numbered migration runner; there is no ORM and no separate database engine.
 * :mod:`mgo.captures.models` -- the immutable :class:`Capture` domain model and
   its JSON serialisers;
 * :mod:`mgo.captures.archive` -- the :class:`CaptureArchive` that records and
-  retrieves capture metadata.
+  retrieves capture metadata;
+* :mod:`mgo.captures.workflow` -- the :class:`CaptureWorkflow` that composes a
+  camera capture with its catalogue record, shared by manual and automatic
+  captures so the two can never diverge.
 """
 
 from __future__ import annotations
@@ -22,11 +25,13 @@ from mgo.captures.archive import (
     DuplicateCaptureError,
 )
 from mgo.captures.models import Capture, capture_detail, capture_summary
+from mgo.captures.workflow import CaptureWorkflow
 
 __all__ = [
     "Capture",
     "CaptureArchive",
     "CaptureArchiveError",
+    "CaptureWorkflow",
     "DuplicateCaptureError",
     "capture_detail",
     "capture_summary",

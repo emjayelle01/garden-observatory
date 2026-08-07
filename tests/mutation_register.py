@@ -30,9 +30,20 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+#: The suite a mutation's ``tests`` selector is applied to, unless the entry
+#: names another. Every gateway entry below predates this field and keeps this
+#: default, so adding it changed no existing mutation.
+GATEWAY_SUITE = "tests/test_deployment_gateway.py"
+
 
 class Mutation(NamedTuple):
-    """One deliberate defect and the tests that must catch it."""
+    """One deliberate defect and the tests that must catch it.
+
+    ``tests`` is a ``pytest -k`` selector; ``suite`` is the whitespace-separated
+    list of test modules it is applied to. ``suite`` has a default because this
+    register began as the deployment gateway's alone: an entry that does not
+    name a suite is a gateway entry, exactly as it was.
+    """
 
     identifier: str
     asset: str
@@ -40,6 +51,7 @@ class Mutation(NamedTuple):
     new: str
     tests: str
     note: str
+    suite: str = GATEWAY_SUITE
 
 
 GATEWAY = "scripts/deploy/mgo-validate"
@@ -71,6 +83,19 @@ ACCEPTANCE_RECORD = "docs/tasks/Task-012-Physical-Camera-Acceptance.md"
 #: installation record, and the one claim in it that must never soften is that
 #: the retired wildcard policy stays retired.
 DEPLOYMENT_DOC = "docs/Deployment-Gateway.md"
+
+#: Task 13.1 application sources. These are not shipped shell assets, but the
+#: register's purpose is the same for them: a motion-triggered capture that
+#: quietly stops being bounded, stops being counted, or stops going through the
+#: one camera owner would keep passing every status check it has.
+EVENT_CAPTURE_SERVICE = "src/mgo/event_capture/service.py"
+CAPTURE_WORKFLOW = "src/mgo/captures/workflow.py"
+APPLICATION = "src/mgo/api/app.py"
+
+#: The suites that own those behaviours.
+EVENT_CAPTURE_SUITE = "tests/test_event_capture.py"
+CAPTURE_WORKFLOW_SUITE = "tests/test_capture_workflow.py"
+APPLICATION_SUITE = "tests/test_app_routes.py"
 
 
 MUTATIONS: tuple[Mutation, ...] = (
@@ -1815,5 +1840,83 @@ MUTATIONS: tuple[Mutation, ...] = (
         ' holds eight rows and stays there.**',
         'capture_catalogue_is_the_stable_eight_record_baseline',
         'The stable baseline is relabelled onto the growing telemetry table.',
+    ),
+    # --- Task 13.1: motion-triggered capture --------------------------------
+    #
+    # Seven entries, and each defends a property that would fail *quietly* in
+    # production: a capture nobody asked for, a backlog nobody bounded, a
+    # counter nobody could trust, a second camera owner, metadata that changed
+    # under the archive, a worker that died on its first bad night, and pending
+    # work that started during shutdown. None of them would be visible from a
+    # passing status endpoint, which is exactly why they are here.
+    #
+    # Single-line anchors throughout: these are Python sources, which check out
+    # CRLF on Windows and LF elsewhere, and a multi-line `old` would match on
+    # one host and go stale on the other.
+    Mutation(
+        'event-capture-triggers-on-any-motion-status',
+        EVENT_CAPTURE_SERVICE,
+        '        if result.status is not MotionStatus.MOTION_DETECTED:',
+        '        if False:',
+        'only_motion_detected_is_admitted',
+        'Waiting, baseline, no-motion and error all take a picture.',
+        suite=EVENT_CAPTURE_SUITE,
+    ),
+    Mutation(
+        'event-capture-queue-becomes-unbounded',
+        EVENT_CAPTURE_SERVICE,
+        'QUEUE_CAPACITY = 1',
+        'QUEUE_CAPACITY = 0',
+        'queue_capacity_is_exactly_one or third_trigger_is_dropped',
+        'A windy afternoon builds an unbounded backlog of stale moments.',
+        suite=EVENT_CAPTURE_SUITE,
+    ),
+    Mutation(
+        'dropped-triggers-stop-being-counted',
+        EVENT_CAPTURE_SERVICE,
+        '            self._state.total_triggers_dropped += 1',
+        '            pass',
+        'third_trigger_is_dropped',
+        'Coalesced work disappears from the only record that holds it.',
+        suite=EVENT_CAPTURE_SUITE,
+    ),
+    Mutation(
+        'automatic-capture-gets-its-own-camera-coordinator',
+        APPLICATION,
+        '    capture_workflow = CaptureWorkflow(camera_coordinator, capture_archive)',
+        '    capture_workflow = CaptureWorkflow(\n'
+        '        CameraCoordinator(capture_service, preview_service),\n'
+        '        capture_archive,\n'
+        '    )',
+        'preview_remains_a_single_producer_with_event_capture_enabled',
+        'A second coordinator ends the single-owner guarantee for the camera.',
+        suite=APPLICATION_SUITE,
+    ),
+    Mutation(
+        'capture-metadata-is-no-longer-defensively-copied',
+        CAPTURE_WORKFLOW,
+        '        metadata = None if extra_metadata is None else dict(extra_metadata)',
+        '        metadata = extra_metadata',
+        'metadata_is_defensively_copied',
+        "A caller's later edit rewrites attribution already being persisted.",
+        suite=CAPTURE_WORKFLOW_SUITE,
+    ),
+    Mutation(
+        'one-failed-capture-kills-the-worker',
+        EVENT_CAPTURE_SERVICE,
+        '        except Exception as error:',
+        '        except asyncio.CancelledError as error:',
+        'worker_survives_a_failure_and_captures_again',
+        'The first bad night ends automatic capture until someone restarts it.',
+        suite=EVENT_CAPTURE_SUITE,
+    ),
+    Mutation(
+        'shutdown-lets-pending-work-start',
+        EVENT_CAPTURE_SERVICE,
+        '                self._queue.get_nowait()',
+        '                break',
+        'pending_trigger_is_discarded_and_never_starts',
+        'A queued trigger takes the camera after shutdown has begun.',
+        suite=EVENT_CAPTURE_SUITE,
     ),
 )

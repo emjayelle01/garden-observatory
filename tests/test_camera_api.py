@@ -349,7 +349,12 @@ def test_archive_persistence_runs_without_the_camera_lock(
     observed: dict[str, bool] = {}
 
     class _ProbingArchive(CaptureArchive):
-        def record_capture(self, result: object) -> object:
+        def record_capture(
+            self,
+            result: object,
+            *,
+            extra_metadata: dict[str, object] | None = None,
+        ) -> object:
             started = threading.Event()
 
             def _probe() -> None:
@@ -360,7 +365,9 @@ def test_archive_persistence_runs_without_the_camera_lock(
             worker.start()
             observed["lock_free"] = started.wait(5.0)
             worker.join(5.0)
-            return super().record_capture(result)  # type: ignore[arg-type]
+            return super().record_capture(  # type: ignore[arg-type]
+                result, extra_metadata=extra_metadata
+            )
 
     database = tmp_path / "mgo.db"
     apply_migrations(database)

@@ -6,6 +6,13 @@ capture archive to ``app.state``. They verify that a successful capture returns
 a ``capture_id`` while remaining backwards compatible, that the archive
 endpoints reflect stored metadata newest-first, that unknown ids yield 404, and
 that a persistence failure preserves the JPEG.
+
+Task 13.1 moved the endpoint's two steps behind the shared
+:class:`~mgo.captures.workflow.CaptureWorkflow`, which the motion-triggered
+worker also uses. The endpoint's public contract did not change, and the tests
+below are the proof: the same path, the same fields, the same ``capture_id``,
+the same failure mapping, the same JPEG-preservation behaviour -- and a manual
+capture that never acquires a motion origin.
 """
 
 from __future__ import annotations
@@ -14,14 +21,25 @@ import asyncio
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fastapi import HTTPException
 
 from mgo.api.app import camera_capture, capture, captures
-from mgo.camera import CaptureService, MockBackend
+from mgo.camera import CameraCoordinator, CaptureService, MockBackend
+from mgo.camera.exceptions import (
+    BackendCaptureError,
+    CameraCaptureError,
+    CameraUnavailableError,
+    CaptureTimeoutError,
+    CaptureWriteError,
+)
+from mgo.camera.preview import PreviewService
+from mgo.camera.preview_backend import MockPreviewBackend
 from mgo.captures.archive import CaptureArchive
-from mgo.core.config import CameraConfig
+from mgo.captures.workflow import CaptureWorkflow
+from mgo.core.config import CameraConfig, PreviewConfig
 from mgo.core.database import apply_migrations
 
 
@@ -231,3 +249,152 @@ def test_unpersisted_result_never_reaches_archive_on_disabled(
         asyncio.run(camera_capture(request))
 
     assert archive.list_captures() == []
+
+
+# --- Task 13.1: the shared workflow did not change this contract -------------
+
+
+def _workflow_request(workflow: object) -> SimpleNamespace:
+    """Build a fake request exposing a pre-built capture workflow."""
+    return SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(capture_workflow=workflow))
+    )
+
+
+class _FailingCoordinator:
+    """A coordinator double whose capture always raises ``error``."""
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+
+    def capture_image(self) -> Any:
+        raise self._error
+
+
+class _RecordingArchive:
+    """Wraps a real archive, remembering what metadata it was handed."""
+
+    def __init__(self, inner: CaptureArchive) -> None:
+        self._inner = inner
+        self.metadata: list[dict[str, Any] | None] = []
+
+    def record_capture(
+        self, result: Any, *, extra_metadata: dict[str, Any] | None = None
+    ) -> Any:
+        self.metadata.append(extra_metadata)
+        return self._inner.record_capture(result, extra_metadata=extra_metadata)
+
+
+def test_the_manual_endpoint_uses_the_shared_workflow(tmp_path: Path) -> None:
+    """The route resolves the one workflow both capture paths run through."""
+    archive = _archive(tmp_path)
+    coordinator = CameraCoordinator(
+        _service(tmp_path),
+        PreviewService(
+            PreviewConfig(
+                enabled=False,
+                width=640,
+                height=480,
+                fps=15,
+                startup_timeout_seconds=1.0,
+                shutdown_timeout_seconds=1.0,
+            ),
+            MockPreviewBackend(),
+        ),
+    )
+    workflow = CaptureWorkflow(coordinator, archive)
+
+    result = asyncio.run(camera_capture(_workflow_request(workflow)))
+
+    assert result["success"] is True
+    uuid.UUID(result["capture_id"])
+    assert len(archive.list_captures()) == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "status_code"),
+    [
+        (CameraUnavailableError("no cameras available"), 503),
+        (CaptureTimeoutError("timed out"), 504),
+        (BackendCaptureError("exit code 1"), 502),
+        (CaptureWriteError("could not write"), 500),
+        (CameraCaptureError("something else in the camera domain"), 500),
+    ],
+)
+def test_the_failure_mapping_is_unchanged(
+    tmp_path: Path, error: BaseException, status_code: int
+) -> None:
+    """Every camera-domain failure still maps to the status code it always did."""
+    workflow = CaptureWorkflow(
+        _FailingCoordinator(error),  # type: ignore[arg-type]
+        _archive(tmp_path),
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(camera_capture(_workflow_request(workflow)))
+
+    assert excinfo.value.status_code == status_code
+    # The camera domain's own message still reaches the client, as before.
+    assert excinfo.value.detail == str(error)
+
+
+def test_a_manual_capture_never_becomes_a_motion_capture(tmp_path: Path) -> None:
+    """An operator's capture carries no motion attribution, ever."""
+    recording = _RecordingArchive(_archive(tmp_path))
+    workflow = CaptureWorkflow(
+        CameraCoordinator(
+            _service(tmp_path),
+            PreviewService(
+                PreviewConfig(
+                    enabled=False,
+                    width=640,
+                    height=480,
+                    fps=15,
+                    startup_timeout_seconds=1.0,
+                    shutdown_timeout_seconds=1.0,
+                ),
+                MockPreviewBackend(),
+            ),
+        ),
+        recording,  # type: ignore[arg-type]
+    )
+
+    result = asyncio.run(camera_capture(_workflow_request(workflow)))
+
+    # The route supplies nothing at all -- not an empty dictionary, nothing.
+    assert recording.metadata == [None]
+    stored = _archive_of(recording).get_capture(uuid.UUID(result["capture_id"]))
+    assert stored is not None
+    assert stored.extra_metadata == {}
+    assert "origin" not in stored.extra_metadata
+
+
+def _archive_of(recording: _RecordingArchive) -> CaptureArchive:
+    """Reach the real archive behind the recording wrapper."""
+    return recording._inner
+
+
+def test_the_response_fields_are_exactly_the_task_2b_set_plus_capture_id(
+    tmp_path: Path,
+) -> None:
+    """A second, explicit guard on the response shape after the refactor."""
+    request = _request(service=_service(tmp_path), archive=_archive(tmp_path))
+
+    result = asyncio.run(camera_capture(request))
+
+    assert set(result) == {
+        "success",
+        "filename",
+        "absolute_path",
+        "timestamp",
+        "width",
+        "height",
+        "filesize_bytes",
+        "backend",
+        "capture_id",
+    }
+    assert result["success"] is True
+    assert result["timestamp"].endswith("+00:00")
+    assert Path(result["absolute_path"]).is_absolute()
+    assert Path(result["absolute_path"]).exists()
+    assert result["filename"] == Path(result["absolute_path"]).name

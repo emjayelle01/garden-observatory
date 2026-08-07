@@ -224,6 +224,29 @@ class NotificationsConfig:
 
 
 @dataclass(frozen=True)
+class EventCaptureConfig:
+    """Motion-triggered still-capture settings.
+
+    ``enabled`` gates the whole feature and is off by default, deliberately and
+    load-bearingly: a configuration written before this section existed must go
+    on behaving exactly as it did, with no trigger queue, no background worker
+    and no camera activity that nobody asked for.
+
+    There is only one setting. Queue length, retries, burst size, pre/post-roll,
+    event duration and retention are all *not* configurable here: the queue is
+    fixed at one pending trigger, there is no retry, and one motion transition
+    produces at most one still. Adding a knob for any of those would advertise a
+    behaviour this feature does not have.
+
+    Enabling it requires ``camera.enabled``, ``preview.enabled``,
+    ``preview.auto_start``, ``preview.restore_after_capture`` and
+    ``motion.enabled`` -- see :func:`_validate_event_capture_policy`.
+    """
+
+    enabled: bool
+
+
+@dataclass(frozen=True)
 class DatabaseConfig:
     """SQLite runtime settings.
 
@@ -268,6 +291,11 @@ class MGOConfig:
     notifications: NotificationsConfig
     database: DatabaseConfig
     health: HealthConfig
+    # Last, and with a default, so every existing construction of this object --
+    # in the application and in the tests -- keeps working unchanged and gets the
+    # feature switched off. A configuration that predates the section is
+    # therefore indistinguishable from one that explicitly disables it.
+    event_capture: EventCaptureConfig = EventCaptureConfig(enabled=False)
 
 
 def _project_path(value: str) -> Path:
@@ -406,6 +434,57 @@ def _validate_motion_config(motion: MotionConfig) -> None:
 
     if motion.cooldown_seconds < 0:
         raise ValueError("Motion cooldown cannot be negative")
+
+
+#: Sensible defaults for event capture when the ``[event_capture]`` section is
+#: absent, so configuration files written before Task 13.1 keep loading
+#: unchanged with motion-triggered capture disabled.
+_EVENT_CAPTURE_DEFAULTS = {
+    "enabled": False,
+}
+
+
+def _validate_event_capture_policy(
+    event_capture: EventCaptureConfig,
+    camera: CameraConfig,
+    preview: PreviewConfig,
+    motion: MotionConfig,
+) -> None:
+    """Reject a motion-triggered capture policy that can never run.
+
+    Every dependency below is a real one, not a tidiness rule:
+
+    * ``camera.enabled`` -- an automatic capture is a camera operation;
+    * ``preview.enabled`` -- motion analyses *preview* frames, so with preview
+      off there is no frame source and no trigger could ever be produced;
+    * ``preview.auto_start`` -- the point of the feature is unattended
+      operation, and without auto-start a service restart or a reboot leaves
+      preview stopped until an operator asks for it, silently ending automatic
+      capture until someone notices;
+    * ``preview.restore_after_capture`` -- a still capture takes the camera away
+      from preview, so without restoration the *first* automatic capture would
+      permanently remove the frame source that produces triggers;
+    * ``motion.enabled`` -- there is no trigger at all without the motion
+      monitor.
+
+    Each message names only the two conflicting settings: no configuration
+    path, no unrelated value and no file content.
+    """
+    if not event_capture.enabled:
+        return
+
+    requirements = (
+        ("camera.enabled", camera.enabled),
+        ("preview.enabled", preview.enabled),
+        ("preview.auto_start", preview.auto_start),
+        ("preview.restore_after_capture", preview.restore_after_capture),
+        ("motion.enabled", motion.enabled),
+    )
+    for name, satisfied in requirements:
+        if not satisfied:
+            raise ValueError(
+                f"event_capture.enabled = true requires {name} = true"
+            )
 
 
 #: Sensible defaults for notifications when the ``[notifications]`` section is
@@ -677,6 +756,21 @@ def parse_config_text(text: str) -> MGOConfig:
     )
     _validate_motion_config(motion)
 
+    # The ``[event_capture]`` section is optional so configuration files written
+    # before Task 13.1 continue to load; an absent section means the feature is
+    # off, which is also its default when the section is present but empty.
+    event_capture_data = raw.get("event_capture", {})
+    event_capture = EventCaptureConfig(
+        enabled=bool(
+            event_capture_data.get(
+                "enabled", _EVENT_CAPTURE_DEFAULTS["enabled"]
+            )
+        ),
+    )
+    # Cross-section: the whole camera/preview/motion chain has to be able to run
+    # before automatic capture can, so this runs once those sections are built.
+    _validate_event_capture_policy(event_capture, camera, preview, motion)
+
     # The ``[notifications]`` section is optional so pre-Task-5 configuration
     # files continue to load; absent keys fall back to safe (disabled) defaults.
     notifications_data = raw.get("notifications", {})
@@ -732,4 +826,5 @@ def parse_config_text(text: str) -> MGOConfig:
         notifications=notifications,
         database=database,
         health=health,
+        event_capture=event_capture,
     )

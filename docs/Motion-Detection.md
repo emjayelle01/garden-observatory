@@ -22,11 +22,21 @@ behaviour, API, limitations and the production-validation procedure.
 
 - bird detection, species identification or any object recognition;
 - object tracking, bounding boxes or classification;
-- automatic still capture triggered by motion;
 - notifications of any kind;
 - any heavy AI/ML framework (TensorFlow, PyTorch, YOLO, OpenCV, …).
 
 Motion detection is **disabled by default**.
+
+**A separate, optional consumer:** since Task 13.1, a material transition into
+`motion_detected` may *also* trigger one automatic still capture, if
+`[event_capture]` is enabled (it is off by default). That feature lives entirely
+outside this subsystem: it is a consumer of the transition callback described
+under [Observations](#observations) and it changes nothing here — not the
+algorithm, not the thresholds, not the rolling reference, not the cooldown, not
+the frame source and not `GET /motion/status`. Motion still reports scene
+activity and nothing else; **`motion_detected` does not mean a bird is present**,
+and neither does an automatic capture. See
+[`docs/Event-Capture.md`](Event-Capture.md).
 
 ## Architecture
 
@@ -205,6 +215,14 @@ The **live status** (`GET /motion/status`) continues to update every cycle even
 while observation persistence is suppressed. Observation payloads are compact
 (`status`, `detected`, `score`, `threshold`, `frames_available`, `detail`,
 `evaluated_at`); **frame bytes are never persisted**.
+
+A persisted material transition also invokes the monitor's transition listener.
+The monitor itself stays transport- and capture-agnostic: it knows only a
+callback, isolates a listener failure so it can never break an analysis cycle,
+and imports nothing from the notification or event-capture packages. The
+application composition layer is what wires that callback to the notification
+manager and — when `[event_capture]` is enabled — to motion-triggered capture.
+The two consumers are independent: a failure in either cannot cost the other.
 
 ## Configuration
 

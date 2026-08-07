@@ -25,6 +25,7 @@ Task 11 simulator backend -- still no Raspberry Pi, camera or camera tooling.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import io
@@ -33,7 +34,9 @@ import logging
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +58,12 @@ from mgo.camera.preview import (
 from mgo.camera.preview_backend import MockPreviewBackend
 from mgo.camera.simulator import SimulatorCaptureBackend
 from mgo.core.config import MGOConfig, parse_config_text
+from mgo.event_capture import (
+    WORKER_TASK_NAME,
+    EventCaptureService,
+    EventCaptureState,
+)
+from mgo.motion.models import MotionResult, MotionStatus
 from mgo.notifications import EventType, NotificationManager, NullProvider
 
 _EXPECTED_FIELDS = {
@@ -251,6 +260,9 @@ shutdown_timeout_seconds = 2.0
 enabled = {motion}
 analysis_interval_seconds = 0.2
 
+[event_capture]
+enabled = {event_capture}
+
 [database]
 health_check_interval_seconds = 3600
 busy_timeout_seconds = 5.0
@@ -285,6 +297,7 @@ def _lifespan_config(
     auto_start: bool = False,
     restore_after_capture: bool = False,
     motion: bool = False,
+    event_capture: bool = False,
 ) -> MGOConfig:
     """Build an isolated configuration through the real parser and validator."""
     return parse_config_text(
@@ -294,8 +307,25 @@ def _lifespan_config(
             auto_start=str(auto_start).lower(),
             restore_after_capture=str(restore_after_capture).lower(),
             motion=str(motion).lower(),
+            event_capture=str(event_capture).lower(),
         )
     )
+
+
+def _event_capture_config(tmp_path: Path, **overrides: Any) -> MGOConfig:
+    """A configuration with the whole motion-triggered capture chain enabled.
+
+    Every dependency the configuration validator requires is on, so this is the
+    only shape in which ``event_capture`` can legally be enabled.
+    """
+    settings: dict[str, Any] = {
+        "auto_start": True,
+        "restore_after_capture": True,
+        "motion": True,
+        "event_capture": True,
+    }
+    settings.update(overrides)
+    return _lifespan_config(tmp_path, **settings)
 
 
 def _run_lifespan(
@@ -1955,3 +1985,664 @@ def test_an_observation_failure_remains_observable(
     ]
     assert "stop-observation" in "\n".join(records)
     assert observed["producers"] == 0
+
+
+# --- Task 13.1: motion-triggered capture in the application lifespan ---------
+#
+# These drive the *real* lifespan, because the wiring under test only exists
+# there: the worker is created by the lifespan, the motion callback is composed
+# by the lifespan, and the shutdown ordering is the lifespan's. The camera
+# backend stays the deterministic simulator, so no Raspberry Pi, camera or
+# camera tooling is involved in any of it.
+
+
+def test_event_capture_is_off_and_absent_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With the defaults there is no worker, no service and no queue."""
+    observed: dict[str, Any] = {}
+
+    async def _body() -> None:
+        observed["service"] = app.state.event_capture_service
+        observed["status"] = await _asgi_call("GET", "/event-capture/status")
+        observed["worker_tasks"] = [
+            task.get_name()
+            for task in asyncio.all_tasks()
+            if task.get_name() == WORKER_TASK_NAME
+        ]
+
+    _run_lifespan(monkeypatch, _lifespan_config(tmp_path, motion=True), _body)
+
+    assert observed["service"] is None
+    assert observed["worker_tasks"] == []
+    code, payload = observed["status"]
+    assert code == 200
+    assert payload["enabled"] is False
+    assert payload["state"] == "disabled"
+    assert payload["total_triggers_received"] == 0
+
+
+def test_an_enabled_feature_starts_exactly_one_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One worker exists while serving, and none survives the lifespan."""
+    observed: dict[str, Any] = {}
+
+    async def _body() -> None:
+        observed["workers"] = sum(
+            1
+            for task in asyncio.all_tasks()
+            if task.get_name() == WORKER_TASK_NAME and not task.done()
+        )
+        observed["status"] = await _asgi_call("GET", "/event-capture/status")
+
+    _run_lifespan(monkeypatch, _event_capture_config(tmp_path), _body)
+
+    assert observed["workers"] == 1
+    code, payload = observed["status"]
+    assert code == 200
+    assert payload["enabled"] is True
+    assert payload["state"] == "idle"
+    # Nothing was captured merely because the worker came up.
+    assert payload["total_triggers_received"] == 0
+    assert payload["total_captures_succeeded"] == 0
+    assert _producer_count() == 0
+
+
+def test_the_worker_is_ready_before_the_motion_monitor_can_trigger(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Startup order is load-bearing: a trigger can never arrive too early."""
+    observed: dict[str, Any] = {}
+
+    async def _stub_motion_monitor(
+        _config: object,
+        _state: object,
+        _source: object,
+        _detector: object,
+        stop_event: asyncio.Event,
+        **_kwargs: object,
+    ) -> None:
+        observed["workers_at_motion_start"] = sum(
+            1
+            for task in asyncio.all_tasks()
+            if task.get_name() == WORKER_TASK_NAME and not task.done()
+        )
+        observed["state_at_motion_start"] = app.state.event_capture_state.state
+        await stop_event.wait()
+
+    monkeypatch.setattr(app_module, "run_motion_monitor", _stub_motion_monitor)
+
+    async def _body() -> None:
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    _run_lifespan(monkeypatch, _event_capture_config(tmp_path), _body)
+
+    assert observed["workers_at_motion_start"] == 1
+    assert observed["state_at_motion_start"] is EventCaptureState.IDLE
+
+
+def _capture_transition_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
+    """Replace the motion monitor with a stub that exposes its listener."""
+    captured: dict[str, Any] = {}
+
+    async def _stub_motion_monitor(
+        _config: object,
+        _state: object,
+        _source: object,
+        _detector: object,
+        stop_event: asyncio.Event,
+        **kwargs: Any,
+    ) -> None:
+        captured["listener"] = kwargs.get("transition_listener")
+        await stop_event.wait()
+
+    monkeypatch.setattr(app_module, "run_motion_monitor", _stub_motion_monitor)
+    return captured
+
+
+def _motion_detected() -> MotionResult:
+    """A material motion transition, built without a camera."""
+    return MotionResult(
+        status=MotionStatus.MOTION_DETECTED,
+        detected=True,
+        score=0.42,
+        threshold=0.08,
+        frames_available=True,
+        detail="Changed-pixel ratio 0.4200 exceeded threshold 0.0800.",
+        evaluated_at=datetime(2026, 8, 7, 9, 30, tzinfo=UTC),
+    )
+
+
+@contextlib.contextmanager
+def _instrumented_consumers(
+    *,
+    publish: Callable[[Any], None] | None = None,
+    submit: Callable[[Any], bool] | None = None,
+) -> Iterator[None]:
+    """Temporarily replace the two motion-transition consumers.
+
+    Scoped rather than patched for the whole lifespan on purpose: the stop
+    notification published during shutdown is a *different* event, and a
+    substitute left in place would either be counted as a motion publication or
+    turn a deliberate test failure into a cleanup failure.
+    """
+    manager = app.state.notification_manager
+    service = app.state.event_capture_service
+    if publish is not None:
+        manager.publish = publish
+    if submit is not None:
+        service.submit = submit
+    try:
+        yield
+    finally:
+        if publish is not None:
+            del manager.publish
+        if submit is not None:
+            del service.submit
+
+
+def test_a_motion_transition_reaches_both_consumers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The existing notification behaviour is preserved AND capture is offered."""
+    captured = _capture_transition_listener(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    async def _body() -> None:
+        for _ in range(10):
+            await asyncio.sleep(0)
+        published: list[Any] = []
+        submitted: list[Any] = []
+
+        def _submit(result: Any) -> bool:
+            submitted.append(result)
+            return True
+
+        with _instrumented_consumers(publish=published.append, submit=_submit):
+            captured["listener"](_motion_detected())
+
+        observed["published"] = list(published)
+        observed["submitted"] = list(submitted)
+
+    _run_lifespan(monkeypatch, _event_capture_config(tmp_path), _body)
+
+    assert len(observed["published"]) == 1
+    assert observed["published"][0].event_type is EventType.MOTION_STATE_CHANGED
+    assert len(observed["submitted"]) == 1
+    assert observed["submitted"][0].status is MotionStatus.MOTION_DETECTED
+
+
+def test_a_notification_failure_does_not_cost_an_automatic_capture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The two callback responsibilities are independent obligations."""
+    captured = _capture_transition_listener(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    async def _body() -> None:
+        for _ in range(10):
+            await asyncio.sleep(0)
+        submitted: list[Any] = []
+
+        def _explode(_event: Any) -> None:
+            raise RuntimeError("notification transport failed")
+
+        def _submit(result: Any) -> bool:
+            submitted.append(result)
+            return True
+
+        with _instrumented_consumers(publish=_explode, submit=_submit):
+            captured["listener"](_motion_detected())
+
+        observed["submitted"] = list(submitted)
+
+    with caplog_at_error() as records:
+        _run_lifespan(monkeypatch, _event_capture_config(tmp_path), _body)
+
+    assert len(observed["submitted"]) == 1
+    assert "notification transport failed" in "\n".join(records)
+
+
+def test_an_event_capture_failure_does_not_cost_a_notification(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """And the same in the other direction."""
+    captured = _capture_transition_listener(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    async def _body() -> None:
+        for _ in range(10):
+            await asyncio.sleep(0)
+        published: list[Any] = []
+
+        def _explode(_result: Any) -> bool:
+            raise RuntimeError("event capture submission failed")
+
+        with _instrumented_consumers(publish=published.append, submit=_explode):
+            captured["listener"](_motion_detected())
+
+        observed["published"] = list(published)
+
+    with caplog_at_error() as records:
+        _run_lifespan(monkeypatch, _event_capture_config(tmp_path), _body)
+
+    assert len(observed["published"]) == 1
+    assert "event capture submission failed" in "\n".join(records)
+
+
+def test_a_material_transition_produces_one_correlated_capture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The whole chain, end to end, against the deterministic simulator.
+
+    Motion transition -> bounded handoff -> worker -> coordinator -> capture
+    service -> archive -> observation. No stubbed capture path and no mocked
+    archive: the JPEG is really written, the catalogue row is really persisted
+    and the timeline entry is really recorded, all without a Raspberry Pi.
+    """
+    captured = _capture_transition_listener(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    async def _body() -> None:
+        for _ in range(10):
+            await asyncio.sleep(0)
+        service = app.state.event_capture_service
+        observed["before"] = service.status().as_dict()
+
+        captured["listener"](_motion_detected())
+        # Wait for the worker to finish, bounded so a defect fails rather than
+        # hangs.
+        for _ in range(400):
+            await asyncio.sleep(0.01)
+            if service.status().total_captures_succeeded:
+                break
+        observed["after"] = service.status().as_dict()
+        observed["captures"] = await _asgi_call("GET", "/captures")
+        observed["status"] = await _asgi_call("GET", "/event-capture/status")
+        observed["producers"] = _producer_count()
+
+    _run_lifespan(
+        monkeypatch, _event_capture_config(tmp_path), _body
+    )
+
+    assert observed["before"]["state"] == "idle"
+    after = observed["after"]
+    assert after["total_triggers_received"] == 1
+    assert after["total_triggers_dropped"] == 0
+    assert after["total_captures_succeeded"] == 1
+    assert after["total_captures_failed"] == 0
+    assert after["state"] == "idle"
+    assert after["last_error"] is None
+    capture_id = after["last_capture_id"]
+    assert capture_id is not None
+    assert after["last_trigger_at"] == "2026-08-07T09:30:00+00:00"
+
+    # Exactly one capture in the catalogue, and it is the automatic one.
+    code, listing = observed["captures"]
+    assert code == 200
+    assert len(listing) == 1
+    assert listing[0]["capture_id"] == capture_id
+    assert listing[0]["backend"] == "simulator"
+
+    record = _capture_record(tmp_path, capture_id)
+    assert record.extra_metadata == {
+        "origin": "motion",
+        "motion_status": "motion_detected",
+        "motion_score": 0.42,
+        "motion_threshold": 0.08,
+        "motion_evaluated_at": "2026-08-07T09:30:00+00:00",
+    }
+    assert Path(record.absolute_path).exists()
+
+    # Exactly one observation, correlated to the capture that was persisted.
+    entries = _event_capture_observations(tmp_path)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind == "event_capture"
+    assert entry.source == "mgo-event-capture"
+    assert entry.status == "captured"
+    assert entry.summary == "Motion-triggered still captured"
+    assert entry.correlation_id == capture_id
+    assert entry.payload["capture_id"] == capture_id
+    assert entry.payload["motion_score"] == 0.42
+    assert entry.payload["motion_threshold"] == 0.08
+    assert entry.payload["motion_evaluated_at"] == "2026-08-07T09:30:00+00:00"
+    assert entry.payload["filename"] == record.filename
+    # The timeline never carries the capture's location.
+    assert "absolute_path" not in entry.payload
+    assert "capture_directory" not in entry.payload
+
+    # Preview was restored by the existing managed contract, not duplicated.
+    assert observed["producers"] == 1
+    assert observed["status"][0] == 200
+    assert _producer_count() == 0
+
+
+def _capture_record(tmp_path: Path, capture_id: str) -> Any:
+    """Read one catalogue record straight out of the lifespan's database."""
+    from mgo.captures.archive import CaptureArchive
+
+    return CaptureArchive(tmp_path / "mgo.db").get_capture(uuid.UUID(capture_id))
+
+
+def _event_capture_observations(tmp_path: Path) -> list[Any]:
+    """Read the event-capture timeline entries the lifespan wrote."""
+    from mgo.core.observations import list_observations
+
+    return list_observations(tmp_path / "mgo.db", kind="event_capture")
+
+
+def test_the_motion_module_never_imports_event_capture() -> None:
+    """The motion subsystem stays capture-agnostic; the app composes them.
+
+    Read from each module's own AST rather than from behaviour: a motion monitor
+    that imports the capture worker keeps working, right up until someone wants
+    motion without it. Imports only -- prose in a docstring explaining what the
+    package deliberately does not do is not a violation of it.
+    """
+    motion_package = (
+        Path(__file__).resolve().parents[1] / "src" / "mgo" / "motion"
+    )
+    forbidden = ("mgo.event_capture", "mgo.captures", "mgo.camera.coordinator")
+    for module in sorted(motion_package.glob("*.py")):
+        tree = ast.parse(module.read_bytes().decode("utf-8"))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imported.add(node.module)
+        for name in imported:
+            assert not name.startswith(forbidden), f"{module.name}: {name}"
+
+        # And no reference to the camera owner or the worker by name, either.
+        identifiers = {
+            node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+        } | {
+            node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        }
+        for token in ("CameraCoordinator", "CaptureWorkflow", "EventCaptureService"):
+            assert token not in identifiers, f"{module.name}: {token}"
+
+
+# --- shutdown ordering -------------------------------------------------------
+
+
+class _StageEventCapture:
+    """An event-capture double that records its retirement, and can fail."""
+
+    def __init__(
+        self,
+        stages: list[str],
+        *,
+        error: BaseException | None = None,
+        probe: Callable[[], None] | None = None,
+    ) -> None:
+        self._stages = stages
+        self._error = error
+        self._probe = probe
+        self.retired = False
+
+    async def shutdown(self) -> None:
+        if self._probe is not None:
+            self._probe()
+        self._stages.append("event-capture-shutdown")
+        self.retired = True
+        if self._error is not None:
+            raise self._error
+
+
+def test_the_worker_is_retired_before_the_camera_is_shut_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The camera may not be released while a capture could still ask for it.
+
+    Two orderings are pinned, and they are the two that matter. The motion
+    *producer* must be terminal before the worker is asked to retire -- a
+    transition published after that would be silently discarded work. And the
+    worker must be terminal before the camera is released -- a capture that
+    still owned the camera would otherwise have it taken away mid-transaction.
+
+    Which order the *other* monitors happen to finish in is deliberately not
+    asserted: they are independent, they are all awaited before camera shutdown,
+    and pinning their scheduling would be pinning the event loop, not the
+    contract.
+    """
+    stages = _install_stage_recorder(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    async def _main() -> None:
+        stop_event = asyncio.Event()
+
+        async def _motion() -> None:
+            await stop_event.wait()
+            stages.append("motion-monitor-stopped")
+
+        async def _other_monitor() -> None:
+            await stop_event.wait()
+
+        motion_task = asyncio.create_task(_motion(), name="mgo-motion-monitor")
+        other = asyncio.create_task(_other_monitor(), name="mgo-health-monitor")
+
+        def _at_retirement() -> None:
+            observed["motion_done_at_retirement"] = motion_task.done()
+
+        event_capture = _StageEventCapture(stages, probe=_at_retirement)
+
+        def _at_camera_shutdown() -> None:
+            observed["worker_retired_at_camera_shutdown"] = event_capture.retired
+            observed["other_done_at_camera_shutdown"] = other.done()
+
+        observed["error"] = await asyncio.wait_for(
+            _shutdown_lifespan(
+                stop_events=(stop_event,),
+                monitor_tasks=[other],
+                coordinator=_StageCoordinator(stages, probe=_at_camera_shutdown),
+                notification_manager=_StageManager(stages),
+                motion_task=motion_task,
+                event_capture=event_capture,
+            ),
+            timeout=_DRAIN_TIMEOUT,
+        )
+        observed["motion_done"] = motion_task.done()
+        observed["other_done"] = other.done()
+
+    asyncio.run(_main())
+
+    assert observed["error"] is None
+    # The producer was terminal before the worker was asked to retire.
+    assert observed["motion_done_at_retirement"] is True
+    # The worker was terminal, and every monitor drained, before the camera went.
+    assert observed["worker_retired_at_camera_shutdown"] is True
+    assert observed["other_done_at_camera_shutdown"] is True
+    assert observed["motion_done"] is True
+    assert observed["other_done"] is True
+    assert stages == [
+        "motion-monitor-stopped",
+        "event-capture-shutdown",
+        "camera-shutdown",
+        "stop-notification",
+        "stop-observation",
+    ]
+
+
+def test_every_remaining_stage_runs_when_the_worker_fails_to_retire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An event-capture failure is never a reason to strand the camera."""
+    stages = _install_stage_recorder(monkeypatch)
+    observed: dict[str, Any] = {}
+    failure = RuntimeError("the event-capture worker would not retire")
+
+    async def _main() -> None:
+        stop_event = asyncio.Event()
+
+        async def _monitor() -> None:
+            await stop_event.wait()
+
+        task = asyncio.create_task(_monitor(), name="mgo-health-monitor")
+
+        observed["error"] = await asyncio.wait_for(
+            _shutdown_lifespan(
+                stop_events=(stop_event,),
+                monitor_tasks=[task],
+                coordinator=_StageCoordinator(stages),
+                notification_manager=_StageManager(stages),
+                event_capture=_StageEventCapture(stages, error=failure),
+            ),
+            timeout=_DRAIN_TIMEOUT,
+        )
+
+    with caplog_at_error() as records:
+        asyncio.run(_main())
+
+    assert observed["error"] is failure
+    assert stages == [
+        "event-capture-shutdown",
+        "camera-shutdown",
+        "stop-notification",
+        "stop-observation",
+    ]
+    logged = "\n".join(records)
+    assert "event-capture-shutdown" in logged
+    assert "would not retire" in logged
+
+
+def test_a_motion_drain_failure_is_recorded_and_cleanup_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A motion monitor that raises on the way out stops nothing else."""
+    stages = _install_stage_recorder(monkeypatch)
+    observed: dict[str, Any] = {}
+    failure = RuntimeError("motion monitor failed during shutdown")
+
+    async def _main() -> None:
+        stop_event = asyncio.Event()
+
+        async def _motion() -> None:
+            await stop_event.wait()
+            raise failure
+
+        motion_task = asyncio.create_task(_motion(), name="mgo-motion-monitor")
+
+        observed["error"] = await asyncio.wait_for(
+            _shutdown_lifespan(
+                stop_events=(stop_event,),
+                monitor_tasks=[],
+                coordinator=_StageCoordinator(stages),
+                notification_manager=_StageManager(stages),
+                motion_task=motion_task,
+                event_capture=_StageEventCapture(stages),
+            ),
+            timeout=_DRAIN_TIMEOUT,
+        )
+
+    with caplog_at_error() as records:
+        asyncio.run(_main())
+
+    assert observed["error"] is failure
+    # The worker was still retired, and the camera still released.
+    assert stages == [
+        "event-capture-shutdown",
+        "camera-shutdown",
+        "stop-notification",
+        "stop-observation",
+    ]
+    assert "mgo-motion-monitor" in "\n".join(records)
+
+
+def test_a_startup_failure_survives_an_event_capture_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The cause an operator has to diagnose is never replaced by a symptom."""
+    _install_monitor_spies(monkeypatch)
+    startup_error = RuntimeError("programming error inside startup validation")
+    cleanup_error = RuntimeError("the event-capture worker would not retire")
+
+    def _explode(self: PreviewService, process: object) -> str | None:
+        raise startup_error
+
+    monkeypatch.setattr(PreviewService, "_validate_startup", _explode)
+
+    class _FailingService(EventCaptureService):
+        async def shutdown(self) -> None:
+            await super().shutdown()
+            raise cleanup_error
+
+    monkeypatch.setattr(app_module, "EventCaptureService", _FailingService)
+    spy = _install_cleanup_spies(monkeypatch)
+
+    with caplog_at_error() as records:
+        observed = _run_lifespan_expecting(
+            monkeypatch, _event_capture_config(tmp_path), RuntimeError
+        )
+
+    assert observed["error"] is startup_error
+    assert observed["error"] is not cleanup_error
+    # Every remaining cleanup stage still ran, in order.
+    assert spy.stages == [
+        "camera-shutdown",
+        "stop-notification",
+        "stop-observation",
+    ]
+    # No worker leaked, and no preview process either.
+    assert observed["live_tasks"] == []
+    assert observed["producers"] == 0
+    assert "would not retire" in "\n".join(records)
+
+
+def test_no_event_capture_task_survives_a_normal_shutdown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The application never returns from its lifespan owing a live worker."""
+    observed: dict[str, Any] = {}
+
+    async def _body() -> None:
+        observed["during"] = sorted(
+            task.get_name()
+            for task in asyncio.all_tasks()
+            if (task.get_name() or "").startswith("mgo-") and not task.done()
+        )
+
+    _run_lifespan(monkeypatch, _event_capture_config(tmp_path), _body)
+
+    assert WORKER_TASK_NAME in observed["during"]
+    assert _producer_count() == 0
+    # Read after the loop closed: any surviving task would have been reported by
+    # asyncio as pending at interpreter teardown.
+    assert not any(
+        thread.name == _PRODUCER_THREAD for thread in threading.enumerate()
+    )
+
+
+def test_preview_remains_a_single_producer_with_event_capture_enabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Enabling automatic capture creates no second preview or camera process."""
+    observed: dict[str, Any] = {}
+
+    async def _body() -> None:
+        observed["producers"] = _producer_count()
+        observed["preview"] = app.state.preview_service.status().as_dict()
+        observed["coordinator"] = app.state.camera_coordinator
+        observed["workflow_coordinator_is_the_same"] = (
+            app.state.capture_workflow._coordinator is app.state.camera_coordinator
+        )
+        # A real capture through the API still restores the one preview.
+        observed["capture"] = await _asgi_call("POST", "/camera/capture")
+        observed["producers_after"] = _producer_count()
+
+    _run_lifespan(monkeypatch, _event_capture_config(tmp_path), _body)
+
+    assert observed["producers"] == 1
+    assert observed["preview"]["state"] == "running"
+    assert observed["preview"]["owner"] == "preview"
+    assert isinstance(observed["coordinator"], CameraCoordinator)
+    assert observed["workflow_coordinator_is_the_same"] is True
+    assert observed["capture"][0] == 200
+    assert observed["producers_after"] == 1
+    assert _producer_count() == 0

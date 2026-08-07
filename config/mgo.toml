@@ -85,6 +85,29 @@ changed_pixel_ratio_threshold = 0.08
 # (seconds); the eventual return to no-motion is never hidden.
 cooldown_seconds = 5.0
 
+[event_capture]
+# Motion-triggered still capture. Disabled by default: no worker is created, no
+# trigger queue exists and no camera activity happens until this is explicitly
+# enabled. When it IS enabled, a material transition into motion_detected may
+# cause ONE full-resolution still capture through the existing camera
+# coordinator, catalogued with the motion facts that triggered it.
+#
+# motion_detected still means "the scene changed", NOT "a bird is present" —
+# event capture is simply another consumer of that signal. There is no
+# detection, classification, species or confidence here.
+#
+# Enabling this requires camera.enabled, preview.enabled, preview.auto_start,
+# preview.restore_after_capture and motion.enabled to all be true; asking for it
+# with any of them off is rejected at load time. Each dependency is real:
+# preview supplies the frames motion analyses, auto_start makes the pipeline
+# survive a restart, and restore_after_capture returns the frame source after a
+# capture has taken the camera.
+#
+# There is deliberately nothing else to configure. The queue holds exactly one
+# pending trigger, there is no retry, and one transition produces at most one
+# still. See docs/Event-Capture.md.
+enabled = false
+
 [notifications]
 # Notification framework. Disabled by default: no provider is constructed and
 # every published event is dropped until this is explicitly enabled. Only the

@@ -78,7 +78,8 @@ shutdown_timeout_seconds = 5.0
 [motion]
 # Motion detection foundation. It shares the live preview stream (no second
 # camera process) and detects SCENE CHANGE only — it does not recognise birds
-# or any other object, and it never triggers a still capture automatically.
+# or any other object. It takes no picture itself; a material transition may
+# optionally drive one through [event_capture] below, which is also disabled.
 # Motion is measured frame-to-frame (each frame vs the previous analysed frame),
 # so it reports recent visual activity rather than presence; ordinary garden
 # movement (wind, leaves, birds) may legitimately trigger it.
@@ -95,6 +96,24 @@ pixel_difference_threshold = 20
 # Default 0.08 is based on real IMX708 production measurements; tune per site.
 changed_pixel_ratio_threshold = 0.08
 cooldown_seconds = 5.0
+
+[event_capture]
+# Motion-triggered still capture (Task 13.1). When enabled, a material
+# transition into motion_detected may cause ONE full-resolution still through
+# the existing camera coordinator, catalogued with the motion facts behind it.
+# motion_detected still means SCENE CHANGE, not bird presence — and so does an
+# automatic capture. There is no detection, classification or species here.
+#
+# Left DISABLED here, and it must stay disabled until an explicit Raspberry Pi
+# validation step. Two things to settle before that step: this feature has never
+# run against the physical camera, and there is NO retention or deletion policy
+# yet, so captured images accumulate under [camera].capture_directory and the
+# disk headroom is an operator's problem until one exists.
+#
+# Enabling it requires camera.enabled, preview.enabled, preview.auto_start,
+# preview.restore_after_capture and motion.enabled to all be true; asking for it
+# with any of them off is rejected at load time. See docs/Event-Capture.md.
+enabled = false
 
 [notifications]
 # Notification framework foundation. Only the transport-free providers exist so

@@ -56,6 +56,7 @@ uv run pytest
 | `GET /preview`        | Simple browser live-preview page.                       |
 | `GET /dashboard`      | Local operational dashboard (browser page).             |
 | `GET /motion/status`  | The latest monitored motion-detection result.           |
+| `GET /event-capture/status` | Motion-triggered capture state and counters.      |
 | `GET /notifications/status` | Notification framework status and counters.       |
 | `GET /captures`       | Capture catalogue (metadata only), newest first.        |
 | `GET /captures/{id}`  | Stored metadata for a single capture.                   |
@@ -612,8 +613,12 @@ What it **does not** do (all future or out of scope):
 
 - it does **not** recognise birds, or identify or classify any object;
 - it does **not** track objects or draw bounding boxes;
-- it does **not** trigger a still capture automatically;
 - it uses **no** heavy AI/ML framework (no TensorFlow, PyTorch, YOLO or OpenCV).
+
+A material `motion_detected` transition *can* now trigger one automatic still
+capture, but only if the separate, optional [`[event_capture]`](#event-capture)
+feature is enabled — it is off by default, and it lives outside the motion
+subsystem. Motion detection itself still only reports scene change.
 
 Motion detection is **disabled by default**. Detailed architecture, algorithm,
 thresholds, baseline behaviour, API state meanings, troubleshooting and the
@@ -660,6 +665,72 @@ non-positive interval, out-of-range dimensions or thresholds, a negative
 cooldown) are rejected at startup with a clear error. To actually receive frames
 when enabled, `[preview]` must also be enabled and running; otherwise motion
 detection sits truthfully in `waiting_for_frames`.
+
+## Event capture
+
+MGO can **optionally** take and catalogue one full-resolution still image when
+the motion subsystem records a material transition into `motion_detected`. That
+is the whole feature: it connects the existing motion monitor to the existing
+camera coordinator and capture archive, and adds nothing else.
+
+```toml
+[event_capture]
+enabled = false     # motion-triggered capture is off unless explicitly enabled
+```
+
+What it **does**:
+
+- submits a trigger only for a material `motion_detected` transition, through
+  the motion monitor's existing transition callback (no second detector, no
+  second frame subscription, and **no second cooldown** — the motion monitor's
+  own transition and cooldown rules remain the authority);
+- hands it to **one** background worker through a queue with exactly **one**
+  pending slot, without ever blocking the motion callback;
+- captures through the existing `CameraCoordinator` (no second camera or preview
+  process), and restores preview under the existing
+  `preview.restore_after_capture` contract;
+- catalogues the capture with its motion attribution
+  (`origin = motion`, score, threshold, evaluated-at);
+- records **one** immutable `event_capture` observation per success, correlated
+  to the capture's UUID;
+- reports itself at `GET /event-capture/status`.
+
+What it **does not** do:
+
+- it does **not** detect, identify or classify birds or anything else;
+- it does **not** buffer pre- or post-event frames, burst, or record video;
+- it does **not** retry a failed capture, and it **drops** triggers that arrive
+  while the camera is already busy with one queued behind it;
+- it adds **no** database, table, migration or dependency;
+- it has **no** retention or deletion policy — captured images accumulate.
+
+Enabling it requires `camera.enabled`, `preview.enabled`, `preview.auto_start`,
+`preview.restore_after_capture` and `motion.enabled` to all be true; asking for
+it with any of them off is rejected at load time. **`motion_detected` still means
+the scene changed, not that a bird is present** — and so does an automatic
+capture. Architecture, trigger semantics, queue behaviour, metadata,
+observations, error categories, startup, shutdown and limitations live in
+[`docs/Event-Capture.md`](docs/Event-Capture.md).
+
+### `GET /event-capture/status`
+
+Read-only and inert: it reads application-managed state and never touches the
+camera, preview, the capture workflow, the trigger queue or the database. It
+returns `200` whenever the application is serving. The `state` field is one of:
+
+| State       | Meaning                                                       |
+| ----------- | ------------------------------------------------------------- |
+| `disabled`  | Off by configuration. No worker exists.                       |
+| `idle`      | Enabled, worker alive, no capture executing.                  |
+| `capturing` | One motion-triggered still capture is executing now.          |
+| `error`     | The most recent attempt failed; the worker is still alive.    |
+
+Alongside it: `enabled`, `pending_triggers`, the process-lifetime counters
+`total_triggers_received`, `total_captures_succeeded`, `total_captures_failed`
+and `total_triggers_dropped`, plus `last_trigger_at`, `last_capture_id`,
+`last_capture_at` and `last_error`. Counters are **not** persisted and reset on
+restart. `last_error` is one of a fixed set of category messages and never
+carries an exception message, traceback or filesystem path.
 
 ## Notifications
 
