@@ -31,6 +31,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from mgo.camera.exceptions import (
     BackendCaptureError,
@@ -269,9 +270,14 @@ class EventCaptureService:
     async def _execute(self, trigger: MotionTrigger) -> None:
         """Run one automatic capture attempt. Never raises.
 
-        The blocking capture-and-archive workflow runs in a worker thread, so
+        *Every* blocking step runs in a worker thread: the capture-and-archive
+        workflow, and the observation write that follows it. Both are awaited, so
         the event loop -- and therefore the motion monitor, the API and every
-        other monitor -- keeps running while the camera is busy.
+        other monitor -- keeps running throughout, while the worker itself does
+        not consider this trigger finished until its observation has been
+        attempted. That ordering is what keeps the queue's one pending slot
+        meaningful: a second trigger cannot start while the first is still
+        writing its timeline entry.
         """
         self._state.state = EventCaptureState.CAPTURING
         try:
@@ -280,11 +286,30 @@ class EventCaptureService:
                 extra_metadata=trigger.capture_metadata(),
             )
         except Exception as error:
-            self._handle_failure(trigger, error)
+            await self._handle_failure(trigger, error)
             return
-        self._handle_success(trigger, capture)
+        await self._handle_success(trigger, capture)
 
-    def _handle_success(self, trigger: MotionTrigger, capture: Capture) -> None:
+    async def _record_observation(self, **fields: Any) -> None:
+        """Write one event-capture observation off the event loop.
+
+        The repository's observation API is deliberately synchronous -- it is a
+        bounded SQLite transaction, used from monitors, the lifespan and here --
+        so this does not make it async; it moves the *call* to a worker thread
+        and awaits it. A ``record_observation`` invoked directly from this
+        coroutine would block the loop for the duration of a database write, and
+        on a struggling SD card that is exactly the moment everything else needs
+        the loop.
+        """
+        await asyncio.to_thread(self._record_blocking, **fields)
+
+    def _record_blocking(self, **fields: Any) -> None:
+        """Invoke the injected recorder. Blocking; call only from a thread."""
+        self._recorder(self._database_path, **fields)
+
+    async def _handle_success(
+        self, trigger: MotionTrigger, capture: Capture
+    ) -> None:
         """Record a successful automatic capture and return to idle."""
         self._state.total_captures_succeeded += 1
         self._state.last_capture_id = str(capture.id)
@@ -301,8 +326,7 @@ class EventCaptureService:
         payload["capture_id"] = str(capture.id)
         payload["filename"] = capture.filename
         try:
-            self._recorder(
-                self._database_path,
+            await self._record_observation(
                 kind=OBSERVATION_KIND,
                 source=OBSERVATION_SOURCE,
                 status=SUCCESS_STATUS,
@@ -324,7 +348,7 @@ class EventCaptureService:
                 capture.id,
             )
 
-    def _handle_failure(
+    async def _handle_failure(
         self, trigger: MotionTrigger, error: BaseException
     ) -> None:
         """Record a failed automatic capture attempt, safely."""
@@ -346,8 +370,7 @@ class EventCaptureService:
         payload = trigger.observation_payload()
         payload["error_category"] = category.value
         try:
-            self._recorder(
-                self._database_path,
+            await self._record_observation(
                 kind=OBSERVATION_KIND,
                 source=OBSERVATION_SOURCE,
                 status=FAILURE_STATUS,

@@ -6432,7 +6432,25 @@ def test_the_task_record_states_the_installation_without_overclaiming() -> None:
     assert "first Raspberry Pi staging attempt (2026-08-04) was incomplete" in section
     assert "does not count as a pass" in section
     assert "Production was untouched" in section
-    assert "Physical camera acceptance remains pending" in section
+    # Acceptance status, scoped to the date on which it was true and followed by
+    # what actually happened afterwards. This assertion used to read
+    # "Physical camera acceptance remains pending" -- a present-tense claim that
+    # `9634e84` corrected, because acceptance passed on 2026-08-06. Requiring
+    # both halves is what keeps the correction honest: the record cannot satisfy
+    # this by deleting the history, and it cannot satisfy it by leaving a stale
+    # "pending" standing as though it were current.
+    assert (
+        "At the conclusion of the second staging validation on 2026-08-04, "
+        "physical\ncamera acceptance remained pending" in section
+    )
+    assert "Matthew had not yet given a decision" in section
+    assert "the observation periods had not begun" in section
+    assert (
+        "Functional prototype acceptance was\nsubsequently completed on "
+        "2026-08-06" in section
+    )
+    # And the deferral is still stated as a deferral, never as a pass.
+    assert "later deferred and were not passed" in section
     # The escaped request was refused as an unsupported action, and this record
     # must not borrow the 2026-08-01 install failure's explanation for it.
     assert "does not implement `deploy-main` at all" in section
@@ -6772,12 +6790,29 @@ def test_the_power_failure_not_the_installation_explains_the_baseline_change() -
     # rather than as having produced it.
     assert "The installation preserved the post-power baseline" in section
 
-    # The acceptance record carries the same attribution.
+    # The acceptance record carries the same attribution. It used to say
+    # "Preview is currently stopped because of a power failure, not because of
+    # the installation" -- true when written, and false since managed preview
+    # was enabled on 2026-08-06. `9634e84` dated it. What must survive that
+    # correction is the attribution itself: the stopped preview belonged to the
+    # power failure and to auto-start not yet being enabled, and never to the
+    # gateway installation.
     acceptance = _remediation_status_section()
     assert (
-        "**Preview is currently stopped because of a power failure, not because of "
-        "the\ninstallation.**" in acceptance
+        "**After the 2026-08-04 power failure, preview remained stopped because "
+        "managed\nauto-start was not yet enabled — not because of the "
+        "installation.**" in acceptance
     )
+    assert "The pre-failure `MainPID` `70709` and preview" in acceptance
+    assert "belong to the earlier\nservice" in acceptance
+    assert "preview correctly did not return" in acceptance
+    # The historical state is explicitly marked as superseded, so a reader
+    # cannot mistake a dated fact for the current one -- which is the failure
+    # mode that made the old present-tense wording wrong in the first place.
+    assert "That historical state was later superseded" in acceptance
+    assert "managed preview was enabled during" in acceptance
+    assert "preview successfully auto-started after both" in acceptance
+    assert "Preview is running." in acceptance
 
 
 @pytest.mark.parametrize(

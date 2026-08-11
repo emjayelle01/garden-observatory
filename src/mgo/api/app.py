@@ -440,6 +440,7 @@ async def _shutdown_lifespan(
     monitor_tasks: Sequence[asyncio.Task[None]],
     coordinator: CameraCoordinator,
     notification_manager: NotificationManager,
+    motion_stop_event: asyncio.Event | None = None,
     motion_task: asyncio.Task[None] | None = None,
     event_capture: EventCaptureService | None = None,
 ) -> BaseException | None:
@@ -453,14 +454,22 @@ async def _shutdown_lifespan(
     a camera process, and an event-capture worker that fails to retire must not
     be able to skip camera shutdown.
 
-    The first three stages are ordered, and the order is the guarantee:
+    The stages are ordered, and the *signalling* order is as load-bearing as the
+    await order:
 
-    1. **the motion producer stops first**, so no new trigger can be submitted;
+    1. **the motion producer is signalled and drained first**, so no new trigger
+       can be submitted by anything still running;
     2. **the event-capture worker is retired next** -- it stops accepting work,
        discards anything queued that had not started, lets one in-flight capture
-       finish, and only then returns;
-    3. **the remaining monitors are drained**, and only after all of that is the
-       camera coordinator shut down.
+       and its observation finish, and only then returns;
+    3. **only then are the remaining monitors signalled** and drained;
+    4. and only after all of that is the camera coordinator shut down.
+
+    Signalling the remaining monitors *later*, rather than all at once up front,
+    is the point of stage 3. Health, database and camera monitoring stay live for
+    the whole of the motion drain and the in-flight capture -- which is precisely
+    the window in which the camera is doing something and an operator would want
+    the health picture to be current, not already torn down.
 
     Camera shutdown therefore cannot begin while an automatic capture still owns
     -- or could still ask for -- the camera.
@@ -474,9 +483,6 @@ async def _shutdown_lifespan(
     order) is returned so the caller can decide whether it is the failure worth
     raising or whether an earlier, more informative one already exists.
     """
-    for event in stop_events:
-        event.set()
-
     first_error: BaseException | None = None
 
     def _record(stage: str, exc: BaseException) -> None:
@@ -484,6 +490,9 @@ async def _shutdown_lifespan(
         LOGGER.error("Lifespan cleanup stage %r failed", stage, exc_info=exc)
         if first_error is None:
             first_error = exc
+
+    if motion_stop_event is not None:
+        motion_stop_event.set()
 
     if motion_task is not None:
         # Drained before anything else: while the motion monitor is alive it can
@@ -504,6 +513,10 @@ async def _shutdown_lifespan(
             # released, the stop event still has to be published and the stop
             # observation still has to be written.
             _record("event-capture-shutdown", exc)
+
+    # The remaining monitors are asked to stop only now -- see stage 3 above.
+    for event in stop_events:
+        event.set()
 
     # ``return_exceptions=True`` is load-bearing, not a style choice. The
     # default propagates the first monitor exception the instant it happens and
@@ -808,15 +821,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # monitors.
         monitor_tasks = [health_task, database_task, camera_task]
         cleanup_error = await _shutdown_lifespan(
+            # The motion stop event is handed over separately for the same
+            # reason as its task: it must be set *before* the drain that leads
+            # into event-capture retirement, while these three must not be set
+            # until after it.
             stop_events=(
                 stop_event,
                 database_stop_event,
                 camera_stop_event,
-                motion_stop_event,
             ),
             monitor_tasks=monitor_tasks,
             coordinator=camera_coordinator,
             notification_manager=notification_manager,
+            motion_stop_event=motion_stop_event,
             motion_task=motion_task,
             event_capture=event_capture_service,
         )

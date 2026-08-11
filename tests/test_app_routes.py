@@ -2416,14 +2416,15 @@ def test_the_worker_is_retired_before_the_camera_is_shut_down(
     observed: dict[str, Any] = {}
 
     async def _main() -> None:
-        stop_event = asyncio.Event()
+        motion_stop_event = asyncio.Event()
+        monitor_stop_event = asyncio.Event()
 
         async def _motion() -> None:
-            await stop_event.wait()
+            await motion_stop_event.wait()
             stages.append("motion-monitor-stopped")
 
         async def _other_monitor() -> None:
-            await stop_event.wait()
+            await monitor_stop_event.wait()
 
         motion_task = asyncio.create_task(_motion(), name="mgo-motion-monitor")
         other = asyncio.create_task(_other_monitor(), name="mgo-health-monitor")
@@ -2439,10 +2440,11 @@ def test_the_worker_is_retired_before_the_camera_is_shut_down(
 
         observed["error"] = await asyncio.wait_for(
             _shutdown_lifespan(
-                stop_events=(stop_event,),
+                stop_events=(monitor_stop_event,),
                 monitor_tasks=[other],
                 coordinator=_StageCoordinator(stages, probe=_at_camera_shutdown),
                 notification_manager=_StageManager(stages),
+                motion_stop_event=motion_stop_event,
                 motion_task=motion_task,
                 event_capture=event_capture,
             ),
@@ -2512,6 +2514,118 @@ def test_every_remaining_stage_runs_when_the_worker_fails_to_retire(
     assert "would not retire" in logged
 
 
+def test_the_remaining_monitors_are_signalled_only_after_event_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Health, database and camera monitoring stay live through the handover.
+
+    Setting every stop event up front is the easy shape and the wrong one: it
+    tears down the health picture during exactly the window when the camera is
+    still finishing an automatic capture. The contract is that the remaining
+    monitors are not even *asked* to stop until the motion producer is terminal
+    and the event-capture worker has been retired.
+    """
+    stages = _install_stage_recorder(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    async def _main() -> None:
+        motion_stop_event = asyncio.Event()
+        monitor_stop_event = asyncio.Event()
+        capture_finished = asyncio.Event()
+
+        async def _motion() -> None:
+            await motion_stop_event.wait()
+            # Observed from inside the motion drain, before it returns.
+            observed["monitors_signalled_during_motion_drain"] = (
+                monitor_stop_event.is_set()
+            )
+            stages.append("motion-monitor-stopped")
+
+        async def _other_monitor() -> None:
+            await monitor_stop_event.wait()
+            observed["monitor_saw_its_stop_event"] = True
+            stages.append("other-monitor-stopped")
+
+        motion_task = asyncio.create_task(_motion(), name="mgo-motion-monitor")
+        other = asyncio.create_task(_other_monitor(), name="mgo-health-monitor")
+
+        class _InFlightEventCapture:
+            """Retires only after an in-flight capture has finished."""
+
+            def __init__(self) -> None:
+                self.retired = False
+
+            async def shutdown(self) -> None:
+                observed["monitors_signalled_at_retirement_start"] = (
+                    monitor_stop_event.is_set()
+                )
+                observed["motion_done_at_retirement"] = motion_task.done()
+                # Stand-in for one in-flight automatic capture plus its
+                # observation write: several loop turns, during which the
+                # remaining monitors must still not have been signalled.
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                    assert not monitor_stop_event.is_set(), (
+                        "the remaining monitors were signalled while an "
+                        "automatic capture was still in flight"
+                    )
+                capture_finished.set()
+                observed["monitors_signalled_at_retirement_end"] = (
+                    monitor_stop_event.is_set()
+                )
+                stages.append("event-capture-shutdown")
+                self.retired = True
+
+        event_capture = _InFlightEventCapture()
+
+        def _at_camera_shutdown() -> None:
+            observed["capture_finished_at_camera_shutdown"] = (
+                capture_finished.is_set()
+            )
+            observed["worker_retired_at_camera_shutdown"] = event_capture.retired
+            observed["monitor_done_at_camera_shutdown"] = other.done()
+
+        observed["error"] = await asyncio.wait_for(
+            _shutdown_lifespan(
+                stop_events=(monitor_stop_event,),
+                monitor_tasks=[other],
+                coordinator=_StageCoordinator(stages, probe=_at_camera_shutdown),
+                notification_manager=_StageManager(stages),
+                motion_stop_event=motion_stop_event,
+                motion_task=motion_task,
+                event_capture=event_capture,
+            ),
+            timeout=_DRAIN_TIMEOUT,
+        )
+        observed["monitor_signalled_at_end"] = monitor_stop_event.is_set()
+
+    asyncio.run(_main())
+
+    assert observed["error"] is None
+    # Not signalled while motion was draining...
+    assert observed["monitors_signalled_during_motion_drain"] is False
+    # ...nor when event-capture retirement began...
+    assert observed["monitors_signalled_at_retirement_start"] is False
+    # ...nor while the in-flight capture was still finishing.
+    assert observed["monitors_signalled_at_retirement_end"] is False
+    # The motion producer really was terminal before retirement started.
+    assert observed["motion_done_at_retirement"] is True
+    # And then they were signalled, and awaited to completion, before the camera.
+    assert observed["monitor_signalled_at_end"] is True
+    assert observed["monitor_saw_its_stop_event"] is True
+    assert observed["capture_finished_at_camera_shutdown"] is True
+    assert observed["worker_retired_at_camera_shutdown"] is True
+    assert observed["monitor_done_at_camera_shutdown"] is True
+    assert stages == [
+        "motion-monitor-stopped",
+        "event-capture-shutdown",
+        "other-monitor-stopped",
+        "camera-shutdown",
+        "stop-notification",
+        "stop-observation",
+    ]
+
+
 def test_a_motion_drain_failure_is_recorded_and_cleanup_continues(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2521,20 +2635,21 @@ def test_a_motion_drain_failure_is_recorded_and_cleanup_continues(
     failure = RuntimeError("motion monitor failed during shutdown")
 
     async def _main() -> None:
-        stop_event = asyncio.Event()
+        motion_stop_event = asyncio.Event()
 
         async def _motion() -> None:
-            await stop_event.wait()
+            await motion_stop_event.wait()
             raise failure
 
         motion_task = asyncio.create_task(_motion(), name="mgo-motion-monitor")
 
         observed["error"] = await asyncio.wait_for(
             _shutdown_lifespan(
-                stop_events=(stop_event,),
+                stop_events=(),
                 monitor_tasks=[],
                 coordinator=_StageCoordinator(stages),
                 notification_manager=_StageManager(stages),
+                motion_stop_event=motion_stop_event,
                 motion_task=motion_task,
                 event_capture=_StageEventCapture(stages),
             ),

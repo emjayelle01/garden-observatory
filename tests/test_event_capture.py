@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -127,14 +128,37 @@ class _FakeWorkflow:
 
 
 class _Recorder:
-    """An observation recorder double that records, and can fail."""
+    """An observation recorder double that records, and can fail.
 
-    def __init__(self, *, error: BaseException | None = None) -> None:
+    It also remembers the identity of the thread it was called on, which is what
+    the event-loop regression tests below assert against: an observation written
+    on the loop thread would block every other coroutine for the duration of a
+    SQLite transaction.
+    """
+
+    def __init__(
+        self,
+        *,
+        error: BaseException | None = None,
+        entered: ThreadEvent | None = None,
+        release: ThreadEvent | None = None,
+    ) -> None:
         self._error = error
+        self._entered = entered
+        self._release = release
         self.calls: list[dict[str, Any]] = []
+        self.thread_ids: list[int] = []
 
     def __call__(self, database_path: Path, **kwargs: Any) -> Any:
         self.calls.append({"database_path": database_path, **kwargs})
+        self.thread_ids.append(threading.get_ident())
+        if self._entered is not None:
+            self._entered.set()
+        if self._release is not None:
+            # Bounded so a defect fails the test instead of hanging the suite.
+            assert self._release.wait(timeout=10.0), (
+                "the observation write was never released"
+            )
         if self._error is not None:
             raise self._error
         return None
@@ -162,18 +186,56 @@ def _service(
 
 
 async def _settle(cycles: int = 40) -> None:
-    """Give the worker task every scheduling opportunity it could need."""
+    """Give the worker task every scheduling opportunity it could need.
+
+    A real (tiny) sleep rather than ``sleep(0)``: the worker's blocking steps run
+    in a thread pool, and their completions reach the loop through
+    ``call_soon_threadsafe``. Yielding without ever letting the loop wait would
+    make the outcome depend on how fast that thread happened to be.
+    """
     for _ in range(cycles):
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.002)
+
+
+async def _until(
+    predicate: Any, *, message: str, timeout: float = 10.0
+) -> None:
+    """Poll ``predicate`` until it holds, or fail with ``message``.
+
+    Bounded and condition-based, never a fixed sleep: the assertion is what the
+    test is waiting *for*, so a slow machine waits longer and a broken one fails
+    with a description rather than a flake.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        assert loop.time() < deadline, message
+        await asyncio.sleep(0.005)
 
 
 async def _drain(service: EventCaptureService) -> None:
     """Let the worker finish whatever it is doing, bounded."""
-    for _ in range(200):
-        await asyncio.sleep(0.005)
-        if service.status().state is not EventCaptureState.CAPTURING:
-            return
-    raise AssertionError("the worker never left the capturing state")
+    await _until(
+        lambda: service.status().state is not EventCaptureState.CAPTURING,
+        message="the worker never left the capturing state",
+    )
+
+
+async def _observations(recorder: _Recorder, count: int) -> None:
+    """Wait until ``count`` observation writes have been attempted.
+
+    The observation write is awaited in a worker thread *after* the runtime state
+    has settled, so "the state says idle" is not the same instant as "the
+    timeline entry was written". Tests that assert on the recorder wait for the
+    recorder.
+    """
+    await _until(
+        lambda: len(recorder.calls) >= count,
+        message=(
+            f"expected {count} observation write(s), "
+            f"saw {len(recorder.calls)}"
+        ),
+    )
 
 
 # --- trigger admission -------------------------------------------------------
@@ -692,13 +754,13 @@ def test_the_worker_survives_a_failure_and_captures_again() -> None:
         service.start()
         try:
             service.submit(_motion())
-            await _drain(service)
-            await _settle()
+            # Wait for the failure's *observation*, not just the state change:
+            # that is the point at which the worker has finished the trigger.
+            await _observations(recorder, 1)
             first = state.snapshot()
 
             service.submit(_motion())
-            await _drain(service)
-            await _settle()
+            await _observations(recorder, 2)
         finally:
             await service.shutdown()
         return {
@@ -765,14 +827,12 @@ def test_a_failing_failure_observation_keeps_the_original_truth(
         service.start()
         try:
             service.submit(_motion())
-            await _drain(service)
-            await _settle()
+            await _observations(recorder, 1)
             after_failure = state.snapshot()
 
             # A later valid trigger still works.
             service.submit(_motion())
-            await _drain(service)
-            await _settle()
+            await _observations(recorder, 2)
         finally:
             await service.shutdown()
         return {
@@ -810,6 +870,215 @@ def test_a_failing_failure_observation_keeps_the_original_truth(
 
     logged = "\n".join(record.getMessage() for record in caplog.records)
     assert "failure observation could not be recorded" in logged
+
+
+# --- observation persistence never runs on the event loop --------------------
+#
+# The capture-and-archive workflow was always offloaded, but the observation
+# write that follows it was not: it was invoked directly from the worker
+# coroutine, so a SQLite transaction on a struggling SD card would stall the
+# event loop -- and with it motion analysis, the API and every monitor -- for as
+# long as the write took.
+#
+# These prove the offload two ways at once. The recorder records the thread it
+# ran on, which must not be the loop's; and while it is *blocked* on a barrier,
+# an independent coroutine must still be able to run. Neither assertion depends
+# on how long anything takes.
+
+
+def test_the_success_observation_is_written_off_the_event_loop() -> None:
+    """A success observation must never block the loop it was produced on."""
+
+    async def _main() -> dict[str, Any]:
+        entered = ThreadEvent()
+        release = ThreadEvent()
+        recorder = _Recorder(entered=entered, release=release)
+        service, _, _ = _service(_FakeWorkflow(), recorder=recorder)
+        loop_thread = threading.get_ident()
+        ticks = 0
+
+        async def _heartbeat() -> None:
+            """An ordinary coroutine, standing in for every other consumer."""
+            nonlocal ticks
+            while not release.is_set():
+                ticks += 1
+                await asyncio.sleep(0.005)
+
+        service.start()
+        beat = asyncio.create_task(_heartbeat(), name="test-heartbeat")
+        try:
+            service.submit(_motion())
+            # The recorder is now inside the observation write and holding.
+            await _until(
+                entered.is_set,
+                message="the observation write never started",
+            )
+            # The decisive assertion: the loop is still running other work
+            # while the database write is blocked.
+            observed_ticks_start = ticks
+            await _until(
+                lambda: ticks > observed_ticks_start + 2,
+                message="the event loop was blocked by the observation write",
+            )
+            blocked_ticks = ticks
+            release.set()
+            await beat
+            await _observations(recorder, 1)
+        finally:
+            release.set()
+            await service.shutdown()
+        return {
+            "recorder": recorder,
+            "loop_thread": loop_thread,
+            "blocked_ticks": blocked_ticks,
+        }
+
+    observed = asyncio.run(_main())
+    recorder: _Recorder = observed["recorder"]
+
+    assert recorder.calls, "the success observation was never attempted"
+    assert recorder.by_status(SUCCESS_STATUS)
+    # It ran, and it ran somewhere else.
+    assert recorder.thread_ids
+    for thread_id in recorder.thread_ids:
+        assert thread_id != observed["loop_thread"], (
+            "the observation recorder ran on the asyncio event-loop thread"
+        )
+    assert observed["blocked_ticks"] > 0
+
+
+def test_the_failure_observation_is_written_off_the_event_loop() -> None:
+    """And the failure path is offloaded on exactly the same terms."""
+
+    async def _main() -> dict[str, Any]:
+        entered = ThreadEvent()
+        release = ThreadEvent()
+        recorder = _Recorder(entered=entered, release=release)
+        workflow = _FakeWorkflow(
+            errors=[BackendCaptureError("rpicam-still exited with code 1")]
+        )
+        service, _, _ = _service(workflow, recorder=recorder)
+        loop_thread = threading.get_ident()
+        ticks = 0
+
+        async def _heartbeat() -> None:
+            nonlocal ticks
+            while not release.is_set():
+                ticks += 1
+                await asyncio.sleep(0.005)
+
+        service.start()
+        beat = asyncio.create_task(_heartbeat(), name="test-heartbeat")
+        try:
+            service.submit(_motion())
+            await _until(
+                entered.is_set,
+                message="the failure observation write never started",
+            )
+            observed_ticks_start = ticks
+            await _until(
+                lambda: ticks > observed_ticks_start + 2,
+                message="the event loop was blocked by the observation write",
+            )
+            blocked_ticks = ticks
+            release.set()
+            await beat
+            await _observations(recorder, 1)
+        finally:
+            release.set()
+            await service.shutdown()
+        return {
+            "recorder": recorder,
+            "loop_thread": loop_thread,
+            "blocked_ticks": blocked_ticks,
+        }
+
+    observed = asyncio.run(_main())
+    recorder: _Recorder = observed["recorder"]
+
+    assert recorder.by_status(FAILURE_STATUS)
+    assert recorder.thread_ids
+    for thread_id in recorder.thread_ids:
+        assert thread_id != observed["loop_thread"], (
+            "the observation recorder ran on the asyncio event-loop thread"
+        )
+    assert observed["blocked_ticks"] > 0
+
+
+def test_the_worker_waits_for_the_observation_before_the_next_trigger() -> None:
+    """A trigger is not finished until its timeline entry has been attempted.
+
+    Otherwise the queue's one pending slot would stop meaning anything: a second
+    capture could take the camera while the first was still writing its record.
+    """
+
+    async def _main() -> dict[str, Any]:
+        entered = ThreadEvent()
+        release = ThreadEvent()
+        recorder = _Recorder(entered=entered, release=release)
+        workflow = _FakeWorkflow()
+        service, _, _ = _service(workflow, recorder=recorder)
+        service.start()
+        try:
+            service.submit(_motion())
+            await _until(
+                entered.is_set,
+                message="the observation write never started",
+            )
+            # A second trigger is queued while the first is still being
+            # recorded.
+            assert service.submit(_motion()) is True
+            await _settle()
+            # It has NOT been captured: the worker is still finishing the first.
+            calls_during_write = workflow.calls
+
+            release.set()
+            await _observations(recorder, 2)
+        finally:
+            release.set()
+            await service.shutdown()
+        return {
+            "calls_during_write": calls_during_write,
+            "workflow": workflow,
+            "recorder": recorder,
+        }
+
+    observed = asyncio.run(_main())
+
+    assert observed["calls_during_write"] == 1
+    # Once released, the queued trigger was processed normally.
+    assert observed["workflow"].calls == 2
+    assert len(observed["recorder"].calls) == 2
+
+
+def test_the_capture_workflow_also_runs_off_the_event_loop() -> None:
+    """The pre-existing offload of capture and archive is still in place."""
+
+    async def _main() -> dict[str, Any]:
+        thread_ids: list[int] = []
+
+        class _ThreadAwareWorkflow(_FakeWorkflow):
+            def capture(
+                self, *, extra_metadata: dict[str, Any] | None = None
+            ) -> Capture:
+                thread_ids.append(threading.get_ident())
+                return super().capture(extra_metadata=extra_metadata)
+
+        service, _, recorder = _service(_ThreadAwareWorkflow())
+        loop_thread = threading.get_ident()
+        service.start()
+        try:
+            service.submit(_motion())
+            await _observations(recorder, 1)
+        finally:
+            await service.shutdown()
+        return {"thread_ids": thread_ids, "loop_thread": loop_thread}
+
+    observed = asyncio.run(_main())
+
+    assert observed["thread_ids"]
+    for thread_id in observed["thread_ids"]:
+        assert thread_id != observed["loop_thread"]
 
 
 # --- runtime state and counters ---------------------------------------------

@@ -168,11 +168,37 @@ worker task (`mgo-event-capture-worker`). It:
 
 - waits efficiently on the queue and never busy-loops;
 - processes one trigger at a time;
-- runs the blocking capture-and-archive workflow in a worker thread, so the event
-  loop — and therefore motion, the API and every monitor — keeps running;
+- runs **every** blocking step in a worker thread — the capture-and-archive
+  workflow *and* the observation write that follows it — so the event loop, and
+  therefore motion, the API and every monitor, keeps running throughout;
 - survives both expected and unexpected per-trigger failures;
 - keeps accepting later valid triggers after a failure;
 - terminates deterministically during shutdown.
+
+### Nothing blocking runs on the event loop
+
+Both offloads matter, and the second one is easy to lose. The capture subprocess
+is the obvious blocker, but the observation write is a SQLite transaction on the
+same SD card the database lives on, and a synchronous call to it from the worker
+coroutine would stall the loop for its full duration — during precisely the
+moment when motion analysis, `/health` and every monitor most need to keep
+running.
+
+So `record_observation` and the injected recorder stay **synchronous** — they are
+used from monitors, the lifespan and the CLI, and making the repository's
+observation API async to suit one caller would be the wrong direction. Instead
+the event-capture worker calls its recorder through `asyncio.to_thread(...)` and
+**awaits** it.
+
+Awaiting rather than detaching is deliberate: a trigger is not finished until its
+timeline entry has been attempted, so the queue's one pending slot keeps meaning
+what it says. A second capture cannot take the camera while the first is still
+writing its record. There is no detached observation task, no second queue and no
+task per observation.
+
+Tests pin this by thread identity — the recorder records
+`threading.get_ident()`, which must differ from the loop's — and by holding the
+recorder on a barrier while an independent coroutine keeps ticking.
 
 **There is no retry.** A failed attempt is recorded truthfully and abandoned;
 motion is a renewable trigger, and re-capturing a moment that has passed produces
@@ -401,19 +427,27 @@ With the feature disabled, none of this happens and startup is exactly as it was
 
 ## Shutdown
 
-Ordering is load-bearing:
+Ordering is load-bearing, and so is the order in which stop events are
+**signalled** — not just the order in which tasks are awaited:
 
-1. the motion producer is stopped and drained, so no new transition can be
-   submitted;
+1. the motion stop event is set and the motion monitor is drained to a terminal
+   state, so no new transition can be submitted;
 2. the service stops accepting triggers;
 3. any queued trigger that had **not started** is discarded;
-4. one already **in-flight** capture is allowed to finish — it owns the camera,
-   and abandoning it mid-transaction would leave a partial file and an unrestored
-   preview;
+4. one already **in-flight** capture and its observation write are allowed to
+   finish — it owns the camera, and abandoning it mid-transaction would leave a
+   partial file and an unrestored preview;
 5. the worker is awaited to a terminal state;
-6. the remaining monitors are drained;
+6. **only now** are the health, database and camera monitors signalled, and then
+   drained;
 7. **only then** is `CameraCoordinator.shutdown()` called;
 8. the existing stop notification and stop observation are performed.
+
+Step 6 is deliberately late. Signalling every monitor up front is the easier
+shape and the wrong one: it tears the health picture down during exactly the
+window in which the camera is still finishing an automatic capture, which is
+when an operator most wants it. Health, database and camera monitoring therefore
+stay live for the whole of the motion drain and the in-flight capture.
 
 No automatic capture may **begin** after shutdown has started. Every cleanup
 stage is still attempted if an earlier one fails, and a cleanup failure never

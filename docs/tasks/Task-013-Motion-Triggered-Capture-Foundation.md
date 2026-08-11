@@ -1,8 +1,12 @@
 # Task 13.1 — Motion-Triggered Capture Foundation
 
-**Status: implemented and validated in the repository. Not reviewed, not merged,
-not deployed. No Raspberry Pi access was used and no hardware validation was
-performed.**
+**Status: implemented, reviewed once, review gaps closed, and validated green in
+the repository. Not merged, not deployed. No Raspberry Pi access was used and no
+hardware validation was performed.**
+
+Two commits on this branch: `Add motion-triggered capture foundation`
+(`0ce49a5`) and `Close Task 13.1 review gaps`. The review correction is recorded
+in its own section below.
 
 Repository starting SHA: `9634e84a19b31411b6d741d4c5a13f8c0aec508a`
 (`main`, and `origin/main`, at the time this branch was created).
@@ -105,13 +109,18 @@ requires `camera.enabled`, `preview.enabled`, `preview.auto_start`,
 produces triggers. Silently accepting such a configuration would leave an
 operator believing captures were being taken when nothing would ever take one.
 
-**Shutdown ordering is explicit.** `_shutdown_lifespan` now drains the motion
-producer first, then retires the event-capture worker, then drains the remaining
-monitors, and only then shuts the camera coordinator down. Queued-but-unstarted
-work is discarded; one in-flight capture is allowed to finish. Every existing
-cleanup guarantee is preserved: each stage is attempted even if an earlier one
-failed, and a cleanup failure never replaces the original startup or serving
-exception.
+**Shutdown ordering is explicit.** `_shutdown_lifespan` signals and drains the
+motion producer first, then retires the event-capture worker, then signals and
+drains the remaining monitors, and only then shuts the camera coordinator down.
+Queued-but-unstarted work is discarded; one in-flight capture is allowed to
+finish. Every existing cleanup guarantee is preserved: each stage is attempted
+even if an earlier one failed, and a cleanup failure never replaces the original
+startup or serving exception.
+
+**Blocking work never runs on the event loop.** The capture-and-archive workflow
+*and* the observation write are both offloaded with `asyncio.to_thread` and
+awaited. See the review correction below — the second of those was a real defect
+in the first commit.
 
 ## Database
 
@@ -191,17 +200,18 @@ observation; the status endpoint's fields and its inertness; motion callback
 composition in both failure directions; and shutdown ordering, in-flight
 completion, pending discard and cleanup-stage precedence.
 
-### The three full-suite failures
+### The three full-suite failures at `0ce49a5` — all resolved
 
-One is a load flake and two pre-date this branch.
+*All three are resolved as of the review-correction commit; the full suite now
+reports 0 failed. This section records what they were.*
 
 `tests/test_operations_deployment.py::test_a_root_caller_validates_a_good_policy`
 timed out after 60 seconds inside a `bash` subprocess while the machine was also
-running the mutation register. Re-run on its own the module passes in full
-(**305 passed in 157 s**). It is a machine-load timeout, not a behaviour change,
-and nothing in Task 13.1 touches that code path.
+running the mutation register. It passes in a sequential run and the test was
+not modified.
 
-The other two are pre-existing:
+The other two were the stale Task 12 assertions, realigned in the review
+correction above:
 
 - `test_the_task_record_states_the_installation_without_overclaiming`
 - `test_the_power_failure_not_the_installation_explains_the_baseline_change`
@@ -220,10 +230,9 @@ assert verbatim:
 
 That commit's own message records that only targeted tests were run for it.
 
-Task 13.1 **did not** change these tests, that document, or anything they read,
-and deliberately does not fix them: they belong to the Task 12 record and
-correcting them here would mix an unrelated documentation change into this
-branch. They are reported for a separate decision.
+The implementation commit `0ce49a5` left them alone and reported them. Review
+directed that the **assertions**, not the record, be brought into line; that is
+what the correction commit does. The Task 12 record remains unchanged.
 
 ## Not performed
 
@@ -237,6 +246,108 @@ branch. They are reported for a separate decision.
   against a physical camera. Enabling it in production is a separate,
   hardware-validated step and must not be inferred from this record.
 - **Task 13.2 has not started.**
+
+## Review correction (second commit on this branch)
+
+Repository review of `0ce49a5` found three gaps. All three are closed by
+`Close Task 13.1 review gaps`.
+
+### 1. Observation persistence still ran on the event loop
+
+`_execute` correctly offloaded the capture-and-archive workflow to
+`asyncio.to_thread`, but the observation write that followed it did not: both
+`_handle_success` and `_handle_failure` invoked the synchronous recorder
+**directly from the worker coroutine**. A SQLite transaction on the SD card
+therefore blocked the event loop — and with it motion analysis, `/health`, the
+API and every monitor — for its full duration.
+
+The finding was correct and the defect was real. It was also invisible: every
+capture, observation, counter and status field was right, and the feature's
+functional tests all passed. Nothing in the first commit's test set would ever
+have caught it.
+
+`record_observation` and the injected recorder stay **synchronous** — they are
+used from the monitors, the lifespan and the CLI, and making the repository's
+observation API async to suit one caller would be the wrong direction. Instead
+both handlers now `await` a threaded call, through one `_record_observation`
+helper. It is **awaited, not detached**: a trigger is not finished until its
+timeline entry has been attempted, which is what keeps the queue's single
+pending slot meaningful. No detached task, no second queue, no task per
+observation, no retry.
+
+Success and failure semantics are unchanged: counters, capture id and timestamp,
+the return to `idle`, the single correlated success observation, the
+category-only failure observation, the no-recursion rule when the failure
+observation itself fails, and the sanitised `last_error`.
+
+### 2. Shutdown signalled every stop event up front
+
+The *await* order was already correct, but `_shutdown_lifespan` set every stop
+event at the top, so the health, database and camera monitors were being torn
+down during the motion drain and the in-flight capture. The signalling now
+follows the contract: motion is signalled and drained, event capture is retired,
+and only then are the remaining monitors signalled and drained, before camera
+shutdown. `motion_stop_event` is passed separately for the same reason its task
+is.
+
+Health, database and camera monitoring therefore stay live through exactly the
+window in which the camera is still doing something — which is when an operator
+most needs them.
+
+### 3. Two stale Task 12 assertions
+
+`tests/test_deployment_gateway.py` still asserted two phrasings that `9634e84`
+("Clarify Task 12 historical camera status") deliberately replaced with dated,
+historically scoped wording:
+
+- `Physical camera acceptance remains pending` — a present-tense claim that
+  became false when acceptance passed on 2026-08-06;
+- `**Preview is currently stopped because of a power failure, not because of
+  the\ninstallation.**` — true when written, false once managed preview was
+  enabled.
+
+**The Task 12 record was not changed.** It is authoritative and correct; the
+assertions were stale. Both were realigned to the current wording and, in each
+case, *strengthened* rather than weakened: they now require the dated scoping
+**and** the statement of what happened afterwards, so the record can satisfy
+them neither by leaving a stale present-tense claim standing nor by deleting the
+history. Installed-versus-exercised remains distinct; the power failure — not
+the gateway installation — remains the explanation of the historical stopped
+preview; and the record must still say plainly that the state was superseded and
+that preview is running. No SHA, PID, timestamp, checksum, capture id, digest,
+mounting answer or acceptance decision was touched.
+
+### Correction validation
+
+| Check | Result |
+| ----- | ------ |
+| `uv sync --frozen` | Pass — no dependency change |
+| `uv run ruff check .` | Pass |
+| `uv run mypy src` | Pass — 54 source files |
+| Focused event-capture / shutdown / Task 12 tests | Pass |
+| Full suite `uv run pytest` | **2568 passed, 12 skipped, 0 failed** |
+| `uv run python scripts/dev/run-mutations.py` | **182/182 detected**, 0 stale, 0 restoration failures, 0 unmatched selectors |
+| `git diff --check` | Pass |
+
+Every workload was run **sequentially**; nothing ran alongside the mutation
+register. `test_a_root_caller_validates_a_good_policy` passes in the normal
+sequential full-suite run and was not modified — the earlier 60-second timeout
+was concurrency-induced, as suspected.
+
+Two mutations were added (180 → **182**), one per code finding:
+
+- `observation-persistence-returns-to-the-event-loop` — replaces the threaded
+  observation write with a direct synchronous call; caught by the thread-identity
+  and loop-responsiveness regression tests.
+- `shutdown-signals-every-monitor-up-front` — restores the up-front signalling;
+  caught by the monitor-signalling-order regression test.
+
+New tests: four event-loop regression tests (success path, failure path, the
+worker waiting for the observation before the next trigger, and the still-intact
+capture offload) and one shutdown-signalling-order test. The event-loop tests
+assert on `threading.get_ident()` and on an independent coroutine continuing to
+run while the recorder is held on a `threading.Event` barrier — no sleep-based
+timing.
 
 ## Recommended next steps
 

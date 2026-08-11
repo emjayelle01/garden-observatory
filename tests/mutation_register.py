@@ -1919,4 +1919,30 @@ MUTATIONS: tuple[Mutation, ...] = (
         'A queued trigger takes the camera after shutdown has begun.',
         suite=EVENT_CAPTURE_SUITE,
     ),
+    # --- Task 13.1 review correction ----------------------------------------
+    #
+    # Both defects below were real, shipped in the first Task 13.1 commit, and
+    # invisible from every status endpoint and every functional test: the
+    # feature kept producing correct captures, correct observations and correct
+    # counters while doing so. They are exactly the kind a register is for.
+    Mutation(
+        'observation-persistence-returns-to-the-event-loop',
+        EVENT_CAPTURE_SERVICE,
+        '        await asyncio.to_thread(self._record_blocking, **fields)',
+        '        self._record_blocking(**fields)',
+        'observation_is_written_off_the_event_loop',
+        'A SQLite observation write stalls the loop it was produced on.',
+        suite=EVENT_CAPTURE_SUITE,
+    ),
+    Mutation(
+        'shutdown-signals-every-monitor-up-front',
+        APPLICATION,
+        '    if motion_stop_event is not None:',
+        '    for _event in stop_events:\n'
+        '        _event.set()\n'
+        '    if motion_stop_event is not None:',
+        'remaining_monitors_are_signalled_only_after_event_capture',
+        'Health and camera monitoring is torn down during an in-flight capture.',
+        suite=APPLICATION_SUITE,
+    ),
 )
