@@ -104,11 +104,15 @@ cooldown_seconds = 5.0
 # motion_detected still means SCENE CHANGE, not bird presence — and so does an
 # automatic capture. There is no detection, classification or species here.
 #
-# Left DISABLED here, and it must stay disabled until an explicit Raspberry Pi
-# validation step. Two things to settle before that step: this feature has never
-# run against the physical camera, and there is NO retention or deletion policy
-# yet, so captured images accumulate under [camera].capture_directory and the
-# disk headroom is an operator's problem until one exists.
+# The pipeline WAS validated against the physical camera on 2026-08-12 (Task
+# 13.2): real motion produced full-resolution stills, correctly attributed and
+# correlated, with preview released and restored each time and one camera owner
+# throughout. It still stays DISABLED here, and that is not caution left over
+# from before validation — it is the retention problem. There is NO retention or
+# deletion policy, and ambient garden motion alone produced ~3.4 captures per
+# minute during that validation (~8 MB/min) under [camera].capture_directory,
+# with nothing to reclaim it. Turning this on for an unattended period is a
+# separate operating decision that needs retention answered first.
 #
 # Enabling it requires camera.enabled, preview.enabled, preview.auto_start,
 # preview.restore_after_capture and motion.enabled to all be true; asking for it

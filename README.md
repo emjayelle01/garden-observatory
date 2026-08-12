@@ -712,6 +712,15 @@ capture. Architecture, trigger semantics, queue behaviour, metadata,
 observations, error categories, startup, shutdown and limitations live in
 [`docs/Event-Capture.md`](docs/Event-Capture.md).
 
+The pipeline was **validated against the physical Raspberry Pi camera on
+2026-08-12** — real motion, real full-resolution stills, correct attribution and
+correlation, preview restored every time, one camera owner throughout, and
+recovery across a service restart. It is **still disabled in production**, and
+that is the retention problem rather than leftover caution: ambient garden motion
+alone produced ~3.4 captures per minute during that window, and nothing reclaims
+them. See
+[`docs/tasks/Task-013-Physical-Motion-Triggered-Capture-Validation.md`](docs/tasks/Task-013-Physical-Motion-Triggered-Capture-Validation.md).
+
 ### `GET /event-capture/status`
 
 Read-only and inert: it reads application-managed state and never touches the

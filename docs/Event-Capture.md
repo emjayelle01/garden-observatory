@@ -484,10 +484,36 @@ MGO modules only.
   sustained activity the record is a sample, not a complete sequence.
 - There is **no retry**: a failed attempt is lost, not re-attempted.
 - Counters are process-lifetime and reset on restart.
-- Captured images accumulate on disk. **There is no retention or deletion policy
-  in this task**, so an enabled deployment needs disk headroom and manual
-  housekeeping until one exists.
-- No hardware validation of this feature has been performed on the Raspberry Pi.
+- Captured images accumulate on disk. **There is no retention or deletion policy**,
+  so an enabled deployment needs disk headroom and manual housekeeping until one
+  exists.
+
+## Physical validation status
+
+The pipeline was validated against the real Raspberry Pi camera on
+**2026-08-12** (Task 13.2, deployed code `48bdaf3`). Real motion transitions
+produced 17 full-resolution `rpicam-still` captures, each catalogued with
+`origin = motion` and its actual motion facts, each correlated to exactly one
+immutable `event_capture` observation. Preview was released and restored every
+time, process sampling observed the producer count go 1 → **0** → 1 across a
+capture and never above one, no `libcamera-vid` producer ever appeared, and
+zero captures failed or were dropped. The pipeline also recovered across a
+service restart and captured again.
+
+**The feature nevertheless remains disabled in production, deliberately.**
+Validation was a short, bounded, supervised window; the configuration was
+restored byte-for-byte afterwards. Permanent enablement is a separate operating
+decision and is blocked on the retention question above — during validation
+ambient garden motion alone produced roughly 3.4 captures per minute, which is
+about 8 MB per minute of imagery with nothing to reclaim it.
+
+Validated by that exercise: the motion→capture→archive→observation transaction,
+single-camera ownership, preview restoration, and restart recovery. **Not**
+validated by it: bird or species detection (not implemented), queue-overflow
+behaviour under sustained load, deployment rollback, unattended long-term
+operation, and camera hardware hardening.
+
+See [`docs/tasks/Task-013-Physical-Motion-Triggered-Capture-Validation.md`](tasks/Task-013-Physical-Motion-Triggered-Capture-Validation.md).
 
 ## Future work
 
