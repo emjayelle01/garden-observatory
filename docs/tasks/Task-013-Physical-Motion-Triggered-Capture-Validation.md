@@ -120,6 +120,12 @@ correlation ID.
 
 Every capture: `4608×2592`, backend `rpicam-still`, ~2.42–2.55 MB.
 
+The 17 recorded JPEG sizes sum to **42 660 151 bytes**. Over the 341-second
+enabled window that is approximately **3.0 captures per minute** and
+approximately **7.5 MB per minute** of JPEG payload (decimal). Those are
+measurements of this short window on this scene under the light and activity of
+that morning — they are not long-term averages and must not be quoted as one.
+
 ### First automatic capture
 
 | Field | Value |
@@ -248,8 +254,12 @@ exercise.
 | While enabled (final) | 49 360 941 056 | 16 (health 14.8) |
 | After restoration | 49 358 385 152 | 16 (health 14.8) |
 
-~44 MB consumed by 17 captures. Free space never approached the 2 GiB floor and
-utilisation never approached 90 %.
+Filesystem free space fell by **43 794 432 bytes** (~43.8 MB decimal) between
+baseline and post-restoration. That is the measured free-space change, which is
+larger than the **42 660 151 bytes** of JPEG payload because it also covers
+database, WAL and log growth over the same period; the two figures are reported
+separately and are not interchangeable. Free space never approached the 2 GiB
+floor and utilisation never approached 90 %.
 
 ## Final production state
 
@@ -288,20 +298,55 @@ cap of 10.** Elapsed time was well inside limits (5 min 41 s of 15 minutes), and
 no other budget threshold — disk free, utilisation, space delta, preview, health,
 database, producer count — was approached.
 
-Cause: ambient garden motion triggered at roughly **3.4 captures per minute**,
-around ten times the rate the budget assumed. The cap is procedural — checked by
-the operator between verification steps — and each verification round trip took
-20–40 s, during which one or two further captures completed. By the time the
-count was read after the post-restart capture it had already passed 10.
+Cause: ambient garden motion triggered at approximately **3.0 captures per
+minute** across the 341-second window, around ten times the rate the budget
+assumed. The cap is procedural — checked by the operator between verification
+steps — and each verification round trip took 20–40 s, during which one or two
+further captures completed. By the time the count was read after the post-restart
+capture it had already passed 10. The enabled window was stopped once the overrun
+was observed.
 
-Consequence: none beyond ~26 MB of additional retained evidence. Every capture
-succeeded, none failed or was dropped, disk moved 14.7 % → 14.8 %, and all
-captures are retained.
+Consequence, computed from the recorded JPEG sizes:
+
+| Item | Bytes |
+| ---- | ----- |
+| All 17 validation captures | 42 660 151 |
+| First 10 chronological captures (within the cap) | 25 087 108 |
+| **Seven captures beyond the cap** | **17 573 043** |
+
+The excess attributable specifically to exceeding the cap is therefore
+**17 573 043 bytes — approximately 17.6 MB decimal, approximately 16.8 MiB** of
+additional retained evidence, and nothing else. Every capture succeeded, none
+failed or was dropped, disk utilisation moved 14.7 % → 14.8 %, and all captures
+are retained.
 
 Lesson for any future enabled window on this scene: **the capture cap, not the
 clock, is the binding constraint.** A future exercise needs either an
 application-side limit or an enabled window measured in tens of seconds, not
 minutes.
+
+### Reviewer disposition
+
+**CAPTURE-BUDGET OVERRUN ACCEPTED AS A NON-BLOCKING VALIDATION DEVIATION.**
+
+The reviewer's recorded reasoning: 17 successful captures occurred against the
+procedural cap of 10; the excess was caused by autonomous ambient garden motion
+while verification operations were in progress; the enabled validation window was
+stopped once the overrun was observed; elapsed time remained well below 15
+minutes; storage remained safe; health remained healthy; the database remained
+healthy; preview restoration remained successful; producer ownership remained
+correct; no capture failed; no trigger was dropped; production configuration was
+restored byte-identically; approval was withdrawn; and repeating the physical
+test would produce additional captures without adding useful validation evidence.
+
+**The absence of separately induced operator motion is likewise accepted.**
+Natural garden motion provided repeated real physical triggers, and deliberately
+introducing additional motion once the autonomous capture rate was known would
+have consumed more of the validation budget without strengthening the pipeline
+evidence.
+
+No capture in this record is attributed to a bird or to any other particular
+subject.
 
 Two smaller notes:
 
@@ -340,7 +385,28 @@ event-capture enablement, which is **not authorised**.
 
 1. Review this record.
 2. Treat **retention/deletion policy** as the blocker for any persistent
-   enablement — at the observed ambient rate this scene generates roughly
-   8 MB/min with nothing to reclaim it.
+   enablement — across this validation window the scene produced approximately
+   7.5 MB per minute of JPEG payload with nothing to reclaim it. Long-term
+   unattended behaviour remains unproven; that figure is a short-window
+   measurement, not a projection.
 3. Permanent enablement remains a separate, explicitly authorised operating
    decision.
+
+## Correction note — evidence accounting
+
+The first evidence commit (`1c72d71`, *Record Task 13.2 physical validation*)
+carried two rough figures in its narrative and commit message: an approximate
+"~26 MB extra" consequence for the capture-budget overrun, and a rough
+"~3.4 captures/minute" ambient rate. **Both were wrong.**
+
+The ~26 MB figure did not correspond to the seven excess captures at all; the
+~25 MB it approximated is the total for the *first ten* captures — the ones
+inside the cap. Recomputed from the recorded JPEG sizes, the seven excess
+captures total **17 573 043 bytes** (~17.6 MB decimal, ~16.8 MiB). The rate,
+recomputed from the recorded enabled-window timestamps
+(2026-08-12T07:52:18Z → 07:57:59Z, **341 s**), is **approximately 3.0 captures
+per minute**, and the JPEG payload rate is **approximately 7.5 MB per minute**.
+
+Repository history is immutable and `1c72d71` was **not** amended. This document,
+as corrected, is the authoritative accounting; where it and the earlier commit
+message disagree, this document is correct.

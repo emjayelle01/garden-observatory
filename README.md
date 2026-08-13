@@ -716,9 +716,12 @@ The pipeline was **validated against the physical Raspberry Pi camera on
 2026-08-12** — real motion, real full-resolution stills, correct attribution and
 correlation, preview restored every time, one camera owner throughout, and
 recovery across a service restart. It is **still disabled in production**, and
-that is the retention problem rather than leftover caution: ambient garden motion
-alone produced ~3.4 captures per minute during that window, and nothing reclaims
-them. See
+that is the retention problem rather than leftover caution: across the
+341-second enabled window ambient garden motion alone produced 17 captures
+totalling 42 660 151 bytes — about 3.0 captures per minute and about 7.5 MB per
+minute of JPEG payload — and nothing reclaims them. That is one short window's
+measurement, not a long-term average, and permanent enablement stays a separate
+operating decision. See
 [`docs/tasks/Task-013-Physical-Motion-Triggered-Capture-Validation.md`](docs/tasks/Task-013-Physical-Motion-Triggered-Capture-Validation.md).
 
 ### `GET /event-capture/status`

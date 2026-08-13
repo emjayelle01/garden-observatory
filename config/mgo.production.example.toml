@@ -109,10 +109,13 @@ cooldown_seconds = 5.0
 # correlated, with preview released and restored each time and one camera owner
 # throughout. It still stays DISABLED here, and that is not caution left over
 # from before validation — it is the retention problem. There is NO retention or
-# deletion policy, and ambient garden motion alone produced ~3.4 captures per
-# minute during that validation (~8 MB/min) under [camera].capture_directory,
-# with nothing to reclaim it. Turning this on for an unattended period is a
-# separate operating decision that needs retention answered first.
+# deletion policy, and across the 341-second enabled window ambient garden motion
+# alone produced 17 captures totalling 42,660,151 bytes under
+# [camera].capture_directory — about 3.0 captures per minute and about 7.5 MB per
+# minute of JPEG payload, with nothing to reclaim it. That is one short window's
+# measurement, not a long-term average; long-term unattended behaviour is
+# unproven. Turning this on for an unattended period is a separate operating
+# decision that needs retention answered first.
 #
 # Enabling it requires camera.enabled, preview.enabled, preview.auto_start,
 # preview.restore_after_capture and motion.enabled to all be true; asking for it

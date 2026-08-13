@@ -503,9 +503,12 @@ service restart and captured again.
 **The feature nevertheless remains disabled in production, deliberately.**
 Validation was a short, bounded, supervised window; the configuration was
 restored byte-for-byte afterwards. Permanent enablement is a separate operating
-decision and is blocked on the retention question above — during validation
-ambient garden motion alone produced roughly 3.4 captures per minute, which is
-about 8 MB per minute of imagery with nothing to reclaim it.
+decision and is blocked on the retention question above. Across the 341-second
+enabled window ambient garden motion alone produced **17 captures totalling
+42 660 151 bytes** — approximately **3.0 captures per minute** and approximately
+**7.5 MB per minute** of JPEG payload, with nothing to reclaim it. That is a
+measurement of one short window, not a long-term average; long-term unattended
+behaviour remains unproven.
 
 Validated by that exercise: the motion→capture→archive→observation transaction,
 single-camera ownership, preview restoration, and restart recovery. **Not**
