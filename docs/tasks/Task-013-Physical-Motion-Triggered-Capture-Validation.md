@@ -255,11 +255,13 @@ exercise.
 | After restoration | 49 358 385 152 | 16 (health 14.8) |
 
 Filesystem free space fell by **43 794 432 bytes** (~43.8 MB decimal) between
-baseline and post-restoration. That is the measured free-space change, which is
-larger than the **42 660 151 bytes** of JPEG payload because it also covers
-database, WAL and log growth over the same period; the two figures are reported
-separately and are not interchangeable. Free space never approached the 2 GiB
-floor and utilisation never approached 90 %.
+baseline and post-restoration. That is **1 134 281 bytes** more than the
+**42 660 151-byte** JPEG payload. The free-space measurement includes all
+filesystem writes and allocation effects occurring during the interval, so the
+difference is **not attributed to any specific component** — no component-level
+size measurement was taken during this exercise — and the two figures are not
+interchangeable. Free space never approached the 2 GiB floor and utilisation
+never approached 90 %.
 
 ## Final production state
 
@@ -298,13 +300,17 @@ cap of 10.** Elapsed time was well inside limits (5 min 41 s of 15 minutes), and
 no other budget threshold — disk free, utilisation, space delta, preview, health,
 database, producer count — was approached.
 
-Cause: ambient garden motion triggered at approximately **3.0 captures per
-minute** across the 341-second window, around ten times the rate the budget
-assumed. The cap is procedural — checked by the operator between verification
-steps — and each verification round trip took 20–40 s, during which one or two
-further captures completed. By the time the count was read after the post-restart
-capture it had already passed 10. The enabled window was stopped once the overrun
-was observed.
+Cause: ambient garden motion produced approximately **3.0 captures per minute**
+across the 341-second enabled window. At that short-window rate the procedural
+10-capture limit would be reached in roughly 3.3 minutes, were the rate to
+persist — and nothing here shows that it would; this is one short-window
+measurement, not a long-term average or a projection. The budget itself defined
+no assumed capture rate: it defined procedural stopping thresholds — 10
+successful automatic captures, or 15 minutes, whichever came first. The cap is
+procedural, checked by the operator between verification steps, and each
+verification round trip took 20–40 s, during which one or two further captures
+completed. By the time the count was read after the post-restart capture it had
+already passed 10. The enabled window was stopped once the overrun was observed.
 
 Consequence, computed from the recorded JPEG sizes:
 
