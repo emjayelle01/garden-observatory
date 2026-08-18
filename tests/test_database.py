@@ -34,7 +34,7 @@ def test_initial_migration_creates_observation_table(tmp_path: Path) -> None:
 
     applied = apply_migrations(database_path)
 
-    assert applied == [1, 2]
+    assert applied == [1, 2, 3]
     assert _table_exists(database_path, "observations")
 
 
@@ -93,7 +93,7 @@ def test_existing_pre_task_2c_database_receives_captures_migration(
 
     applied = apply_migrations(database_path)
 
-    assert applied == [2]
+    assert applied == [2, 3]
     assert _table_exists(database_path, "captures")
     # Pre-existing observation data survives the migration untouched.
     connection = sqlite3.connect(database_path)
@@ -114,5 +114,5 @@ def test_migrations_are_idempotent(tmp_path: Path) -> None:
     first_result = apply_migrations(database_path)
     second_result = apply_migrations(database_path)
 
-    assert first_result == [1, 2]
+    assert first_result == [1, 2, 3]
     assert second_result == []

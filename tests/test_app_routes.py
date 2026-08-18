@@ -58,6 +58,7 @@ from mgo.camera.preview import (
 from mgo.camera.preview_backend import MockPreviewBackend
 from mgo.camera.simulator import SimulatorCaptureBackend
 from mgo.core.config import MGOConfig, parse_config_text
+from mgo.core.database import database_connection
 from mgo.event_capture import (
     WORKER_TASK_NAME,
     EventCaptureService,
@@ -65,6 +66,7 @@ from mgo.event_capture import (
 )
 from mgo.motion.models import MotionResult, MotionStatus
 from mgo.notifications import EventType, NotificationManager, NullProvider
+from mgo.retention import RetentionRuntimeState, RetentionService
 
 _EXPECTED_FIELDS = {
     "enabled",
@@ -263,6 +265,10 @@ analysis_interval_seconds = 0.2
 [event_capture]
 enabled = {event_capture}
 
+[retention]
+enabled = {retention}
+{retention_bounds}
+
 [database]
 health_check_interval_seconds = 3600
 busy_timeout_seconds = 5.0
@@ -298,6 +304,7 @@ def _lifespan_config(
     restore_after_capture: bool = False,
     motion: bool = False,
     event_capture: bool = False,
+    retention: bool = False,
 ) -> MGOConfig:
     """Build an isolated configuration through the real parser and validator."""
     return parse_config_text(
@@ -308,6 +315,10 @@ def _lifespan_config(
             restore_after_capture=str(restore_after_capture).lower(),
             motion=str(motion).lower(),
             event_capture=str(event_capture).lower(),
+            retention=str(retention).lower(),
+            # An enabled policy must carry at least one bound, so the age bound
+            # appears only when retention is on. Nothing invokes it either way.
+            retention_bounds="max_age_days = 30" if retention else "",
         )
     )
 
@@ -2761,3 +2772,120 @@ def test_preview_remains_a_single_producer_with_event_capture_enabled(
     assert observed["capture"][0] == 200
     assert observed["producers_after"] == 1
     assert _producer_count() == 0
+
+
+# --- retention lifecycle wiring (Task 14.1) ---------------------------------
+#
+# Task 14.1 establishes the retention service and deliberately does not schedule
+# it. These tests run the real lifespan and assert that: the objects exist and
+# are truthful, nothing executes a run, and nothing creates a task, timer or
+# loop that could execute one later. "There is no scheduler" is a property that
+# can only be proven by starting the application and finding nothing there.
+
+
+def _retention_run_trap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make any destructive or preview retention call a test failure."""
+
+    def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the application lifespan executed retention")
+
+    monkeypatch.setattr(RetentionService, "run_once", _explode)
+    monkeypatch.setattr(RetentionService, "dry_run", _explode)
+
+
+def test_the_lifespan_attaches_retention_without_running_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Startup builds the holder and the service and invokes neither."""
+    _retention_run_trap(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    async def _body() -> None:
+        observed["state"] = app.state.retention_state
+        observed["service"] = app.state.retention_service
+        observed["status"] = await _asgi_call("GET", "/retention/status")
+
+    _run_lifespan(monkeypatch, _lifespan_config(tmp_path), _body)
+
+    assert isinstance(observed["state"], RetentionRuntimeState)
+    assert isinstance(observed["service"], RetentionService)
+    assert observed["status"][0] == 200
+    assert observed["status"][1]["state"] == "disabled"
+    assert observed["status"][1]["total_runs"] == 0
+
+
+def test_enabling_retention_still_starts_no_scheduler(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Even fully enabled, nothing runs and no retention task exists.
+
+    This is the assertion that would fail the moment a timer, an interval loop
+    or a startup deletion is added -- which is exactly the change Task 14.1 is
+    not permitted to make.
+    """
+    _retention_run_trap(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    async def _body() -> None:
+        observed["status"] = await _asgi_call("GET", "/retention/status")
+        observed["tasks"] = sorted(
+            task.get_name() or "" for task in asyncio.all_tasks()
+        )
+
+    _run_lifespan(
+        monkeypatch, _lifespan_config(tmp_path, retention=True), _body
+    )
+
+    assert observed["status"][1]["enabled"] is True
+    assert observed["status"][1]["state"] == "idle"
+    assert observed["status"][1]["total_runs"] == 0
+    assert not any("retention" in name for name in observed["tasks"])
+
+
+def test_retention_creates_no_lifecycle_row_at_startup_or_shutdown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A full start-and-stop cycle leaves the media lifecycle table empty.
+
+    There is no startup deletion and no shutdown deletion, so a service that
+    starts and stops must reclaim nothing -- including the capture an enabled
+    policy would consider eligible.
+    """
+    _retention_run_trap(monkeypatch)
+    captures = tmp_path / "captures"
+    captures.mkdir(parents=True, exist_ok=True)
+    media = captures / "old.jpg"
+    media.write_bytes(b"jpeg")
+
+    async def _body() -> None:
+        return None
+
+    _run_lifespan(
+        monkeypatch, _lifespan_config(tmp_path, retention=True), _body
+    )
+
+    with database_connection(tmp_path / "mgo.db") as connection:
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM capture_media_lifecycle"
+        ).fetchone()
+    assert rows[0] == 0
+    assert media.exists()
+
+
+def test_the_retention_service_is_built_from_the_loaded_configuration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The service uses the configured capture root and database, not defaults."""
+    _retention_run_trap(monkeypatch)
+    observed: dict[str, Any] = {}
+    configuration = _lifespan_config(tmp_path, retention=True)
+
+    async def _body() -> None:
+        service = app.state.retention_service
+        observed["root"] = service._capture_directory
+        observed["config"] = service._config
+
+    _run_lifespan(monkeypatch, configuration, _body)
+
+    assert observed["root"] == configuration.camera.capture_directory
+    assert observed["config"] == configuration.retention

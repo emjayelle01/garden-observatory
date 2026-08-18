@@ -57,6 +57,7 @@ uv run pytest
 | `GET /dashboard`      | Local operational dashboard (browser page).             |
 | `GET /motion/status`  | The latest monitored motion-detection result.           |
 | `GET /event-capture/status` | Motion-triggered capture state and counters.      |
+| `GET /retention/status` | Capture-media retention state and counters.           |
 | `GET /notifications/status` | Notification framework status and counters.       |
 | `GET /captures`       | Capture catalogue (metadata only), newest first.        |
 | `GET /captures/{id}`  | Stored metadata for a single capture.                   |
@@ -175,6 +176,12 @@ tracked in a `schema_migrations` table and applied automatically at startup:
   shape and adopted without touching its data — it is never assumed to be empty;
 - a database recording a version **newer** than the running build is refused,
   and startup fails rather than opening it.
+
+The current schema version is **3**: migration 001 creates the observation
+timeline, 002 the capture catalogue, and 003 the capture **media lifecycle**
+table used by retention. Migration 003 is additive — it creates a new table and
+alters neither `captures` nor `observations`, so an existing unversioned
+version-2 database is still adopted and then migrated.
 
 Connections enforce foreign keys, use WAL journalling (verified, not assumed)
 and a finite `busy_timeout`. A migration failure prevents the application from
@@ -702,7 +709,10 @@ What it **does not** do:
 - it does **not** retry a failed capture, and it **drops** triggers that arrive
   while the camera is already busy with one queued behind it;
 - it adds **no** database, table, migration or dependency;
-- it has **no** retention or deletion policy — captured images accumulate.
+- it has **no** automatic retention: Task 14.1 added the retention *foundation*
+  (see [Capture retention](#capture-retention)), but it is disabled by default,
+  nothing schedules it, and captured images still accumulate until an operator
+  decides on a policy.
 
 Enabling it requires `camera.enabled`, `preview.enabled`, `preview.auto_start`,
 `preview.restore_after_capture` and `motion.enabled` to all be true; asking for
@@ -743,6 +753,102 @@ and `total_triggers_dropped`, plus `last_trigger_at`, `last_capture_id`,
 `last_capture_at` and `last_error`. Counters are **not** persisted and reset on
 restart. `last_error` is one of a fixed set of category messages and never
 carries an exception message, traceback or filesystem path.
+
+## Capture retention
+
+MGO includes a **capture-media retention foundation** (Task 14.1). It is the
+software machinery for reclaiming captured JPEGs safely — and only that.
+
+**It is disabled by default and is not authorised for production.** It has never
+deleted a real capture on the Raspberry Pi.
+
+What it deliberately does **not** have:
+
+- **no automatic scheduler** — no interval, timer, systemd timer, periodic loop,
+  startup deletion or shutdown deletion. Startup constructs the service and
+  invokes nothing;
+- **no public destructive endpoint** — `GET /retention/status` is read-only and
+  inert; there is no `POST /retention/run`;
+- **no disk-pressure policy** — it never reads free space, filesystem fullness
+  or the `health.disk_*` thresholds;
+- **no manual-capture or unknown-origin deletion policy.**
+
+What it does have:
+
+- **only `origin = "motion"` captures are managed.** Manual captures, captures
+  with no origin and captures from any unrecognised origin are **protected** and
+  can never be selected. Matching is exact equality;
+- an **age** policy (`max_age_days`, inclusive boundary) and/or a **managed-byte**
+  policy (`max_managed_bytes`, covering only the catalogued size of present
+  managed captures — not manual captures, the database, logs or the filesystem);
+- `minimum_keep_count` — the newest N managed captures are preserved
+  unconditionally, and the floor is **never** broken to meet a byte target;
+- `max_deletions_per_run` — a hard ceiling on how many captures one run may
+  newly select, with any remainder reported rather than silently dropped;
+- a **separate `capture_media_lifecycle` table**. Historical `captures` rows are
+  retained permanently: retention reclaims media, it never erases the record
+  that a capture happened, and a reclaimed capture is still returned by
+  `GET /captures`;
+- a **recoverable deletion state machine** — a durable `pending_delete` intent is
+  committed before the filesystem is touched, so a crash between unlink and
+  finalisation is recoverable rather than an unexplained missing file. A
+  `PRESENT` capture whose media is already missing is an inconsistency and is
+  never claimed as a retention success;
+- a strict **filesystem boundary** — absolute path, no `..`, filename agreement,
+  no symlink, containment inside the capture root, regular file, and an on-disk
+  size matching the catalogue. Any failure means *do not delete*. Nothing is ever
+  removed recursively, and an untracked file in the capture folder is never
+  touched;
+- a **dry run** that reads and reports and mutates nothing at all;
+- immutable `capture_retention` observations with a bounded, fixed public error
+  vocabulary carrying no paths, tracebacks or exception text.
+
+```toml
+[retention]
+enabled = false
+# max_age_days = 30
+# max_managed_bytes = 2147483648
+minimum_keep_count = 100
+max_deletions_per_run = 25
+```
+
+The `[retention]` section is optional — configuration files without it load
+unchanged with retention off. When `enabled = true`, at least one of
+`max_age_days` and `max_managed_bytes` is **required**; an enabled policy with
+no bound is rejected at load time. Retention requires neither `camera.enabled`
+nor `event_capture.enabled`: it must be able to reclaim media a now-disabled
+capture feature already produced.
+
+Task 14.1 is a **software foundation**. It does not authorise production
+retention, has had no physical validation, and by itself does **not** make the
+event-capture pipeline ready for permanent unattended enablement — event capture
+remains disabled in production, Task 13.2 was point-in-time physical validation
+only, and long-term unattended behaviour remains unproven. Full semantics,
+policy, state machine, recovery, safety rules and error categories live in
+[`docs/Retention.md`](docs/Retention.md).
+
+### `GET /retention/status`
+
+Read-only and inert: it reads application-managed state and never runs the
+planner, queries the captures table, stats a file, deletes anything, creates a
+lifecycle row, records an observation or touches the camera. It returns `200`
+whenever the application is serving, and it moves no counter. The `state` field
+is one of:
+
+| State      | Meaning                                                        |
+| ---------- | -------------------------------------------------------------- |
+| `disabled` | Off by configuration. Nothing may mutate.                      |
+| `idle`     | Enabled and not currently executing a run.                     |
+| `running`  | One destructive run is executing now.                          |
+| `error`    | The most recent run stopped on a failure.                      |
+
+Alongside it: `enabled`, the process-lifetime counters `total_runs`,
+`total_captures_deleted` and `total_bytes_reclaimed`, plus `last_run_at`,
+`last_run_candidate_count`, `last_run_deleted_count`,
+`last_run_bytes_reclaimed` and `last_error`. Counters are **not** persisted and
+reset on restart — the durable history is the lifecycle table and the
+observation timeline. `last_error` is one of a fixed set of category messages
+and never carries an exception message, traceback or filesystem path.
 
 ## Notifications
 

@@ -484,9 +484,11 @@ MGO modules only.
   sustained activity the record is a sample, not a complete sequence.
 - There is **no retry**: a failed attempt is lost, not re-attempted.
 - Counters are process-lifetime and reset on restart.
-- Captured images accumulate on disk. **There is no retention or deletion policy**,
-  so an enabled deployment needs disk headroom and manual housekeeping until one
-  exists.
+- Captured images accumulate on disk. Task 14.1 added the **retention
+  foundation** ([`docs/Retention.md`](Retention.md)), but it is **disabled by
+  default, nothing schedules it, and it has never been physically validated**.
+  Until an operator decides on a policy and on how retention is invoked, an
+  enabled deployment still needs disk headroom and manual housekeeping.
 
 ## Physical validation status
 
@@ -503,7 +505,11 @@ service restart and captured again.
 **The feature nevertheless remains disabled in production, deliberately.**
 Validation was a short, bounded, supervised window; the configuration was
 restored byte-for-byte afterwards. Permanent enablement is a separate operating
-decision and is blocked on the retention question above. Across the 341-second
+decision and is blocked on the retention question above. Task 14.1 builds the
+retention machinery but does **not** resolve that decision: it authorises no
+production retention, sets no production retention period or storage budget, and
+by itself does **not** make this pipeline ready for permanent unattended
+enablement. Across the 341-second
 enabled window ambient garden motion alone produced **17 captures totalling
 42 660 151 bytes** — approximately **3.0 captures per minute** and approximately
 **7.5 MB per minute** of JPEG payload, with nothing to reclaim it. That is a
@@ -523,5 +529,7 @@ See [`docs/tasks/Task-013-Physical-Motion-Triggered-Capture-Validation.md`](task
 Explicitly *not* started here, and each its own task: bird detection and species
 identification; regions of interest and feeder masking; pre/post-event frame
 buffers, burst capture and sharpest-frame selection; visit/session grouping and
-incident modelling; media retention and deletion policy; thumbnails and an image
-serving or download API; notification image attachments and real transports.
+incident modelling; retention *scheduling*, invocation and production
+enablement (Task 14.1 built the policy and executor only — see
+[`docs/Retention.md`](Retention.md)); thumbnails and an image serving or
+download API; notification image attachments and real transports.

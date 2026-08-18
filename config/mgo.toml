@@ -108,6 +108,38 @@ cooldown_seconds = 5.0
 # still. See docs/Event-Capture.md.
 enabled = false
 
+[retention]
+# Capture-media retention (Task 14.1). Disabled by default: no lifecycle row is
+# written, no file is removed, no interrupted deletion is recovered and no
+# retention observation is recorded until this is explicitly enabled.
+#
+# Nothing schedules retention. Task 14.1 builds the policy and the executor and
+# deliberately does not arm them: there is no interval, no timer, no startup or
+# shutdown deletion, and no destructive HTTP endpoint. GET /retention/status is
+# read-only and inert. How retention is invoked operationally is a later
+# decision. See docs/Retention.md.
+#
+# Only automatic captures — those catalogued with origin = "motion" by
+# [event_capture] — are managed. Manual captures, captures with no origin and
+# captures from any origin this build does not recognise are PROTECTED and are
+# never selected.
+enabled = false
+# Age bound: managed captures older than this are eligible. Left commented,
+# because there is no safe guessed retention period — an operator who wants one
+# writes it down. At least one of max_age_days / max_managed_bytes is REQUIRED
+# when enabled = true; enabling with neither is rejected at load time.
+# max_age_days = 30
+# Managed-byte bound: the total catalogued size of PRESENT managed captures.
+# It measures the media the automatic capture feature generates — not manual
+# captures, not the database, not the logs and not filesystem utilisation.
+# max_managed_bytes = 2147483648
+# Safety bounds rather than policy. The newest minimum_keep_count managed
+# captures are preserved unconditionally, whatever the bounds above would say;
+# the floor is never traded away to meet a byte target. max_deletions_per_run is
+# the hard ceiling on how many captures ONE run may newly select for deletion.
+minimum_keep_count = 100
+max_deletions_per_run = 25
+
 [notifications]
 # Notification framework. Disabled by default: no provider is constructed and
 # every published event is dropped until this is explicitly enabled. Only the

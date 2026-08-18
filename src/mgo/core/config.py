@@ -247,6 +247,41 @@ class EventCaptureConfig:
 
 
 @dataclass(frozen=True)
+class RetentionConfig:
+    """Capture-media retention settings.
+
+    ``enabled`` gates every destructive action and is off by default,
+    deliberately and load-bearingly: a configuration written before this section
+    existed must go on behaving exactly as it did, with no lifecycle row, no
+    filesystem mutation and no deletion nobody asked for.
+
+    The two optional bounds are the only policy inputs. ``max_age_days`` expires
+    media by age; ``max_managed_bytes`` caps the total catalogued size of the
+    *managed* media -- the automatic ``origin = "motion"`` captures only, never
+    manual captures, the database, the logs or the filesystem as a whole. At
+    least one of them is required when the feature is enabled, because a
+    retention policy with no bound is a destructive subsystem with nothing to
+    stop it.
+
+    The other two are safety bounds rather than policy. ``minimum_keep_count``
+    is how many of the newest managed captures are preserved unconditionally,
+    whatever the policy would otherwise say. ``max_deletions_per_run`` is the
+    hard ceiling on how many captures one run may newly select for deletion.
+
+    There is deliberately no interval, no schedule and no disk-pressure
+    threshold: Task 14.1 establishes the policy and the executor, and nothing
+    invokes them automatically. A cadence knob would advertise a behaviour this
+    feature does not have.
+    """
+
+    enabled: bool
+    max_age_days: int | None
+    max_managed_bytes: int | None
+    minimum_keep_count: int
+    max_deletions_per_run: int
+
+
+@dataclass(frozen=True)
 class DatabaseConfig:
     """SQLite runtime settings.
 
@@ -296,6 +331,17 @@ class MGOConfig:
     # feature switched off. A configuration that predates the section is
     # therefore indistinguishable from one that explicitly disables it.
     event_capture: EventCaptureConfig = EventCaptureConfig(enabled=False)
+    # Same reasoning as ``event_capture`` above, one task later: last, with a
+    # default, so every existing construction of this object keeps working and
+    # gets retention switched off. A configuration that predates the section is
+    # indistinguishable from one that explicitly disables it.
+    retention: RetentionConfig = RetentionConfig(
+        enabled=False,
+        max_age_days=None,
+        max_managed_bytes=None,
+        minimum_keep_count=100,
+        max_deletions_per_run=25,
+    )
 
 
 def _project_path(value: str) -> Path:
@@ -485,6 +531,63 @@ def _validate_event_capture_policy(
             raise ValueError(
                 f"event_capture.enabled = true requires {name} = true"
             )
+
+
+#: Sensible defaults for retention when the ``[retention]`` section is absent,
+#: so configuration files written before Task 14.1 keep loading unchanged with
+#: retention disabled. The two destructive bounds default to *absent*: there is
+#: no such thing as a safe guessed retention period, so an operator who wants
+#: one has to write it down.
+#:
+#: The numeric safety bounds are irrelevant while the feature is disabled and
+#: are conservative values for a future explicit enablement: keep the newest 100
+#: managed captures whatever else the policy says, and never newly select more
+#: than 25 captures for deletion in one run.
+_RETENTION_DEFAULTS = {
+    "enabled": False,
+    "max_age_days": None,
+    "max_managed_bytes": None,
+    "minimum_keep_count": 100,
+    "max_deletions_per_run": 25,
+}
+
+
+def _validate_retention_config(retention: RetentionConfig) -> None:
+    """Validate retention settings, rejecting unusable or unbounded policy.
+
+    The two optional bounds are checked whenever they are *supplied*, enabled or
+    not: a configuration file carrying ``max_age_days = 0`` is a mistake worth
+    surfacing now rather than at the moment someone turns the feature on.
+
+    The last rule is the important one. ``enabled = true`` with neither
+    ``max_age_days`` nor ``max_managed_bytes`` is a destructive subsystem with
+    no bound on what makes media eligible, so it is refused rather than accepted
+    and quietly treated as "delete nothing" -- an operator who asked for
+    retention and got silence would reasonably believe it was working.
+
+    Every message names only the setting at fault. No configuration path, no
+    capture directory and no unrelated value appears in any of them.
+    """
+    if retention.max_age_days is not None and retention.max_age_days <= 0:
+        raise ValueError("retention.max_age_days must be greater than zero")
+
+    if retention.max_managed_bytes is not None and retention.max_managed_bytes <= 0:
+        raise ValueError("retention.max_managed_bytes must be greater than zero")
+
+    if retention.minimum_keep_count < 1:
+        raise ValueError("retention.minimum_keep_count must be at least 1")
+
+    if retention.max_deletions_per_run < 1:
+        raise ValueError("retention.max_deletions_per_run must be at least 1")
+
+    if not retention.enabled:
+        return
+
+    if retention.max_age_days is None and retention.max_managed_bytes is None:
+        raise ValueError(
+            "retention.enabled = true requires retention.max_age_days "
+            "and/or retention.max_managed_bytes"
+        )
 
 
 #: Sensible defaults for notifications when the ``[notifications]`` section is
@@ -771,6 +874,47 @@ def parse_config_text(text: str) -> MGOConfig:
     # before automatic capture can, so this runs once those sections are built.
     _validate_event_capture_policy(event_capture, camera, preview, motion)
 
+    # The ``[retention]`` section is optional so configuration files written
+    # before Task 14.1 continue to load; an absent section means retention is
+    # off, which is also its default when the section is present but empty.
+    # Deliberately no cross-section requirement: retention must be able to
+    # reclaim media that a now-disabled capture feature already produced, so it
+    # depends on neither ``camera.enabled`` nor ``event_capture.enabled``.
+    retention_data = raw.get("retention", {})
+    retention_max_age_raw = retention_data.get(
+        "max_age_days", _RETENTION_DEFAULTS["max_age_days"]
+    )
+    retention_max_bytes_raw = retention_data.get(
+        "max_managed_bytes", _RETENTION_DEFAULTS["max_managed_bytes"]
+    )
+    retention = RetentionConfig(
+        enabled=bool(
+            retention_data.get("enabled", _RETENTION_DEFAULTS["enabled"])
+        ),
+        max_age_days=(
+            int(retention_max_age_raw)
+            if retention_max_age_raw is not None
+            else None
+        ),
+        max_managed_bytes=(
+            int(retention_max_bytes_raw)
+            if retention_max_bytes_raw is not None
+            else None
+        ),
+        minimum_keep_count=int(
+            retention_data.get(
+                "minimum_keep_count", _RETENTION_DEFAULTS["minimum_keep_count"]
+            )
+        ),
+        max_deletions_per_run=int(
+            retention_data.get(
+                "max_deletions_per_run",
+                _RETENTION_DEFAULTS["max_deletions_per_run"],
+            )
+        ),
+    )
+    _validate_retention_config(retention)
+
     # The ``[notifications]`` section is optional so pre-Task-5 configuration
     # files continue to load; absent keys fall back to safe (disabled) defaults.
     notifications_data = raw.get("notifications", {})
@@ -827,4 +971,5 @@ def parse_config_text(text: str) -> MGOConfig:
         database=database,
         health=health,
         event_capture=event_capture,
+        retention=retention,
     )

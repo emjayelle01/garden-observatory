@@ -44,7 +44,7 @@ MIGRATIONS_DIRECTORY = PROJECT_ROOT / "migrations"
 #: It is an explicit constant rather than "whatever the highest file is" so a
 #: stray or half-finished migration file can never silently redefine what
 #: "current" means. A test asserts it stays in step with the migration files.
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 #: Bounded wait for a competing writer's lock before SQLite gives up with
 #: ``database is locked``. Five seconds comfortably covers the application's
@@ -85,6 +85,7 @@ class IncompatibleSchemaError(DatabaseError):
 _VERSION_TABLES: dict[int, tuple[str, ...]] = {
     1: ("observations",),
     2: ("captures",),
+    3: ("capture_media_lifecycle",),
 }
 
 #: The exact column set each recognisable table must have before an unversioned
@@ -116,6 +117,15 @@ _VERSION_TABLE_COLUMNS: dict[str, frozenset[str]] = {
             "camera_backend",
             "created_at_utc",
             "extra_metadata",
+        }
+    ),
+    "capture_media_lifecycle": frozenset(
+        {
+            "capture_id",
+            "state",
+            "requested_at_utc",
+            "deleted_at_utc",
+            "reason",
         }
     ),
 }

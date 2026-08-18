@@ -38,8 +38,7 @@ def _utc_datetime(value: datetime | None = None) -> datetime:
     return result.astimezone(UTC)
 
 
-def record_observation(
-    database_path: Path,
+def build_observation(
     *,
     kind: str,
     source: str,
@@ -49,7 +48,17 @@ def record_observation(
     correlation_id: str | None = None,
     observed_at: datetime | None = None,
 ) -> Observation:
-    """Create and persist an immutable observation."""
+    """Validate the fields of one observation and return it, unpersisted.
+
+    Every rule about what an observation may contain lives here and only here:
+    the four required strings must be non-blank, timestamps must be
+    timezone-aware UTC, the identifier is generated, and an absent payload
+    becomes an empty mapping. Splitting it out of :func:`record_observation` is
+    what lets a caller holding an *open transaction* -- retention finalisation,
+    which must commit a lifecycle transition and its observation together --
+    write an observation under exactly the same rules, without a second
+    validation path or a second ``INSERT`` drifting away from this one.
+    """
     if not kind.strip():
         raise ValueError("Observation kind cannot be empty")
 
@@ -62,51 +71,118 @@ def record_observation(
     if not summary.strip():
         raise ValueError("Observation summary cannot be empty")
 
-    observation_time = _utc_datetime(observed_at)
-    creation_time = datetime.now(UTC)
-    observation_id = str(uuid4())
-    observation_payload = payload or {}
-
-    with database_connection(database_path) as connection:
-        connection.execute(
-            """
-            INSERT INTO observations (
-                id,
-                observed_at,
-                kind,
-                source,
-                status,
-                summary,
-                payload_json,
-                correlation_id,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                observation_id,
-                observation_time.isoformat(),
-                kind,
-                source,
-                status,
-                summary,
-                json.dumps(observation_payload, sort_keys=True),
-                correlation_id,
-                creation_time.isoformat(),
-            ),
-        )
-
     return Observation(
-        id=observation_id,
-        observed_at=observation_time,
+        id=str(uuid4()),
+        observed_at=_utc_datetime(observed_at),
         kind=kind,
         source=source,
         status=status,
         summary=summary,
-        payload=observation_payload,
+        payload=payload or {},
         correlation_id=correlation_id,
-        created_at=creation_time,
+        created_at=datetime.now(UTC),
     )
+
+
+def insert_observation(
+    connection: sqlite3.Connection, observation: Observation
+) -> None:
+    """Insert one already-validated observation on an existing connection.
+
+    The single ``INSERT`` for the observations table. It neither opens nor
+    commits a transaction, so the caller decides what this row commits *with*:
+    :func:`record_observation` gives it a transaction of its own, while the
+    retention finaliser makes it share the transaction that transitions a
+    capture's media lifecycle -- so a reclaimed JPEG can never end up recorded
+    in one of those places and not the other.
+    """
+    connection.execute(
+        """
+        INSERT INTO observations (
+            id,
+            observed_at,
+            kind,
+            source,
+            status,
+            summary,
+            payload_json,
+            correlation_id,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            observation.id,
+            observation.observed_at.isoformat(),
+            observation.kind,
+            observation.source,
+            observation.status,
+            observation.summary,
+            json.dumps(observation.payload, sort_keys=True),
+            observation.correlation_id,
+            observation.created_at.isoformat(),
+        ),
+    )
+
+
+def record_observation_in_transaction(
+    connection: sqlite3.Connection,
+    *,
+    kind: str,
+    source: str,
+    status: str,
+    summary: str,
+    payload: dict[str, Any] | None = None,
+    correlation_id: str | None = None,
+    observed_at: datetime | None = None,
+) -> Observation:
+    """Validate and insert an observation inside the caller's transaction.
+
+    Same validation and same ``INSERT`` as :func:`record_observation`; the only
+    difference is who owns the transaction. Nothing here commits, so if the
+    caller's transaction rolls back, the observation goes with it -- which is
+    the entire point for retention, where an observation claiming media was
+    reclaimed must not survive a lifecycle transition that did not.
+    """
+    observation = build_observation(
+        kind=kind,
+        source=source,
+        status=status,
+        summary=summary,
+        payload=payload,
+        correlation_id=correlation_id,
+        observed_at=observed_at,
+    )
+    insert_observation(connection, observation)
+    return observation
+
+
+def record_observation(
+    database_path: Path,
+    *,
+    kind: str,
+    source: str,
+    status: str,
+    summary: str,
+    payload: dict[str, Any] | None = None,
+    correlation_id: str | None = None,
+    observed_at: datetime | None = None,
+) -> Observation:
+    """Create and persist an immutable observation."""
+    observation = build_observation(
+        kind=kind,
+        source=source,
+        status=status,
+        summary=summary,
+        payload=payload,
+        correlation_id=correlation_id,
+        observed_at=observed_at,
+    )
+
+    with database_connection(database_path) as connection:
+        insert_observation(connection, observation)
+
+    return observation
 
 
 def list_observations(

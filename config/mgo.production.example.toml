@@ -122,6 +122,42 @@ cooldown_seconds = 5.0
 # with any of them off is rejected at load time. See docs/Event-Capture.md.
 enabled = false
 
+[retention]
+# Capture-media retention (Task 14.1). This is the SOFTWARE FOUNDATION for
+# reclaiming captured media safely. It is not an operating policy, and enabling
+# it here is not authorised by Task 14.1.
+#
+# Left DISABLED. Disabled means no filesystem mutation and no database mutation
+# of any kind: no lifecycle row, no deletion, no recovery of an interrupted
+# deletion, no observation.
+#
+# Nothing schedules retention. There is no interval, no systemd timer, no
+# startup or shutdown deletion and no destructive HTTP endpoint;
+# GET /retention/status is read-only and inert. How retention is invoked
+# operationally is a separate, later decision.
+#
+# Task 14.1 has had NO physical validation: no deletion has been performed
+# against this host, this database or this media directory. It also does not
+# make the event-capture pipeline ready for permanent unattended enablement —
+# [event_capture] above stays disabled, and long-term unattended behaviour
+# remains unproven.
+#
+# Only origin = "motion" captures are managed. Manual captures, captures with no
+# origin and captures from any unrecognised origin are PROTECTED.
+enabled = false
+# The two destructive bounds are deliberately left commented. The production
+# retention period and storage budget have NOT been decided, and a value written
+# here would read as an accepted operating policy. At least one of them is
+# required when enabled = true; enabling with neither is rejected at load time.
+# max_age_days = 30
+# max_managed_bytes = 2147483648
+# Safety bounds. The newest minimum_keep_count managed captures are preserved
+# unconditionally and the floor is never broken to meet a byte target;
+# max_deletions_per_run bounds how many captures one run may newly select.
+# See docs/Retention.md.
+minimum_keep_count = 100
+max_deletions_per_run = 25
+
 [notifications]
 # Notification framework foundation. Only the transport-free providers exist so
 # far: "log" (application log, for validation) and "null" (discard). Real

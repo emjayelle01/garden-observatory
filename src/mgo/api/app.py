@@ -80,6 +80,11 @@ from mgo.notifications import (
     build_notification_manager,
     create_event,
 )
+from mgo.retention import (
+    RetentionRepository,
+    RetentionRuntimeState,
+    RetentionService,
+)
 
 config = load_config()
 
@@ -278,6 +283,28 @@ class EventCaptureStatusResponse(BaseModel):
     last_error: str | None
 
 
+class RetentionStatusResponse(BaseModel):
+    """Typed, read-only projection of the capture-retention state.
+
+    Every field is either a counter this process has kept since it started, a
+    state name, a timestamp or the fixed public message for the last failure
+    category. There is deliberately no capture directory, no media path, no
+    database location and no raw exception text: an operator learns *what
+    retention has done*, and nothing about where the media lives.
+    """
+
+    enabled: bool
+    state: str
+    total_runs: int
+    total_captures_deleted: int
+    total_bytes_reclaimed: int
+    last_run_at: str | None
+    last_run_candidate_count: int
+    last_run_deleted_count: int
+    last_run_bytes_reclaimed: int
+    last_error: str | None
+
+
 def _capture_service(app: FastAPI) -> CaptureService:
     """Return the capture service, building a default if none was attached.
 
@@ -406,6 +433,25 @@ def _event_capture_state(app: FastAPI) -> EventCaptureRuntimeState:
         return state
     state = EventCaptureRuntimeState(enabled=config.event_capture.enabled)
     app.state.event_capture_state = state
+    return state
+
+
+def _retention_state(app: FastAPI) -> RetentionRuntimeState:
+    """Return the retention runtime state, building a default if absent.
+
+    The lifespan always attaches one -- enabled or not -- so the status endpoint
+    is truthful from the first request. The fallback mirrors the configured
+    enablement and creates no repository, no service and no lifecycle row, which
+    is what keeps ``GET /retention/status`` a pure read of application-managed
+    state.
+    """
+    state: RetentionRuntimeState | None = getattr(
+        app.state, "retention_state", None
+    )
+    if state is not None:
+        return state
+    state = RetentionRuntimeState(enabled=config.retention.enabled)
+    app.state.retention_state = state
     return state
 
 
@@ -698,6 +744,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             config.storage.database_path,
         )
     app.state.event_capture_service = event_capture_service
+    # Retention (Task 14.1). Attached always, enabled or not, so
+    # GET /retention/status is truthful from the first request.
+    #
+    # Constructing these is inert by design. The holder is a few counters; the
+    # repository holds a path and opens no connection; the service creates a
+    # lock and nothing else. Nothing below calls run_once(), creates a task,
+    # arms a timer or starts a loop -- Task 14.1 establishes the service and
+    # deliberately does not schedule it, so there is also nothing to shut down.
+    retention_state = RetentionRuntimeState(enabled=config.retention.enabled)
+    app.state.retention_state = retention_state
+    app.state.retention_service = RetentionService(
+        config.retention,
+        RetentionRepository(config.storage.database_path),
+        retention_state,
+        config.camera.capture_directory,
+        database_path=config.storage.database_path,
+    )
     camera_detector = build_detector(config.camera.backend)
 
     # Material camera readiness changes become notification events. The monitor
@@ -1115,6 +1178,46 @@ def event_capture_status(request: Request) -> EventCaptureStatusResponse:
             if snapshot.last_capture_at is not None
             else None
         ),
+        last_error=snapshot.last_error,
+    )
+
+
+@app.get("/retention/status")
+def retention_status(request: Request) -> RetentionStatusResponse:
+    """Return the capture-retention state and its lifetime counters.
+
+    Inert in the strongest sense available: it reads one application-managed
+    holder and nothing else. It never runs the planner, never queries the
+    captures table, never stats a media file, never deletes anything, never
+    creates or modifies a lifecycle row, never records an observation, never
+    starts a worker, never touches the camera and never runs a migration.
+    Requesting it is as cheap and as safe as reading a variable, and it moves no
+    counter -- polling it a thousand times leaves the numbers exactly where they
+    were.
+
+    Always HTTP 200 while the application is serving -- including ``disabled``
+    when retention is off (every counter zero, every timestamp ``null``) and
+    including ``error`` after a run that stopped on a failure, which is reported
+    in ``state`` and ``last_error`` rather than as an HTTP error.
+
+    ``last_error`` is one of a fixed set of category messages. It never carries
+    an exception message, a traceback, a media path or the capture directory.
+    """
+    snapshot = _retention_state(request.app).snapshot()
+    return RetentionStatusResponse(
+        enabled=snapshot.enabled,
+        state=snapshot.state.value,
+        total_runs=snapshot.total_runs,
+        total_captures_deleted=snapshot.total_captures_deleted,
+        total_bytes_reclaimed=snapshot.total_bytes_reclaimed,
+        last_run_at=(
+            snapshot.last_run_at.isoformat()
+            if snapshot.last_run_at is not None
+            else None
+        ),
+        last_run_candidate_count=snapshot.last_run_candidate_count,
+        last_run_deleted_count=snapshot.last_run_deleted_count,
+        last_run_bytes_reclaimed=snapshot.last_run_bytes_reclaimed,
         last_error=snapshot.last_error,
     )
 

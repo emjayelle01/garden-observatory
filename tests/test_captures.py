@@ -289,7 +289,7 @@ def test_repeated_migration_is_idempotent(tmp_path: Path) -> None:
     # Simulates an existing installation being provisioned again on restart.
     second = apply_migrations(database_path)
 
-    assert first == [1, 2]
+    assert first == [1, 2, 3]
     assert second == []
     assert len(archive.list_captures()) == 1
 

@@ -118,7 +118,7 @@ def test_new_database_migrates_to_the_current_schema(tmp_path: Path) -> None:
 
     applied = apply_migrations(database_path)
 
-    assert applied == [1, 2]
+    assert applied == [1, 2, 3]
     assert read_schema_version(database_path) == CURRENT_SCHEMA_VERSION
 
 
@@ -130,12 +130,16 @@ def test_migration_creates_the_expected_tables_and_indexes(
 
     apply_migrations(database_path)
 
-    assert {"schema_migrations", "observations", "captures"} <= _tables(
-        database_path
-    )
+    assert {
+        "schema_migrations",
+        "observations",
+        "captures",
+        "capture_media_lifecycle",
+    } <= _tables(database_path)
     indexes = _objects(database_path, "index")
     assert indexes >= _OBSERVATION_INDEXES
     assert "idx_captures_captured_at_utc" in indexes
+    assert "idx_capture_media_lifecycle_state" in indexes
 
 
 def test_current_schema_version_is_recorded(tmp_path: Path) -> None:
@@ -150,9 +154,10 @@ def test_current_schema_version_is_recorded(tmp_path: Path) -> None:
             "ORDER BY version"
         ).fetchall()
 
-    assert [int(row["version"]) for row in rows] == [1, 2]
+    assert [int(row["version"]) for row in rows] == [1, 2, 3]
     assert str(rows[0]["name"]) == "001_initial_observation_engine.sql"
     assert str(rows[1]["name"]) == "002_capture_archive.sql"
+    assert str(rows[2]["name"]) == "003_capture_media_lifecycle.sql"
     assert all(str(row["applied_at"]) for row in rows)
 
 
@@ -181,7 +186,7 @@ def test_migration_is_idempotent(tmp_path: Path) -> None:
     second = apply_migrations(database_path)
     third = apply_migrations(database_path)
 
-    assert first == [1, 2]
+    assert first == [1, 2, 3]
     assert second == []
     assert third == []
     assert _tables(database_path) == before
@@ -240,8 +245,8 @@ def test_unversioned_legacy_database_is_adopted_without_data_loss(
 
     applied = apply_migrations(database_path)
 
-    # Version 1 was adopted (not re-run); only version 2 was actually applied.
-    assert applied == [2]
+    # Version 1 was adopted (not re-run); 2 and 3 were actually applied.
+    assert applied == [2, 3]
     assert read_schema_version(database_path) == CURRENT_SCHEMA_VERSION
     after = list_observations(database_path)
     assert after == before
@@ -249,10 +254,16 @@ def test_unversioned_legacy_database_is_adopted_without_data_loss(
     assert after[0].payload == {"legacy": True}
 
 
-def test_fully_unversioned_current_schema_is_adopted_at_the_top_version(
+def test_unversioned_version_two_database_is_adopted_then_migrated(
     tmp_path: Path,
 ) -> None:
-    """An unversioned database with both tables adopts version 2 directly."""
+    """An unversioned version-2 database adopts at 2, then migrates to 3.
+
+    This is the shape a real pre-Task-14.1 deployment presents, and it is the
+    reason migration 003 adds a *new table* rather than a column on ``captures``:
+    the legacy-adoption logic compares an exact column set, so widening the
+    capture table would have made every existing database unrecognisable.
+    """
     database_path = tmp_path / "legacy-full.db"
     with database_connection(database_path) as connection:
         for name in ("001_initial_observation_engine", "002_capture_archive"):
@@ -264,9 +275,90 @@ def test_fully_unversioned_current_schema_is_adopted_at_the_top_version(
 
     applied = apply_migrations(database_path)
 
-    assert applied == []
-    assert read_schema_version(database_path) == 2
+    assert applied == [3]
+    assert read_schema_version(database_path) == 3
     assert len(list_observations(database_path)) == 1
+    assert "capture_media_lifecycle" in _tables(database_path)
+
+
+def test_fully_unversioned_current_schema_is_adopted_at_the_top_version(
+    tmp_path: Path,
+) -> None:
+    """An unversioned database with all three tables adopts version 3 directly.
+
+    Nothing is executed against it: the tables already exist, so adoption only
+    writes the missing history rows.
+    """
+    database_path = tmp_path / "legacy-v3.db"
+    with database_connection(database_path) as connection:
+        for name in (
+            "001_initial_observation_engine",
+            "002_capture_archive",
+            "003_capture_media_lifecycle",
+        ):
+            connection.executescript(
+                (MIGRATIONS_DIRECTORY / f"{name}.sql").read_text(encoding="utf-8")
+            )
+        connection.execute("DROP TABLE schema_migrations")
+        _write_legacy_observation(connection, "legacy-3")
+
+    applied = apply_migrations(database_path)
+
+    assert applied == []
+    assert read_schema_version(database_path) == 3
+    assert len(list_observations(database_path)) == 1
+
+
+def test_a_partial_version_three_legacy_schema_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """A lifecycle table of the wrong shape is refused, not adopted.
+
+    Adoption records history rows without inspecting data, so a table that only
+    *looks* like the lifecycle table would be trusted forever afterwards. An
+    exact column-set match is what stops that.
+    """
+    database_path = tmp_path / "legacy-bad-v3.db"
+    with database_connection(database_path) as connection:
+        for name in ("001_initial_observation_engine", "002_capture_archive"):
+            connection.executescript(
+                (MIGRATIONS_DIRECTORY / f"{name}.sql").read_text(encoding="utf-8")
+            )
+        connection.execute("DROP TABLE schema_migrations")
+        connection.execute(
+            "CREATE TABLE capture_media_lifecycle "
+            "(capture_id TEXT PRIMARY KEY, state TEXT NOT NULL)"
+        )
+
+    with pytest.raises(IncompatibleSchemaError):
+        apply_migrations(database_path)
+
+    assert "schema_migrations" not in _tables(database_path)
+
+
+def test_a_lifecycle_table_without_the_schema_beneath_it_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """A version-3 table with no version-2 table beneath it is not adoptable."""
+    database_path = tmp_path / "stray-v3.db"
+    with database_connection(database_path) as connection:
+        connection.executescript(
+            (MIGRATIONS_DIRECTORY / "001_initial_observation_engine.sql").read_text(
+                encoding="utf-8"
+            )
+        )
+        connection.execute("DROP TABLE schema_migrations")
+        connection.execute(
+            "CREATE TABLE capture_media_lifecycle ("
+            "capture_id TEXT PRIMARY KEY, state TEXT NOT NULL, "
+            "requested_at_utc TEXT NOT NULL, deleted_at_utc TEXT, "
+            "reason TEXT NOT NULL)"
+        )
+
+    with pytest.raises(IncompatibleSchemaError):
+        apply_migrations(database_path)
+
+    assert "schema_migrations" not in _tables(database_path)
 
 
 # --- refusing what cannot be used -------------------------------------------
@@ -403,21 +495,23 @@ def test_failed_migration_preserves_existing_observations(
     before = list_observations(database_path)
 
     directory = _install_failing_migrations(tmp_path, monkeypatch)
-    # Renumber so the broken migration is version 3, i.e. genuinely pending
-    # against the already-current database above.
-    (directory / "002_broken.sql").rename(directory / "003_broken.sql")
-    (directory / "002_capture_archive.sql").write_text(
-        (MIGRATIONS_DIRECTORY / "002_capture_archive.sql").read_text(
-            encoding="utf-8"
-        ),
-        encoding="utf-8",
+    # Renumber so the broken migration sits one version above the current
+    # schema, i.e. genuinely pending against the already-current database above,
+    # and supply real copies of every migration beneath it.
+    (directory / "002_broken.sql").rename(
+        directory / f"{CURRENT_SCHEMA_VERSION + 1:03d}_broken.sql"
     )
+    for name in ("002_capture_archive", "003_capture_media_lifecycle"):
+        (directory / f"{name}.sql").write_text(
+            (MIGRATIONS_DIRECTORY / f"{name}.sql").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
 
     with pytest.raises(DatabaseError):
         apply_migrations(database_path)
 
     assert list_observations(database_path) == before
-    assert read_schema_version(database_path) == 2
+    assert read_schema_version(database_path) == CURRENT_SCHEMA_VERSION
 
 
 # --- SQLite runtime configuration -------------------------------------------
@@ -471,7 +565,7 @@ def test_in_memory_database_is_handled_explicitly(tmp_path: Path) -> None:
 
     # The migration runner works against it, but it is per-connection and
     # transient, so it can never be opened read-only for a health check.
-    assert apply_migrations(memory_path) == [1, 2]
+    assert apply_migrations(memory_path) == [1, 2, 3]
     with pytest.raises(DatabaseError):
         connect_readonly(memory_path)
 

@@ -97,6 +97,33 @@ EVENT_CAPTURE_SUITE = "tests/test_event_capture.py"
 CAPTURE_WORKFLOW_SUITE = "tests/test_capture_workflow.py"
 APPLICATION_SUITE = "tests/test_app_routes.py"
 
+#: Task 14.1 retention sources. Retention is the only subsystem in MGO that
+#: deletes anything, and every safety property it has is a *refusal*: a check
+#: that stops a deletion. A refusal is invisible while it works, so a weakened
+#: one changes no status endpoint, no counter and no observation until the day
+#: it removes the wrong file. That is exactly what a register is for.
+#:
+#: Every `old` below is a single line. The working tree checks out as CRLF on
+#: Windows while this register is pinned to LF by .gitattributes, so a
+#: multi-line anchor would stop matching on a developer machine and report a
+#: stale mutation for code that never changed.
+RETENTION_POLICY = "src/mgo/retention/policy.py"
+RETENTION_SERVICE = "src/mgo/retention/service.py"
+RETENTION_REPOSITORY = "src/mgo/retention/repository.py"
+RETENTION_MODELS = "src/mgo/retention/models.py"
+
+#: The observation engine, which retention now shares rather than copies. The
+#: point of the shared helper is that there is one validation path and one
+#: INSERT; a mutation there must be caught by a *retention* test, or the sharing
+#: is decorative.
+OBSERVATIONS = "src/mgo/core/observations.py"
+
+#: The suites that own the retention behaviours.
+RETENTION_POLICY_SUITE = "tests/test_retention_policy.py"
+RETENTION_SERVICE_SUITE = "tests/test_retention_service.py"
+RETENTION_DATABASE_SUITE = "tests/test_retention_database.py"
+RETENTION_API_SUITE = "tests/test_retention_api.py"
+
 
 MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
@@ -1944,5 +1971,373 @@ MUTATIONS: tuple[Mutation, ...] = (
         'remaining_monitors_are_signalled_only_after_event_capture',
         'Health and camera monitoring is torn down during an in-flight capture.',
         suite=APPLICATION_SUITE,
+    ),
+    # --- Task 14.1 retention policy -----------------------------------------
+    Mutation(
+        'retention-manages-any-capture-with-an-origin',
+        RETENTION_POLICY,
+        '        record.origin == MANAGED_ORIGIN',
+        '        record.origin is not None',
+        'only_exactly_motion_is_managed or only_unknown_origin',
+        "An unrecognised subsystem's media becomes automatically disposable.",
+        suite=RETENTION_POLICY_SUITE,
+    ),
+    Mutation(
+        'retention-manages-captures-it-has-already-claimed',
+        RETENTION_POLICY,
+        '        and record.lifecycle_state is MediaLifecycleState.PRESENT',
+        '        and record.lifecycle_state is not None',
+        'pending_captures_are_excluded or already_deleted_captures_are_excluded',
+        'One deletion is planned twice and finalised twice.',
+        suite=RETENTION_POLICY_SUITE,
+    ),
+    Mutation(
+        'the-minimum-keep-floor-is-removed',
+        RETENTION_POLICY,
+        '    eligible_count = max(0, len(ordered) - config.minimum_keep_count)',
+        '    eligible_count = len(ordered)',
+        'minimum_keep_count_protects or floor_is_never_broken or keep_count_larger',
+        'The newest captures stop being protected from the policy.',
+        suite=RETENTION_POLICY_SUITE,
+    ),
+    Mutation(
+        'the-age-boundary-becomes-exclusive',
+        RETENTION_POLICY,
+        '        if record.captured_at_utc <= cutoff',
+        '        if record.captured_at_utc < cutoff',
+        'the_age_boundary_is_inclusive',
+        'The documented age boundary and the enforced one disagree.',
+        suite=RETENTION_POLICY_SUITE,
+    ),
+    Mutation(
+        'the-managed-byte-boundary-becomes-strict',
+        RETENTION_POLICY,
+        '        if running <= config.max_managed_bytes:',
+        '        if running < config.max_managed_bytes:',
+        'the_managed_byte_boundary_is_inclusive_of_the_limit',
+        'A managed total exactly at the limit deletes a capture anyway.',
+        suite=RETENTION_POLICY_SUITE,
+    ),
+    Mutation(
+        'the-byte-policy-stops-counting-down',
+        RETENTION_POLICY,
+        '        running -= record.filesize_bytes',
+        '        running -= 0',
+        'byte_policy_selects_no_more_than_the_bound_requires',
+        'Byte pressure selects every eligible capture instead of the oldest few.',
+        suite=RETENTION_POLICY_SUITE,
+    ),
+    Mutation(
+        'the-per-run-destructive-bound-is-removed',
+        RETENTION_POLICY,
+        '    capped = selected[: config.max_deletions_per_run]',
+        '    capped = selected',
+        'max_deletions_per_run_caps_the_plan',
+        'One run may delete an unbounded number of captures.',
+        suite=RETENTION_POLICY_SUITE,
+    ),
+    Mutation(
+        'a-truncated-plan-stops-reporting-remaining-work',
+        RETENTION_POLICY,
+        '    more_work_remains = len(selected) > len(capped)',
+        '    more_work_remains = False',
+        'a_capped_plan_reports_that_more_work_remains',
+        'A capped run reads as having finished the backlog.',
+        suite=RETENTION_POLICY_SUITE,
+    ),
+    Mutation(
+        'ordering-loses-its-final-tie-break',
+        RETENTION_POLICY,
+        '        record.capture_id,',
+        '        "",',
+        'identical_timestamps_fall_through_to_the_capture_id',
+        "SQLite's incidental row order starts deciding what is deleted.",
+        suite=RETENTION_POLICY_SUITE,
+    ),
+    Mutation(
+        'ordering-loses-its-creation-time-tie-break',
+        RETENTION_POLICY,
+        '        record.created_at_utc.isoformat(),',
+        '        "",',
+        'identical_capture_timestamps_break_on_creation_time',
+        'Captures sharing an instant are selected in an undefined order.',
+        suite=RETENTION_POLICY_SUITE,
+    ),
+    Mutation(
+        'an-unreachable-byte-target-is-reported-as-reachable',
+        RETENTION_POLICY,
+        '    return preserved_bytes <= config.max_managed_bytes',
+        '    return True',
+        'the_floor_is_never_broken_to_satisfy_the_byte_limit',
+        'An operator is told a budget is being met that never can be.',
+        suite=RETENTION_POLICY_SUITE,
+    ),
+    Mutation(
+        'the-combined-policy-reason-collapses',
+        RETENTION_POLICY,
+        '    if by_age and by_bytes:',
+        '    if False:',
+        'combined_policy_marks_a_capture_reached_by_both_rules',
+        'A deletion is attributed to one rule when two reached it.',
+        suite=RETENTION_POLICY_SUITE,
+    ),
+    # --- Task 14.1 filesystem safety boundary --------------------------------
+    Mutation(
+        'path-containment-is-abandoned',
+        RETENTION_SERVICE,
+        '    if not _is_within(capture_root, _realpath(candidate.parent)):',
+        '    if False:',
+        'a_path_outside_the_capture_root_is_refused',
+        'A tampered catalogue row deletes a file anywhere on the host.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'traversal-is-no-longer-rejected',
+        RETENTION_SERVICE,
+        '    if ".." in candidate.parts:',
+        '    if False:',
+        'a_traversal',
+        'A parent-directory path walks out of the capture root.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'filename-agreement-is-no-longer-required',
+        RETENTION_SERVICE,
+        '    if candidate.name != filename:',
+        '    if False:',
+        'a_filename_that_disagrees_with_the_path_is_refused',
+        'Two catalogue columns disagree and the deletion proceeds anyway.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'symlinked-targets-become-deletable',
+        RETENTION_SERVICE,
+        '    if _is_symlink(candidate):',
+        '    if False:',
+        'a_symlinked_target_is_refused',
+        'A link inside the capture root redirects the unlink outside it.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'a-relative-catalogue-path-is-accepted',
+        RETENTION_SERVICE,
+        '    if not candidate.is_absolute():',
+        '    if False:',
+        'a_relative_path_is_refused',
+        'A path with no defined target is resolved against the process cwd.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'the-regular-file-check-is-removed',
+        RETENTION_SERVICE,
+        '    if not _is_regular_file(candidate):',
+        '    if False:',
+        'a_non_regular_target_is_refused',
+        'A device node or socket is unlinked as if it were a capture.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'the-size-check-is-removed',
+        RETENTION_SERVICE,
+        '    if _file_size(candidate) != filesize_bytes:',
+        '    if False:',
+        'a_size_mismatch_is_refused',
+        'A file that is not the catalogued one is deleted under its name.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'missing-media-is-treated-as-already-reclaimed',
+        RETENTION_SERVICE,
+        '        return RetentionErrorCategory.MEDIA_MISSING',
+        '        return None',
+        'missing_media_without_a_pending_intent_is_an_inconsistency',
+        'An unexplained missing file is silently claimed as a retention success.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'the-capture-root-need-not-be-absolute',
+        RETENTION_SERVICE,
+        '        if not root.is_absolute():',
+        '        if False:',
+        'a_relative_capture_root_stops_the_run',
+        'Containment is checked against a root that depends on the cwd.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    # --- Task 14.1 run gating and the deletion state machine ------------------
+    Mutation(
+        'the-disabled-gate-is-removed',
+        RETENTION_SERVICE,
+        '        if not self._config.enabled:',
+        '        if False:',
+        'a_disabled_run_mutates_nothing or disabled_retention_does_not_recover',
+        'A deployment that never enabled retention starts deleting media.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'an-overlapping-run-stops-reporting-busy',
+        RETENTION_SERVICE,
+        '                error_category=RetentionErrorCategory.BUSY,',
+        '                error_category=None,',
+        'a_busy_run_deletes_nothing_and_records_nothing',
+        'A refused run is indistinguishable from one that found nothing to do.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'the-run-lock-becomes-reentrant',
+        RETENTION_SERVICE,
+        '        self._run_lock = threading.Lock()',
+        '        self._run_lock = threading.RLock()',
+        'an_overlapping_run_is_refused_as_busy',
+        'Two runs delete against the same plan from one thread.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'a-destructive-failure-no-longer-stops-the-run',
+        RETENTION_SERVICE,
+        '            error = self._delete_candidate(candidate, capture_root)',
+        '            self._delete_candidate(candidate, capture_root); error = None',
+        'a_run_stops_at_the_first_destructive_failure',
+        'A run keeps deleting after the first safety refusal.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'pending-intents-are-never-recovered',
+        RETENTION_SERVICE,
+        '        for record in self._pending_records(records):',
+        '        for record in []:',
+        'the_next_run_recovers_an_interrupted_deletion',
+        'An interrupted deletion is stranded pending forever.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'pending-recovery-loses-the-missing-file-distinction',
+        RETENTION_SERVICE,
+        '        if _path_exists(Path(record.absolute_path)):',
+        '        if True:',
+        'recovering_a_missing_file_finalises_exactly_one_success',
+        'A completed deletion awaiting its record is called an inconsistency.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'pending-recovery-skips-its-file-revalidation',
+        RETENTION_SERVICE,
+        '            if file_error is not None:',
+        '            if False:',
+        'a_pending_intent_whose_file_changed_size_is_not_touched',
+        'A file that no longer matches its record is deleted anyway.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'pending-recovery-ignores-an-unsafe-path',
+        RETENTION_SERVICE,
+        '            return path_error, 0',
+        '            pass',
+        'an_unsafe_pending_intent_is_not_touched',
+        'A durable intent with a tampered path deletes outside the root.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'a-failed-finalisation-is-reported-as-success',
+        RETENTION_SERVICE,
+        '        if not finalized:',
+        '        if False:',
+        'a_finalisation_that_matches_no_intent_is_not_a_success',
+        'A deletion nothing recorded is counted as reclaimed.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'the-dry-run-acquires-a-side-effect',
+        RETENTION_SERVICE,
+        '        catalogue = self._repository.list_lifecycle_records()',
+        '        self._state.mark_running()\n'
+        '        catalogue = self._repository.list_lifecycle_records()',
+        'a_dry_run_moves_no_counter',
+        'A read-only preview mutates the state an operator is watching.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    # --- Task 14.1 lifecycle transitions -------------------------------------
+    Mutation(
+        'the-deletion-claim-becomes-unconditional',
+        RETENTION_REPOSITORY,
+        '                claimed = cursor.rowcount == 1',
+        '                claimed = True',
+        'a_second_claim_on_the_same_capture_is_refused',
+        'Two executions both believe they own the same deletion.',
+        suite=RETENTION_DATABASE_SUITE,
+    ),
+    Mutation(
+        'finalisation-stops-being-conditional',
+        RETENTION_REPOSITORY,
+        '                advanced = cursor.rowcount == 1',
+        '                advanced = True',
+        'repeated_finalisation_cannot_duplicate_the_success_observation',
+        'One deletion produces two success observations.',
+        suite=RETENTION_DATABASE_SUITE,
+    ),
+    Mutation(
+        'cancellation-stops-being-conditional',
+        RETENTION_REPOSITORY,
+        '                removed = cursor.rowcount == 1',
+        '                removed = True',
+        'cancelling_a_deleted_capture_is_refused',
+        'Reclaimed media is quietly restored to present.',
+        suite=RETENTION_DATABASE_SUITE,
+    ),
+    # --- Task 14.1 shared observation engine ---------------------------------
+    Mutation(
+        'the-shared-observation-validation-is-bypassed',
+        OBSERVATIONS,
+        '    if not summary.strip():',
+        '    if False:',
+        'an_invalid_observation_rolls_back_the_lifecycle_transition',
+        'Retention writes observations under rules the timeline does not have.',
+        suite=RETENTION_DATABASE_SUITE,
+    ),
+    Mutation(
+        'the-shared-observation-insert-drops-its-correlation',
+        OBSERVATIONS,
+        '            observation.correlation_id,',
+        '            None,',
+        'finalising_transitions_and_records_together',
+        'A retention observation stops naming the capture it describes.',
+        suite=RETENTION_DATABASE_SUITE,
+    ),
+    # --- Task 14.1 runtime state and the inert status endpoint ---------------
+    Mutation(
+        'a-run-in-progress-is-not-reported',
+        RETENTION_MODELS,
+        '            self._state = RetentionState.RUNNING',
+        '            self._state = RetentionState.IDLE',
+        'a_run_in_progress_is_reported_as_running',
+        'A destructive run in flight reads as an idle subsystem.',
+        suite=RETENTION_API_SUITE,
+    ),
+    Mutation(
+        'completed-runs-stop-being-counted',
+        RETENTION_MODELS,
+        '            self._total_runs += 1',
+        '            self._total_runs += 0',
+        'counters_reflect_completed_runs',
+        'An operator cannot tell whether retention has ever run.',
+        suite=RETENTION_API_SUITE,
+    ),
+    Mutation(
+        'a-failed-run-reports-itself-as-idle',
+        RETENTION_MODELS,
+        '                RetentionState.ERROR',
+        '                RetentionState.IDLE',
+        'a_failed_run_is_reported_as_error_with_http_200',
+        'A run that stopped on a safety refusal reads as healthy.',
+        suite=RETENTION_API_SUITE,
+    ),
+    Mutation(
+        'the-status-endpoint-executes-retention',
+        APPLICATION,
+        '    snapshot = _retention_state(request.app).snapshot()',
+        '    request.app.state.retention_service.run_once()\n'
+        '    snapshot = _retention_state(request.app).snapshot()',
+        'the_endpoint_touches_no_other_subsystem',
+        'Reading a status endpoint deletes media.',
+        suite=RETENTION_API_SUITE,
     ),
 )

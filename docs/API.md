@@ -177,8 +177,8 @@ endpoint predates Task 8 and its contract is unchanged.
   "database": {
     "status": "healthy",
     "accessible": true,
-    "schema_version": 2,
-    "expected_schema_version": 2,
+    "schema_version": 3,
+    "expected_schema_version": 3,
     "migration_status": "current",
     "integrity": "ok"
   },
@@ -472,6 +472,75 @@ second preview process.
 The feature is **disabled by default** and adds no schema migration and no
 dependency. See [`docs/Event-Capture.md`](Event-Capture.md).
 
+## Capture retention (Task 14.1)
+
+Task 14.1 added **one read-only endpoint** and changed none. It adds **no
+destructive HTTP endpoint**: there is deliberately no `POST /retention/run`.
+Unauthenticated destructive media deletion over HTTP is a decision for a later,
+controlled task, and shipping the endpoint first would pre-empt it.
+
+`GET /captures` and `GET /captures/{capture_id}` are unchanged — no field
+removed or renamed, neither call destructive, and captures whose media has since
+been reclaimed are **still listed**. The catalogue is a history of captures that
+happened; the separate `capture_media_lifecycle` table is the authority on
+whether their media was later reclaimed. No image-serving or download behaviour
+was added.
+
+### `GET /retention/status`
+
+Read-only, typed, and additive. It returns `200` whenever the application is
+serving — including when retention is disabled, and including after a run that
+stopped on a failure, which is reported in `state` and `last_error` rather than
+as an HTTP error.
+
+```json
+{
+  "enabled": false,
+  "state": "disabled",
+  "total_runs": 0,
+  "total_captures_deleted": 0,
+  "total_bytes_reclaimed": 0,
+  "last_run_at": null,
+  "last_run_candidate_count": 0,
+  "last_run_deleted_count": 0,
+  "last_run_bytes_reclaimed": 0,
+  "last_error": null
+}
+```
+
+`state` is one of `disabled`, `idle`, `running`, `error`. Timestamps are
+ISO-8601 UTC or `null`. Counters are process-lifetime and are never persisted;
+the durable history is the lifecycle table and the observation timeline.
+
+**What a request to it does not do:** it does not run the retention planner,
+scan the captures table, stat a media file, delete anything, create or modify a
+lifecycle row, record an observation, start a worker, touch the camera or run a
+migration. It reads one application-managed holder and nothing else, and it
+alters no counter.
+
+**Privacy and information disclosure:** the response carries no filesystem path,
+no capture directory, no database location and no configuration path.
+`last_error` is one of a fixed set of category sentences and never contains an
+exception message, `repr`, traceback or command line — the raw exception goes to
+the application log only.
+
+### Which operations are coordinated (unchanged by retention)
+
+| Endpoint / actor | Kind | Coordinated |
+| ---------------- | ---- | ----------- |
+| `GET /retention/status` | read | No |
+| **retention run** | mutation of *media*, never of the camera | No — it never acquires the camera coordinator |
+
+Retention is a storage-lifecycle operation, not a camera operation. It never
+acquires the `CameraCoordinator`, starts or stops preview, invokes
+`CaptureService` or `CaptureWorkflow`, or touches a camera backend. A capture
+still in progress is not yet catalogued and therefore cannot be a candidate.
+
+Retention is **disabled by default**, and **nothing schedules it** — no interval,
+no timer, no startup deletion, no shutdown deletion. Task 14.1 is a software
+foundation and does not authorise production retention. See
+[`docs/Retention.md`](Retention.md).
+
 ## Compatibility promise
 
 - `/` keeps its exact three keys and their values. Only the *source* of
@@ -484,6 +553,12 @@ dependency. See [`docs/Event-Capture.md`](Event-Capture.md).
 - `/event-capture/status` is additive: a new read-only route with no schema
   change, whose feature is off by default. `POST /camera/capture` keeps every
   field, value and status code it had before Task 13.1.
+- `/retention/status` is additive: a new read-only route whose feature is off by
+  default. `GET /captures` and `GET /captures/{capture_id}` keep every field,
+  value and status code they had before Task 14.1, and a capture whose media was
+  later reclaimed is still returned by both. Task 14.1 adds migration 003, which
+  is additive: it creates a new table and does not alter `captures` or
+  `observations`.
 
 No client, script, probe or dashboard needs to change in either direction, and
 reverting the branch restores the previous behaviour exactly.

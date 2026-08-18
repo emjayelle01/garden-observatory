@@ -42,6 +42,7 @@ The schema is versioned by **ordered, numbered SQL files** under `migrations/`:
 ```text
 migrations/001_initial_observation_engine.sql
 migrations/002_capture_archive.sql
+migrations/003_capture_media_lifecycle.sql
 ```
 
 A file's version is the integer prefix of its name. Migrations are applied in
@@ -56,7 +57,7 @@ ascending version order, and each one that runs writes a row into the
 
 The database's **schema version** is simply `MAX(version)` from that table. The
 application's expected version is the constant
-`mgo.core.database.CURRENT_SCHEMA_VERSION`, currently **2**. A test asserts the
+`mgo.core.database.CURRENT_SCHEMA_VERSION`, currently **3**. A test asserts the
 constant stays in step with the migration files, so a new migration cannot land
 without moving the application's notion of "current".
 
@@ -122,6 +123,28 @@ Migration **002** adds the capture catalogue:
   `width`, `height`, `filesize_bytes`, `camera_backend`, `created_at_utc`,
   `extra_metadata`
 - an index on `captured_at_utc`
+
+Migration **003** adds the capture **media lifecycle** table:
+
+- `capture_media_lifecycle` — `capture_id` (primary key, `REFERENCES
+  captures(id)`), `state`, `requested_at_utc`, `deleted_at_utc`, `reason`
+- an index on `state`
+- `CHECK` constraints enforcing the state vocabulary (`pending_delete`,
+  `deleted`), the policy-reason vocabulary (`age`, `managed_bytes`,
+  `age_and_managed_bytes`) and coherent timestamps: a `pending_delete` row has
+  no `deleted_at_utc`, and a `deleted` row must have one
+
+Migration 003 is **additive**. It creates a new table and does not alter
+`captures` or `observations` — deliberately, for two reasons. First, a capture
+record is the *history that a capture happened*, and reclaiming its JPEG does
+not un-happen it: those are two facts and they live in two places. Second, the
+legacy-adoption logic below compares an **exact** column set, so a retention
+column added to `captures` would have made every existing unversioned version-2
+database unrecognisable.
+
+**Retention never deletes a `captures` row.** The absence of a lifecycle row
+means the media is present; a `deleted` row means the media was reclaimed while
+the capture record remains. See [`docs/Retention.md`](Retention.md).
 
 That is the entire schema. Tables for events, detections, sightings and reviews
 are **not** created in advance: each arrives with the task that implements it.
@@ -307,8 +330,8 @@ top-level `status`:
   "database": {
     "status": "healthy",
     "accessible": true,
-    "schema_version": 2,
-    "expected_schema_version": 2,
+    "schema_version": 3,
+    "expected_schema_version": 3,
     "migration_status": "current",
     "integrity": "ok"
   },
@@ -331,13 +354,13 @@ The full result, following the same read-only pattern as `/camera/status`,
   "status": "healthy",
   "accessible": true,
   "database": "mgo.db",
-  "schema_version": 2,
-  "expected_schema_version": 2,
+  "schema_version": 3,
+  "expected_schema_version": 3,
   "migration_status": "current",
   "journal_mode": "wal",
   "foreign_keys": true,
   "integrity": "ok",
-  "detail": "Database is at schema version 2 with wal journalling and foreign keys enforced.",
+  "detail": "Database is at schema version 3 with wal journalling and foreign keys enforced.",
   "checked_at": "2026-07-27T10:00:00+00:00"
 }
 ```
