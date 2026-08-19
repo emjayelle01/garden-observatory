@@ -24,9 +24,11 @@ individual statements and executed inside one explicit ``BEGIN IMMEDIATE`` /
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -88,45 +90,99 @@ _VERSION_TABLES: dict[int, tuple[str, ...]] = {
     3: ("capture_media_lifecycle",),
 }
 
-#: The exact column set each recognisable table must have before an unversioned
-#: database may be adopted at that version. A superset or subset is treated as
-#: an unknown schema rather than being adopted optimistically.
-_VERSION_TABLE_COLUMNS: dict[str, frozenset[str]] = {
-    "observations": frozenset(
-        {
-            "id",
-            "observed_at",
-            "kind",
-            "source",
-            "status",
-            "summary",
-            "payload_json",
-            "correlation_id",
-            "created_at",
-        }
+@dataclass(frozen=True)
+class _TableShape:
+    """What an unversioned table must look like before it may be adopted.
+
+    ``columns`` is required for every recognisable table and is checked as an
+    exact set -- a superset or a subset is an unknown schema, not a close enough
+    one.
+
+    The remaining fields describe *semantics* rather than names, and are opt-in
+    per table. They exist because a column set is a weak promise: two tables can
+    carry the same five column names while one enforces a primary key, a foreign
+    key and three ``CHECK`` constraints and the other enforces nothing at all.
+    For a table that merely records history that is a tolerable risk. For one
+    that governs the deletion of media it is not, so
+    ``capture_media_lifecycle`` declares its safety-critical shape in full and a
+    table that does not genuinely have it is refused.
+
+    Existing version-1 and version-2 tables deliberately keep the original
+    columns-only contract: strengthening them here would change whether real
+    deployed databases can still be adopted, which is not this task's decision
+    to make.
+    """
+
+    columns: frozenset[str]
+    #: Columns that must form the table's PRIMARY KEY, in order.
+    primary_key: tuple[str, ...] = ()
+    #: Columns that must be declared NOT NULL. A ``TEXT PRIMARY KEY`` column is
+    #: nullable in SQLite unless it says otherwise, so a primary key is listed
+    #: here only when the DDL really does declare it.
+    not_null: frozenset[str] = frozenset()
+    #: ``(column, referenced table, referenced column)`` triples that must exist.
+    foreign_keys: tuple[tuple[str, str, str], ...] = ()
+    #: Fragments that must appear in the stored ``CREATE TABLE`` text once
+    #: comments are stripped, whitespace removed and case folded. SQLite exposes
+    #: primary keys and foreign keys through pragmas but not ``CHECK``
+    #: constraints, so these are the only way to verify the vocabularies and the
+    #: timestamp-coherence rule actually exist.
+    required_sql: tuple[str, ...] = field(default=())
+
+
+#: The shape each recognisable table must have before an unversioned database
+#: may be adopted at that version.
+_VERSION_TABLE_SHAPES: dict[str, _TableShape] = {
+    "observations": _TableShape(
+        columns=frozenset(
+            {
+                "id",
+                "observed_at",
+                "kind",
+                "source",
+                "status",
+                "summary",
+                "payload_json",
+                "correlation_id",
+                "created_at",
+            }
+        ),
     ),
-    "captures": frozenset(
-        {
-            "id",
-            "filename",
-            "absolute_path",
-            "captured_at_utc",
-            "width",
-            "height",
-            "filesize_bytes",
-            "camera_backend",
-            "created_at_utc",
-            "extra_metadata",
-        }
+    "captures": _TableShape(
+        columns=frozenset(
+            {
+                "id",
+                "filename",
+                "absolute_path",
+                "captured_at_utc",
+                "width",
+                "height",
+                "filesize_bytes",
+                "camera_backend",
+                "created_at_utc",
+                "extra_metadata",
+            }
+        ),
     ),
-    "capture_media_lifecycle": frozenset(
-        {
-            "capture_id",
-            "state",
-            "requested_at_utc",
-            "deleted_at_utc",
-            "reason",
-        }
+    "capture_media_lifecycle": _TableShape(
+        columns=frozenset(
+            {
+                "capture_id",
+                "state",
+                "requested_at_utc",
+                "deleted_at_utc",
+                "reason",
+            }
+        ),
+        primary_key=("capture_id",),
+        not_null=frozenset({"state", "requested_at_utc", "reason"}),
+        foreign_keys=(("capture_id", "captures", "id"),),
+        required_sql=(
+            "check(statein('pending_delete','deleted'))",
+            "check(reasonin('age','managed_bytes','age_and_managed_bytes'))",
+            "check((state='pending_delete'anddeleted_at_utcisnull)"
+            "or(state='deleted'anddeleted_at_utcisnotnull))",
+        ),
     ),
 }
 
@@ -278,6 +334,35 @@ def _column_names(connection: sqlite3.Connection, table: str) -> frozenset[str]:
     """
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     return frozenset(str(row[1]) for row in rows)
+
+
+def _table_definition(connection: sqlite3.Connection, table: str) -> str:
+    """Return the stored ``CREATE TABLE`` text for ``table``, or ``""``."""
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return ""
+    return str(row[0])
+
+
+def _normalised_definition(sql: str) -> str:
+    """Reduce table DDL to a form that ignores layout but not meaning.
+
+    SQLite stores the ``CREATE TABLE`` statement verbatim, comments and all, so
+    a byte comparison would reject a table that is semantically identical but
+    formatted differently. Stripping comments, removing whitespace and folding
+    case leaves the constraint text itself, which is what actually has to match.
+
+    Comment stripping is intentionally naive: it would also cut a ``--`` inside
+    a string literal. No vocabulary value in this schema contains one, and the
+    failure direction is refusal rather than acceptance, which is the correct
+    way for a safety check to be wrong.
+    """
+    without_block_comments = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    without_line_comments = re.sub(r"--[^\n]*", " ", without_block_comments)
+    return re.sub(r"\s+", "", without_line_comments).lower()
 
 
 def schema_version(connection: sqlite3.Connection) -> int | None:
@@ -452,24 +537,111 @@ def _adoptable_version(existing_tables: frozenset[str]) -> int:
     return adopted
 
 
+def _verify_table_semantics(
+    connection: sqlite3.Connection,
+    table: str,
+    shape: _TableShape,
+) -> None:
+    """Confirm a table's safety-critical constraints are genuinely present.
+
+    Only tables that declare them are checked, so version-1 and version-2
+    adoption is unchanged. ``PRAGMA table_info`` supplies the primary key and
+    nullability, ``PRAGMA foreign_key_list`` the references, and the normalised
+    DDL the ``CHECK`` constraints -- which no pragma exposes.
+    """
+    rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+
+    if shape.primary_key:
+        # ``pk`` is the 1-based position of the column within the primary key,
+        # or 0 when it is not part of one.
+        actual_key = tuple(
+            str(row[1])
+            for row in sorted(rows, key=lambda row: int(row[5]))
+            if int(row[5]) > 0
+        )
+        if actual_key != shape.primary_key:
+            raise IncompatibleSchemaError(
+                f"Legacy table {table!r} does not declare the required primary "
+                f"key {list(shape.primary_key)}; refusing to adopt it"
+            )
+
+    if shape.not_null:
+        actual_not_null = frozenset(
+            str(row[1]) for row in rows if int(row[3]) == 1
+        )
+        missing = sorted(shape.not_null - actual_not_null)
+        if missing:
+            raise IncompatibleSchemaError(
+                f"Legacy table {table!r} does not declare NOT NULL on "
+                f"{missing}; refusing to adopt it"
+            )
+        nullable = frozenset(shape.columns) - shape.not_null - set(shape.primary_key)
+        unexpected = sorted(actual_not_null & nullable)
+        if unexpected:
+            raise IncompatibleSchemaError(
+                f"Legacy table {table!r} declares NOT NULL on {unexpected}, "
+                "which the supported schema leaves nullable; refusing to adopt it"
+            )
+
+    if shape.foreign_keys:
+        actual_keys = {
+            (str(row[3]), str(row[2]), str(row[4]))
+            for row in connection.execute(
+                f"PRAGMA foreign_key_list({table})"
+            ).fetchall()
+        }
+        missing_keys = sorted(set(shape.foreign_keys) - actual_keys)
+        if missing_keys:
+            raise IncompatibleSchemaError(
+                f"Legacy table {table!r} is missing the required foreign "
+                f"key(s) {missing_keys}; refusing to adopt it"
+            )
+
+    if shape.required_sql:
+        definition = _normalised_definition(
+            _table_definition(connection, table)
+        )
+        absent = [
+            fragment
+            for fragment in shape.required_sql
+            if fragment not in definition
+        ]
+        if absent:
+            raise IncompatibleSchemaError(
+                f"Legacy table {table!r} does not enforce the constraints the "
+                f"supported schema requires ({len(absent)} missing); refusing "
+                "to adopt it"
+            )
+
+
 def _verify_adoptable_shape(
     connection: sqlite3.Connection,
     adopted_version: int,
 ) -> None:
-    """Confirm every table being adopted has exactly its expected columns."""
+    """Confirm every table being adopted matches its supported shape.
+
+    Adoption writes history rows and then trusts the tables forever afterwards,
+    so what is checked here is the whole of what "this database is at version N"
+    is ever going to mean. For the media-lifecycle table that has to include the
+    constraints, not only the column names: a table with the right names and no
+    primary key, no foreign key and no ``CHECK`` would be adopted as version 3
+    and would then accept a lifecycle row for a capture that does not exist, in
+    a state that does not exist, for a reason nobody defined.
+    """
     for version in range(1, adopted_version + 1):
         for table in _VERSION_TABLES[version]:
-            expected = _VERSION_TABLE_COLUMNS[table]
+            shape = _VERSION_TABLE_SHAPES[table]
             actual = _column_names(connection, table)
-            if actual != expected:
-                missing = sorted(expected - actual)
-                unexpected = sorted(actual - expected)
+            if actual != shape.columns:
+                missing = sorted(shape.columns - actual)
+                unexpected = sorted(actual - shape.columns)
                 raise IncompatibleSchemaError(
                     f"Legacy table {table!r} does not match the supported "
                     f"schema (missing columns: {missing or 'none'}; "
                     f"unexpected columns: {unexpected or 'none'}); "
                     "refusing to adopt it"
                 )
+            _verify_table_semantics(connection, table, shape)
 
 
 def _adopt_legacy_schema(

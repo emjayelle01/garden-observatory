@@ -658,3 +658,316 @@ def test_importing_the_database_module_creates_nothing(tmp_path: Path) -> None:
 
     assert result == str(CURRENT_SCHEMA_VERSION)
     assert list(tmp_path.iterdir()) == []
+
+
+# --- version-3 lifecycle schema safety (Task 14.1 correction round) ---------
+#
+# The lifecycle table governs the deletion of media, so "this database is at
+# version 3" has to mean the constraints are really there. Adoption writes
+# history rows and then trusts the tables forever afterwards: a table with the
+# right five column names and none of the guarantees would be adopted once and
+# believed permanently.
+
+#: The canonical lifecycle DDL, and the variants that each drop exactly one
+#: safety property while keeping the same five column names. Every variant must
+#: be refused.
+_CANONICAL_LIFECYCLE = """
+    CREATE TABLE capture_media_lifecycle (
+        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
+        requested_at_utc TEXT NOT NULL,
+        deleted_at_utc TEXT,
+        reason TEXT NOT NULL
+            CHECK (reason IN ('age', 'managed_bytes', 'age_and_managed_bytes')),
+        CHECK (
+            (state = 'pending_delete' AND deleted_at_utc IS NULL)
+            OR (state = 'deleted' AND deleted_at_utc IS NOT NULL)
+        )
+    )
+"""
+
+_NO_CONSTRAINTS_AT_ALL = """
+    CREATE TABLE capture_media_lifecycle (
+        capture_id TEXT,
+        state TEXT,
+        requested_at_utc TEXT,
+        deleted_at_utc TEXT,
+        reason TEXT
+    )
+"""
+
+_NO_PRIMARY_KEY = """
+    CREATE TABLE capture_media_lifecycle (
+        capture_id TEXT REFERENCES captures(id),
+        state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
+        requested_at_utc TEXT NOT NULL,
+        deleted_at_utc TEXT,
+        reason TEXT NOT NULL
+            CHECK (reason IN ('age', 'managed_bytes', 'age_and_managed_bytes')),
+        CHECK (
+            (state = 'pending_delete' AND deleted_at_utc IS NULL)
+            OR (state = 'deleted' AND deleted_at_utc IS NOT NULL)
+        )
+    )
+"""
+
+_NO_FOREIGN_KEY = """
+    CREATE TABLE capture_media_lifecycle (
+        capture_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
+        requested_at_utc TEXT NOT NULL,
+        deleted_at_utc TEXT,
+        reason TEXT NOT NULL
+            CHECK (reason IN ('age', 'managed_bytes', 'age_and_managed_bytes')),
+        CHECK (
+            (state = 'pending_delete' AND deleted_at_utc IS NULL)
+            OR (state = 'deleted' AND deleted_at_utc IS NOT NULL)
+        )
+    )
+"""
+
+_NO_STATE_CHECK = """
+    CREATE TABLE capture_media_lifecycle (
+        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        state TEXT NOT NULL,
+        requested_at_utc TEXT NOT NULL,
+        deleted_at_utc TEXT,
+        reason TEXT NOT NULL
+            CHECK (reason IN ('age', 'managed_bytes', 'age_and_managed_bytes')),
+        CHECK (
+            (state = 'pending_delete' AND deleted_at_utc IS NULL)
+            OR (state = 'deleted' AND deleted_at_utc IS NOT NULL)
+        )
+    )
+"""
+
+_WIDENED_STATE_CHECK = """
+    CREATE TABLE capture_media_lifecycle (
+        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        state TEXT NOT NULL
+            CHECK (state IN ('pending_delete', 'deleted', 'quarantined')),
+        requested_at_utc TEXT NOT NULL,
+        deleted_at_utc TEXT,
+        reason TEXT NOT NULL
+            CHECK (reason IN ('age', 'managed_bytes', 'age_and_managed_bytes')),
+        CHECK (
+            (state = 'pending_delete' AND deleted_at_utc IS NULL)
+            OR (state = 'deleted' AND deleted_at_utc IS NOT NULL)
+        )
+    )
+"""
+
+_NO_REASON_CHECK = """
+    CREATE TABLE capture_media_lifecycle (
+        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
+        requested_at_utc TEXT NOT NULL,
+        deleted_at_utc TEXT,
+        reason TEXT NOT NULL,
+        CHECK (
+            (state = 'pending_delete' AND deleted_at_utc IS NULL)
+            OR (state = 'deleted' AND deleted_at_utc IS NOT NULL)
+        )
+    )
+"""
+
+_WIDENED_REASON_CHECK = """
+    CREATE TABLE capture_media_lifecycle (
+        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
+        requested_at_utc TEXT NOT NULL,
+        deleted_at_utc TEXT,
+        reason TEXT NOT NULL CHECK (reason IN ('age', 'operator')),
+        CHECK (
+            (state = 'pending_delete' AND deleted_at_utc IS NULL)
+            OR (state = 'deleted' AND deleted_at_utc IS NOT NULL)
+        )
+    )
+"""
+
+_NO_TIMESTAMP_COHERENCE = """
+    CREATE TABLE capture_media_lifecycle (
+        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
+        requested_at_utc TEXT NOT NULL,
+        deleted_at_utc TEXT,
+        reason TEXT NOT NULL
+            CHECK (reason IN ('age', 'managed_bytes', 'age_and_managed_bytes'))
+    )
+"""
+
+_MISSING_NOT_NULL = """
+    CREATE TABLE capture_media_lifecycle (
+        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        state TEXT CHECK (state IN ('pending_delete', 'deleted')),
+        requested_at_utc TEXT NOT NULL,
+        deleted_at_utc TEXT,
+        reason TEXT NOT NULL
+            CHECK (reason IN ('age', 'managed_bytes', 'age_and_managed_bytes')),
+        CHECK (
+            (state = 'pending_delete' AND deleted_at_utc IS NULL)
+            OR (state = 'deleted' AND deleted_at_utc IS NOT NULL)
+        )
+    )
+"""
+
+
+def _unversioned_v3(tmp_path: Path, lifecycle_ddl: str, name: str) -> Path:
+    """Build an unversioned database whose lifecycle table uses ``lifecycle_ddl``."""
+    database_path = tmp_path / f"{name}.db"
+    with database_connection(database_path) as connection:
+        for migration in ("001_initial_observation_engine", "002_capture_archive"):
+            connection.executescript(
+                (MIGRATIONS_DIRECTORY / f"{migration}.sql").read_text(
+                    encoding="utf-8"
+                )
+            )
+        connection.execute("DROP TABLE schema_migrations")
+        connection.execute(lifecycle_ddl)
+        _write_legacy_observation(connection, "legacy-v3")
+    return database_path
+
+
+def test_a_canonical_unversioned_version_three_database_is_adopted(
+    tmp_path: Path,
+) -> None:
+    """The real schema, written by hand rather than by the runner, is accepted.
+
+    This is the control for the rejection cases below: without it they would
+    only prove that the verifier refuses things, not that it still recognises
+    the schema it is meant to recognise.
+    """
+    database_path = _unversioned_v3(tmp_path, _CANONICAL_LIFECYCLE, "canonical")
+
+    applied = apply_migrations(database_path)
+
+    assert applied == []
+    assert read_schema_version(database_path) == 3
+    assert len(list_observations(database_path)) == 1
+
+
+@pytest.mark.parametrize(
+    ("label", "lifecycle_ddl"),
+    [
+        ("no constraints at all", _NO_CONSTRAINTS_AT_ALL),
+        ("no primary key", _NO_PRIMARY_KEY),
+        ("no foreign key", _NO_FOREIGN_KEY),
+        ("no state CHECK", _NO_STATE_CHECK),
+        ("widened state CHECK", _WIDENED_STATE_CHECK),
+        ("no reason CHECK", _NO_REASON_CHECK),
+        ("widened reason CHECK", _WIDENED_REASON_CHECK),
+        ("no timestamp coherence CHECK", _NO_TIMESTAMP_COHERENCE),
+        ("missing NOT NULL", _MISSING_NOT_NULL),
+    ],
+)
+def test_an_unconstrained_unversioned_version_three_table_is_rejected(
+    tmp_path: Path, label: str, lifecycle_ddl: str
+) -> None:
+    """The same five column names are not enough to be adopted as version 3.
+
+    Each variant drops exactly one safety property. A table adopted without it
+    would go on to accept a lifecycle row for a capture that does not exist, in
+    a state that does not exist, for a reason nobody defined, or a completed
+    deletion with no deletion time -- and nothing would ever check again.
+    """
+    database_path = _unversioned_v3(
+        tmp_path, lifecycle_ddl, label.replace(" ", "-")
+    )
+
+    with pytest.raises(IncompatibleSchemaError):
+        apply_migrations(database_path)
+
+
+def test_a_rejected_version_three_adoption_fabricates_no_history(
+    tmp_path: Path,
+) -> None:
+    """A refused database is left exactly as it was found.
+
+    No ``schema_migrations`` table is created, so nothing later reads the
+    refusal as a partially adopted database.
+    """
+    database_path = _unversioned_v3(
+        tmp_path, _NO_CONSTRAINTS_AT_ALL, "no-history"
+    )
+
+    with pytest.raises(IncompatibleSchemaError):
+        apply_migrations(database_path)
+
+    assert "schema_migrations" not in _tables(database_path)
+    assert read_schema_version(database_path) is None
+
+
+def test_a_pre_existing_lifecycle_table_fails_migration_003(
+    tmp_path: Path,
+) -> None:
+    """A version-2 database carrying a shadow lifecycle table must not migrate.
+
+    ``CREATE TABLE IF NOT EXISTS`` would have made this statement a no-op, and
+    the runner would then have recorded version 3 over a table it never created.
+    The shadow table below deliberately carries a ``state`` column, so the index
+    creation that follows would have succeeded and nothing else would have
+    noticed.
+    """
+    database_path = tmp_path / "shadow.db"
+    with database_connection(database_path) as connection:
+        for migration in ("001_initial_observation_engine", "002_capture_archive"):
+            connection.executescript(
+                (MIGRATIONS_DIRECTORY / f"{migration}.sql").read_text(
+                    encoding="utf-8"
+                )
+            )
+        connection.execute("DELETE FROM schema_migrations WHERE version > 2")
+        connection.execute(
+            "INSERT OR REPLACE INTO schema_migrations (version, name, applied_at) "
+            "VALUES (1, '001.sql', ?), (2, '002.sql', ?)",
+            (utc_now_iso(), utc_now_iso()),
+        )
+        connection.execute(
+            "CREATE TABLE capture_media_lifecycle (capture_id TEXT, state TEXT)"
+        )
+        _write_legacy_observation(connection, "legacy-shadow")
+
+    with pytest.raises(DatabaseError):
+        apply_migrations(database_path)
+
+    # Rolled back to the version it really is, with its data intact.
+    assert read_schema_version(database_path) == 2
+    assert len(list_observations(database_path)) == 1
+
+
+def test_a_failed_migration_003_leaves_the_shadow_table_untouched(
+    tmp_path: Path,
+) -> None:
+    """The failed migration creates nothing and rewrites nothing."""
+    database_path = tmp_path / "shadow-intact.db"
+    with database_connection(database_path) as connection:
+        for migration in ("001_initial_observation_engine", "002_capture_archive"):
+            connection.executescript(
+                (MIGRATIONS_DIRECTORY / f"{migration}.sql").read_text(
+                    encoding="utf-8"
+                )
+            )
+        connection.execute("DELETE FROM schema_migrations WHERE version > 2")
+        connection.execute(
+            "INSERT OR REPLACE INTO schema_migrations (version, name, applied_at) "
+            "VALUES (1, '001.sql', ?), (2, '002.sql', ?)",
+            (utc_now_iso(), utc_now_iso()),
+        )
+        connection.execute(
+            "CREATE TABLE capture_media_lifecycle (capture_id TEXT, state TEXT)"
+        )
+
+    with pytest.raises(DatabaseError):
+        apply_migrations(database_path)
+
+    with database_connection(database_path) as connection:
+        columns = [
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(capture_media_lifecycle)"
+            )
+        ]
+    assert columns == ["capture_id", "state"]
+    assert "idx_capture_media_lifecycle_state" not in _objects(
+        database_path, "index"
+    )

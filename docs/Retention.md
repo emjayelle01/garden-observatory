@@ -250,6 +250,45 @@ The current schema version is now **3**.
 | `pending_delete` | Retention deletion intended, not yet finalised. |
 | `deleted` | Media reclaimed; the observation recording it committed with the transition. |
 
+Migration 003 uses a plain `CREATE TABLE`, **not** `CREATE TABLE IF NOT
+EXISTS`. The migration runner already guarantees, from the `schema_migrations`
+history, that the file executes only when version 3 is genuinely pending, so
+`IF NOT EXISTS` could never make a legitimate re-run succeed — it could only let
+a *pre-existing* table of some other shape silently satisfy the statement while
+the runner went on to record version 3. A database claiming version 3 with a
+table the migration never created is precisely the state that must fail closed,
+so a name collision aborts the migration and rolls the database back to
+version 2. Migration idempotency comes from the recorded history, not from the
+DDL.
+
+### Adopting an unversioned version-3 database
+
+Legacy adoption writes history rows and then trusts the tables forever
+afterwards, so for the lifecycle table an exact **column set is not enough**.
+Two tables can carry the same five column names while one enforces a primary
+key, a foreign key and three `CHECK` constraints and the other enforces nothing
+at all. Before an unversioned database is adopted at version 3, MGO verifies
+that `capture_media_lifecycle` genuinely has:
+
+* `capture_id` as the primary key;
+* `NOT NULL` on `state`, `requested_at_utc` and `reason`, and a nullable
+  `deleted_at_utc`;
+* a foreign key from `capture_id` to `captures(id)`;
+* the `state` vocabulary `CHECK`;
+* the `reason` vocabulary `CHECK`;
+* the pending/deleted timestamp-coherence `CHECK`.
+
+Primary keys and foreign keys come from `PRAGMA table_info` and
+`PRAGMA foreign_key_list`. `CHECK` constraints are exposed by no pragma, so the
+stored `CREATE TABLE` text is compared with comments stripped, whitespace
+removed and case folded — which ignores layout but not meaning. Anything that
+does not match is refused with `IncompatibleSchemaError`, and the database is
+left exactly as it was found with no fabricated migration history.
+
+Version-1 and version-2 adoption is deliberately unchanged and remains a
+columns-only check: strengthening it would change whether real deployed
+databases can still be adopted, which is not this task's decision to make.
+
 ### Why a separate table
 
 The `captures` table is the historical catalogue of captures that **happened**.
@@ -441,6 +480,20 @@ A destructive retention run is conservative. On any safety-relevant failure it
 * unattempted candidates are left entirely untouched;
 * the **first** fixed failure category is reported.
 
+An **unexpected** exception is not an exception to any of that. Ordinary
+`Exception`s escaping the run are converted at an execution boundary into a
+result with category `unexpected`: the run stops, the process lock is released,
+the runtime state moves to `error` (never left stranded in `running`), and the
+counters for any deletion that had **already completed** are preserved — because
+stopping does not un-delete what was already reclaimed. If the exception
+occurred after the unlink but before finalisation, the `pending_delete` row is
+left durable and the next run recovers it.
+
+`KeyboardInterrupt`, `SystemExit` and the rest of `BaseException` are
+deliberately **not** converted. They are process-control signals, not retention
+failures, and catching them to make a status endpoint look tidy would suppress a
+shutdown.
+
 Detailed exception information is logged internally and only there. No raw
 exception, traceback, database path or capture-root path appears in the public
 status contract.
@@ -465,7 +518,18 @@ parallel event log, and never mutates or deletes an existing observation.
 Success payload: `capture_id`, `filename`, `filesize_bytes`, `policy_reason`,
 `captured_at`, `recovered_pending`.
 
-Failure payload: `capture_id`, `filename`, `error_category`, `policy_reason`.
+Failure payload: `capture_id`, `error_category`, `policy_reason`.
+
+**A failure payload deliberately carries no `filename`**, and the asymmetry with
+the success payload is the point. A success observation is only ever written
+after the full path/filename safety boundary has passed, so its filename is a
+value retention has already verified. A *failure* is frequently the boundary
+refusing that very value — a damaged catalogue filename may itself be an
+absolute path, a traversal or a database location — and persisting it would
+write exactly the string the privacy contract exists to keep out of the
+immutable timeline. A sanitised path or a basename is not offered in its place
+either: the capture id identifies the record completely, and anything derived
+from the rejected value would still be derived from it.
 
 Never included anywhere: `absolute_path`, the capture directory, the database
 path, command lines, tracebacks, raw exception strings.
@@ -483,12 +547,36 @@ configuration value can ride out on one.
 
 ### Failing closed on a bad catalogue
 
-Malformed stored `extra_metadata` JSON, an unrecognised stored lifecycle state,
-an unrecognised stored reason and a naive stored timestamp all stop the run with
-`catalogue_invalid`. **No deletion occurs after catalogue parsing has become
-untrustworthy.** The origin is the single field standing between an automatic
-capture and a manual one; reading it out of a document that will not parse is
-how a manual capture gets deleted.
+Every column of the retention projection is **validated, never coerced**, and
+any column that cannot be decoded stops the run with `catalogue_invalid`:
+
+| Column | Rule |
+| --- | --- |
+| `id`, `filename`, `absolute_path`, `extra_metadata` | must be a non-empty string |
+| `filesize_bytes` | must be an integer (not `bool`), and must be `> 0` |
+| `captured_at_utc`, `created_at_utc`, `requested_at_utc`, `deleted_at_utc` | must parse as a timezone-aware ISO-8601 instant |
+| `extra_metadata` | must parse as a JSON object |
+| `state`, `reason` | must be in the stored vocabulary |
+
+Two of these are worth stating plainly, because SQLite does not enforce them.
+Column affinity is a *conversion preference*, not a constraint — the `captures`
+table is not `STRICT` — so a damaged or hand-repaired row can hold text, a real,
+a blob or `NULL` in any column:
+
+* `str()` is never used to coerce a required text column. `str(None)` is the
+  four-character filename `"None"`: a value that looks real, would be compared
+  against a real path, and was never in the catalogue. The filename and the
+  absolute path are the two columns that decide *which file is about to be
+  removed*, so neither may be manufactured.
+* `filesize_bytes` must be **positive**. The capture service only ever
+  catalogues a verified non-empty JPEG, so zero or negative is not a small file
+  — it is a corrupt record, and it must not be allowed to present itself as an
+  ordinary size mismatch against a real file on disk.
+
+**No deletion occurs after catalogue parsing has become untrustworthy**, and no
+decoding failure escapes as a raw Python conversion error. The origin is the
+single field standing between an automatic capture and a manual one; reading it
+out of a document that will not parse is how a manual capture gets deleted.
 
 ---
 

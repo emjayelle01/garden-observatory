@@ -1214,3 +1214,367 @@ def test_the_service_never_deletes_recursively(tmp_path: Path) -> None:
         assert "rmtree" not in source
         assert "shutil" not in source
         assert "rmdir" not in source
+
+
+# --- the execution boundary (Task 14.1 correction round) --------------------
+#
+# A destructive subsystem that lets an unexpected exception escape leaves its
+# caller with no result, its runtime state stuck in ``running``, and its
+# lifetime counters missing the deletions it had already completed. These tests
+# exist because that is exactly what the first implementation did.
+
+
+def _explode_unexpectedly(message: str = "unexpected internal failure"):
+    """Return an unlink seam that raises an ordinary, unanticipated error."""
+
+    def _seam(path: Path) -> None:
+        raise RuntimeError(message)
+
+    return _seam
+
+
+def test_an_unexpected_exception_becomes_a_bounded_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ordinary unexpected error is reduced to ``UNEXPECTED``, not raised.
+
+    ``RuntimeError`` is not in any of the handled domains, so before the
+    execution boundary existed this escaped ``run_once`` entirely.
+    """
+    harness = _harness(tmp_path)
+    harness.add("cap-old")
+    monkeypatch.setattr(service_module, "_unlink", _explode_unexpectedly())
+
+    result = harness.service.run_once()
+
+    assert result.executed is True
+    assert result.error_category is RetentionErrorCategory.UNEXPECTED
+    assert result.deleted_count == 0
+    # The point is that ``run_once`` returned at all: before the execution
+    # boundary existed, this line was never reached.
+    assert result.enabled is True
+
+
+def test_an_unexpected_exception_leaves_the_state_in_error_not_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The holder must never be left reporting a run that has finished.
+
+    ``running`` is a claim that a destructive run is executing *now*. Leaving it
+    there after the run has ended tells an operator a deletion is in flight that
+    is not, and no later run corrects it because none is scheduled.
+    """
+    harness = _harness(tmp_path)
+    harness.add("cap-old")
+    monkeypatch.setattr(service_module, "_unlink", _explode_unexpectedly())
+
+    harness.service.run_once()
+
+    snapshot = harness.state.snapshot()
+    assert snapshot.state is RetentionState.ERROR
+    assert snapshot.state is not RetentionState.RUNNING
+    assert snapshot.total_runs == 1
+
+
+def test_an_unexpected_exception_publishes_only_the_fixed_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exception's own text never reaches the public contract."""
+    harness = _harness(tmp_path)
+    harness.add("cap-old")
+    secret = "C:/secret/location/mgo.db"
+    monkeypatch.setattr(
+        service_module,
+        "_unlink",
+        _explode_unexpectedly(f"cannot remove {secret}"),
+    )
+
+    result = harness.service.run_once()
+
+    message = result.error_message or ""
+    assert message == "The retention run failed unexpectedly."
+    assert secret not in message
+    assert "RuntimeError" not in message
+    assert str(harness.root) not in message
+    assert harness.state.snapshot().last_error == message
+
+
+def test_an_unexpected_exception_releases_the_run_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stranded lock would make every later run report BUSY forever."""
+    harness = _harness(tmp_path)
+    harness.add("cap-old")
+    monkeypatch.setattr(service_module, "_unlink", _explode_unexpectedly())
+
+    harness.service.run_once()
+
+    assert harness.service._run_lock.locked() is False
+
+
+def test_a_later_run_after_an_unexpected_failure_is_not_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The subsystem recovers: the next run executes normally and succeeds."""
+    harness = _harness(tmp_path)
+    media = harness.add("cap-old")
+    monkeypatch.setattr(service_module, "_unlink", _explode_unexpectedly())
+    harness.service.run_once()
+
+    monkeypatch.undo()
+    result = harness.service.run_once()
+
+    assert result.error_category is not RetentionErrorCategory.BUSY
+    assert result.error_category is None
+    assert result.deleted_count == 1
+    assert not media.exists()
+    assert harness.state.snapshot().state is RetentionState.IDLE
+
+
+def test_an_unexpected_failure_preserves_an_earlier_completed_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deletion that already completed is still counted, and still gone.
+
+    The boundary sits where the partial tally is in hand precisely so this
+    stays true: the first capture really was reclaimed, and a run that later
+    failed must not report otherwise.
+    """
+    harness = _harness(tmp_path)
+    first = harness.add("cap-1", days_old=903)
+    second = harness.add("cap-2", days_old=902)
+    third = harness.add("cap-3", days_old=901)
+    real_unlink = service_module._unlink
+    seen: list[str] = []
+
+    def _fail_on_the_second(path: Path) -> None:
+        seen.append(Path(path).name)
+        if len(seen) == 1:
+            real_unlink(path)
+            return
+        raise RuntimeError("unexpected internal failure")
+
+    monkeypatch.setattr(service_module, "_unlink", _fail_on_the_second)
+
+    result = harness.service.run_once()
+
+    assert result.error_category is RetentionErrorCategory.UNEXPECTED
+    assert result.deleted_count == 1
+    assert result.bytes_reclaimed == len(PAYLOAD)
+    assert not first.exists()
+    # The run stopped at the second candidate, so the third was never attempted.
+    assert seen == ["cap-1.jpg", "cap-2.jpg"]
+    assert second.exists()
+    assert third.exists()
+    snapshot = harness.state.snapshot()
+    assert snapshot.total_captures_deleted == 1
+    assert snapshot.total_bytes_reclaimed == len(PAYLOAD)
+
+
+def test_an_unexpected_failure_after_unlink_leaves_the_intent_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unexpected error between unlink and finalisation stays recoverable."""
+    harness = _harness(tmp_path)
+    media = harness.add("cap-old")
+
+    def _explode(*args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("unexpected internal failure")
+
+    monkeypatch.setattr(harness.repository, "finalize_deletion", _explode)
+
+    result = harness.service.run_once()
+
+    assert result.error_category is RetentionErrorCategory.UNEXPECTED
+    assert not media.exists()
+    assert harness.lifecycle() == {"cap-old": "pending_delete"}
+
+
+def test_process_control_exceptions_are_not_converted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``BaseException`` still propagates; only ``Exception`` is converted.
+
+    Catching ``KeyboardInterrupt`` or ``SystemExit`` to make a status endpoint
+    look tidy would suppress a shutdown, so the boundary deliberately does not.
+    """
+
+    def _interrupt(path: Path) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(service_module, "_unlink", _interrupt)
+    harness = _harness(tmp_path)
+    harness.add("cap-old")
+
+    with pytest.raises(KeyboardInterrupt):
+        harness.service.run_once()
+
+    # The lock is still released, so the process can be shut down cleanly.
+    assert harness.service._run_lock.locked() is False
+
+
+# --- corrupt catalogue file sizes (Task 14.1 correction round) --------------
+#
+# SQLite column affinity is a conversion preference, not a constraint: the
+# captures table is not STRICT, so a damaged row can hold text here. Before the
+# correction that produced a bare ValueError out of catalogue decoding, which
+# escaped the run and stranded the runtime state.
+
+
+@pytest.mark.parametrize(
+    ("label", "value"),
+    [
+        ("non-numeric text", "'not-a-number'"),
+        ("empty text", "''"),
+        ("a real", "12.5"),
+        ("zero", "0"),
+        ("negative", "-1"),
+    ],
+)
+def test_a_corrupt_catalogue_filesize_stops_the_run(
+    tmp_path: Path, label: str, value: str
+) -> None:
+    """An unusable catalogue size is ``catalogue_invalid``, and nothing is deleted.
+
+    ``NULL`` is absent from this list on purpose: the ``captures`` schema
+    declares ``filesize_bytes`` NOT NULL, so SQLite refuses it here. The decoder
+    still rejects it, and that is proved in the repository suite against a table
+    without the constraint -- the shape a hand-repaired database can present.
+
+    Zero and negative matter as much as the unparseable forms: the capture
+    service only ever catalogues a verified non-empty JPEG, so a non-positive
+    size is a corrupt record. Before the correction it was silently accepted and
+    then reported as a *size mismatch* against a real file -- a corrupt row
+    wearing the costume of an ordinary safety refusal.
+    """
+    harness = _harness(tmp_path)
+    media = harness.add("cap-old")
+    with database_connection(harness.database_path) as connection:
+        connection.execute(
+            f"UPDATE captures SET filesize_bytes = {value} WHERE id = 'cap-old'"
+        )
+
+    result = harness.service.run_once()
+
+    assert result.error_category is RetentionErrorCategory.CATALOGUE_INVALID
+    assert result.deleted_count == 0
+    assert media.exists()
+    assert harness.lifecycle() == {}
+    assert harness.state.snapshot().state is RetentionState.ERROR
+
+
+def test_a_corrupt_catalogue_filesize_never_reaches_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decoding fails before any filesystem call is made."""
+
+    def _explode(path: Path) -> None:
+        raise AssertionError("retention unlinked against an undecodable catalogue")
+
+    monkeypatch.setattr(service_module, "_unlink", _explode)
+    harness = _harness(tmp_path)
+    harness.add("cap-old")
+    with database_connection(harness.database_path) as connection:
+        connection.execute("UPDATE captures SET filesize_bytes = 'bad'")
+
+    assert (
+        harness.service.run_once().error_category
+        is RetentionErrorCategory.CATALOGUE_INVALID
+    )
+
+
+def test_a_valid_positive_filesize_is_still_accepted(tmp_path: Path) -> None:
+    """The control: an ordinary catalogue size still works exactly as before."""
+    harness = _harness(tmp_path)
+    media = harness.add("cap-old")
+
+    result = harness.service.run_once()
+
+    assert result.error_category is None
+    assert result.deleted_count == 1
+    assert not media.exists()
+
+
+# --- failure observations carry no filename (Task 14.1 correction round) ----
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "/secret/location/mgo.db",
+        "C:/Windows/System32/config/SAM",
+        "../../../etc/shadow",
+        "/var/lib/garden-observatory/db/mgo.db",
+    ],
+)
+def test_a_failure_observation_never_persists_an_untrusted_filename(
+    tmp_path: Path, hostile: str
+) -> None:
+    """A rejected filename must not ride into the immutable timeline.
+
+    The failure here *is* the boundary refusing this value, so writing it to an
+    observation would persist exactly the string the safety contract exists to
+    keep out. A success observation may carry a filename because success means
+    the boundary already passed it; a failure has no such guarantee.
+    """
+    harness = _harness(tmp_path)
+    harness.add(
+        "cap-bad",
+        filename=hostile,
+        absolute_path=hostile,
+        write_file=False,
+    )
+
+    result = harness.service.run_once()
+
+    assert result.error_category is RetentionErrorCategory.UNSAFE_PATH
+    [observation] = harness.observations()
+    rendered = json.dumps(observation.payload)
+    assert hostile not in rendered
+    assert "filename" not in observation.payload
+    assert "/" not in rendered
+    assert "\\" not in rendered
+
+
+def test_a_failure_observation_keeps_its_category_and_correlation(
+    tmp_path: Path,
+) -> None:
+    """Removing the filename removed nothing an operator needs.
+
+    The capture id identifies the record completely, and it is also the
+    correlation that ties the failure to the catalogue row.
+    """
+    harness = _harness(tmp_path)
+    harness.add("cap-old", catalogue_size=len(PAYLOAD) + 1)
+
+    harness.service.run_once()
+
+    [observation] = harness.observations()
+    assert observation.payload == {
+        "capture_id": "cap-old",
+        "error_category": RetentionErrorCategory.SIZE_MISMATCH.value,
+        "policy_reason": RetentionReason.AGE.value,
+    }
+    assert observation.correlation_id == "cap-old"
+
+
+def test_the_success_observation_still_carries_its_filename(
+    tmp_path: Path,
+) -> None:
+    """The control: success is unchanged, because success passed the boundary."""
+    harness = _harness(tmp_path)
+    harness.add("cap-old")
+
+    harness.service.run_once()
+
+    [observation] = harness.observations()
+    assert observation.status == SUCCESS_STATUS
+    assert observation.payload["filename"] == "cap-old.jpg"
+    assert set(observation.payload) == {
+        "capture_id",
+        "filename",
+        "filesize_bytes",
+        "policy_reason",
+        "captured_at",
+        "recovered_pending",
+    }

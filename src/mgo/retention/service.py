@@ -32,6 +32,7 @@ import logging
 import os
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -212,6 +213,23 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+@dataclass
+class _RunTally:
+    """What one run has completed so far. Mutable on purpose.
+
+    A run reports the same counters whether it finished, stopped on a safety
+    refusal, or was ended by an unexpected exception -- so the numbers have to
+    live somewhere the execution boundary can still read after the stack it was
+    accumulated on has unwound.
+    """
+
+    deleted_count: int = 0
+    bytes_reclaimed: int = 0
+    recovered_count: int = 0
+    candidate_count: int = 0
+    more_work_remains: bool = False
+
+
 class RetentionDisabledError(RuntimeError):
     """Raised when destructive retention is requested while it is disabled.
 
@@ -329,124 +347,109 @@ class RetentionService:
 
         try:
             self._state.mark_running()
+            # ``_execute`` converts every ordinary failure into a result, so the
+            # two lines below always run and the holder can never be left
+            # reporting ``running`` for a run that has finished.
             result = self._execute()
+            self._state.record_run(
+                completed_at=self._clock(),
+                candidate_count=result.candidate_count,
+                deleted_count=result.deleted_count,
+                bytes_reclaimed=result.bytes_reclaimed,
+                error=result.error_message,
+            )
         finally:
+            # Released last, so the state a waiting caller can observe is
+            # already the finished state rather than a stale ``running``.
             self._run_lock.release()
-
-        self._state.record_run(
-            completed_at=self._clock(),
-            candidate_count=result.candidate_count,
-            deleted_count=result.deleted_count,
-            bytes_reclaimed=result.bytes_reclaimed,
-            error=result.error_message,
-        )
         return result
 
     # -- the run -----------------------------------------------------------
 
     def _execute(self) -> RetentionRunResult:
-        """Run recovery, then policy, stopping at the first failure."""
-        deleted_count = 0
-        bytes_reclaimed = 0
-        recovered_count = 0
-        candidate_count = 0
-        more_work_remains = False
+        """Execute one run, converting any ordinary failure into a result.
 
+        This is the execution boundary. A destructive subsystem that lets an
+        unexpected exception escape leaves its caller with no result, its
+        runtime state stuck in ``running`` and its lifetime counters missing the
+        deletions it had already completed -- so the boundary is here, where the
+        partial tally is still in hand, rather than around the call in
+        :meth:`run_once` where it would have been lost.
+
+        Only ``Exception`` is converted. ``KeyboardInterrupt``, ``SystemExit``
+        and the rest of ``BaseException`` are process-control signals, not
+        retention failures, and are deliberately allowed to propagate: catching
+        them to make a status endpoint look tidy would suppress a shutdown.
+        """
+        tally = _RunTally()
+        try:
+            return self._execute_tracked(tally)
+        except Exception:
+            # The raw exception is logged with its traceback here and *only*
+            # here. It is arbitrary application data -- it may carry a media
+            # path, a database location or an environment value -- so nothing
+            # derived from it reaches the result, the status endpoint or an
+            # observation.
+            LOGGER.exception(
+                "The retention run failed unexpectedly and was stopped"
+            )
+            return self._result(tally, RetentionErrorCategory.UNEXPECTED)
+
+    def _execute_tracked(self, tally: _RunTally) -> RetentionRunResult:
+        """Run recovery, then policy, stopping at the first failure.
+
+        Every completed deletion is folded into ``tally`` immediately, so a
+        failure -- expected or unexpected -- reports what this run genuinely
+        reclaimed rather than discarding it.
+        """
         capture_root = self._resolved_capture_root()
         if capture_root is None:
-            return self._result(
-                deleted_count=0,
-                bytes_reclaimed=0,
-                recovered_count=0,
-                candidate_count=0,
-                more_work_remains=False,
-                error=RetentionErrorCategory.UNSAFE_PATH,
-            )
+            return self._result(tally, RetentionErrorCategory.UNSAFE_PATH)
 
         try:
             records = self._repository.list_lifecycle_records()
         except RetentionCatalogueError:
             LOGGER.exception("The capture catalogue could not be parsed safely")
-            return self._result(
-                deleted_count=0,
-                bytes_reclaimed=0,
-                recovered_count=0,
-                candidate_count=0,
-                more_work_remains=False,
-                error=RetentionErrorCategory.CATALOGUE_INVALID,
-            )
+            return self._result(tally, RetentionErrorCategory.CATALOGUE_INVALID)
         except RetentionRepositoryError:
             LOGGER.exception("The capture catalogue could not be read")
-            return self._result(
-                deleted_count=0,
-                bytes_reclaimed=0,
-                recovered_count=0,
-                candidate_count=0,
-                more_work_remains=False,
-                error=RetentionErrorCategory.CATALOGUE_INVALID,
-            )
+            return self._result(tally, RetentionErrorCategory.CATALOGUE_INVALID)
 
         for record in self._pending_records(records):
             error, reclaimed = self._recover_pending(record, capture_root)
             if error is not None:
-                return self._result(
-                    deleted_count=deleted_count,
-                    bytes_reclaimed=bytes_reclaimed,
-                    recovered_count=recovered_count,
-                    candidate_count=candidate_count,
-                    more_work_remains=more_work_remains,
-                    error=error,
-                )
-            deleted_count += 1
-            recovered_count += 1
-            bytes_reclaimed += reclaimed
+                return self._result(tally, error)
+            tally.deleted_count += 1
+            tally.recovered_count += 1
+            tally.bytes_reclaimed += reclaimed
 
         plan = plan_retention(records, self._config, now_utc=self._clock())
-        candidate_count = len(plan.candidates)
-        more_work_remains = plan.more_work_remains
+        tally.candidate_count = len(plan.candidates)
+        tally.more_work_remains = plan.more_work_remains
 
         for candidate in plan.candidates:
             error = self._delete_candidate(candidate, capture_root)
             if error is not None:
-                return self._result(
-                    deleted_count=deleted_count,
-                    bytes_reclaimed=bytes_reclaimed,
-                    recovered_count=recovered_count,
-                    candidate_count=candidate_count,
-                    more_work_remains=more_work_remains,
-                    error=error,
-                )
-            deleted_count += 1
-            bytes_reclaimed += candidate.filesize_bytes
+                return self._result(tally, error)
+            tally.deleted_count += 1
+            tally.bytes_reclaimed += candidate.filesize_bytes
 
-        return self._result(
-            deleted_count=deleted_count,
-            bytes_reclaimed=bytes_reclaimed,
-            recovered_count=recovered_count,
-            candidate_count=candidate_count,
-            more_work_remains=more_work_remains,
-            error=None,
-        )
+        return self._result(tally, None)
 
+    @staticmethod
     def _result(
-        self,
-        *,
-        deleted_count: int,
-        bytes_reclaimed: int,
-        recovered_count: int,
-        candidate_count: int,
-        more_work_remains: bool,
+        tally: _RunTally,
         error: RetentionErrorCategory | None,
     ) -> RetentionRunResult:
         """Build the run result. A run that started always reports executed."""
         return RetentionRunResult(
             executed=True,
             enabled=True,
-            candidate_count=candidate_count,
-            deleted_count=deleted_count,
-            bytes_reclaimed=bytes_reclaimed,
-            recovered_count=recovered_count,
-            more_work_remains=more_work_remains,
+            candidate_count=tally.candidate_count,
+            deleted_count=tally.deleted_count,
+            bytes_reclaimed=tally.bytes_reclaimed,
+            recovered_count=tally.recovered_count,
+            more_work_remains=tally.more_work_remains,
             error_category=error,
         )
 
@@ -527,7 +530,7 @@ class RetentionService:
                 record.capture_id,
                 path_error.value,
             )
-            self._record_failure(record.capture_id, record.filename, path_error)
+            self._record_failure(record.capture_id, path_error)
             return path_error, 0
 
         if _path_exists(Path(record.absolute_path)):
@@ -542,9 +545,7 @@ class RetentionService:
                     record.capture_id,
                     file_error.value,
                 )
-                self._record_failure(
-                    record.capture_id, record.filename, file_error
-                )
+                self._record_failure(record.capture_id, file_error)
                 return file_error, 0
 
             try:
@@ -556,7 +557,6 @@ class RetentionService:
                 )
                 self._record_failure(
                     record.capture_id,
-                    record.filename,
                     RetentionErrorCategory.FILESYSTEM_DELETE_FAILED,
                 )
                 return RetentionErrorCategory.FILESYSTEM_DELETE_FAILED, 0
@@ -593,10 +593,7 @@ class RetentionService:
                 pre_error.value,
             )
             self._record_failure(
-                candidate.capture_id,
-                candidate.filename,
-                pre_error,
-                reason=candidate.reason,
+                candidate.capture_id, pre_error, reason=candidate.reason
             )
             return pre_error
 
@@ -612,7 +609,6 @@ class RetentionService:
             )
             self._record_failure(
                 candidate.capture_id,
-                candidate.filename,
                 RetentionErrorCategory.DATABASE_TRANSITION_FAILED,
                 reason=candidate.reason,
             )
@@ -628,7 +624,6 @@ class RetentionService:
             )
             self._record_failure(
                 candidate.capture_id,
-                candidate.filename,
                 RetentionErrorCategory.DATABASE_TRANSITION_FAILED,
                 reason=candidate.reason,
             )
@@ -706,10 +701,7 @@ class RetentionService:
             self._repository.cancel_pending_delete(
                 candidate.capture_id,
                 observation_fields=self._failure_fields(
-                    candidate.capture_id,
-                    candidate.filename,
-                    error,
-                    reason=candidate.reason,
+                    candidate.capture_id, error, reason=candidate.reason
                 ),
             )
         except RetentionRepositoryError:
@@ -815,12 +807,25 @@ class RetentionService:
     @staticmethod
     def _failure_fields(
         capture_id: str,
-        filename: str,
         category: RetentionErrorCategory,
         *,
         reason: RetentionReason | None = None,
     ) -> dict[str, Any]:
-        """Build the immutable observation for one refused or failed deletion."""
+        """Build the immutable observation for one refused or failed deletion.
+
+        There is deliberately **no filename here**, and that asymmetry with the
+        success payload is the whole point. A success observation is only ever
+        written after the full path/filename safety boundary has passed, so its
+        filename is a value this code has already verified. A *failure* is
+        frequently the boundary refusing that very value -- the catalogue
+        filename may itself be an absolute path, a traversal or a database
+        location -- and writing it here would put the untrusted string into the
+        immutable timeline, which is exactly what the privacy contract forbids.
+
+        A sanitised path or a basename is not offered in its place either: the
+        capture id already identifies the record completely, and anything
+        derived from the rejected value would still be derived from it.
+        """
         return {
             "kind": OBSERVATION_KIND,
             "source": OBSERVATION_SOURCE,
@@ -828,7 +833,6 @@ class RetentionService:
             "summary": FAILURE_SUMMARY,
             "payload": {
                 "capture_id": capture_id,
-                "filename": filename,
                 "error_category": category.value,
                 "policy_reason": reason.value if reason is not None else None,
             },
@@ -838,7 +842,6 @@ class RetentionService:
     def _record_failure(
         self,
         capture_id: str,
-        filename: str,
         category: RetentionErrorCategory,
         *,
         reason: RetentionReason | None = None,
@@ -856,9 +859,7 @@ class RetentionService:
         try:
             self._recorder(
                 self._database_path,
-                **self._failure_fields(
-                    capture_id, filename, category, reason=reason
-                ),
+                **self._failure_fields(capture_id, category, reason=reason),
             )
         except Exception:
             LOGGER.exception(

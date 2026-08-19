@@ -124,6 +124,19 @@ RETENTION_SERVICE_SUITE = "tests/test_retention_service.py"
 RETENTION_DATABASE_SUITE = "tests/test_retention_database.py"
 RETENTION_API_SUITE = "tests/test_retention_api.py"
 
+#: The migration that creates the media-lifecycle table. It is a shipped asset
+#: in exactly the sense the gateway scripts are: a one-word weakening of its
+#: CREATE statement lets a database claim version 3 over a table this file never
+#: created, and every test that builds a *fresh* database still passes.
+MIGRATION_003 = "migrations/003_capture_media_lifecycle.sql"
+
+#: The schema-migration runner, which now verifies the version-3 table's
+#: constraints rather than only its column names.
+DATABASE = "src/mgo/core/database.py"
+
+#: The suite that owns migration and legacy-adoption behaviour.
+MIGRATIONS_SUITE = "tests/test_database_migrations.py"
+
 
 MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
@@ -2339,5 +2352,123 @@ MUTATIONS: tuple[Mutation, ...] = (
         'the_endpoint_touches_no_other_subsystem',
         'Reading a status endpoint deletes media.',
         suite=RETENTION_API_SUITE,
+    ),
+    # --- Task 14.1 correction round 1 ---------------------------------------
+    #
+    # Four safety defects survived the first implementation, every automated
+    # test and the whole 222-mutation register. Each one is registered here
+    # against the property it broke, because each was invisible from every
+    # status endpoint and every functional test until it was reproduced.
+    Mutation(
+        'an-unexpected-exception-escapes-the-run',
+        RETENTION_SERVICE,
+        '            return self._execute_tracked(tally)',
+        '            return self._execute_tracked(tally)  # boundary removed\n'
+        '        except _NeverRaised:',
+        'an_unexpected_exception_becomes_a_bounded_result',
+        'A destructive run raises, stranding runtime state in "running".',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'the-unexpected-boundary-discards-completed-deletions',
+        RETENTION_SERVICE,
+        'self._result(tally, RetentionErrorCategory.UNEXPECTED)',
+        'self._result(_RunTally(), RetentionErrorCategory.UNEXPECTED)',
+        'an_unexpected_failure_preserves_an_earlier_completed_deletion',
+        'A run reports zero reclaimed after it had already deleted media.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'the-completed-run-is-recorded-outside-the-lock',
+        RETENTION_SERVICE,
+        '            self._state.record_run(',
+        '            pass\n'
+        '        if False:\n'
+        '            self._state.record_run(',
+        'an_unexpected_exception_leaves_the_state_in_error_not_running',
+        'A finished run leaves the holder claiming it is still running.',
+        suite=RETENTION_SERVICE_SUITE,
+    ),
+    Mutation(
+        'a-corrupt-catalogue-filesize-is-coerced',
+        RETENTION_REPOSITORY,
+        '    if isinstance(raw_value, bool) or not isinstance(raw_value, int):',
+        '    if False:',
+        'an_unusable_catalogue_filesize_fails_closed',
+        'A raw conversion error escapes catalogue decoding and strands the run.',
+        suite=RETENTION_DATABASE_SUITE,
+    ),
+    Mutation(
+        'a-non-positive-catalogue-filesize-is-accepted',
+        RETENTION_REPOSITORY,
+        '    if raw_value <= 0:',
+        '    if False:',
+        'an_unusable_catalogue_filesize_fails_closed',
+        'A corrupt zero-byte record is treated as an ordinary size mismatch.',
+        suite=RETENTION_DATABASE_SUITE,
+    ),
+    Mutation(
+        'a-required-text-column-is-coerced-with-str',
+        RETENTION_REPOSITORY,
+        '    if not isinstance(raw_value, str) or not raw_value:',
+        '    if False:',
+        'a_required_text_column_fails_closed',
+        'A missing filename becomes the manufactured string "None".',
+        suite=RETENTION_DATABASE_SUITE,
+    ),
+    Mutation(
+        'version-three-adoption-checks-only-column-names',
+        DATABASE,
+        '            _verify_table_semantics(connection, table, shape)',
+        '            pass',
+        'an_unconstrained_unversioned_version_three_table_is_rejected',
+        'A lifecycle table with no constraints is adopted as version 3.',
+        suite=MIGRATIONS_SUITE,
+    ),
+    Mutation(
+        'version-three-adoption-stops-requiring-its-primary-key',
+        DATABASE,
+        '        if actual_key != shape.primary_key:',
+        '        if False:',
+        'an_unconstrained_unversioned_version_three_table_is_rejected',
+        'One capture may hold two conflicting deletion intents.',
+        suite=MIGRATIONS_SUITE,
+    ),
+    Mutation(
+        'version-three-adoption-stops-requiring-its-foreign-key',
+        DATABASE,
+        '        missing_keys = sorted(set(shape.foreign_keys) - actual_keys)',
+        '        missing_keys = []',
+        'an_unconstrained_unversioned_version_three_table_is_rejected',
+        'A lifecycle row may reference a capture that does not exist.',
+        suite=MIGRATIONS_SUITE,
+    ),
+    Mutation(
+        'version-three-adoption-stops-requiring-its-check-constraints',
+        DATABASE,
+        '        if absent:',
+        '        if False:',
+        'an_unconstrained_unversioned_version_three_table_is_rejected',
+        'The state and reason vocabularies stop being enforced by the database.',
+        suite=MIGRATIONS_SUITE,
+    ),
+    Mutation(
+        'migration-003-silently-accepts-a-pre-existing-table',
+        MIGRATION_003,
+        'CREATE TABLE capture_media_lifecycle (',
+        'CREATE TABLE IF NOT EXISTS capture_media_lifecycle (',
+        'a_pre_existing_lifecycle_table_fails_migration_003',
+        'A database records version 3 over a table the migration never created.',
+        suite=MIGRATIONS_SUITE,
+    ),
+    Mutation(
+        'a-failure-observation-persists-the-untrusted-filename',
+        RETENTION_SERVICE,
+        '                "error_category": category.value,',
+        '                "filename": "unused",\n'
+        '                "error_category": category.value,',
+        'a_failure_observation_never_persists_an_untrusted_filename',
+        'A rejected path is written into the immutable observation timeline.',
+        suite=RETENTION_SERVICE_SUITE,
     ),
 )

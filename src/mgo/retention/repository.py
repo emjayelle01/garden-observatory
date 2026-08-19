@@ -168,9 +168,64 @@ def _parse_timestamp(
     return parsed.astimezone(UTC)
 
 
+def _require_text(capture_id: str, label: str, raw_value: Any) -> str:
+    """Return a required non-empty text column, failing closed on anything else.
+
+    ``str(raw_value)`` is deliberately **not** used. SQLite's column affinity is
+    a conversion preference, not a constraint -- the ``captures`` table is not
+    ``STRICT`` -- so a damaged or hand-edited row can hold ``NULL``, a number or
+    a blob here. Coercing one would manufacture a plausible-looking value:
+    ``str(None)`` is the four-character filename ``"None"``, and a filename is
+    one of the two columns that decides which file is about to be removed.
+    """
+    if not isinstance(raw_value, str) or not raw_value:
+        raise RetentionCatalogueError(
+            f"Capture {capture_id} has an invalid {label}"
+        )
+    return raw_value
+
+
+def _parse_filesize(capture_id: str, raw_value: Any) -> int:
+    """Return the catalogued media size, failing closed on anything unusable.
+
+    Three rules, all fail-closed:
+
+    * the value must already be an integer. Under the column's ``INTEGER``
+      affinity SQLite converts a *numeric* string on insert, so a string that
+      survives to be read back is one it could not convert -- and ``int()`` on
+      it would raise a bare ``ValueError`` out of catalogue decoding and strand
+      a destructive run. A float is refused for the same reason it is
+      suspicious: the capture pipeline never writes one;
+    * ``bool`` is excluded explicitly. It is a subclass of ``int``, so
+      ``isinstance`` alone would let ``True`` through as the size ``1``;
+    * the value must be positive. The capture service only ever catalogues a
+      verified non-empty JPEG, so zero or negative is not a small file -- it is
+      a corrupt record, and it must not be allowed to masquerade as a size
+      mismatch against a real file on disk.
+    """
+    if isinstance(raw_value, bool) or not isinstance(raw_value, int):
+        raise RetentionCatalogueError(
+            f"Capture {capture_id} has a non-integer filesize_bytes"
+        )
+    if raw_value <= 0:
+        raise RetentionCatalogueError(
+            f"Capture {capture_id} has a non-positive filesize_bytes"
+        )
+    return raw_value
+
+
 def _record_from_row(row: sqlite3.Row) -> CaptureLifecycleRecord:
-    """Convert one projection row into the retention domain projection."""
-    capture_id = str(row["capture_id"])
+    """Convert one projection row into the retention domain projection.
+
+    Every column is validated rather than coerced. A retention catalogue that
+    cannot be decoded must surface as :class:`RetentionCatalogueError` -- which
+    the service maps to the fixed ``catalogue_invalid`` category -- and never as
+    an arbitrary Python conversion exception escaping a destructive run.
+    """
+    raw_identifier = row["capture_id"]
+    if not isinstance(raw_identifier, str) or not raw_identifier:
+        raise RetentionCatalogueError("A capture row has an invalid identifier")
+    capture_id = raw_identifier
 
     captured_at = _parse_timestamp(
         capture_id, "captured_at_utc", row["captured_at_utc"]
@@ -188,12 +243,17 @@ def _record_from_row(row: sqlite3.Row) -> CaptureLifecycleRecord:
 
     return CaptureLifecycleRecord(
         capture_id=capture_id,
-        filename=str(row["filename"]),
-        absolute_path=str(row["absolute_path"]),
+        filename=_require_text(capture_id, "filename", row["filename"]),
+        absolute_path=_require_text(
+            capture_id, "absolute_path", row["absolute_path"]
+        ),
         captured_at_utc=captured_at,
         created_at_utc=created_at,
-        filesize_bytes=int(row["filesize_bytes"]),
-        origin=_parse_origin(capture_id, str(row["extra_metadata"])),
+        filesize_bytes=_parse_filesize(capture_id, row["filesize_bytes"]),
+        origin=_parse_origin(
+            capture_id,
+            _require_text(capture_id, "extra_metadata", row["extra_metadata"]),
+        ),
         lifecycle_state=_parse_state(capture_id, row["lifecycle_state"]),
         requested_at_utc=_parse_timestamp(
             capture_id, "requested_at_utc", row["requested_at_utc"]

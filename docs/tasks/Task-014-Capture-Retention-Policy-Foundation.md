@@ -635,3 +635,162 @@ Each requires its own task.
 
 A future physical validation is **not** recorded here as complete, because it has
 not happened.
+
+
+---
+
+## 21. Correction round 1 — retention safety hardening
+
+The first implementation commit, `02bdf176fbcf3ae35598080dca3ce4ac8d409f27`, was
+independently reviewed against the pushed repository state. The architecture was
+accepted; **four safety defects were found**, all in a destructive subsystem, and
+all corrected in a subsequent normal commit on the same branch. `02bdf176` was
+**not** amended, squashed or rebased.
+
+Every one of the four survived the full 2756-test suite and the whole
+222-mutation register. That is the finding behind the findings: a destructive
+subsystem's failure paths are exactly the code that ordinary success-path testing
+does not reach, and each defect was only visible once it was deliberately
+reproduced. Each reproduction is recorded below with its before/after behaviour.
+
+### 21.1 Unexpected exceptions stranded the runtime state
+
+**Before.** `run_once()` marked the state `running`, called `_execute()`, and
+recorded the completed run only if `_execute()` returned normally. An ordinary
+unexpected `Exception` therefore escaped `run_once()` entirely, leaving the
+runtime state permanently `running`, recording no run, never using
+`RetentionErrorCategory.UNEXPECTED`, and discarding the counters for deletions
+the run had already completed.
+
+Reproduced with an unlink seam raising `RuntimeError`: `run_once` raised,
+`state == "running"`, `total_runs == 0`, `last_error is None`.
+
+**After.** An execution boundary sits inside `_execute()`, where the partial
+tally is still in hand — deliberately not around the call in `run_once()`, which
+would have lost the already-completed deletions. A `_RunTally` value accumulates
+what the run has genuinely finished, so a failure reports it truthfully. The run
+now returns `UNEXPECTED`, the state becomes `error`, `total_runs == 1`, the lock
+is released, the published message is the fixed safe sentence, an already-deleted
+capture stays counted and deleted, the next candidate is never attempted, and a
+`pending_delete` written before the exception is left durable for recovery.
+`record_run` was also moved inside the lock, so the state a waiting caller can
+observe is already the finished state.
+
+Only `Exception` is converted. `KeyboardInterrupt`, `SystemExit` and the rest of
+`BaseException` propagate, and a test asserts that — converting them would
+suppress a shutdown.
+
+### 21.2 An invalid catalogue file size escaped as a raw Python error
+
+**Before.** `int(row["filesize_bytes"])` was unguarded. SQLite's column affinity
+is a conversion preference rather than a constraint and `captures` is not
+`STRICT`, so a damaged row could hold text; decoding then raised a bare
+`ValueError` out of catalogue decoding, escaped the run and stranded the state in
+`running`. Zero and negative sizes were accepted outright and later surfaced as
+a *size mismatch* — a corrupt record wearing the costume of an ordinary safety
+refusal.
+
+**After.** `_parse_filesize()` requires a non-`bool` integer that is `> 0`, and
+raises `RetentionCatalogueError` otherwise, which the service maps to
+`catalogue_invalid`. Text, the empty string, a real, a blob, `NULL`, zero and
+negative are all refused; no lifecycle row is created, no file is unlinked, no
+success observation is written, and the run finishes in `error`.
+
+**Wider decoder review (Finding 7).** `_record_from_row()` was audited for the
+same class of defect. `str()` coercion was removed from every required text
+column: `id`, `filename`, `absolute_path` and `extra_metadata` must now be
+non-empty strings. `str(None)` is the four-character filename `"None"` — a
+manufactured value that looks real and would be compared against a real path,
+in the two columns that decide which file is about to be removed. A test
+enumerates every corrupt column and asserts that **no** decoding failure escapes
+as an arbitrary Python conversion error.
+
+### 21.3 Version-3 schema safety could be bypassed
+
+**Defect A — unversioned adoption.** Legacy adoption validated only the exact
+column set. An unversioned table with the same five column names and none of the
+constraints was adopted as version 3, and then accepted a lifecycle row for a
+capture that did not exist, in a state that did not exist, with a free-text
+reason. Reproduced end to end.
+
+**Defect B — a pre-existing shadow table.** Migration 003 used
+`CREATE TABLE IF NOT EXISTS`. A version-2 database carrying a table already named
+`capture_media_lifecycle` had the statement quietly do nothing while the runner
+recorded version 3 over it. Reproduced with a two-column shadow table carrying a
+`state` column, so the index creation that follows also succeeded and nothing
+noticed: `applied == [3]`, recorded version 3, actual columns
+`['capture_id', 'state']`.
+
+**After.** Migration 003 now uses a plain `CREATE TABLE` (and `CREATE INDEX`), so
+a name collision aborts the migration and the database rolls back to version 2
+with its data intact. Idempotency comes from the recorded history, which is
+where it always came from.
+
+Adoption now verifies semantics rather than names. A `_TableShape` describes the
+required primary key, `NOT NULL` columns, foreign keys and constraint text;
+`_verify_table_semantics()` checks keys and nullability through
+`PRAGMA table_info` and `PRAGMA foreign_key_list`, and — because no pragma
+exposes `CHECK` constraints — compares the stored `CREATE TABLE` text with
+comments stripped, whitespace removed and case folded. Nine variants, each
+dropping exactly one safety property, are refused; the canonical schema is still
+adopted; a refusal leaves no fabricated migration history. Version-1 and
+version-2 adoption is unchanged and remains columns-only, so no existing deployed
+database becomes unadoptable.
+
+### 21.4 Failure observations persisted an untrusted filename
+
+**Before.** `_failure_fields()` wrote the raw catalogue `filename` into the
+immutable observation payload. Reproduced with a catalogue filename of
+`/secret/location/mgo.db`, which was persisted verbatim.
+
+**After.** `filename` is removed from failure payloads entirely; they carry
+`capture_id`, `error_category` and `policy_reason`. The asymmetry with the
+success payload is deliberate and is documented in the code: a success
+observation is written only after the path/filename boundary has passed, whereas
+a failure is frequently the boundary *refusing that value*. No sanitised path and
+no basename is offered in its place — anything derived from the rejected value is
+still derived from it, and the capture id identifies the record completely.
+Success payloads are unchanged.
+
+### 21.5 Correction-round validation
+
+| Gate | Result |
+| --- | --- |
+| `uv sync --frozen` | Checked 36 packages |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy src` | Success: no issues found in 59 source files |
+| Focused correction suites | 341 passed, 0 failed |
+| `uv run pytest` (complete suite) | **2812 passed, 12 skipped, 0 failed** |
+| `uv run python scripts/dev/run-mutations.py` | **234/234 detected**, 0 stale, 0 restoration failures, 0 unmatched selectors |
+| `git diff --check` | PASS |
+
+The 12 skips are byte-identical to the baseline: the same files and line
+numbers, all pre-existing Windows/POSIX capability skips. No new skip was
+introduced by the correction round.
+
+Twelve mutations were added — one per corrected safety property — bringing the
+register from 222 to **234**. Each was confirmed to fail the suite before the
+correction and to be detected after it. The full register was run strictly
+after the complete test suite had finished, with nothing overlapping it; the
+first implementation round's report disclosed an overlap that produced two
+spurious deployment-gateway failures, and that was not repeated.
+
+### 21.6 What the correction round did not change
+
+None of the accepted Task 14.1 contracts moved: retention stays disabled by
+default; there is still no scheduler, no startup or shutdown run and no public
+destructive endpoint; `GET /retention/status` remains inert; only exact
+`origin == "motion"` is managed; manual, no-origin and unknown-origin captures
+remain protected; the age policy stays inclusive; the managed-byte policy stays
+catalogue-byte based; `minimum_keep_count` is never broken; `max_deletions_per_run`
+still bounds newly selected work only; pending recovery still precedes new
+planning; capture rows are still never deleted; lifecycle state stays separate
+from `captures`; the pending intent still precedes the unlink; no database
+transaction is held across an unlink; finalisation and the success observation
+remain atomic; `PRESENT` + missing remains an inconsistency and
+`pending_delete` + missing remains recoverable; there is still no camera,
+preview or capture-workflow interaction, no disk-pressure policy and no new
+dependency.
+
+No Raspberry Pi access, no production change, no deployment, no pull request, no
+merge, and Task 14.2 remains not started.

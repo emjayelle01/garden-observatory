@@ -809,3 +809,155 @@ def test_retention_never_mutates_an_existing_observation(tmp_path: Path) -> None
             )
         ]
     assert after == before
+
+
+# --- the catalogue decoder fails closed (Task 14.1 correction round) --------
+#
+# SQLite column affinity is a conversion preference, not a constraint: the
+# ``captures`` table is not STRICT, and a hand-repaired or third-party-written
+# database can hold a value of any storage class in any column. A decoder that
+# coerces one manufactures a plausible-looking value for a destructive
+# subsystem; a decoder that lets the conversion raise strands the run with an
+# arbitrary Python exception. Both are refused here.
+
+#: The captures table without any of its constraints, so a test can present the
+#: storage classes the real schema would reject at insert time.
+_UNCONSTRAINED_CAPTURES_TABLE = """
+    CREATE TABLE captures (
+        id TEXT PRIMARY KEY,
+        filename TEXT,
+        absolute_path TEXT,
+        captured_at_utc TEXT,
+        width INTEGER,
+        height INTEGER,
+        filesize_bytes INTEGER,
+        camera_backend TEXT,
+        created_at_utc TEXT,
+        extra_metadata TEXT
+    )
+"""
+
+
+def _hand_edited_capture(tmp_path: Path, column: str, literal: str) -> Path:
+    """Return a database whose single capture row has ``column`` set to ``literal``."""
+    database_path = _database(tmp_path)
+    _insert_capture(database_path, "cap-1")
+    with database_connection(database_path) as connection:
+        connection.execute("DROP TABLE capture_media_lifecycle")
+        connection.execute("ALTER TABLE captures RENAME TO captures_old")
+        connection.execute(_UNCONSTRAINED_CAPTURES_TABLE)
+        connection.execute("INSERT INTO captures SELECT * FROM captures_old")
+        connection.execute("DROP TABLE captures_old")
+        connection.execute(f"UPDATE captures SET {column} = {literal}")
+        connection.execute(_UNCONSTRAINED_LIFECYCLE_TABLE)
+    return database_path
+
+
+@pytest.mark.parametrize(
+    ("label", "literal"),
+    [
+        ("non-numeric text", "'not-a-number'"),
+        ("empty text", "''"),
+        ("a real", "12.5"),
+        ("null", "NULL"),
+        ("a blob", "x'00ff'"),
+        ("zero", "0"),
+        ("negative", "-1"),
+    ],
+)
+def test_an_unusable_catalogue_filesize_fails_closed(
+    tmp_path: Path, label: str, literal: str
+) -> None:
+    """Every storage class but a positive integer is refused.
+
+    A positive integer is the only thing the capture service ever writes here:
+    it catalogues a verified non-empty JPEG. Anything else is a corrupt record,
+    and a corrupt record must stop retention rather than be interpreted.
+    """
+    database_path = _hand_edited_capture(tmp_path, "filesize_bytes", literal)
+
+    with pytest.raises(RetentionCatalogueError):
+        RetentionRepository(database_path).list_lifecycle_records()
+
+
+def test_a_positive_integer_filesize_is_accepted(tmp_path: Path) -> None:
+    """The control: an ordinary size decodes exactly as before."""
+    database_path = _hand_edited_capture(tmp_path, "filesize_bytes", "4242")
+
+    [record] = RetentionRepository(database_path).list_lifecycle_records()
+
+    assert record.filesize_bytes == 4242
+
+
+@pytest.mark.parametrize(
+    "column", ["id", "filename", "absolute_path", "extra_metadata"]
+)
+@pytest.mark.parametrize("literal", ["NULL", "''", "x'00ff'"])
+def test_a_required_text_column_fails_closed(
+    tmp_path: Path, column: str, literal: str
+) -> None:
+    """A required text column is validated, never coerced with ``str()``.
+
+    An integer literal is deliberately absent: SQLite's TEXT affinity converts
+    it to a genuine string on write, so ``7`` really does arrive as ``"7"`` and
+    is a valid -- if odd -- value rather than a corruption. What must be refused
+    is what affinity does *not* convert: NULL, a blob, and the empty string.
+
+    ``str(None)`` is the four-character filename ``"None"`` -- a value that
+    looks real, would be compared against a real path, and was never in the
+    catalogue. The filename and the absolute path are the two columns that
+    decide which file is about to be removed, so neither may be manufactured.
+    """
+    database_path = _hand_edited_capture(tmp_path, column, literal)
+
+    with pytest.raises(RetentionCatalogueError):
+        RetentionRepository(database_path).list_lifecycle_records()
+
+
+def test_valid_text_columns_are_accepted(tmp_path: Path) -> None:
+    """The control: an ordinary row still decodes into a complete projection."""
+    database_path = _hand_edited_capture(tmp_path, "filename", "'cap-1.jpg'")
+
+    [record] = RetentionRepository(database_path).list_lifecycle_records()
+
+    assert record.capture_id == "cap-1"
+    assert record.filename == "cap-1.jpg"
+    assert record.absolute_path == "/captures/cap-1.jpg"
+    assert record.origin == "motion"
+
+
+def test_no_catalogue_decoding_failure_escapes_as_a_python_error(
+    tmp_path: Path,
+) -> None:
+    """Every corrupt column raises the domain error, never a raw conversion one.
+
+    This is the property the destructive service depends on: it maps
+    :class:`RetentionCatalogueError` to the fixed ``catalogue_invalid``
+    category, and anything else would escape the run and strand the runtime
+    state in ``running``.
+    """
+    corruptions = [
+        ("filesize_bytes", "'x'"),
+        ("filesize_bytes", "NULL"),
+        ("filename", "NULL"),
+        ("absolute_path", "x'00ff'"),
+        ("extra_metadata", "NULL"),
+        ("extra_metadata", "'{'"),
+        ("captured_at_utc", "'not-a-timestamp'"),
+        ("created_at_utc", "NULL"),
+        ("id", "NULL"),
+    ]
+
+    for index, (column, literal) in enumerate(corruptions):
+        database_path = _hand_edited_capture(
+            tmp_path / f"{index}-{column}", column, literal
+        )
+        try:
+            RetentionRepository(database_path).list_lifecycle_records()
+        except RetentionCatalogueError:
+            continue
+        except Exception as error:
+            raise AssertionError(
+                f"{column}={literal} escaped as {type(error).__name__}"
+            ) from error
+        raise AssertionError(f"{column}={literal} was accepted")

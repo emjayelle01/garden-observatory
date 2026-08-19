@@ -10,8 +10,17 @@
 -- an unversioned version-2 database stays adoptable by the legacy-schema logic,
 -- and it keeps "a capture occurred" and "its media was later reclaimed" as the
 -- two different facts they are.
+--
+-- Deliberately NOT "CREATE TABLE IF NOT EXISTS". The migration runner
+-- already guarantees, from the schema_migrations history, that this file
+-- executes only when version 3 is genuinely pending, so IF NOT EXISTS could
+-- never make a legitimate re-run succeed -- it could only let a PRE-EXISTING
+-- table of some other shape silently satisfy this statement while the runner
+-- went on to record version 3. A database claiming version 3 with a table
+-- this file never created is exactly the state that must fail closed, so the
+-- CREATE is unconditional and a name collision aborts the migration.
 
-CREATE TABLE IF NOT EXISTS capture_media_lifecycle (
+CREATE TABLE capture_media_lifecycle (
     capture_id TEXT PRIMARY KEY
         REFERENCES captures(id),
     state TEXT NOT NULL
@@ -30,5 +39,5 @@ CREATE TABLE IF NOT EXISTS capture_media_lifecycle (
     )
 );
 
-CREATE INDEX IF NOT EXISTS idx_capture_media_lifecycle_state
+CREATE INDEX idx_capture_media_lifecycle_state
     ON capture_media_lifecycle(state);

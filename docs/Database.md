@@ -134,6 +134,13 @@ Migration **003** adds the capture **media lifecycle** table:
   `age_and_managed_bytes`) and coherent timestamps: a `pending_delete` row has
   no `deleted_at_utc`, and a `deleted` row must have one
 
+Migration 003 uses a plain `CREATE TABLE`, not `CREATE TABLE IF NOT EXISTS`.
+The runner already guarantees from the recorded history that the file executes
+only when version 3 is pending, so `IF NOT EXISTS` could only let a pre-existing
+table of another shape satisfy the statement while version 3 was recorded over
+it. A name collision therefore aborts the migration and the database rolls back
+to version 2. Idempotency comes from `schema_migrations`, never from the DDL.
+
 Migration 003 is **additive**. It creates a new table and does not alter
 `captures` or `observations` — deliberately, for two reasons. First, a capture
 record is the *history that a capture happened*, and reclaiming its JPEG does
@@ -194,9 +201,24 @@ runner:
 1. reads the tables that actually exist;
 2. works out the highest version those tables satisfy, in order;
 3. verifies each of those tables has **exactly** the expected column set;
-4. records the corresponding history rows in one transaction — creating and
+4. for tables that declare them, verifies the **safety-critical constraints**
+   are genuinely present — see below;
+5. records the corresponding history rows in one transaction — creating and
    modifying **nothing else**;
-5. then applies whatever migrations remain.
+6. then applies whatever migrations remain.
+
+Step 4 exists because a column set is a weak promise. Adoption writes history
+rows and then trusts those tables permanently, so for `capture_media_lifecycle`
+— the table that governs the deletion of media — the primary key, the foreign
+key to `captures(id)`, the `NOT NULL` columns and all three `CHECK` constraints
+are verified, not just the five column names. Keys and nullability come from
+`PRAGMA table_info` and `PRAGMA foreign_key_list`; `CHECK` constraints are
+exposed by no pragma, so the stored `CREATE TABLE` text is compared with
+comments stripped, whitespace removed and case folded.
+
+`observations` and `captures` deliberately keep the original columns-only
+contract: strengthening them would change whether existing deployed databases
+can still be adopted.
 
 Adoption is logged at warning level so it appears in the journal.
 
