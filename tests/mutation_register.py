@@ -2471,4 +2471,28 @@ MUTATIONS: tuple[Mutation, ...] = (
         'A rejected path is written into the immutable observation timeline.',
         suite=RETENTION_SERVICE_SUITE,
     ),
+    # --- Task 14.1 final correction: lifecycle capture identity -------------
+    #
+    # Two genuinely distinct sites. The first is what the schema enforces for a
+    # database this build creates; the second is what adoption demands of a
+    # database it did not create. Weakening either one alone reopens the
+    # invariant, from a different direction.
+    Mutation(
+        'the-lifecycle-identity-becomes-nullable',
+        MIGRATION_003,
+        '    capture_id TEXT NOT NULL PRIMARY KEY',
+        '    capture_id TEXT PRIMARY KEY',
+        'a_null_lifecycle_capture_id_is_rejected or multiple_null_lifecycle',
+        'Lifecycle rows bound to no capture become storable, and multiply.',
+        suite=MIGRATIONS_SUITE,
+    ),
+    Mutation(
+        'adoption-stops-requiring-a-non-null-lifecycle-identity',
+        DATABASE,
+        '            {"capture_id", "state", "requested_at_utc", "reason"}',
+        '            {"state", "requested_at_utc", "reason"}',
+        'a_nullable_capture_id_unversioned_schema_is_rejected',
+        'A foreign database with a nullable identity is adopted as version 3.',
+        suite=MIGRATIONS_SUITE,
+    ),
 )

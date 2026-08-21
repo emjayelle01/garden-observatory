@@ -961,3 +961,127 @@ def test_no_catalogue_decoding_failure_escapes_as_a_python_error(
                 f"{column}={literal} escaped as {type(error).__name__}"
             ) from error
         raise AssertionError(f"{column}={literal} was accepted")
+
+
+# --- lifecycle capture identity through the repository (final correction) ---
+#
+# The schema is the enforcement point, not the application. Retention is never
+# taught to interpret a lifecycle row that belongs to no capture, because the
+# database refuses to hold one. These tests prove the repository can only ever
+# create bound rows, and that the invalid state fails at the schema boundary.
+
+
+def test_every_repository_lifecycle_row_carries_the_supplied_capture_id(
+    tmp_path: Path,
+) -> None:
+    """A claim binds the row to exactly the capture id it was given.
+
+    Checked across several ids at once so a repository that dropped, defaulted
+    or reused an identity would show up as a mismatch rather than as a row that
+    merely exists.
+    """
+    database_path = _database(tmp_path)
+    identifiers = ["cap-a", "cap-b", "cap-c"]
+    for identifier in identifiers:
+        _insert_capture(database_path, identifier)
+    repository = RetentionRepository(database_path, clock=lambda: NOW)
+
+    for identifier, reason in zip(
+        identifiers,
+        (
+            RetentionReason.AGE,
+            RetentionReason.MANAGED_BYTES,
+            RetentionReason.AGE_AND_MANAGED_BYTES,
+        ),
+        strict=True,
+    ):
+        assert repository.claim_pending_delete(identifier, reason) is True
+
+    with database_connection(database_path) as connection:
+        stored = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT capture_id FROM capture_media_lifecycle"
+            )
+        }
+        orphans = connection.execute(
+            "SELECT COUNT(*) FROM capture_media_lifecycle "
+            "WHERE capture_id IS NULL"
+        ).fetchone()[0]
+    assert stored == set(identifiers)
+    assert orphans == 0
+
+
+def test_a_finalised_lifecycle_row_keeps_its_capture_identity(
+    tmp_path: Path,
+) -> None:
+    """The identity survives the pending -> deleted transition unchanged."""
+    database_path = _database(tmp_path)
+    _insert_capture(database_path, "cap-1")
+    repository = RetentionRepository(database_path, clock=lambda: NOW)
+    repository.claim_pending_delete("cap-1", RetentionReason.AGE)
+
+    repository.finalize_deletion(
+        "cap-1", observation_fields=_observation_fields("cap-1")
+    )
+
+    assert _lifecycle_rows(database_path) == [
+        ("cap-1", "deleted", NOW.isoformat(), NOW.isoformat(), "age")
+    ]
+
+
+def test_every_lifecycle_row_joins_to_a_real_capture(tmp_path: Path) -> None:
+    """No lifecycle row can exist without the capture it describes.
+
+    An anti-join is the direct statement of the invariant: the set of lifecycle
+    rows with no matching capture must be empty, whatever route created them.
+    """
+    database_path = _database(tmp_path)
+    for identifier in ("cap-1", "cap-2"):
+        _insert_capture(database_path, identifier)
+    repository = RetentionRepository(database_path, clock=lambda: NOW)
+    repository.claim_pending_delete("cap-1", RetentionReason.AGE)
+    repository.claim_pending_delete("cap-2", RetentionReason.MANAGED_BYTES)
+    repository.finalize_deletion(
+        "cap-1", observation_fields=_observation_fields("cap-1")
+    )
+
+    with database_connection(database_path) as connection:
+        unbound = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM capture_media_lifecycle AS l
+            LEFT JOIN captures AS c ON c.id = l.capture_id
+            WHERE c.id IS NULL
+            """
+        ).fetchone()[0]
+    assert unbound == 0
+
+
+def test_the_schema_refuses_a_null_identity_rather_than_the_application(
+    tmp_path: Path,
+) -> None:
+    """The invalid state is impossible to store, not merely unhandled.
+
+    Retention deliberately has no behaviour for a NULL-identity lifecycle row.
+    Teaching it to interpret one would be the wrong fix: the row must not be
+    creatable in the first place, so the refusal is asserted at the schema
+    boundary through a direct write that bypasses the repository entirely.
+    """
+    database_path = _database(tmp_path)
+    _insert_capture(database_path, "cap-1")
+
+    with (
+        pytest.raises(sqlite3.IntegrityError, match="NOT NULL"),
+        database_connection(database_path) as connection,
+    ):
+        connection.execute(
+            "INSERT INTO capture_media_lifecycle VALUES "
+            "(NULL, 'pending_delete', ?, NULL, 'age')",
+            (NOW.isoformat(),),
+        )
+
+    # The projection is therefore never asked to decode an unbound row.
+    [record] = RetentionRepository(database_path).list_lifecycle_records()
+    assert record.capture_id == "cap-1"
+    assert record.lifecycle_state is MediaLifecycleState.PRESENT

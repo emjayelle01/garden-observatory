@@ -126,8 +126,9 @@ Migration **002** adds the capture catalogue:
 
 Migration **003** adds the capture **media lifecycle** table:
 
-- `capture_media_lifecycle` — `capture_id` (primary key, `REFERENCES
-  captures(id)`), `state`, `requested_at_utc`, `deleted_at_utc`, `reason`
+- `capture_media_lifecycle` — `capture_id` (`NOT NULL`, primary key,
+  `REFERENCES captures(id)`), `state`, `requested_at_utc`, `deleted_at_utc`,
+  `reason`
 - an index on `state`
 - `CHECK` constraints enforcing the state vocabulary (`pending_delete`,
   `deleted`), the policy-reason vocabulary (`age`, `managed_bytes`,
@@ -211,7 +212,15 @@ Step 4 exists because a column set is a weak promise. Adoption writes history
 rows and then trusts those tables permanently, so for `capture_media_lifecycle`
 — the table that governs the deletion of media — the primary key, the foreign
 key to `captures(id)`, the `NOT NULL` columns and all three `CHECK` constraints
-are verified, not just the five column names. Keys and nullability come from
+are verified, not just the five column names.
+
+`capture_id` is explicitly `NOT NULL` as well as being the primary key, and
+adoption requires that too. In SQLite a `PRIMARY KEY` column that is not
+`INTEGER PRIMARY KEY` stays **nullable**, and a `NULL` foreign key is never
+checked because there is no referenced value to check — so without it the table
+would admit lifecycle rows bound to no capture, and more than one of them, as the
+primary-key index treats `NULL`s as distinct. Every lifecycle row belongs to
+exactly one real capture. Keys and nullability come from
 `PRAGMA table_info` and `PRAGMA foreign_key_list`; `CHECK` constraints are
 exposed by no pragma, so the stored `CREATE TABLE` text is compared with
 comments stripped, whitespace removed and case folded.

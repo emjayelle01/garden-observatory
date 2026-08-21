@@ -673,7 +673,7 @@ def test_importing_the_database_module_creates_nothing(tmp_path: Path) -> None:
 #: be refused.
 _CANONICAL_LIFECYCLE = """
     CREATE TABLE capture_media_lifecycle (
-        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        capture_id TEXT NOT NULL PRIMARY KEY REFERENCES captures(id),
         state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
         requested_at_utc TEXT NOT NULL,
         deleted_at_utc TEXT,
@@ -698,7 +698,7 @@ _NO_CONSTRAINTS_AT_ALL = """
 
 _NO_PRIMARY_KEY = """
     CREATE TABLE capture_media_lifecycle (
-        capture_id TEXT REFERENCES captures(id),
+        capture_id TEXT NOT NULL REFERENCES captures(id),
         state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
         requested_at_utc TEXT NOT NULL,
         deleted_at_utc TEXT,
@@ -713,7 +713,7 @@ _NO_PRIMARY_KEY = """
 
 _NO_FOREIGN_KEY = """
     CREATE TABLE capture_media_lifecycle (
-        capture_id TEXT PRIMARY KEY,
+        capture_id TEXT NOT NULL PRIMARY KEY,
         state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
         requested_at_utc TEXT NOT NULL,
         deleted_at_utc TEXT,
@@ -728,7 +728,7 @@ _NO_FOREIGN_KEY = """
 
 _NO_STATE_CHECK = """
     CREATE TABLE capture_media_lifecycle (
-        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        capture_id TEXT NOT NULL PRIMARY KEY REFERENCES captures(id),
         state TEXT NOT NULL,
         requested_at_utc TEXT NOT NULL,
         deleted_at_utc TEXT,
@@ -743,7 +743,7 @@ _NO_STATE_CHECK = """
 
 _WIDENED_STATE_CHECK = """
     CREATE TABLE capture_media_lifecycle (
-        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        capture_id TEXT NOT NULL PRIMARY KEY REFERENCES captures(id),
         state TEXT NOT NULL
             CHECK (state IN ('pending_delete', 'deleted', 'quarantined')),
         requested_at_utc TEXT NOT NULL,
@@ -759,7 +759,7 @@ _WIDENED_STATE_CHECK = """
 
 _NO_REASON_CHECK = """
     CREATE TABLE capture_media_lifecycle (
-        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        capture_id TEXT NOT NULL PRIMARY KEY REFERENCES captures(id),
         state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
         requested_at_utc TEXT NOT NULL,
         deleted_at_utc TEXT,
@@ -773,7 +773,7 @@ _NO_REASON_CHECK = """
 
 _WIDENED_REASON_CHECK = """
     CREATE TABLE capture_media_lifecycle (
-        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        capture_id TEXT NOT NULL PRIMARY KEY REFERENCES captures(id),
         state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
         requested_at_utc TEXT NOT NULL,
         deleted_at_utc TEXT,
@@ -787,7 +787,7 @@ _WIDENED_REASON_CHECK = """
 
 _NO_TIMESTAMP_COHERENCE = """
     CREATE TABLE capture_media_lifecycle (
-        capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        capture_id TEXT NOT NULL PRIMARY KEY REFERENCES captures(id),
         state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
         requested_at_utc TEXT NOT NULL,
         deleted_at_utc TEXT,
@@ -796,9 +796,24 @@ _NO_TIMESTAMP_COHERENCE = """
     )
 """
 
-_MISSING_NOT_NULL = """
+_NULLABLE_CAPTURE_ID = """
     CREATE TABLE capture_media_lifecycle (
         capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+        state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
+        requested_at_utc TEXT NOT NULL,
+        deleted_at_utc TEXT,
+        reason TEXT NOT NULL
+            CHECK (reason IN ('age', 'managed_bytes', 'age_and_managed_bytes')),
+        CHECK (
+            (state = 'pending_delete' AND deleted_at_utc IS NULL)
+            OR (state = 'deleted' AND deleted_at_utc IS NOT NULL)
+        )
+    )
+"""
+
+_MISSING_NOT_NULL = """
+    CREATE TABLE capture_media_lifecycle (
+        capture_id TEXT NOT NULL PRIMARY KEY REFERENCES captures(id),
         state TEXT CHECK (state IN ('pending_delete', 'deleted')),
         requested_at_utc TEXT NOT NULL,
         deleted_at_utc TEXT,
@@ -858,6 +873,7 @@ def test_a_canonical_unversioned_version_three_database_is_adopted(
         ("widened reason CHECK", _WIDENED_REASON_CHECK),
         ("no timestamp coherence CHECK", _NO_TIMESTAMP_COHERENCE),
         ("missing NOT NULL", _MISSING_NOT_NULL),
+        ("nullable capture_id", _NULLABLE_CAPTURE_ID),
     ],
 )
 def test_an_unconstrained_unversioned_version_three_table_is_rejected(
@@ -971,3 +987,182 @@ def test_a_failed_migration_003_leaves_the_shadow_table_untouched(
     assert "idx_capture_media_lifecycle_state" not in _objects(
         database_path, "index"
     )
+
+
+# --- lifecycle capture identity (Task 14.1 final correction) ----------------
+#
+# Every lifecycle row belongs to exactly one real capture. SQLite does not give
+# that for free: a PRIMARY KEY column that is not INTEGER PRIMARY KEY stays
+# nullable -- a documented legacy quirk -- and a NULL foreign key is never
+# checked, because NULL means there is no referenced value to check. Before
+# capture_id was declared NOT NULL the table admitted rows bound to no capture,
+# and admitted more than one of them, because the primary key index treats NULLs
+# as distinct.
+
+
+def test_the_lifecycle_capture_id_is_declared_not_null(tmp_path: Path) -> None:
+    """The migrated table reports the identity column as NOT NULL and PK."""
+    database_path = tmp_path / "identity.db"
+    apply_migrations(database_path)
+
+    with database_connection(database_path) as connection:
+        columns = {
+            str(row[1]): {"notnull": int(row[3]), "pk": int(row[5])}
+            for row in connection.execute(
+                "PRAGMA table_info(capture_media_lifecycle)"
+            )
+        }
+
+    assert columns["capture_id"] == {"notnull": 1, "pk": 1}
+    # The rest of the shape is unchanged by this correction.
+    assert columns["state"]["notnull"] == 1
+    assert columns["requested_at_utc"]["notnull"] == 1
+    assert columns["reason"]["notnull"] == 1
+    assert columns["deleted_at_utc"]["notnull"] == 0
+
+
+def test_a_null_lifecycle_capture_id_is_rejected(tmp_path: Path) -> None:
+    """A lifecycle row bound to no capture cannot exist."""
+    database_path = tmp_path / "null-identity.db"
+    apply_migrations(database_path)
+
+    with (
+        pytest.raises(sqlite3.IntegrityError, match="NOT NULL"),
+        database_connection(database_path) as connection,
+    ):
+        connection.execute(
+            "INSERT INTO capture_media_lifecycle VALUES "
+            "(NULL, 'pending_delete', ?, NULL, 'age')",
+            (utc_now_iso(),),
+        )
+
+
+def test_multiple_null_lifecycle_capture_ids_cannot_accumulate(
+    tmp_path: Path,
+) -> None:
+    """Not even a second NULL row can be created.
+
+    The primary key alone would not have stopped this: SQLite's index treats
+    NULLs as distinct, so a nullable identity column admits *many* orphan rows
+    rather than one. Only NOT NULL closes it.
+    """
+    database_path = tmp_path / "many-null.db"
+    apply_migrations(database_path)
+
+    for state, deleted_at in (
+        ("pending_delete", None),
+        ("deleted", utc_now_iso()),
+    ):
+        with (
+            pytest.raises(sqlite3.IntegrityError),
+            database_connection(database_path) as connection,
+        ):
+            connection.execute(
+                "INSERT INTO capture_media_lifecycle VALUES "
+                "(NULL, ?, ?, ?, 'age')",
+                (state, utc_now_iso(), deleted_at),
+            )
+
+    with database_connection(database_path) as connection:
+        remaining = connection.execute(
+            "SELECT COUNT(*) FROM capture_media_lifecycle"
+        ).fetchone()[0]
+    assert remaining == 0
+
+
+def _insert_lifecycle_capture(database_path: Path, identifier: str) -> None:
+    """Insert one minimal capture row so a lifecycle row has something to bind to."""
+    stamp = utc_now_iso()
+    with database_connection(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO captures (
+                id, filename, absolute_path, captured_at_utc, width, height,
+                filesize_bytes, camera_backend, created_at_utc, extra_metadata
+            )
+            VALUES (?, ?, ?, ?, 4608, 2592, 1000, 'simulator', ?, '{}')
+            """,
+            (identifier, f"{identifier}.jpg", f"/captures/{identifier}.jpg",
+             stamp, stamp),
+        )
+
+
+def test_a_lifecycle_row_for_a_real_capture_still_succeeds(
+    tmp_path: Path,
+) -> None:
+    """The control: an ordinary bound lifecycle row is unaffected."""
+    database_path = tmp_path / "valid-identity.db"
+    apply_migrations(database_path)
+    _insert_lifecycle_capture(database_path, "cap-1")
+
+    with database_connection(database_path) as connection:
+        connection.execute(
+            "INSERT INTO capture_media_lifecycle VALUES "
+            "(?, 'pending_delete', ?, NULL, 'age')",
+            ("cap-1", utc_now_iso()),
+        )
+
+    with database_connection(database_path) as connection:
+        rows = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT capture_id, state FROM capture_media_lifecycle"
+            )
+        ]
+    assert rows == [("cap-1", "pending_delete")]
+
+
+def test_a_non_null_unknown_lifecycle_capture_id_still_fails(
+    tmp_path: Path,
+) -> None:
+    """The foreign key still catches a present-but-unreal identity.
+
+    NOT NULL and the foreign key close different halves of the same invariant:
+    NOT NULL refuses "no capture at all", the foreign key refuses "a capture
+    that does not exist".
+    """
+    database_path = tmp_path / "unknown-identity.db"
+    apply_migrations(database_path)
+
+    with (
+        pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"),
+        database_connection(database_path) as connection,
+    ):
+        connection.execute(
+            "INSERT INTO capture_media_lifecycle VALUES "
+            "('no-such-capture', 'pending_delete', ?, NULL, 'age')",
+            (utc_now_iso(),),
+        )
+
+
+def test_a_nullable_capture_id_unversioned_schema_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """An otherwise perfect unversioned v3 table with a nullable identity fails.
+
+    Every other property matches canonical exactly -- same columns, primary key,
+    foreign key and all three CHECK constraints. Only the NOT NULL on the
+    identity column is missing, and that alone is enough to refuse adoption.
+    """
+    database_path = _unversioned_v3(
+        tmp_path, _NULLABLE_CAPTURE_ID, "nullable-identity"
+    )
+
+    with pytest.raises(IncompatibleSchemaError, match="capture_id"):
+        apply_migrations(database_path)
+
+
+def test_a_rejected_nullable_identity_adoption_fabricates_no_history(
+    tmp_path: Path,
+) -> None:
+    """The refused database keeps no trace of the attempt."""
+    database_path = _unversioned_v3(
+        tmp_path, _NULLABLE_CAPTURE_ID, "nullable-no-history"
+    )
+
+    with pytest.raises(IncompatibleSchemaError):
+        apply_migrations(database_path)
+
+    assert "schema_migrations" not in _tables(database_path)
+    assert read_schema_version(database_path) is None
+    assert len(list_observations(database_path)) == 1

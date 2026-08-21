@@ -21,7 +21,14 @@
 -- CREATE is unconditional and a name collision aborts the migration.
 
 CREATE TABLE capture_media_lifecycle (
-    capture_id TEXT PRIMARY KEY
+    -- NOT NULL is explicit and load-bearing. In SQLite a PRIMARY KEY column
+    -- that is not INTEGER PRIMARY KEY stays nullable -- a documented legacy
+    -- quirk -- and a NULL foreign key is never checked, because NULL means
+    -- there is no referenced value to check. Without this, the table would
+    -- admit lifecycle rows bound to no capture at all, and admit MORE THAN
+    -- ONE of them, since the primary key index treats NULLs as distinct.
+    -- Every lifecycle row belongs to exactly one real capture.
+    capture_id TEXT NOT NULL PRIMARY KEY
         REFERENCES captures(id),
     state TEXT NOT NULL
         CHECK (state IN ('pending_delete', 'deleted')),

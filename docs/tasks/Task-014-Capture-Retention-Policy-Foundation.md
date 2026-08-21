@@ -794,3 +794,126 @@ dependency.
 
 No Raspberry Pi access, no production change, no deployment, no pull request, no
 merge, and Task 14.2 remains not started.
+
+
+---
+
+## 22. Final review correction — lifecycle capture identity
+
+Independent final review confirmed the four findings in §21 were corrected, and
+identified one remaining schema-invariant defect. It was corrected in a third
+normal commit on this branch. Neither `02bdf176` nor `8d50c0b4` was amended,
+squashed or rebased, and the §21 correction note is unchanged.
+
+### 22.1 The defect
+
+Migration 003 declared:
+
+```sql
+capture_id TEXT PRIMARY KEY
+    REFERENCES captures(id)
+```
+
+with no explicit `NOT NULL`. That is unsafe in SQLite. For an ordinary rowid
+table a `PRIMARY KEY` column that is not `INTEGER PRIMARY KEY` remains
+**nullable** — a documented legacy quirk — and SQLite never checks a `NULL`
+foreign key, because `NULL` means there is no referenced value to check.
+
+The omission was made conspicuous by the very code added in `8d50c0b4`:
+`_TableShape` correctly documents that a `TEXT PRIMARY KEY` is nullable unless
+declared otherwise, yet the canonical lifecycle shape required `NOT NULL` only
+for `state`, `requested_at_utc` and `reason` — not for the identity column.
+
+**Reproduced against `8d50c0b4`.** `PRAGMA table_info` reported
+`capture_id notnull=0 pk=1`, and both of these inserts succeeded:
+
+```
+(NULL, 'pending_delete', …, NULL, 'age')
+(NULL, 'deleted',        …, …,   'managed_bytes')
+```
+
+leaving **two** lifecycle rows bound to no capture. The primary key did not even
+deduplicate them: SQLite's index treats `NULL`s as distinct, so a nullable
+identity column admits *many* orphan rows rather than one. That contradicts the
+Task 14.1 lifecycle invariant that every lifecycle row belongs to exactly one
+real capture.
+
+### 22.2 The correction
+
+Migration 003 now declares `capture_id TEXT NOT NULL PRIMARY KEY REFERENCES
+captures(id)`, with the reasoning recorded in the file itself. Migration 003 had
+not been merged or deployed, so the unreleased migration was corrected in place;
+**no migration 004 was added** to repair it, and migrations 001 and 002 are
+untouched.
+
+The legacy-adoption shape now requires `capture_id` in the `NOT NULL` set, so an
+unversioned version-3 database is adopted only when its identity column is
+genuinely non-null. None of the safety verification added by `8d50c0b4` was
+weakened.
+
+After the correction: `capture_id notnull=1 pk=1`, both `NULL` inserts rejected
+with `NOT NULL constraint failed`, and zero orphan rows.
+
+The two constraints close different halves of one invariant — `NOT NULL` refuses
+"no capture at all", the foreign key refuses "a capture that does not exist" —
+and both are proven separately.
+
+### 22.3 Where the invariant is enforced
+
+At the **schema boundary**, deliberately. Retention has no behaviour for an
+unbound lifecycle row and gained none: teaching the application to interpret one
+would be the wrong fix when the row must not be creatable at all. A
+repository-level test proves every lifecycle row created through
+`RetentionRepository` carries exactly the capture id supplied, that the identity
+survives the `pending_delete` → `deleted` transition, and that an anti-join
+against `captures` returns no unbound rows. A direct write bypassing the
+repository is refused by SQLite itself.
+
+### 22.4 Tests and mutations
+
+Twelve tests were added or updated. Ten prove the database contract: the
+`PRAGMA` report; `NULL` rejection; multiple-`NULL` rejection; a valid bound row;
+a non-null unknown id still failing through the foreign key; canonical
+unversioned v3 still adopting; a nullable-identity unversioned v3 rejected;
+rejection fabricating no history; normal v2 → v3; and v3 idempotency. Four prove
+the repository-level identity. Every existing rejection fixture was updated so
+each variant still isolates exactly **one** dropped safety property, and a new
+`_NULLABLE_CAPTURE_ID` variant differs from canonical in that one property alone.
+
+Two mutations were registered, at genuinely distinct sites — what the schema
+enforces for a database this build creates, and what adoption demands of a
+database it did not create. Weakening either alone reopens the invariant from a
+different direction. The register moves from 234 to **236**.
+
+No new platform skip was introduced.
+
+### 22.5 Final-correction validation
+
+| Gate | Result |
+| --- | --- |
+| `uv sync --frozen` | Checked 36 packages |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy src` | Success: no issues found in 59 source files |
+| Focused database/migration/retention tests | 358 passed, 0 failed |
+| `uv run pytest` (complete suite) | **2824 passed, 12 skipped, 0 failed** |
+| `uv run python scripts/dev/run-mutations.py` | **236/236 detected**, 0 stale, 0 restoration failures, 0 unmatched selectors |
+| `git diff --check` | PASS |
+
+The 12 skips are byte-identical to the established baseline: the same files and
+line numbers, all pre-existing Windows/POSIX capability skips. No new skip was
+introduced. The mutation register was run strictly after the complete suite had
+finished, with nothing overlapping it.
+
+### 22.6 What this correction did not change
+
+Retention defaults, policy, the `origin == "motion"` rule, manual and
+unknown-origin protection, `minimum_keep_count`, `max_deletions_per_run`,
+pending recovery, dry-run behaviour, concurrency behaviour, the
+unexpected-exception correction, the catalogue-decoder correction, the
+failure-observation privacy correction, the status API, event-capture behaviour,
+camera behaviour, observation payloads, scheduling and HTTP routes are all
+unchanged. Still no scheduler, no destructive retention HTTP endpoint, no
+production policy and no new dependency.
+
+No Raspberry Pi access, no production change, no deployment, no pull request, no
+merge, and Task 14.2 remains not started.

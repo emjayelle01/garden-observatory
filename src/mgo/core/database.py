@@ -117,8 +117,12 @@ class _TableShape:
     #: Columns that must form the table's PRIMARY KEY, in order.
     primary_key: tuple[str, ...] = ()
     #: Columns that must be declared NOT NULL. A ``TEXT PRIMARY KEY`` column is
-    #: nullable in SQLite unless it says otherwise, so a primary key is listed
-    #: here only when the DDL really does declare it.
+    #: nullable in SQLite unless it says so explicitly -- a documented legacy
+    #: quirk -- and a NULL foreign key is never checked, because NULL means
+    #: there is no referenced value to check. A primary key that is also an
+    #: identity therefore has to appear here as well: ``capture_media_lifecycle``
+    #: lists ``capture_id`` precisely because a nullable one would admit
+    #: lifecycle rows bound to no capture, and more than one of them.
     not_null: frozenset[str] = frozenset()
     #: ``(column, referenced table, referenced column)`` triples that must exist.
     foreign_keys: tuple[tuple[str, str, str], ...] = ()
@@ -175,7 +179,9 @@ _VERSION_TABLE_SHAPES: dict[str, _TableShape] = {
             }
         ),
         primary_key=("capture_id",),
-        not_null=frozenset({"state", "requested_at_utc", "reason"}),
+        not_null=frozenset(
+            {"capture_id", "state", "requested_at_utc", "reason"}
+        ),
         foreign_keys=(("capture_id", "captures", "id"),),
         required_sql=(
             "check(statein('pending_delete','deleted'))",

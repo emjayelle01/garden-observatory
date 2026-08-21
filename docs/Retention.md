@@ -229,7 +229,7 @@ Migration `003_capture_media_lifecycle.sql` adds:
 
 ```sql
 CREATE TABLE capture_media_lifecycle (
-    capture_id TEXT PRIMARY KEY REFERENCES captures(id),
+    capture_id TEXT NOT NULL PRIMARY KEY REFERENCES captures(id),
     state TEXT NOT NULL CHECK (state IN ('pending_delete', 'deleted')),
     requested_at_utc TEXT NOT NULL,
     deleted_at_utc TEXT,
@@ -243,6 +243,28 @@ CREATE TABLE capture_media_lifecycle (
 ```
 
 The current schema version is now **3**.
+
+### Capture identity
+
+**Every lifecycle row belongs to exactly one real capture.** `capture_id` is the
+primary key **and** is explicitly `NOT NULL`, and it references `captures(id)`.
+`NULL` is not a valid lifecycle capture identity.
+
+The explicit `NOT NULL` is load-bearing rather than decorative. In SQLite a
+`PRIMARY KEY` column that is not `INTEGER PRIMARY KEY` remains **nullable** — a
+documented legacy quirk — and a `NULL` foreign key is never checked, because
+`NULL` means there is no referenced value to check. Without it the table would
+admit lifecycle rows bound to no capture at all, and would admit *more than one*
+of them, since the primary-key index treats `NULL`s as distinct.
+
+The two constraints close different halves of the same invariant: `NOT NULL`
+refuses "no capture at all", and the foreign key refuses "a capture that does not
+exist". Legacy version-3 adoption verifies the `NOT NULL` requirement alongside
+the primary key, the foreign key and the three `CHECK` constraints.
+
+Retention deliberately has **no behaviour** for an unbound lifecycle row. The
+database prevents the invalid state rather than the application learning to
+interpret it — the failure belongs at the schema boundary.
 
 | Lifecycle state | Meaning |
 | --- | --- |
@@ -271,8 +293,8 @@ at all. Before an unversioned database is adopted at version 3, MGO verifies
 that `capture_media_lifecycle` genuinely has:
 
 * `capture_id` as the primary key;
-* `NOT NULL` on `state`, `requested_at_utc` and `reason`, and a nullable
-  `deleted_at_utc`;
+* `NOT NULL` on `capture_id`, `state`, `requested_at_utc` and `reason`, and a
+  nullable `deleted_at_utc`;
 * a foreign key from `capture_id` to `captures(id)`;
 * the `state` vocabulary `CHECK`;
 * the `reason` vocabulary `CHECK`;
