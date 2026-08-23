@@ -1,9 +1,11 @@
 # Task 14.1 — Capture Retention Policy Foundation
 
-**Status: implemented, validated off-Pi, awaiting architectural and QA review.**
+**Status: implementation complete, validated off-Pi, architectural and QA
+review complete, and submitted as PR #12.**
 
-**Not merged. No pull request. Not deployed. No Raspberry Pi access. No
-production change. No physical validation.**
+**Task 14.1 has not been deployed and has never been physically validated.
+No Raspberry Pi access and no production change was performed during Task
+14.1, and retention remains disabled in production.**
 
 ---
 
@@ -917,3 +919,39 @@ production policy and no new dependency.
 
 No Raspberry Pi access, no production change, no deployment, no pull request, no
 merge, and Task 14.2 remains not started.
+
+
+---
+
+## 23. PR #12 merge-gate status correction
+
+When the original implementation record was written it correctly stated that no
+pull request existed and that the work was awaiting architectural and QA review.
+Both statements were true at the time.
+
+They were overtaken by events. Architectural and QA review completed, and PR #12
+(`Add Task 14.1 capture retention policy foundation`) was subsequently created
+against `main`. The top-level status was therefore describing a state the branch
+had already left.
+
+That stale status was corrected **before** merge rather than knowingly carrying
+an incorrect repository status into `main`. The replacement wording is
+deliberately chosen to stay truthful on both sides of a merge: "submitted as
+PR #12" remains a fact once the PR is merged or closed, whereas "PR #12 is open"
+would have become stale the moment its state changed. The record does not
+predict whether PR #12 will merge, and names no future merge SHA.
+
+Two clarifications, so nothing else reads as stale:
+
+* the closing lines of §21 and §22 record what **those correction rounds** did
+  and did not do. Their "no pull request" wording is a statement about the
+  actions taken in each of those rounds, not a claim about the branch's current
+  state, and both notes are left exactly as written;
+* the operational facts in the corrected header are unchanged in substance and
+  remain true: not deployed, never physically validated, no Raspberry Pi access
+  or production change during Task 14.1, and retention disabled in production.
+
+This correction is **documentation-only**. No implementation, schema, migration,
+policy, configuration, test, mutation register entry or runtime behaviour
+changed. Exactly one file was modified. No Raspberry Pi access, no deployment,
+no production change, retention not enabled, and Task 14.2 not started.
