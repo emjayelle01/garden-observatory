@@ -819,12 +819,43 @@ no bound is rejected at load time. Retention requires neither `camera.enabled`
 nor `event_capture.enabled`: it must be able to reclaim media a now-disabled
 capture feature already produced.
 
-Task 14.1 is a **software foundation**. It does not authorise production
-retention, has had no physical validation, and by itself does **not** make the
-event-capture pipeline ready for permanent unattended enablement — event capture
-remains disabled in production, Task 13.2 was point-in-time physical validation
-only, and long-term unattended behaviour remains unproven. Full semantics,
-policy, state machine, recovery, safety rules and error categories live in
+### The operator command
+
+Task 14.2 added `mgo-retention`, the first supported way to invoke retention by
+hand. Two subcommands, no aliases, and nothing that schedules future work:
+
+```bash
+mgo-retention plan
+mgo-retention run-once --execute
+```
+
+`plan` is **read-only** — and read-only at the SQLite boundary, not merely in
+intent: it opens the database with `mode=ro`, so it cannot create a missing
+database, create a missing directory or change a database's journal mode. It
+creates no lifecycle row, deletes no file, records no observation and moves no
+counter, and it works whether or not retention is enabled.
+
+`run-once --execute` can permanently delete capture media and is gated three
+ways: the exact `--execute` flag, `MGO_CONFIG_PATH` naming the configuration to
+act on, and `retention.enabled = true` in that configuration. It executes
+**exactly one** run and exits — even when the result reports that more eligible
+work remains, because a second run is a second operator decision.
+
+Neither command applies migrations: both refuse any database not already at
+schema version 3, so inspecting retention can never silently upgrade a database.
+Neither accepts policy on the command line — no `--max-age-days`, no
+`--capture-id`, no date range — so the reviewed configured policy is the only
+policy that runs. Exit codes are `0` success, `2` operator/configuration
+refusal, `3` schema refusal, `4` bounded retention error, `5` unexpected.
+
+Task 14.1 is a **software foundation** and Task 14.2 is a **manual operator
+interface**. Neither authorises production retention, neither has had physical
+validation, and neither makes the event-capture pipeline ready for permanent
+unattended enablement — event capture remains disabled in production, Task 13.2
+was point-in-time physical validation only, and long-term unattended behaviour
+remains unproven. There is still no scheduler and no destructive HTTP endpoint.
+Full semantics, policy, state machine, recovery, safety rules, the command
+contract and error categories live in
 [`docs/Retention.md`](docs/Retention.md).
 
 ### `GET /retention/status`

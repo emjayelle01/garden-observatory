@@ -296,8 +296,14 @@ class RetentionService:
         Deliberately available whether or not retention is enabled: previewing a
         policy is how an operator decides whether to enable it, and a read-only
         preview cannot do harm from either side of that switch.
+
+        The catalogue is read through the repository's genuinely read-only path,
+        not the ordinary read-write one. That distinction is the difference
+        between a preview that mutates nothing and a preview that quietly creates
+        a database, creates a directory, or switches a database's journal mode --
+        all of which the read-write helper will do.
         """
-        catalogue = self._repository.list_lifecycle_records()
+        catalogue = self._repository.read_lifecycle_records()
         return plan_retention(catalogue, self._config, now_utc=self._clock())
 
     def run_once(self) -> RetentionRunResult:

@@ -120,6 +120,16 @@ OBSERVATIONS = "src/mgo/core/observations.py"
 
 #: The suites that own the retention behaviours.
 RETENTION_POLICY_SUITE = "tests/test_retention_policy.py"
+
+#: The Task 14.2 operator command. Every safety property it has is a *refusal*
+#: standing between an operator and a deletion, and a refusal is invisible while
+#: it works: a weakened gate changes no output at all until the run it should
+#: have stopped goes ahead.
+RETENTION_CLI = "src/mgo/retention/cli.py"
+
+#: The suites that own the operator interface and the read-only boundary.
+RETENTION_CLI_SUITE = "tests/test_retention_cli.py"
+RETENTION_READONLY_SUITE = "tests/test_retention_readonly.py"
 RETENTION_SERVICE_SUITE = "tests/test_retention_service.py"
 RETENTION_DATABASE_SUITE = "tests/test_retention_database.py"
 RETENTION_API_SUITE = "tests/test_retention_api.py"
@@ -2261,9 +2271,9 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'the-dry-run-acquires-a-side-effect',
         RETENTION_SERVICE,
-        '        catalogue = self._repository.list_lifecycle_records()',
+        '        catalogue = self._repository.read_lifecycle_records()',
         '        self._state.mark_running()\n'
-        '        catalogue = self._repository.list_lifecycle_records()',
+        '        catalogue = self._repository.read_lifecycle_records()',
         'a_dry_run_moves_no_counter',
         'A read-only preview mutates the state an operator is watching.',
         suite=RETENTION_SERVICE_SUITE,
@@ -2494,5 +2504,103 @@ MUTATIONS: tuple[Mutation, ...] = (
         'a_nullable_capture_id_unversioned_schema_is_rejected',
         'A foreign database with a nullable identity is adopted as version 3.',
         suite=MIGRATIONS_SUITE,
+    ),
+    # --- Task 14.2 controlled retention operator interface -------------------
+    Mutation(
+        'the-preview-reads-through-the-read-write-path',
+        RETENTION_SERVICE,
+        '        catalogue = self._repository.read_lifecycle_records()',
+        '        catalogue = self._repository.list_lifecycle_records()',
+        'creates_no_missing_parent_directory or does_not_change_the_journal_mode',
+        'A read-only preview creates a database, a directory and a WAL mode.',
+        suite=RETENTION_READONLY_SUITE,
+    ),
+    Mutation(
+        'the-read-only-projection-opens-read-write',
+        RETENTION_REPOSITORY,
+        '            connection = connect_readonly(self._database_path)',
+        '            connection = database_connection(self._database_path).__enter__()',
+        'against_a_missing_database_creates_nothing',
+        'The mode=ro boundary is abandoned and the preview can mutate again.',
+        suite=RETENTION_READONLY_SUITE,
+    ),
+    Mutation(
+        'run-once-stops-requiring-the-execute-flag',
+        RETENTION_CLI,
+        '    if not arguments.execute:',
+        '    if False:',
+        'without_execute_refuses_before_any_mutation',
+        'A bare run-once deletes media with no explicit confirmation.',
+        suite=RETENTION_CLI_SUITE,
+    ),
+    Mutation(
+        'run-once-stops-requiring-retention-to-be-enabled',
+        RETENTION_CLI,
+        '    if not config.retention.enabled:',
+        '    if False:',
+        'with_retention_disabled_refuses_before_any_mutation',
+        'A deployment that never enabled retention is deleted from anyway.',
+        suite=RETENTION_CLI_SUITE,
+    ),
+    Mutation(
+        'run-once-stops-requiring-an-explicit-configuration',
+        RETENTION_CLI,
+        '    _require_explicit_configuration()',
+        '    pass',
+        'without_an_explicit_configuration_refuses',
+        'A destructive run resolves whichever development config is default.',
+        suite=RETENTION_CLI_SUITE,
+    ),
+    Mutation(
+        'a-blank-configuration-variable-counts-as-explicit',
+        RETENTION_CLI,
+        '    if raw is None or not raw.strip():',
+        '    if raw is None:',
+        'an_empty_configuration_variable_is_not_an_explicit_choice',
+        'An empty environment variable passes as a deliberate selection.',
+        suite=RETENTION_CLI_SUITE,
+    ),
+    Mutation(
+        'the-schema-gate-accepts-any-version',
+        RETENTION_CLI,
+        '    if version != CURRENT_SCHEMA_VERSION:',
+        '    if False:',
+        'lower_schema_is_refused_and_not_migrated or higher_schema_is_refused',
+        'An older or newer database is acted on instead of refused.',
+        suite=RETENTION_CLI_SUITE,
+    ),
+    Mutation(
+        'the-command-repeats-while-work-remains',
+        RETENTION_CLI,
+        '    result = _build_service(config).run_once()',
+        '    service = _build_service(config)\n'
+        '    result = service.run_once()\n'
+        '    while result.more_work_remains:\n'
+        '        result = service.run_once()',
+        'more_work_remaining_does_not_trigger_a_second_run',
+        'A one-shot operator command becomes an unreviewed deletion loop.',
+        suite=RETENTION_CLI_SUITE,
+    ),
+    Mutation(
+        'a-missing-subcommand-is-tolerated',
+        RETENTION_CLI,
+        '    subcommands.required = True',
+        '    subcommands.required = False',
+        'an_unsupported_invocation_is_refused',
+        'An incomplete invocation is accepted instead of refused.',
+        suite=RETENTION_CLI_SUITE,
+    ),
+    Mutation(
+        'the-preview-publishes-the-media-path',
+        RETENTION_CLI,
+        '    payload = plan.as_dict()',
+        '    payload = plan.as_dict()\n'
+        '    for _entry, _candidate in zip(\n'
+        '        payload["candidates"], plan.candidates, strict=True\n'
+        '    ):\n'
+        '        _entry["absolute_path"] = _candidate.absolute_path',
+        'plan_leaks_no_path_of_any_kind or plan_output_has_a_deterministic_shape',
+        'Absolute media paths enter the operator-facing JSON.',
+        suite=RETENTION_CLI_SUITE,
     ),
 )

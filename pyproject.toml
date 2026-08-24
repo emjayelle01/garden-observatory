@@ -11,6 +11,13 @@ dependencies = [
     "uvicorn[standard]>=0.51.0",
 ]
 
+[project.scripts]
+# The supported operator entry point for capture-media retention (Task 14.2).
+# "plan" is read-only; "run-once --execute" can delete capture media and is
+# additionally gated by MGO_CONFIG_PATH and retention.enabled. Neither
+# subcommand schedules anything. See docs/Retention.md.
+mgo-retention = "mgo.retention.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

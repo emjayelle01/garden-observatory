@@ -1,12 +1,18 @@
 # Capture Media Retention
 
-**Status: software foundation. Disabled by default. Not authorised for
-production. Never physically validated.**
+**Status: software foundation plus a manual operator command. Disabled by
+default. Not authorised for production. Never physically validated.**
 
-Task 14.1 builds the machinery MGO needs to reclaim captured media safely. It
-does not turn that machinery on, does not schedule it, does not expose it
-destructively over HTTP, and has never deleted a real capture on the Raspberry
-Pi.
+Task 14.1 built the machinery MGO needs to reclaim captured media safely.
+Task 14.2 added the first supported way for an operator to invoke it by hand.
+Neither turns the machinery on, schedules it, or exposes it destructively over
+HTTP, and nothing here has ever deleted a real capture on the Raspberry Pi.
+
+| Task | What it provides |
+| --- | --- |
+| 14.1 | The safe retention machinery: policy, lifecycle, executor, status. |
+| 14.2 | A manual operator command, `mgo-retention`, and a genuinely read-only preview. |
+| Not yet implemented or authorised | Automatic scheduling; production enablement; physical retention validation; permanent event-capture enablement. |
 
 ---
 
@@ -464,6 +470,148 @@ file, record an observation, alter a capture record, or move a runtime counter.
 It is a pure preview of the current policy decision, and it is available whether
 or not retention is enabled — previewing a policy is how an operator decides
 whether to enable it.
+
+### Read-only at the SQLite boundary
+
+"Read-only" here means read-only *at the connection*, not merely "this method
+only issues a `SELECT`". Task 14.1 read the catalogue through the ordinary
+read-write helper, which — as a side effect of **opening**, not of the statement
+— will create a missing parent directory, bring a missing database file into
+existence, and request WAL journalling on a database that was not using it. All
+three were reachable from an operation documented as mutating nothing.
+
+The preview now reads through SQLite's `mode=ro` URI instead. A missing database
+fails cleanly rather than being created, no directory is made, no journal mode is
+requested, no migration runs, and no statement can modify anything. It reuses the
+**same** projection SQL and the **same** fail-closed decoder as the destructive
+path — a second interpretation of origin, lifecycle state, reason, timestamps or
+filesize is exactly the divergence that would let a preview disagree with the run
+it is previewing.
+
+One honest limitation: a database in WAL mode cannot be read *at all*, even
+read-only, without SQLite's shared-memory index, so a `-shm` file may appear
+beside it. That is SQLite's own mechanism for reading WAL rather than a change
+this code makes; the journal mode and every table are unaffected, and both are
+asserted directly.
+
+---
+
+## 10a. The operator command (Task 14.2)
+
+`mgo-retention` is the first supported way to invoke retention by hand. It is a
+thin boundary: it parses arguments, checks preconditions, calls the retention
+domain service, prints one JSON document and maps the outcome to an exit status.
+Every policy decision and safety refusal still happens behind it in the Task 14.1
+engine.
+
+```bash
+mgo-retention plan
+mgo-retention run-once --execute
+```
+
+There are exactly two subcommands and no aliases.
+
+### `plan` — read-only
+
+Evaluates the configured policy and prints what it would select, using the
+read-only path above. It creates no lifecycle row, deletes no file, records no
+observation, applies no migration and moves no counter. It works whether or not
+retention is enabled.
+
+`plan` deliberately performs **no filesystem validation**. The filesystem is only
+ever a veto during destructive execution; stat-ing candidates during a preview
+would make `plan` report a different set from the one the policy actually chose.
+A capture whose media is already missing therefore still appears in the plan.
+
+Output is JSON on stdout: the fields of `RetentionPlan.as_dict()` plus
+`retention_enabled`. Candidates carry `capture_id`, `filename`, `captured_at`,
+`filesize_bytes` and `policy_reason` — never an absolute path, capture root,
+database location or configuration path.
+
+### `run-once --execute` — potentially destructive
+
+Executes **exactly one** retention run and exits. Three gates must all be
+satisfied before anything is opened or read:
+
+| Gate | Requirement |
+| --- | --- |
+| A | The exact `--execute` flag. There is no `-y`, `--yes`, `--force`, `--really` or `--override`: one spelling is easier to audit. |
+| B | `MGO_CONFIG_PATH` set, naming the configuration this run acts on. |
+| C | `retention.enabled = true` in that configuration. |
+
+Gate B exists because configuration identity decides *which* media is deleted.
+Without it, an operator standing in the repository could run
+`run-once --execute` and have it resolve the tracked **development**
+configuration — pointing a deletion at whichever database and capture directory
+that file happens to name.
+
+The command **never repeats**. When the result reports `more_work_remains`, that
+is a fact for the operator, not a trigger: a second run is a second decision.
+There is no loop, no retry, no daemon and no interval.
+
+Output is a bounded JSON result: `executed`, `enabled`, `candidate_count`,
+`deleted_count`, `bytes_reclaimed`, `recovered_count`, `more_work_remains`,
+`error_category` and `error_message`. No filename, path, raw exception or
+traceback appears in it.
+
+### The schema gate
+
+Neither subcommand applies migrations. Schema migration belongs to application
+startup, where it is transactional, logged and part of a reviewed deployment. An
+operator asking to inspect or execute retention must never silently upgrade a
+database as a side effect of asking — and an *older* database is precisely where
+a silent upgrade would be most tempting and least safe.
+
+Both commands therefore require the database to already record exactly schema
+version **3**. Every other case is refused identically and the database is left
+untouched: lower, higher, unversioned, missing and unreadable.
+
+### No policy on the command line
+
+There is no `--max-age-days`, `--max-managed-bytes`, `--minimum-keep-count`,
+`--max-deletions`, `--origin`, `--capture-id`, `--before` or `--after`, and
+unknown arguments are refused rather than ignored. The command executes the
+**configured, reviewed** policy or it executes nothing. An operator who could
+retune the policy at the prompt could turn a reviewed retention policy into an
+unreviewed deletion at the moment of deletion.
+
+There is likewise no `delete`, `purge` or `rm` subcommand. Task 14.2 exposes the
+existing policy engine and nothing else; deleting an arbitrary named file remains
+out of scope.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Completed successfully. |
+| `2` | Operator or configuration refusal — missing `--execute`, retention disabled, no `MGO_CONFIG_PATH`, invalid arguments. |
+| `3` | Database or schema precondition refused. |
+| `4` | The run completed but stopped on a bounded retention error category. |
+| `5` | Unexpected failure, reduced to one fixed sentence. |
+
+`0` and `2` carry the same meaning they already carry in the backup and
+support-bundle commands. `1` is deliberately unused. No capture id, filename or
+policy reason is ever encoded into an exit code, and no traceback is ever
+printed — it is the one part of the output that could carry a capture path or a
+database location into a log an operator forwards elsewhere.
+
+### Concurrency, stated plainly
+
+Task 14.2 introduces no scheduler and no cross-process lock. The Task 14.1
+process-local mutex protects two runs inside one process; two *separately
+invoked* CLI processes are not serialised by it. The final safety boundary
+across processes remains the database's conditional lifecycle transitions: a
+deletion intent can be claimed once, a finalisation can fire once, and one
+deletion produces exactly one success observation. That is a real limitation,
+not a guarantee, and inventing a broad cross-process locking subsystem was
+deliberately out of scope here.
+
+### What Task 14.2 does not do
+
+It performs **no production deletion**. It does not deploy, does not access the
+Raspberry Pi, does not enable retention, does not choose a retention period or
+storage budget, does not schedule anything, and does not physically validate
+deletion. Those remain a later controlled task.
 
 ---
 

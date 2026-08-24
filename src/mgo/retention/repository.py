@@ -31,7 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from mgo.core.database import database_connection
+from mgo.core.database import connect_readonly, database_connection
 from mgo.core.observations import record_observation_in_transaction
 from mgo.retention.models import (
     CaptureLifecycleRecord,
@@ -282,9 +282,14 @@ class RetentionRepository:
     def list_lifecycle_records(self) -> list[CaptureLifecycleRecord]:
         """Return every catalogued capture with its media lifecycle state.
 
-        Read-only. Ordered oldest first at the database, though the planner sorts
-        again for itself: the order is a convenience here, never a dependency,
-        because a destructive decision must not rest on a collation.
+        Uses the ordinary read-write connection, which is correct here: this is
+        the read a *destructive* run performs, and that run is going on to open
+        read-write transactions anyway. A preview must not use this path -- see
+        :meth:`read_lifecycle_records`.
+
+        Ordered oldest first at the database, though the planner sorts again for
+        itself: the order is a convenience here, never a dependency, because a
+        destructive decision must not rest on a collation.
         """
         try:
             with database_connection(self._database_path) as connection:
@@ -294,6 +299,49 @@ class RetentionRepository:
             raise RetentionRepositoryError(
                 f"Could not read the capture retention projection: {exc}"
             ) from exc
+
+        return [_record_from_row(row) for row in rows]
+
+    def read_lifecycle_records(self) -> list[CaptureLifecycleRecord]:
+        """Return the same projection over a genuinely read-only connection.
+
+        "Read-only" has to mean read-only at the *SQLite boundary*, not merely
+        "this method happens to issue a SELECT". The ordinary connection helper
+        will create a missing parent directory, bring a missing database file
+        into existence, and request WAL journalling on a database that was not
+        using it -- so a preview run through it can leave three separate marks on
+        a system it was supposed only to look at.
+
+        This path opens the database with SQLite's ``mode=ro`` URI instead. A
+        missing file fails cleanly rather than being created, no directory is
+        made, no journal mode is requested, no migration runs and no statement
+        can modify anything.
+
+        It deliberately reuses the *same* projection SQL and the *same*
+        fail-closed row decoder as :meth:`list_lifecycle_records`. A second
+        interpretation of origin, lifecycle state, reason, timestamps or filesize
+        is exactly the divergence that would let a preview disagree with the run
+        it is previewing.
+        """
+        try:
+            connection = connect_readonly(self._database_path)
+        except sqlite3.Error as exc:
+            LOGGER.error(
+                "Could not open the retention catalogue read-only: %s", exc
+            )
+            raise RetentionRepositoryError(
+                "Could not open the capture retention catalogue read-only"
+            ) from exc
+
+        try:
+            rows = connection.execute(_PROJECTION_SQL).fetchall()
+        except sqlite3.Error as exc:
+            LOGGER.error("Failed to read the retention projection: %s", exc)
+            raise RetentionRepositoryError(
+                f"Could not read the capture retention projection: {exc}"
+            ) from exc
+        finally:
+            connection.close()
 
         return [_record_from_row(row) for row in rows]
 
