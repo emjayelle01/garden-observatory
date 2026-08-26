@@ -103,6 +103,10 @@ class _Deployment:
             encoding="utf-8",
         )
 
+    def rewrite_config(self, body: str) -> None:
+        """Replace the configuration file wholesale, for shape-error tests."""
+        self.config_path.write_text(body, encoding="utf-8")
+
     def add(
         self,
         identifier: str,
@@ -110,8 +114,14 @@ class _Deployment:
         days_old: float = 900.0,
         origin: str | None = "motion",
         write_file: bool = True,
+        filename: str | None = None,
     ) -> Path:
-        """Catalogue one capture and (by default) write its media."""
+        """Catalogue one capture and (by default) write its media.
+
+        ``filename`` overrides the catalogue's filename column *without* moving
+        the media, which is how a damaged or hand-edited catalogue presents: the
+        column holds something the capture pipeline would never have written.
+        """
         media = self.captures / f"{identifier}.jpg"
         if write_file:
             media.write_bytes(PAYLOAD)
@@ -128,7 +138,7 @@ class _Deployment:
                 """,
                 (
                     identifier,
-                    media.name,
+                    filename if filename is not None else media.name,
                     str(media),
                     stamp,
                     len(PAYLOAD),
@@ -330,9 +340,11 @@ def test_plan_output_has_a_deterministic_shape(
         "byte_target_satisfiable",
         "retention_enabled",
     }
+    # No ``filename``: the catalogue value has only been validated as a
+    # non-empty string, so it is omitted from operator output rather than
+    # published unverified. See the hostile-filename tests below.
     assert set(first[1]["candidates"][0]) == {
         "capture_id",
-        "filename",
         "captured_at",
         "filesize_bytes",
         "policy_reason",
@@ -999,3 +1011,492 @@ def test_the_database_is_never_migrated_by_the_command() -> None:
 
     assert "apply_migrations" not in source
     assert "read_schema_version" in source
+
+
+# --- operator plan output carries no filename (correction round 1) ----------
+#
+# ``RetentionPlan.as_dict()`` includes each candidate's catalogue ``filename``,
+# and that value has been validated only as a non-empty string. It has not
+# passed the path/filename safety boundary -- that boundary belongs to
+# destructive execution, and running it during a preview would make ``plan``
+# disagree with the pure policy selection it exists to report. So a damaged
+# catalogue can hold a "filename" that is really a path, and publishing it would
+# put that string into operator output the contract says carries none.
+
+#: Filenames the capture pipeline would never write, which a damaged or
+#: hand-edited catalogue can nonetheless contain.
+HOSTILE_FILENAMES = [
+    "/var/lib/garden-observatory/db/mgo.db",
+    "../../secret.jpg",
+    "C:\\sensitive\\secret.jpg",
+    "/etc/garden-observatory/mgo.toml",
+    "../../../captures/private.jpg",
+]
+
+
+def test_ordinary_plan_output_has_no_filename_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even an entirely benign filename is omitted, not merely a hostile one."""
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+
+    code, payload, _ = _run(deployment, ["plan"], monkeypatch)
+
+    assert code == cli.EXIT_SUCCESS
+    assert payload["candidate_count"] == 1
+    assert "filename" not in payload["candidates"][0]
+    assert set(payload["candidates"][0]) == {
+        "capture_id",
+        "captured_at",
+        "filesize_bytes",
+        "policy_reason",
+    }
+
+
+@pytest.mark.parametrize("hostile", HOSTILE_FILENAMES)
+def test_a_hostile_catalogue_filename_never_reaches_operator_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hostile: str
+) -> None:
+    """The raw string appears nowhere in stdout or stderr.
+
+    Checked against the decoded JSON as well as the raw text: a Windows-style
+    filename is backslash-escaped on the way out, so a naive substring search of
+    the rendered document would miss a leak that ``json.loads`` recovers
+    perfectly.
+    """
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-hostile", filename=hostile)
+    deployment.add("cap-new", days_old=0.0)
+
+    code, payload, stderr = _run(deployment, ["plan"], monkeypatch)
+
+    assert code == cli.EXIT_SUCCESS
+    rendered = json.dumps(payload)
+    assert hostile not in rendered
+    assert hostile not in stderr
+    # And the value is absent from the decoded structure, not merely escaped.
+    assert hostile not in json.dumps(json.loads(rendered))
+    for value in payload["candidates"][0].values():
+        assert str(value) != hostile
+
+
+@pytest.mark.parametrize("hostile", HOSTILE_FILENAMES)
+def test_a_hostile_filename_is_still_selected_by_the_pure_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hostile: str
+) -> None:
+    """Privacy is achieved by omission, not by dropping the candidate.
+
+    This is the control that keeps the previous test honest: if the hostile
+    capture simply vanished from the plan, "the string is absent" would prove
+    nothing about output privacy. The candidate is still selected, still
+    reported, and still carries every planning fact.
+    """
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-hostile", filename=hostile)
+    deployment.add("cap-new", days_old=0.0)
+
+    _, payload, _ = _run(deployment, ["plan"], monkeypatch)
+
+    assert payload["candidate_count"] == 1
+    candidate = payload["candidates"][0]
+    assert candidate["capture_id"] == "cap-hostile"
+    assert candidate["policy_reason"] == "age"
+    assert candidate["filesize_bytes"] == len(PAYLOAD)
+    assert candidate["captured_at"]
+
+
+def test_plan_output_stays_deterministic_without_the_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dropping a field did not make the projection unstable."""
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-a", days_old=900)
+    deployment.add("cap-b", days_old=800)
+    deployment.add("cap-new", days_old=0.0)
+
+    assert _run(deployment, ["plan"], monkeypatch) == _run(
+        deployment, ["plan"], monkeypatch
+    )
+
+
+def test_the_operator_projection_adds_no_filesystem_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The correction did not smuggle validation into ``plan``.
+
+    Omitting the filename is an output decision. It must not have become an
+    excuse to start stat-ing candidates, which would change what ``plan``
+    reports.
+    """
+
+    def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("plan touched the filesystem")
+
+    for name in ("_path_exists", "_is_regular_file", "_file_size", "_unlink"):
+        monkeypatch.setattr(service_module, name, _explode)
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-hostile", filename="../../secret.jpg", write_file=False)
+    deployment.add("cap-new", days_old=0.0)
+
+    code, payload, _ = _run(deployment, ["plan"], monkeypatch)
+
+    assert code == cli.EXIT_SUCCESS
+    assert payload["candidates"][0]["capture_id"] == "cap-hostile"
+
+
+def test_destructive_execution_still_validates_the_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Omitting it from *output* did not remove it from the safety boundary.
+
+    The catalogue filename disagrees with the path's final component, which is
+    exactly what the Task 14.1 boundary refuses -- and it must still refuse,
+    because the destructive path is where that value actually matters.
+    """
+    deployment = _Deployment(tmp_path, enabled=True)
+    media = deployment.add("cap-hostile", filename="../../secret.jpg")
+    deployment.add("cap-new", days_old=0.0)
+
+    code, payload, _ = _run(deployment, ["run-once", "--execute"], monkeypatch)
+
+    assert code == cli.EXIT_RETENTION_ERROR
+    assert payload["error_category"] == "unsafe_path"
+    assert payload["deleted_count"] == 0
+    assert media.exists()
+    assert deployment.lifecycle() == {}
+
+
+# --- configuration-shape errors are refusals (correction round 1) -----------
+#
+# The loader can legitimately raise TypeError and AttributeError for
+# syntactically valid TOML whose values or sections have the wrong shape. Those
+# are operator mistakes, and reporting them as unexpected internal failures told
+# the operator to look at MGO instead of at their file.
+
+_VALID_PREFIX = """
+[application]
+name = "t"
+environment = "test"
+host = "127.0.0.1"
+port = 8080
+
+[storage]
+data_directory = "d"
+log_directory = "l"
+database_path = "d/mgo.db"
+
+[camera]
+enabled = false
+backend = "simulator"
+detection_interval_seconds = 60
+capture_directory = "d/captures"
+"""
+
+_VALID_HEALTH = """
+[health]
+enabled = true
+collection_interval_seconds = 60
+temperature_warning_celsius = 70.0
+temperature_critical_celsius = 80.0
+disk_warning_percent = 80.0
+disk_critical_percent = 90.0
+memory_warning_percent = 85.0
+memory_critical_percent = 95.0
+"""
+
+_MALFORMED_CONFIGS = {
+    # tomllib raises TOMLDecodeError, a ValueError subclass.
+    "invalid TOML": "this is not = = valid toml [[[",
+    # KeyError: a whole required section is absent.
+    "missing section": "[application]\nname = \"t\"\n",
+    # KeyError: a required key inside a present section is absent.
+    "missing key": _VALID_PREFIX + "\n[health]\nenabled = true\n",
+    # TypeError: float() is handed a list.
+    "wrong value type": _VALID_PREFIX
+    + _VALID_HEALTH.replace(
+        "temperature_warning_celsius = 70.0",
+        "temperature_warning_celsius = [1, 2]",
+    ),
+    # AttributeError: a section is a scalar, so .get() does not exist on it.
+    "wrong section shape": 'health = "not-a-table"\n' + _VALID_PREFIX,
+    # ValueError: a validator rejects an otherwise well-typed value.
+    "rejected value": _VALID_PREFIX
+    + _VALID_HEALTH.replace(
+        "disk_warning_percent = 80.0", "disk_warning_percent = 95.0"
+    ),
+}
+
+
+@pytest.mark.parametrize("label", sorted(_MALFORMED_CONFIGS))
+@pytest.mark.parametrize("command", [["plan"], ["run-once", "--execute"]])
+def test_a_malformed_configuration_is_an_operator_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    command: list[str],
+) -> None:
+    """Every configuration-shape mistake exits 2, never 5.
+
+    Exit 5 is reserved for genuine defects. Spending it on an ordinary mistake
+    in the operator's own file points them at the wrong thing entirely.
+    """
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.rewrite_config(_MALFORMED_CONFIGS[label])
+
+    code, _, stderr = _run(deployment, command, monkeypatch)
+
+    assert code == cli.EXIT_REFUSED
+    assert stderr.strip() == cli.REFUSAL_CONFIGURATION_INVALID
+
+
+@pytest.mark.parametrize("label", sorted(_MALFORMED_CONFIGS))
+def test_a_malformed_configuration_refusal_leaks_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str
+) -> None:
+    """The refusal is one fixed sentence: no exception, path or TOML value."""
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.rewrite_config(_MALFORMED_CONFIGS[label])
+
+    _, _, stderr = _run(deployment, ["plan"], monkeypatch)
+
+    for leak in (
+        "TypeError",
+        "AttributeError",
+        "KeyError",
+        "ValueError",
+        "TOMLDecodeError",
+        "Traceback",
+        "not-a-table",
+        "temperature_warning",
+        str(deployment.config_path),
+        str(deployment.database_path),
+        str(deployment.captures),
+    ):
+        assert leak not in stderr
+
+
+@pytest.mark.parametrize("label", sorted(_MALFORMED_CONFIGS))
+def test_a_malformed_configuration_mutates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str
+) -> None:
+    """A destructive invocation against a broken config touches nothing."""
+
+    def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a malformed configuration reached the filesystem")
+
+    monkeypatch.setattr(service_module, "_unlink", _explode)
+    deployment = _Deployment(tmp_path, enabled=True)
+    media = deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+    before = deployment.capture_ids()
+    deployment.rewrite_config(_MALFORMED_CONFIGS[label])
+
+    code, _, _ = _run(deployment, ["run-once", "--execute"], monkeypatch)
+
+    assert code == cli.EXIT_REFUSED
+    assert media.exists()
+    assert deployment.lifecycle() == {}
+    assert list_observations(deployment.database_path) == []
+    assert deployment.capture_ids() == before
+
+
+def test_a_genuine_internal_defect_is_still_unexpected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: widening the refusal boundary did not swallow real bugs.
+
+    An injected ``RuntimeError`` is not a configuration problem and must not be
+    reported as one -- otherwise every defect inside the command would be
+    blamed on the operator's file.
+    """
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-old")
+
+    def _explode(self: Any) -> Any:
+        raise RuntimeError("a genuine internal defect")
+
+    monkeypatch.setattr(service_module.RetentionService, "run_once", _explode)
+
+    code, _, stderr = _run(deployment, ["run-once", "--execute"], monkeypatch)
+
+    assert code == cli.EXIT_UNEXPECTED
+    assert stderr.strip() == cli.UNEXPECTED_FAILURE
+
+
+# --- the destructive gate needs a stable identity (correction round 1) ------
+#
+# The application's own rules resolve a relative MGO_CONFIG_PATH against the
+# current working directory. That is fine for configuration generally and far
+# too weak for a gate whose entire purpose is that the operator has identified
+# one deployment: "config/mgo.toml" names a different file after a cd, and would
+# then point a deletion at a different database and capture directory.
+
+
+def test_a_relative_configuration_path_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative value does not identify a deployment, so it is refused."""
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-old")
+    monkeypatch.setenv(CONFIG_PATH_ENV, "mgo.toml")
+
+    out, err = io.StringIO(), io.StringIO()
+    code = cli.main(["run-once", "--execute"], stdout=out, stderr=err)
+
+    assert code == cli.EXIT_REFUSED
+    assert err.getvalue().strip() == cli.REFUSAL_RELATIVE_CONFIG
+
+
+def test_a_relative_path_is_refused_even_when_it_would_resolve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The headline case: it resolves, it is valid, and it is still refused.
+
+    Standing in the deployment directory, ``mgo.toml`` names a perfectly good
+    retention-enabled configuration and the run would succeed. It is refused
+    anyway, because a value whose meaning depends on where the operator happens
+    to be standing is not the stable identity this gate asks for.
+    """
+
+    def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a relative configuration path reached the unlink")
+
+    monkeypatch.setattr(service_module, "_unlink", _explode)
+    deployment = _Deployment(tmp_path, enabled=True)
+    media = deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(CONFIG_PATH_ENV, "mgo.toml")
+
+    out, err = io.StringIO(), io.StringIO()
+    code = cli.main(["run-once", "--execute"], stdout=out, stderr=err)
+
+    assert code == cli.EXIT_REFUSED
+    assert err.getvalue().strip() == cli.REFUSAL_RELATIVE_CONFIG
+    assert media.exists()
+    assert deployment.lifecycle() == {}
+    assert list_observations(deployment.database_path) == []
+
+
+@pytest.mark.parametrize(
+    "value", ["mgo.toml", "./mgo.toml", "config/mgo.toml", "../mgo.toml"]
+)
+def test_every_relative_spelling_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """No relative spelling slips through."""
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-old")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(CONFIG_PATH_ENV, value)
+
+    out, err = io.StringIO(), io.StringIO()
+
+    assert (
+        cli.main(["run-once", "--execute"], stdout=out, stderr=err)
+        == cli.EXIT_REFUSED
+    )
+    assert deployment.lifecycle() == {}
+
+
+def test_the_relative_refusal_does_not_echo_the_supplied_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The supplied value is operator text and is not repeated back."""
+    _Deployment(tmp_path, enabled=True)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(CONFIG_PATH_ENV, "secret/location/mgo.toml")
+
+    out, err = io.StringIO(), io.StringIO()
+    cli.main(["run-once", "--execute"], stdout=out, stderr=err)
+
+    assert "secret/location" not in err.getvalue()
+    assert str(tmp_path) not in err.getvalue()
+
+
+def test_the_relative_gate_refuses_before_reading_any_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing is opened: no schema read, no repository read, no unlink."""
+
+    def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the relative gate ran after opening the database")
+
+    monkeypatch.setattr(cli, "read_schema_version", _explode)
+    monkeypatch.setattr(
+        cli.RetentionRepository, "read_lifecycle_records", _explode
+    )
+    monkeypatch.setattr(
+        cli.RetentionRepository, "list_lifecycle_records", _explode
+    )
+    monkeypatch.setattr(service_module, "_unlink", _explode)
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-old")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(CONFIG_PATH_ENV, "mgo.toml")
+
+    out, err = io.StringIO(), io.StringIO()
+
+    assert (
+        cli.main(["run-once", "--execute"], stdout=out, stderr=err)
+        == cli.EXIT_REFUSED
+    )
+
+
+def test_an_absolute_configuration_path_still_executes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: a stable absolute identity runs exactly as before."""
+    deployment = _Deployment(tmp_path, enabled=True)
+    old = deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+    assert deployment.config_path.is_absolute()
+
+    code, payload, _ = _run(deployment, ["run-once", "--execute"], monkeypatch)
+
+    assert code == cli.EXIT_SUCCESS
+    assert payload["deleted_count"] == 1
+    assert not old.exists()
+
+
+def test_plan_still_accepts_a_relative_configuration_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stricter rule is destructive-only and did not spread to ``plan``.
+
+    ``plan`` is read-only, so the ordinary application resolution rules remain
+    appropriate for it. Tightening it too would have been scope creep dressed as
+    caution.
+    """
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(CONFIG_PATH_ENV, "mgo.toml")
+
+    out, err = io.StringIO(), io.StringIO()
+    code = cli.main(["plan"], stdout=out, stderr=err)
+
+    assert code == cli.EXIT_SUCCESS
+    assert json.loads(out.getvalue())["candidate_count"] == 1
+
+
+def test_the_general_configuration_resolver_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``resolve_config_path`` keeps its documented relative-path behaviour.
+
+    The destructive gate is a CLI rule layered on top; it must not have altered
+    the application-wide contract that every other component depends on.
+    """
+    from mgo.core.config import resolve_config_path
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(CONFIG_PATH_ENV, "relative/mgo.toml")
+
+    resolved = resolve_config_path()
+
+    assert resolved.is_absolute()
+    assert resolved == tmp_path / "relative" / "mgo.toml"

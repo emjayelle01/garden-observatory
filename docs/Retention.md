@@ -467,9 +467,15 @@ can be satisfied.
 
 A dry run **must not and does not**: create or modify a lifecycle row, delete a
 file, record an observation, alter a capture record, or move a runtime counter.
-It is a pure preview of the current policy decision, and it is available whether
-or not retention is enabled — previewing a policy is how an operator decides
-whether to enable it.
+It issues no SQL write of any kind, creates no missing database or parent
+directory, and changes no journal mode. It is a pure preview of the current
+policy decision, and it is available whether or not retention is enabled —
+previewing a policy is how an operator decides whether to enable it.
+
+The precise claim is **no MGO-managed state changes**. That is deliberately not
+the same as "no byte on the filesystem moves": reading a live WAL database
+requires SQLite to use its own `-shm` shared-memory index, and that is SQLite's
+documented read mechanism rather than anything this code chooses. See below.
 
 ### Read-only at the SQLite boundary
 
@@ -488,11 +494,20 @@ path — a second interpretation of origin, lifecycle state, reason, timestamps 
 filesize is exactly the divergence that would let a preview disagree with the run
 it is previewing.
 
-One honest limitation: a database in WAL mode cannot be read *at all*, even
-read-only, without SQLite's shared-memory index, so a `-shm` file may appear
-beside it. That is SQLite's own mechanism for reading WAL rather than a change
-this code makes; the journal mode and every table are unaffected, and both are
-asserted directly.
+One honest limitation, stated precisely rather than hidden behind "mutates
+nothing": a database in WAL mode cannot be read *at all* — even read-only, even
+with `mode=ro` — without SQLite's `-shm` shared-memory index, so SQLite may
+create or use that sidecar. That is SQLite's documented mechanism for reading
+WAL, not a change this code makes.
+
+`immutable=1` would avoid it and is **deliberately not used**: it tells SQLite
+the file cannot change, which is untrue of a live database and would licence
+SQLite to ignore concurrent WAL state. Reading a live database through semantics
+that may miss committed data is a worse trade than a sidecar.
+
+What is asserted directly, on both journal modes: no SQL write, no database or
+directory created, journal mode unchanged, and every table byte-identical
+afterwards.
 
 ---
 
@@ -524,26 +539,55 @@ would make `plan` report a different set from the one the policy actually chose.
 A capture whose media is already missing therefore still appears in the plan.
 
 Output is JSON on stdout: the fields of `RetentionPlan.as_dict()` plus
-`retention_enabled`. Candidates carry `capture_id`, `filename`, `captured_at`,
+`retention_enabled`. Candidates carry `capture_id`, `captured_at`,
 `filesize_bytes` and `policy_reason` — never an absolute path, capture root,
 database location or configuration path.
 
+**The catalogue `filename` is deliberately omitted.** It has been validated only
+as a non-empty string; it has *not* passed the path/filename safety boundary,
+because that boundary belongs to destructive execution and running it during a
+preview would make `plan` disagree with the pure policy selection it exists to
+report. A damaged or hand-edited catalogue can therefore hold a "filename" that
+is really a path, and publishing it would put that string into output the
+contract says carries none. It is omitted rather than sanitised or reduced to a
+basename: anything derived from an unverified value is still derived from it, and
+the capture id identifies the record completely. Destructive execution still
+uses the filename, and still validates it before any unlink.
+
 ### `run-once --execute` — potentially destructive
 
-Executes **exactly one** retention run and exits. Three gates must all be
-satisfied before anything is opened or read:
+Executes **exactly one** retention run and exits. Three gates must all pass, in
+this order:
 
-| Gate | Requirement |
-| --- | --- |
-| A | The exact `--execute` flag. There is no `-y`, `--yes`, `--force`, `--really` or `--override`: one spelling is easier to audit. |
-| B | `MGO_CONFIG_PATH` set, naming the configuration this run acts on. |
-| C | `retention.enabled = true` in that configuration. |
+| Gate | Requirement | When it is checked |
+| --- | --- | --- |
+| A | The exact `--execute` flag. There is no `-y`, `--yes`, `--force`, `--really` or `--override`: one spelling is easier to audit. | Before anything is opened or read. |
+| B | `MGO_CONFIG_PATH` set, **absolute**, naming the configuration this run acts on. | Before anything is opened or read. |
+| C | `retention.enabled = true` in that configuration. | After the configuration file is read — necessarily, since that is where the value lives. |
+
+Only once all three pass does the schema gate run and the database get opened.
+
+Gates A and B are the ones that hold *before any file is touched*; gate C cannot
+be, because establishing it means reading the configuration. Nothing destructive
+happens in between: reading the operator's own configuration file is the only
+step, and the database and capture directory are still untouched when gate C is
+evaluated.
 
 Gate B exists because configuration identity decides *which* media is deleted.
 Without it, an operator standing in the repository could run
 `run-once --execute` and have it resolve the tracked **development**
 configuration — pointing a deletion at whichever database and capture directory
 that file happens to name.
+
+It must be **absolute**. The application's general rules resolve a relative
+`MGO_CONFIG_PATH` against the current working directory, which is fine for
+configuration at large and too weak here: `config/mgo.toml` names a different
+file after a `cd`, so the same environment value would select a different
+deployment to delete from. A relative value is refused rather than resolved on
+the operator's behalf — silently making it absolute would produce exactly the
+outcome the gate prevents while looking like it had been checked. This is a
+CLI-only destructive rule; it changes nothing about `resolve_config_path()` and
+nothing about `plan`, which is read-only and keeps the ordinary rules.
 
 The command **never repeats**. When the result reports `more_work_remains`, that
 is a fact for the operator, not a trigger: a second run is a second decision.
@@ -584,7 +628,7 @@ out of scope.
 | Code | Meaning |
 | --- | --- |
 | `0` | Completed successfully. |
-| `2` | Operator or configuration refusal — missing `--execute`, retention disabled, no `MGO_CONFIG_PATH`, invalid arguments. |
+| `2` | Operator or configuration refusal — missing `--execute`, retention disabled, `MGO_CONFIG_PATH` unset or relative, a malformed configuration file, invalid arguments. |
 | `3` | Database or schema precondition refused. |
 | `4` | The run completed but stopped on a bounded retention error category. |
 | `5` | Unexpected failure, reduced to one fixed sentence. |

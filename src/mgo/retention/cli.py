@@ -2,7 +2,8 @@
 
 Two subcommands, and deliberately only two:
 
-``plan``      show what the configured policy would select. Read-only.
+``plan``      show what the configured policy would select. Read-only: it
+              changes no MGO-managed state and issues no SQL write.
 ``run-once``  execute exactly one bounded retention run. Potentially destructive,
               and gated three separate ways before it can remove anything.
 
@@ -48,7 +49,7 @@ from mgo.core.database import (
     DatabaseError,
     read_schema_version,
 )
-from mgo.retention.models import RetentionRuntimeState
+from mgo.retention.models import RetentionPlan, RetentionRuntimeState
 from mgo.retention.repository import (
     RetentionCatalogueError,
     RetentionRepository,
@@ -91,6 +92,10 @@ REFUSAL_NO_EXPLICIT_CONFIG = (
     f"Refusing to run: {CONFIG_PATH_ENV} must be set to the configuration this "
     "run should act on."
 )
+REFUSAL_RELATIVE_CONFIG = (
+    f"Refusing to run: {CONFIG_PATH_ENV} must be an absolute path, so the "
+    "configuration this run acts on does not depend on the working directory."
+)
 REFUSAL_CONFIGURATION_INVALID = (
     "Refusing to run: the selected configuration could not be loaded."
 )
@@ -130,10 +135,39 @@ def _load_configuration() -> MGOConfig:
     retention run deletes media, and configuration identity decides *which*
     media: allowing an arbitrary path on the command line would make the most
     dangerous input the easiest one to get wrong.
+
+    The exception list is the set the *existing* loader can legitimately raise
+    for a malformed configuration, established by reading it rather than by
+    guessing:
+
+    * ``OSError`` -- the file is missing or unreadable (``FileNotFoundError``);
+    * ``ValueError`` -- ``tomllib`` cannot parse it (``TOMLDecodeError``), a
+      numeric conversion fails, or a validator rejects a value;
+    * ``KeyError`` -- a required section or key is absent;
+    * ``TypeError`` -- a value has the wrong container type, so ``int(...)`` or
+      ``float(...)`` is handed a list, or a string is subscripted as a table;
+    * ``AttributeError`` -- a section is a scalar rather than a table, so
+      ``.get()`` does not exist on it.
+
+    The last two were missing, and a syntactically valid file with a wrongly
+    typed value therefore reported an *unexpected internal failure* rather than
+    the configuration problem it is. That is the wrong answer twice over: it
+    tells the operator to look at MGO instead of at their file, and it spends the
+    exit code reserved for genuine defects on an ordinary mistake.
+
+    ``Exception`` is deliberately not caught wholesale. Turning every programmer
+    defect inside the loader into "bad configuration" would hide real bugs behind
+    a message blaming the operator.
     """
     try:
         return load_config()
-    except (OSError, ValueError, KeyError) as exc:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+    ) as exc:
         raise _Refusal(REFUSAL_CONFIGURATION_INVALID, EXIT_REFUSED) from exc
 
 
@@ -148,10 +182,33 @@ def _require_explicit_configuration() -> None:
 
     Requiring ``MGO_CONFIG_PATH`` makes the operator state which deployment they
     mean before anything is deleted, not after.
+
+    It must also be **absolute**. The application's own resolution rules accept a
+    relative value and resolve it against the current working directory, which is
+    correct for general configuration but too weak for this gate: the whole point
+    is that the operator has identified *one deployment*, and
+    ``MGO_CONFIG_PATH=config/mgo.toml`` names a different file after a ``cd``.
+    The same environment value would then select a different database and a
+    different capture directory to delete from.
+
+    A relative path is refused rather than resolved on the operator's behalf.
+    Silently making it absolute would produce exactly the outcome this gate
+    exists to prevent -- a deletion against whatever that path happened to mean
+    at that moment -- while looking like it had been checked. The operator states
+    the stable identity themselves.
+
+    This is a CLI-only destructive gate. It changes nothing about
+    :func:`~mgo.core.config.resolve_config_path`, and nothing about ``plan``,
+    which is read-only and may use the ordinary rules.
     """
     raw = os.environ.get(CONFIG_PATH_ENV)
     if raw is None or not raw.strip():
         raise _Refusal(REFUSAL_NO_EXPLICIT_CONFIG, EXIT_REFUSED)
+
+    # The supplied value is never echoed: it is operator-supplied text that may
+    # itself be a path worth keeping out of a forwarded log.
+    if not Path(raw.strip()).expanduser().is_absolute():
+        raise _Refusal(REFUSAL_RELATIVE_CONFIG, EXIT_REFUSED)
 
 
 def _require_current_schema(database_path: Path) -> None:
@@ -197,6 +254,40 @@ def _build_service(config: MGOConfig) -> RetentionService:
     )
 
 
+def _operator_plan(
+    plan: RetentionPlan, *, retention_enabled: bool
+) -> dict[str, Any]:
+    """Project a plan for operator output, without the catalogue filename.
+
+    ``RetentionPlan.as_dict()`` includes each candidate's ``filename``, and that
+    value has been validated only as *a non-empty string*. It has not passed the
+    path/filename safety boundary, because that boundary belongs to destructive
+    execution and running it here would make a preview disagree with the pure
+    policy selection it is supposed to report.
+
+    So a damaged or hand-edited catalogue can hold a "filename" like
+    ``/var/lib/garden-observatory/db/mgo.db`` or ``../../private/file.jpg``, and
+    publishing it would put that string into operator output that the contract
+    says carries no path of any kind.
+
+    The filename is therefore **omitted**, not sanitised and not reduced to a
+    basename: anything derived from an unverified value is still derived from it,
+    and the capture id identifies the record completely. The candidate keeps
+    every fact a planning decision actually rests on.
+
+    This is an output projection only. It re-implements no policy and no
+    catalogue interpretation, and ``RetentionCandidate.filename`` is untouched --
+    destructive execution still needs it, and still validates it before unlink.
+    """
+    payload = plan.as_dict()
+    payload["candidates"] = [
+        {key: value for key, value in candidate.items() if key != "filename"}
+        for candidate in payload["candidates"]
+    ]
+    payload["retention_enabled"] = retention_enabled
+    return payload
+
+
 def _plan(arguments: argparse.Namespace, stream: IO[str]) -> int:
     """Show what the configured policy would select. Mutates nothing.
 
@@ -216,8 +307,7 @@ def _plan(arguments: argparse.Namespace, stream: IO[str]) -> int:
     except RetentionRepositoryError as exc:
         raise _Refusal(CATALOGUE_REFUSAL, EXIT_SCHEMA) from exc
 
-    payload = plan.as_dict()
-    payload["retention_enabled"] = config.retention.enabled
+    payload = _operator_plan(plan, retention_enabled=config.retention.enabled)
     _emit(payload, stream)
     return EXIT_SUCCESS
 
@@ -377,6 +467,7 @@ __all__ = [
     "EXIT_SCHEMA",
     "EXIT_SUCCESS",
     "EXIT_UNEXPECTED",
+    "REFUSAL_RELATIVE_CONFIG",
     "build_parser",
     "main",
 ]

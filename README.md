@@ -832,14 +832,19 @@ mgo-retention run-once --execute
 `plan` is **read-only** — and read-only at the SQLite boundary, not merely in
 intent: it opens the database with `mode=ro`, so it cannot create a missing
 database, create a missing directory or change a database's journal mode. It
-creates no lifecycle row, deletes no file, records no observation and moves no
-counter, and it works whether or not retention is enabled.
+issues no SQL write, creates no lifecycle row, deletes no file, records no
+observation and moves no counter, and it works whether or not retention is
+enabled. (Reading a live WAL database does let SQLite use its own `-shm`
+shared-memory index; that is SQLite's documented read mechanism, and no
+MGO-managed state changes.) Its output omits the catalogue `filename`, which has
+been validated only as a string and could itself be a path.
 
 `run-once --execute` can permanently delete capture media and is gated three
-ways: the exact `--execute` flag, `MGO_CONFIG_PATH` naming the configuration to
-act on, and `retention.enabled = true` in that configuration. It executes
-**exactly one** run and exits — even when the result reports that more eligible
-work remains, because a second run is a second operator decision.
+ways: the exact `--execute` flag and an **absolute** `MGO_CONFIG_PATH` — both
+checked before anything is opened — then `retention.enabled = true`, which can
+only be established once that configuration has been read. It executes **exactly
+one** run and exits, even when the result reports that more eligible work
+remains, because a second run is a second operator decision.
 
 Neither command applies migrations: both refuse any database not already at
 schema version 3, so inspecting retention can never silently upgrade a database.
