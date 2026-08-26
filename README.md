@@ -799,7 +799,11 @@ What it does have:
   size matching the catalogue. Any failure means *do not delete*. Nothing is ever
   removed recursively, and an untracked file in the capture folder is never
   touched;
-- a **dry run** that reads and reports and mutates nothing at all;
+- a **dry run** that reads and reports and changes no MGO-managed state
+  — no SQL write, no lifecycle row, no deletion, no observation, no
+  database or directory creation and no journal-mode change (reading a live
+  WAL database does let SQLite use its own `-shm` index, which is SQLite's
+  read mechanism rather than a change MGO makes);
 - immutable `capture_retention` observations with a bounded, fixed public error
   vocabulary carrying no paths, tracebacks or exception text.
 
@@ -840,11 +844,20 @@ MGO-managed state changes.) Its output omits the catalogue `filename`, which has
 been validated only as a string and could itself be a path.
 
 `run-once --execute` can permanently delete capture media and is gated three
-ways: the exact `--execute` flag and an **absolute** `MGO_CONFIG_PATH` — both
-checked before anything is opened — then `retention.enabled = true`, which can
-only be established once that configuration has been read. It executes **exactly
-one** run and exits, even when the result reports that more eligible work
-remains, because a second run is a second operator decision.
+ways: the exact `--execute` flag and an `MGO_CONFIG_PATH` that is **absolute as
+supplied** — both checked before anything is opened — then
+`retention.enabled = true`, which can only be established once that
+configuration has been read. *Exact* is enforced rather than intended:
+long-option abbreviation is disabled parser-wide, so `--exe` is not `--execute`.
+*As supplied* means `~` is not expanded first, because `~/mgo.toml` names a
+different file under a different account — the same context-dependence a
+relative path has. It executes **exactly one** run and exits, even when the
+result reports that more eligible work remains, because a second run is a second
+operator decision.
+
+An invalid invocation is refused with one fixed sentence on the caller's stream:
+no usage dump, and nothing the operator typed repeated back. A configuration the
+loader cannot read is an operator refusal too, never an internal failure.
 
 Neither command applies migrations: both refuse any database not already at
 schema version 3, so inspecting retention can never silently upgrade a database.

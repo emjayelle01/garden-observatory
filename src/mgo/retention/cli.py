@@ -7,6 +7,13 @@ Two subcommands, and deliberately only two:
 ``run-once``  execute exactly one bounded retention run. Potentially destructive,
               and gated three separate ways before it can remove anything.
 
+Two properties of the argument surface are part of the safety contract rather
+than presentation. Long-option **abbreviation is disabled**, so ``--execute``
+means ``--execute`` and nothing shorter authorises a deletion; and an invalid
+invocation is refused through this command's own bounded message rather than
+argparse's, which would otherwise echo the operator's own arguments -- paths
+included -- into stderr before anything could intercept them.
+
 This is the first supported way to invoke the Task 14.1 retention engine. It is
 a thin boundary: it parses arguments, checks preconditions, calls the retention
 domain service, prints one JSON document and maps the outcome to an exit status.
@@ -41,7 +48,7 @@ import sqlite3
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, NoReturn
 
 from mgo.core.config import CONFIG_PATH_ENV, MGOConfig, load_config
 from mgo.core.database import (
@@ -99,6 +106,7 @@ REFUSAL_RELATIVE_CONFIG = (
 REFUSAL_CONFIGURATION_INVALID = (
     "Refusing to run: the selected configuration could not be loaded."
 )
+REFUSAL_INVALID_ARGUMENTS = "Refusing to run: invalid command arguments."
 SCHEMA_REFUSAL = (
     "Refusing to proceed: the database is not at the schema version this build "
     f"expects ({CURRENT_SCHEMA_VERSION})."
@@ -116,6 +124,45 @@ class _Refusal(Exception):
         super().__init__(message)
         self.message = message
         self.code = code
+
+
+class _BoundedParser(argparse.ArgumentParser):
+    """An ``ArgumentParser`` with two of this command's safety rules built in.
+
+    **Abbreviation is off.** ``argparse`` accepts unambiguous prefixes of long
+    options by default, so ``--exe``, ``--exec`` and even ``--e`` were all
+    accepted as ``--execute`` -- which turned the one deliberate destructive
+    authorisation spelling into a family of them, and let a typo satisfy the
+    gate. Setting ``allow_abbrev=False`` on the top-level parser alone is not
+    enough: ``add_subparsers`` builds each subparser through this class but with
+    ``argparse``'s own constructor defaults, so the flag has to default off
+    *here*, where every parser and subparser inherits it.
+
+    **Argument errors are this command's refusals.** ``ArgumentParser.error()``
+    writes its own diagnostic -- a usage dump plus the offending argument text --
+    straight to ``sys.stderr`` and only then raises ``SystemExit``. Catching
+    ``SystemExit`` afterwards is too late: the text is already written, it names
+    whatever the operator typed (``--config /etc/garden-observatory/mgo.toml``
+    rides out verbatim), and it bypasses the stream the caller injected. Raising
+    the bounded refusal instead means one fixed sentence, on the caller's stream,
+    with nothing operator-supplied in it.
+
+    ``--help`` is untouched: it exits through ``parser.exit()``, not
+    ``error()``, and still prints the ordinary static help text successfully.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+    def error(self, message: str) -> NoReturn:
+        """Refuse with a fixed sentence instead of reporting ``message``.
+
+        ``message`` is deliberately discarded rather than wrapped or truncated:
+        it is built from the operator's own argument text, and a truncated path
+        is still a path.
+        """
+        raise _Refusal(REFUSAL_INVALID_ARGUMENTS, EXIT_REFUSED)
 
 
 def _emit(payload: dict[str, Any], stream: IO[str]) -> None:
@@ -147,13 +194,18 @@ def _load_configuration() -> MGOConfig:
     * ``TypeError`` -- a value has the wrong container type, so ``int(...)`` or
       ``float(...)`` is handed a list, or a string is subscripted as a table;
     * ``AttributeError`` -- a section is a scalar rather than a table, so
-      ``.get()`` does not exist on it.
+      ``.get()`` does not exist on it;
+    * ``OverflowError`` -- an ``int(...)`` conversion is handed a floating-point
+      infinity. TOML has a literal ``inf``, so ``collection_interval_seconds =
+      inf`` is *syntactically valid*, parses to ``float('inf')`` and reaches
+      ``int(...)``, which raises ``OverflowError``. That is not a ``ValueError``
+      subclass, so it escaped the boundary entirely.
 
-    The last two were missing, and a syntactically valid file with a wrongly
-    typed value therefore reported an *unexpected internal failure* rather than
-    the configuration problem it is. That is the wrong answer twice over: it
-    tells the operator to look at MGO instead of at their file, and it spends the
-    exit code reserved for genuine defects on an ordinary mistake.
+    Each of these was missing at some point, and a syntactically valid file with
+    a wrongly typed value therefore reported an *unexpected internal failure*
+    rather than the configuration problem it is. That is the wrong answer twice
+    over: it tells the operator to look at MGO instead of at their file, and it
+    spends the exit code reserved for genuine defects on an ordinary mistake.
 
     ``Exception`` is deliberately not caught wholesale. Turning every programmer
     defect inside the loader into "bad configuration" would hide real bugs behind
@@ -167,6 +219,7 @@ def _load_configuration() -> MGOConfig:
         KeyError,
         TypeError,
         AttributeError,
+        OverflowError,
     ) as exc:
         raise _Refusal(REFUSAL_CONFIGURATION_INVALID, EXIT_REFUSED) from exc
 
@@ -183,19 +236,31 @@ def _require_explicit_configuration() -> None:
     Requiring ``MGO_CONFIG_PATH`` makes the operator state which deployment they
     mean before anything is deleted, not after.
 
-    It must also be **absolute**. The application's own resolution rules accept a
-    relative value and resolve it against the current working directory, which is
-    correct for general configuration but too weak for this gate: the whole point
-    is that the operator has identified *one deployment*, and
-    ``MGO_CONFIG_PATH=config/mgo.toml`` names a different file after a ``cd``.
-    The same environment value would then select a different database and a
-    different capture directory to delete from.
+    It must also be **absolute as supplied**. The application's own resolution
+    rules accept a relative value and resolve it against the current working
+    directory, which is correct for general configuration but too weak for this
+    gate: the whole point is that the operator has identified *one deployment*,
+    and ``MGO_CONFIG_PATH=config/mgo.toml`` names a different file after a
+    ``cd``. The same environment value would then select a different database
+    and a different capture directory to delete from.
 
-    A relative path is refused rather than resolved on the operator's behalf.
-    Silently making it absolute would produce exactly the outcome this gate
-    exists to prevent -- a deletion against whatever that path happened to mean
-    at that moment -- while looking like it had been checked. The operator states
-    the stable identity themselves.
+    ``~`` is not expanded before that decision, and that is the whole difference
+    between a stable identity and a contextual one. ``~/mgo.toml`` is not an
+    absolute path; it is an instruction to look in *the executing account's*
+    home directory, so the same string names a different configuration under a
+    different account -- exactly the context-dependence this gate exists to
+    remove, merely a different context from the working directory. The test is
+    therefore on the value as supplied, not on what it happens to expand to for
+    whoever is running.
+
+    A relative value -- ``~`` forms included -- is refused rather than resolved
+    on the operator's behalf. Silently making it absolute would produce exactly
+    the outcome this gate exists to prevent, a deletion against whatever that
+    path happened to mean at that moment, while looking like it had been
+    checked. The operator states the stable identity themselves.
+
+    An already-expanded absolute path is of course accepted: a home directory is
+    not the problem, the *deferred interpretation* of one is.
 
     This is a CLI-only destructive gate. It changes nothing about
     :func:`~mgo.core.config.resolve_config_path`, and nothing about ``plan``,
@@ -207,7 +272,7 @@ def _require_explicit_configuration() -> None:
 
     # The supplied value is never echoed: it is operator-supplied text that may
     # itself be a path worth keeping out of a forwarded log.
-    if not Path(raw.strip()).expanduser().is_absolute():
+    if not Path(raw.strip()).is_absolute():
         raise _Refusal(REFUSAL_RELATIVE_CONFIG, EXIT_REFUSED)
 
 
@@ -289,7 +354,17 @@ def _operator_plan(
 
 
 def _plan(arguments: argparse.Namespace, stream: IO[str]) -> int:
-    """Show what the configured policy would select. Mutates nothing.
+    """Show what the configured policy would select.
+
+    No MGO-managed state changes. Specifically: no SQL write, no lifecycle row
+    created or modified, no media deleted, no observation recorded, no database
+    or parent directory created, and no journal-mode change. The one thing not
+    claimed is that no byte moves on disk -- reading a live WAL database
+    requires SQLite to create or use its own ``-shm`` shared-memory index, which
+    is SQLite's documented read mechanism rather than anything this command
+    chooses. ``immutable=1`` would avoid the sidecar and is deliberately not
+    used: it asserts a live database cannot change, which would licence SQLite
+    to ignore concurrent WAL state.
 
     Runs whether or not retention is enabled -- previewing a policy is how an
     operator decides whether to enable it. No filesystem validation happens
@@ -315,11 +390,20 @@ def _plan(arguments: argparse.Namespace, stream: IO[str]) -> int:
 def _run_once(arguments: argparse.Namespace, stream: IO[str]) -> int:
     """Execute exactly one bounded retention run.
 
-    Three gates, checked before anything is opened or read:
+    Three gates, in this order:
 
-    1. the exact ``--execute`` flag;
-    2. ``MGO_CONFIG_PATH`` naming the configuration deliberately;
-    3. ``retention.enabled = true`` in that configuration.
+    1. **Gate A** -- the exact ``--execute`` flag, checked before any file is
+       read. Abbreviation is disabled parser-wide, so ``--exe`` is not it;
+    2. **Gate B** -- ``MGO_CONFIG_PATH`` set and absolute *as supplied*, also
+       checked before any file is read;
+    3. **Gate C** -- ``retention.enabled = true``, necessarily checked *after*
+       the configuration has been read, because that is where the value lives.
+
+    Gates A and B are the ones that hold before anything is opened; gate C
+    cannot be, and describing all three that way was simply untrue. Nothing
+    destructive happens in between: reading the operator's own configuration
+    file is the only step, and the database and capture directory are still
+    untouched when gate C is evaluated.
 
     Then the schema gate, then one -- exactly one -- call into the retention
     service. The result is reported and the command exits, including when it
@@ -371,8 +455,14 @@ _COMMANDS = {
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Return the argument parser. Exposed so tests can inspect the contract."""
-    parser = argparse.ArgumentParser(
+    """Return the argument parser. Exposed so tests can inspect the contract.
+
+    Every parser in the tree is a :class:`_BoundedParser`, subparsers included:
+    ``parser_class`` is passed explicitly rather than relying on
+    ``add_subparsers`` defaulting it to ``type(self)``, so the guarantee survives
+    someone later constructing the subparsers differently.
+    """
+    parser = _BoundedParser(
         prog=COMMAND_NAME,
         description=(
             "Preview or execute capture-media retention. 'plan' is read-only. "
@@ -386,7 +476,9 @@ def build_parser() -> argparse.ArgumentParser:
             "to choose the configuration a destructive run acts on."
         ),
     )
-    subcommands = parser.add_subparsers(dest="command", metavar="COMMAND")
+    subcommands = parser.add_subparsers(
+        dest="command", metavar="COMMAND", parser_class=_BoundedParser
+    )
     subcommands.required = True
 
     subcommands.add_parser(
@@ -441,9 +533,18 @@ def main(
     parser = build_parser()
     try:
         arguments = parser.parse_args(argv)
+    except _Refusal as refusal:
+        # An invalid invocation. The parser raised this instead of writing
+        # argparse's own diagnostic, so the offending argument text was never
+        # produced at all, and the refusal goes to the caller's stream rather
+        # than to the process's ``sys.stderr`` behind the caller's back.
+        err.write(refusal.message + "\n")
+        return refusal.code
     except SystemExit as exc:
-        # argparse already reported the usage problem; map its status onto this
-        # command's refusal code so an operator sees one vocabulary.
+        # ``--help`` exits this way, having already printed the static help
+        # text. The non-zero mapping is retained defensively: any argparse path
+        # that exits without going through ``error()`` should still land in this
+        # command's refusal vocabulary rather than escape as a traceback.
         return EXIT_SUCCESS if exc.code == 0 else EXIT_REFUSED
 
     try:
@@ -467,6 +568,8 @@ __all__ = [
     "EXIT_SCHEMA",
     "EXIT_SUCCESS",
     "EXIT_UNEXPECTED",
+    "REFUSAL_CONFIGURATION_INVALID",
+    "REFUSAL_INVALID_ARGUMENTS",
     "REFUSAL_RELATIVE_CONFIG",
     "build_parser",
     "main",

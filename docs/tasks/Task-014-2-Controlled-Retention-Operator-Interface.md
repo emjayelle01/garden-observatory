@@ -496,3 +496,218 @@ capture-preservation semantic, one service call per invocation, no looping on
 
 No new dependency, no migration, retention still disabled and `event_capture`
 still disabled in tracked configuration, and no production policy chosen.
+
+
+---
+
+## 16. Correction round 2 — destructive command boundary
+
+Independent final review accepted the architecture, the command, the read-only
+planning path and the three corrections in `aea90fa7`. Four further
+operator-boundary defects remained, plus a set of source-level contract
+statements that Task 14.2's own findings had made stale. All were corrected in a
+third normal commit on this branch; neither `2da0c17b` nor `aea90fa7` was
+amended.
+
+### 16.1 `--execute` was not actually an exact flag
+
+The documentation says "the exact `--execute` flag", "no alias", "one spelling
+is easier to audit". `argparse` accepts unambiguous prefixes of long options by
+default, and neither the parser nor its `run-once` subparser disabled it.
+
+**Reproduced** against `aea90fa7`, through real parse behaviour:
+
+```
+'--execute'  -> parsed, execute=True
+'--exe'      -> parsed, execute=True
+'--exec'     -> parsed, execute=True
+'--execut'   -> parsed, execute=True
+'--ex'       -> parsed, execute=True
+'--e'        -> parsed, execute=True
+```
+
+Every one of those satisfied Gate A and reached destructive execution. A single
+mistyped character was a destructive consent, and the one deliberate
+authorisation spelling was really six.
+
+**Corrected** with a narrow `_BoundedParser(argparse.ArgumentParser)` whose
+constructor defaults `allow_abbrev` to `False`, used for the top-level parser
+*and* passed explicitly as `parser_class` to `add_subparsers`. Setting the flag
+on the parent alone would not have been enough: `add_subparsers` builds each
+subparser through that class but with argparse's own constructor defaults, so
+the guarantee has to live in `__init__`, where every parser and subparser
+inherits it. No second destructive flag was added; `--execute` remains the only
+successful spelling.
+
+Tests exercise parse *behaviour*, not `parser.option_strings` — the defect was
+never in what the parser declared, it was in what the parser accepted. A control
+proves the same deployment, with retention enabled and eligible media, still
+deletes exactly one capture under the full spelling, so the refusals are not
+passing vacuously.
+
+### 16.2 argparse echoed private operator input
+
+Unsupported arguments went through vanilla `ArgumentParser.error()`, which
+writes its own diagnostic — a usage dump plus the offending argument text —
+straight to `sys.stderr` and only then raises `SystemExit`. Catching
+`SystemExit` afterwards is too late; the text is already out.
+
+**Reproduced.** Every hostile value rode out verbatim:
+
+```
+mgo-retention: error: unrecognized arguments: --config /etc/garden-observatory/mgo.toml
+mgo-retention: error: unrecognized arguments: --database /var/lib/garden-observatory/db/mgo.db
+mgo-retention: error: unrecognized arguments: --config ../../secret
+mgo-retention: error: argument COMMAND: invalid choice: '../../secret' ...
+```
+
+There was a second half to this, and the easier half to miss: argparse wrote to
+the process's `sys.stderr`, not to the stream passed as `cli.main(...,
+stderr=...)`. The injected stream was **empty** in every case. A test capturing
+only the injected stream would have seen an innocent-looking refusal while the
+real stderr carried the operator's path.
+
+**Corrected**: `_BoundedParser.error()` raises this command's own bounded
+refusal instead of reporting `message`, and `main()` handles a parse-time
+refusal on the caller's stream. The result is exit `2`, one fixed sentence
+(`REFUSAL_INVALID_ARGUMENTS`), no usage dump, no offending argument, no path and
+no traceback. The message is discarded rather than truncated — a truncated path
+is still a path. `Exception` is still not caught wholesale, and `--help` is
+untouched: it exits through `parser.exit()`, still succeeds and still prints the
+ordinary static help.
+
+Both streams are asserted in the tests, for hostile POSIX, traversal and
+Windows-style values across `--config`, `--database`, `--capture-root`, an
+unknown positional and an unknown subcommand.
+
+### 16.3 Valid TOML could still escape as `OverflowError`
+
+Round 1 established the loader's exception set by reading it, and still missed
+one. `parse_config_text()` converts several values through `int(...)`, and TOML
+has a literal `inf`. So:
+
+```
+collection_interval_seconds = inf   ->  OverflowError: cannot convert float infinity to integer
+isinstance(exc, ValueError)         ->  False
+caught by the round-1 boundary      ->  False
+```
+
+A syntactically valid file with an ordinary mistake in it was reported as
+`EXIT_UNEXPECTED` / exit `5`, the code reserved for genuine defects.
+
+**Corrected** by adding `OverflowError` to the explicit tuple. `Exception` is
+still not caught wholesale — the distinction between an operator's mistake and a
+program defect is the point of the boundary, and a control test proves an
+injected `RuntimeError` still exits `5`.
+
+The `inf` case joins the shared malformed-configuration matrix, so it is
+exercised by the existing exit-code, privacy and no-mutation tests as well as by
+dedicated ones. A further test asserts the *reason* the entry exists — that this
+is an `OverflowError` and not a `ValueError` — so the reasoning fails loudly if
+it ever stops being true rather than quietly becoming redundant.
+
+### 16.4 A tilde path passed the "absolute" destructive gate
+
+The round-1 gate tested `Path(raw.strip()).expanduser().is_absolute()`, so
+`~/mgo.toml` passed: it became `/home/<current-user>/mgo.toml` *before* the
+decision.
+
+**Reproduced.** `~/mgo.toml` and `~someone/mgo.toml` both passed the gate on
+`aea90fa7`, while every relative spelling was correctly refused.
+
+That is inconsistent with why Gate B exists. `~/mgo.toml` is not an absolute
+path; it is an instruction to look in the executing account's home directory, so
+the same string names a different configuration under a different account —
+exactly the context-dependence the gate removes, merely a different context from
+the working directory.
+
+**Corrected**: the destructive gate now tests the operator-supplied value as
+supplied, `Path(raw.strip()).is_absolute()`, with no expansion first. An
+already-expanded absolute path still passes: a home directory is not the
+problem, the deferred interpretation of one is.
+
+`resolve_config_path()` is unchanged and still expands `~`; `plan` still uses
+the ordinary rules; both are asserted, the latter by pointing `~` at a temporary
+deployment created by the test with `HOME`/`USERPROFILE` redirected into
+`tmp_path`, so nothing of the developer's own home is read. A further test
+asserts that these `~` values *would* have expanded to absolute paths on this
+platform — otherwise the refusals would prove nothing.
+
+### 16.5 Stale source contracts
+
+Task 14.2's findings made several developer-facing statements untrue. Corrected
+in source, without changing any Task 14.1 behaviour:
+
+* `RetentionService.dry_run()` said "Mutates nothing" and called the preview one
+  that "cannot do harm". It now claims **no MGO-managed state changes**, listed
+  as the separate facts it is made of — no SQL write, no lifecycle mutation, no
+  media deletion, no observation, no capture altered, no counter moved, no
+  database or directory creation, no journal-mode change — and states plainly
+  that SQLite may create or use its own WAL `-shm` sidecar, which is SQLite's
+  read mechanism rather than a change this code makes. `immutable=1` is
+  explicitly rejected: it asserts a live database cannot change, which would
+  licence SQLite to ignore concurrent WAL state.
+* `_plan()` said "Mutates nothing" and now uses the same precise contract.
+* `_run_once()` said "Three gates, checked before anything is opened or read",
+  which was false of gate C. It now names gate A (exact `--execute`, pre-read),
+  gate B (literal-absolute `MGO_CONFIG_PATH`, pre-read) and gate C
+  (`retention.enabled`, necessarily post-read), then the schema gate, with the
+  note that nothing destructive happens between B and C.
+* The test module labelled `retention.enabled` as Gate B and the explicit
+  configuration as Gate C — the reverse of the implementation and of the
+  accepted documentation. The labels were corrected; no test semantics changed.
+* `RetentionPlan.as_dict()` said "without media paths" while still emitting the
+  raw catalogue `filename`, which Task 14.2 proved can be path-shaped. The
+  filename stays — this round changes no Task 14.1 domain behaviour — but its
+  contract is now truthful: the absolute path is omitted, the raw filename is
+  retained for the domain model, it has not passed destructive path validation,
+  and `as_dict()` **must not** be treated as an operator-safe projection. The
+  bounded operator projection is the CLI's `_operator_plan()`.
+* `README.md` described the dry run as one that "mutates nothing at all"; it now
+  carries the same precise claim.
+
+An audit for the remaining variants — "three gates ... before anything is
+opened", "Gate B"/"Gate C", "filename" plus "safe", "without media paths" — found
+no other statement made inaccurate by these findings. Task 12, Task 13 and Task
+14.1 historical records were not touched.
+
+### 16.6 Correction-round validation
+
+| Gate | Result |
+| --- | --- |
+| `uv sync --frozen` | See the completion report |
+| `uv run ruff check .` | See the completion report |
+| `uv run mypy src` | See the completion report |
+| Focused Task 14.2 suites | See the completion report |
+| `uv run pytest` | See the completion report |
+| `uv run python scripts/dev/run-mutations.py` | See the completion report |
+| `git diff --check` | See the completion report |
+
+Four mutations were added, one per corrected executable property — abbreviation
+re-enabled, argument errors reverted to argparse's own diagnostic,
+`OverflowError` removed from the configuration boundary, and tilde expansion
+reintroduced into the destructive gate — taking the register from 250 to **254**.
+One round-1 mutation was **re-anchored** rather than dropped: it pinned the
+`expanduser()` spelling of the gate line, which this round changed, and a
+mutation whose anchor no longer applies is a mutation that has silently stopped
+testing anything.
+
+### 16.7 What the correction round did not change
+
+Two subcommands, no aliases, no scheduler, no timer, no loop, no retry, no
+destructive HTTP endpoint, no arbitrary capture-id deletion, no policy on the
+command line, no `--config`, `--database` or `--capture-root` option, no
+migration from the CLI, the exact schema-version-3 precondition, the genuinely
+read-only SQLite path for `plan`, no filesystem validation during `plan`,
+pure-policy candidate selection, the raw filename omitted from operator plan
+output, `RetentionPlan` and `RetentionCandidate` domain semantics, the Task 14.1
+deletion and recovery state machine, the `origin == "motion"` management
+boundary, manual/no-origin/unknown-origin protection, `minimum_keep_count`,
+`max_deletions_per_run`, one service run per destructive invocation, no
+automatic rerun on `more_work_remains`, the bounded destructive result fields,
+capture-row preservation and immutable retention observation semantics.
+
+No new dependency, no migration, retention still disabled and `event_capture`
+still disabled in tracked configuration, no production retention bound chosen,
+no Raspberry Pi access, no deployment, no production change, no production media
+deleted, and Task 14.3 not started.

@@ -227,11 +227,25 @@ class RetentionPlan:
     byte_target_satisfiable: bool
 
     def as_dict(self) -> dict[str, Any]:
-        """Return the plan as JSON-compatible values, without media paths.
+        """Return the plan as JSON-compatible values. Not an operator projection.
 
-        A candidate is identified by its capture id and filename. The absolute
-        path is deliberately dropped: it is needed to *delete* a file and never
-        needed to *describe* the decision.
+        The absolute path is deliberately dropped: it is needed to *delete* a
+        file and never needed to *describe* the decision. The raw catalogue
+        ``filename`` is retained, for the domain model and for callers that
+        already depend on it.
+
+        That retained filename is why this is **not** an operator-safe or public
+        projection, and must not be treated as one. It has been validated only
+        as a non-empty string; it has not passed the destructive path/filename
+        safety boundary, because that boundary belongs to execution rather than
+        to description. A damaged or hand-edited catalogue can therefore hold a
+        "filename" that is really a path -- Task 14.2 demonstrated absolute,
+        traversal and Windows-style values surviving into output.
+
+        The bounded operator projection is the ``mgo-retention`` command's own
+        ``_operator_plan()``, which omits the filename. Anything else publishing
+        a plan to an operator needs its own equivalent; this method is the
+        domain rendering, not that.
         """
         return {
             "candidates": [

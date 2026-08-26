@@ -561,8 +561,8 @@ this order:
 
 | Gate | Requirement | When it is checked |
 | --- | --- | --- |
-| A | The exact `--execute` flag. There is no `-y`, `--yes`, `--force`, `--really` or `--override`: one spelling is easier to audit. | Before anything is opened or read. |
-| B | `MGO_CONFIG_PATH` set, **absolute**, naming the configuration this run acts on. | Before anything is opened or read. |
+| A | The exact `--execute` flag — and *exact* is enforced, not merely intended. There is no `-y`, `--yes`, `--force`, `--really` or `--override`, and no abbreviation: one spelling is easier to audit. | Before anything is opened or read. |
+| B | `MGO_CONFIG_PATH` set, and **absolute as supplied**, naming the configuration this run acts on. | Before anything is opened or read. |
 | C | `retention.enabled = true` in that configuration. | After the configuration file is read — necessarily, since that is where the value lives. |
 
 Only once all three pass does the schema gate run and the database get opened.
@@ -573,21 +573,42 @@ happens in between: reading the operator's own configuration file is the only
 step, and the database and capture directory are still untouched when gate C is
 evaluated.
 
+Gate A needed help from the parser to mean what it says. `argparse` accepts
+unambiguous prefixes of long options by default, so `--exe`, `--exec`, `--execut`
+and even `--e` were all accepted as `--execute` and all reached deletion — one
+deliberate authorisation spelling had quietly become a family of them, and a
+typo was a destructive consent. Abbreviation is now disabled on every parser in
+the tree, subparsers included: setting it on the top-level parser alone is not
+enough, because `add_subparsers` builds each subparser with argparse's own
+defaults.
+
 Gate B exists because configuration identity decides *which* media is deleted.
 Without it, an operator standing in the repository could run
 `run-once --execute` and have it resolve the tracked **development**
 configuration — pointing a deletion at whichever database and capture directory
 that file happens to name.
 
-It must be **absolute**. The application's general rules resolve a relative
-`MGO_CONFIG_PATH` against the current working directory, which is fine for
-configuration at large and too weak here: `config/mgo.toml` names a different
+It must be **absolute as supplied**. The application's general rules resolve a
+relative `MGO_CONFIG_PATH` against the current working directory, which is fine
+for configuration at large and too weak here: `config/mgo.toml` names a different
 file after a `cd`, so the same environment value would select a different
-deployment to delete from. A relative value is refused rather than resolved on
-the operator's behalf — silently making it absolute would produce exactly the
-outcome the gate prevents while looking like it had been checked. This is a
-CLI-only destructive rule; it changes nothing about `resolve_config_path()` and
-nothing about `plan`, which is read-only and keeps the ordinary rules.
+deployment to delete from.
+
+`~` is not expanded before that decision, and that distinction is the whole gate.
+`~/mgo.toml` is not an absolute path — it is an instruction to look in *the
+executing account's* home directory, so the same string names a different
+configuration under a different account. Expanding it first made it look
+absolute and let it through, which is the same context-dependence the gate
+exists to remove, merely a different context from the working directory. An
+already-expanded absolute path is of course fine: a home directory is not the
+problem, the *deferred interpretation* of one is.
+
+A relative value — `~` forms included — is refused rather than resolved on the
+operator's behalf. Silently making it absolute would produce exactly the outcome
+the gate prevents while looking like it had been checked. This is a CLI-only
+destructive rule; it changes nothing about `resolve_config_path()`, which still
+expands `~` and still resolves relative values, and nothing about `plan`, which
+is read-only and keeps the ordinary rules.
 
 The command **never repeats**. When the result reports `more_work_remains`, that
 is a fact for the operator, not a trigger: a second run is a second decision.
@@ -597,6 +618,26 @@ Output is a bounded JSON result: `executed`, `enabled`, `candidate_count`,
 `deleted_count`, `bytes_reclaimed`, `recovered_count`, `more_work_remains`,
 `error_category` and `error_message`. No filename, path, raw exception or
 traceback appears in it.
+
+### A malformed configuration is the operator's, not MGO's
+
+A configuration the loader cannot turn into an `MGOConfig` is an operator
+refusal (exit `2`), never an internal failure (exit `5`). Exit `5` is reserved
+for genuine defects, and spending it on an ordinary mistake in the operator's
+own file points them at the wrong thing entirely.
+
+The boundary catches the exceptions the *existing* loader can legitimately
+raise, established by reading it rather than guessing: `OSError`, `ValueError`
+(which covers `TOMLDecodeError`), `KeyError`, `TypeError`, `AttributeError` and
+`OverflowError`. The last is the least obvious and the reason it is listed: TOML
+has a literal `inf`, so `collection_interval_seconds = inf` is *syntactically
+valid*, parses to a floating-point infinity and reaches `int(...)`, which raises
+`OverflowError` — and that is not a `ValueError` subclass, so it escaped
+entirely.
+
+`Exception` is deliberately **not** caught wholesale. Turning every programmer
+defect inside the loader into "bad configuration" would hide real bugs behind a
+message blaming the operator, so a genuine internal defect still exits `5`.
 
 ### The schema gate
 
@@ -609,6 +650,25 @@ a silent upgrade would be most tempting and least safe.
 Both commands therefore require the database to already record exactly schema
 version **3**. Every other case is refused identically and the database is left
 untouched: lower, higher, unversioned, missing and unreadable.
+
+### An invalid invocation is refused without repeating it
+
+`argparse`'s own `error()` writes a usage dump *plus the offending argument text*
+straight to `sys.stderr`, and only then raises `SystemExit`. Catching
+`SystemExit` afterwards is too late: the text has already been written, it names
+whatever the operator typed — `--config /etc/garden-observatory/mgo.toml` rode
+out verbatim — and it goes to the process's stderr rather than to the stream the
+caller asked for, so a test capturing the injected stream would have seen an
+innocent-looking empty refusal.
+
+Invalid arguments are therefore refused through this command's own boundary: one
+fixed sentence, on the caller's stream, exit `2`, no usage dump, and nothing
+operator-supplied in it. The offending text is discarded rather than truncated —
+a truncated path is still a path.
+
+`--help` is untouched. It exits through `parser.exit()` rather than `error()`,
+still succeeds, and still prints the ordinary help; its text is static, so there
+is nothing in it to bound.
 
 ### No policy on the command line
 
@@ -628,7 +688,7 @@ out of scope.
 | Code | Meaning |
 | --- | --- |
 | `0` | Completed successfully. |
-| `2` | Operator or configuration refusal — missing `--execute`, retention disabled, `MGO_CONFIG_PATH` unset or relative, a malformed configuration file, invalid arguments. |
+| `2` | Operator or configuration refusal — missing or abbreviated `--execute`, retention disabled, `MGO_CONFIG_PATH` unset or not absolute as supplied (`~` included), a malformed configuration file, invalid arguments. |
 | `3` | Database or schema precondition refused. |
 | `4` | The run completed but stopped on a bounded retention error category. |
 | `5` | Unexpected failure, reduced to one fixed sentence. |

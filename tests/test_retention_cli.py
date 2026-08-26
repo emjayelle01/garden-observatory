@@ -2,9 +2,16 @@
 
 The command is the first supported way to invoke the retention engine, so what
 matters most is what it *refuses*. Three gates stand between an operator and a
-deletion -- the explicit ``--execute`` flag, an explicitly named configuration,
-and ``retention.enabled`` -- and a fourth refuses any database that is not
-already at the expected schema version, because this command must never migrate.
+deletion, and they are named here in the order the code checks them:
+
+* **Gate A** -- the exact ``--execute`` flag, before any file is read;
+* **Gate B** -- ``MGO_CONFIG_PATH`` set and absolute as supplied, also before
+  any file is read;
+* **Gate C** -- ``retention.enabled``, necessarily after the configuration has
+  been read, because that is where the value lives.
+
+A fourth gate refuses any database that is not already at the expected schema
+version, because this command must never migrate.
 
 Every destructive test operates on a temporary database and a temporary capture
 directory created by the test itself. No Raspberry Pi, no real capture
@@ -15,6 +22,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -562,7 +570,7 @@ def test_a_malformed_catalogue_is_refused_safely(
 def test_run_once_without_execute_refuses_before_any_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Gate A. The flag is required and has no alias."""
+    """Gate A. The flag is required, and has no alias and no abbreviation."""
 
     def _explode(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("run-once unlinked without --execute")
@@ -584,7 +592,11 @@ def test_run_once_without_execute_refuses_before_any_mutation(
 def test_run_once_with_retention_disabled_refuses_before_any_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Gate B. The flag alone is not enough; configuration must agree."""
+    """Gate C. The flag alone is not enough; the configuration must agree.
+
+    Checked after the configuration is read, because ``retention.enabled`` is a
+    value inside it. Nothing destructive happens in between.
+    """
 
     def _explode(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("run-once unlinked while retention was disabled")
@@ -604,7 +616,7 @@ def test_run_once_with_retention_disabled_refuses_before_any_mutation(
 def test_run_once_without_an_explicit_configuration_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Gate C. A destructive run must name the deployment it acts on.
+    """Gate B. A destructive run must name the deployment it acts on.
 
     Without this, an operator standing in the repository could run
     ``run-once --execute`` and have it resolve the tracked *development*
@@ -1221,6 +1233,14 @@ _MALFORMED_CONFIGS = {
     ),
     # AttributeError: a section is a scalar, so .get() does not exist on it.
     "wrong section shape": 'health = "not-a-table"\n' + _VALID_PREFIX,
+    # OverflowError: int() is handed a floating-point infinity. TOML has a
+    # literal inf, so this file is *syntactically valid* -- and OverflowError is
+    # not a ValueError subclass, so it escaped the boundary entirely.
+    "overflowing value": _VALID_PREFIX
+    + _VALID_HEALTH.replace(
+        "collection_interval_seconds = 60",
+        "collection_interval_seconds = inf",
+    ),
     # ValueError: a validator rejects an otherwise well-typed value.
     "rejected value": _VALID_PREFIX
     + _VALID_HEALTH.replace(
@@ -1266,6 +1286,7 @@ def test_a_malformed_configuration_refusal_leaks_nothing(
         "AttributeError",
         "KeyError",
         "ValueError",
+        "OverflowError",
         "TOMLDecodeError",
         "Traceback",
         "not-a-table",
@@ -1500,3 +1521,494 @@ def test_the_general_configuration_resolver_is_unchanged(
 
     assert resolved.is_absolute()
     assert resolved == tmp_path / "relative" / "mgo.toml"
+
+
+# --- the execute flag is exact (correction round 2) -------------------------
+#
+# argparse accepts unambiguous prefixes of long options by default, so the one
+# deliberate destructive authorisation spelling was really a family of them:
+# --exe, --exec, --execut and even --e all satisfied Gate A and reached
+# deletion. A flag that a typo can produce is not an authorisation.
+
+
+_ABBREVIATIONS = ["--exe", "--exec", "--execut", "--e", "--ex"]
+
+
+def _forbid_everything(monkeypatch: pytest.MonkeyPatch, why: str) -> None:
+    """Make configuration, schema, catalogue and unlink all fatal to touch."""
+
+    def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(why)
+
+    monkeypatch.setattr(cli, "load_config", _explode)
+    monkeypatch.setattr(cli, "read_schema_version", _explode)
+    monkeypatch.setattr(
+        cli.RetentionRepository, "read_lifecycle_records", _explode
+    )
+    monkeypatch.setattr(
+        cli.RetentionRepository, "list_lifecycle_records", _explode
+    )
+    monkeypatch.setattr(service_module, "_unlink", _explode)
+
+
+def test_the_exact_execute_flag_is_accepted_by_the_parser() -> None:
+    """The control, read off real parse behaviour rather than a declaration."""
+    arguments = cli.build_parser().parse_args(["run-once", "--execute"])
+
+    assert arguments.command == "run-once"
+    assert arguments.execute is True
+
+
+@pytest.mark.parametrize("spelling", _ABBREVIATIONS)
+def test_an_abbreviated_execute_flag_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
+) -> None:
+    """No prefix of ``--execute`` authorises anything.
+
+    Exercised through a real invocation, not by inspecting
+    ``parser.option_strings``: the defect was never in what the parser declared,
+    it was in what the parser *accepted*.
+    """
+    deployment = _Deployment(tmp_path, enabled=True)
+    media = deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+
+    code, payload, stderr = _run(
+        deployment, ["run-once", spelling], monkeypatch
+    )
+
+    assert code == cli.EXIT_REFUSED
+    assert payload == {}
+    assert stderr.strip() == cli.REFUSAL_INVALID_ARGUMENTS
+    assert media.exists()
+    assert deployment.lifecycle() == {}
+    assert list_observations(deployment.database_path) == []
+
+
+@pytest.mark.parametrize("spelling", _ABBREVIATIONS)
+def test_an_abbreviated_flag_is_refused_before_anything_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
+) -> None:
+    """Gate A holds at the parser, ahead of every other moving part."""
+    _forbid_everything(monkeypatch, f"{spelling} reached past the parser")
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-old")
+
+    code, _, _ = _run(deployment, ["run-once", spelling], monkeypatch)
+
+    assert code == cli.EXIT_REFUSED
+
+
+def test_an_enabled_policy_still_deletes_nothing_for_an_abbreviation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Everything else is satisfied, so only the spelling can be doing this.
+
+    A refusal proves nothing if the run would have been a no-op anyway. This
+    deployment has retention enabled, an absolute configuration path and an
+    eligible capture -- the exact conditions under which the control below
+    deletes -- and the abbreviation alone stops it.
+    """
+    deployment = _Deployment(tmp_path, enabled=True)
+    media = deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+
+    code, _, _ = _run(deployment, ["run-once", "--exec"], monkeypatch)
+
+    assert code == cli.EXIT_REFUSED
+    assert media.exists()
+    assert media.read_bytes() == PAYLOAD
+    assert deployment.lifecycle() == {}
+    assert deployment.capture_ids() == {"cap-old", "cap-new"}
+
+
+def test_the_exact_flag_still_performs_one_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The paired control: the same deployment, the full spelling, one delete."""
+    deployment = _Deployment(tmp_path, enabled=True)
+    media = deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+
+    code, payload, _ = _run(deployment, ["run-once", "--execute"], monkeypatch)
+
+    assert code == cli.EXIT_SUCCESS
+    assert payload["deleted_count"] == 1
+    assert not media.exists()
+
+
+def test_abbreviation_is_disabled_on_every_parser_in_the_tree() -> None:
+    """Including the subparsers, which argparse would otherwise default back on.
+
+    ``allow_abbrev=False`` on the parent alone is not enough: ``add_subparsers``
+    constructs each subparser with argparse's own defaults, so a subparser could
+    happily accept ``--exe`` under a parent that would not.
+    """
+    parser = cli.build_parser()
+
+    assert parser.allow_abbrev is False
+
+    subparsers = [
+        action
+        for action in parser._subparsers._group_actions
+        if hasattr(action, "choices")
+    ]
+    children = [
+        child
+        for action in subparsers
+        for child in action.choices.values()  # type: ignore[union-attr]
+    ]
+
+    assert children
+    for child in children:
+        assert child.allow_abbrev is False
+
+
+# --- an invalid invocation is refused without echoing it (round 2) ----------
+#
+# ArgumentParser.error() writes a usage dump plus the offending argument text
+# straight to sys.stderr and only then raises SystemExit, so catching SystemExit
+# afterwards was too late -- "--config /etc/garden-observatory/mgo.toml" had
+# already been published, and to a stream the caller never chose.
+
+
+_HOSTILE_ARGUMENTS = {
+    "posix absolute": "/var/lib/garden-observatory/db/mgo.db",
+    "posix configuration": "/etc/garden-observatory/mgo.toml",
+    "traversal": "../../secret",
+    "windows absolute": "C:\\sensitive\\secret.db",
+}
+
+
+def _invalid_invocations(secret: str) -> list[list[str]]:
+    """Every shape of invalid invocation that can carry operator text."""
+    return [
+        ["run-once", "--execute", "--config", secret],
+        ["run-once", "--execute", "--database", secret],
+        ["run-once", "--execute", "--capture-root", secret],
+        ["plan", secret],
+        [secret],
+    ]
+
+
+@pytest.mark.parametrize("label", sorted(_HOSTILE_ARGUMENTS))
+def test_an_invalid_invocation_never_echoes_the_operators_argument(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str
+) -> None:
+    """One fixed sentence, no usage dump, and nothing that was typed."""
+    secret = _HOSTILE_ARGUMENTS[label]
+    deployment = _Deployment(tmp_path, enabled=True)
+
+    for argv in _invalid_invocations(secret):
+        out, err = io.StringIO(), io.StringIO()
+        code = cli.main(argv, stdout=out, stderr=err)
+        stderr = err.getvalue()
+
+        assert code == cli.EXIT_REFUSED, argv
+        assert out.getvalue() == "", argv
+        assert stderr.strip() == cli.REFUSAL_INVALID_ARGUMENTS, argv
+        assert secret not in stderr, argv
+        assert secret not in out.getvalue(), argv
+        for leak in (
+            "usage:",
+            "unrecognized arguments",
+            "invalid choice",
+            "Traceback",
+            "--config",
+            "--database",
+            "--capture-root",
+            str(deployment.database_path),
+        ):
+            assert leak not in stderr, (argv, leak)
+
+
+@pytest.mark.parametrize("label", sorted(_HOSTILE_ARGUMENTS))
+def test_a_parser_refusal_reaches_the_injected_stream_and_no_other(
+    monkeypatch: pytest.MonkeyPatch, label: str
+) -> None:
+    """The refusal goes where the caller asked, not to the process's stderr.
+
+    This is the second half of the defect and the easier half to miss. Argparse
+    writes to ``sys.stderr`` directly, so a test that captured only the injected
+    stream would have seen an empty, innocent-looking refusal while the real
+    stderr carried the operator's path. Both streams are asserted.
+    """
+    secret = _HOSTILE_ARGUMENTS[label]
+    process_stderr = io.StringIO()
+    process_stdout = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", process_stderr)
+    monkeypatch.setattr(sys, "stdout", process_stdout)
+
+    out, err = io.StringIO(), io.StringIO()
+    code = cli.main(
+        ["run-once", "--execute", "--config", secret], stdout=out, stderr=err
+    )
+
+    assert code == cli.EXIT_REFUSED
+    assert err.getvalue().strip() == cli.REFUSAL_INVALID_ARGUMENTS
+    assert process_stderr.getvalue() == ""
+    assert process_stdout.getvalue() == ""
+    assert secret not in process_stderr.getvalue()
+
+
+def test_an_invalid_invocation_deletes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal is at the parser, so nothing downstream is even reached."""
+    _forbid_everything(monkeypatch, "an invalid invocation reached the engine")
+    deployment = _Deployment(tmp_path, enabled=True)
+    media = deployment.add("cap-old")
+
+    code, _, _ = _run(
+        deployment,
+        ["run-once", "--execute", "--config", "/etc/garden-observatory/mgo.toml"],
+        monkeypatch,
+    )
+
+    assert code == cli.EXIT_REFUSED
+    assert media.exists()
+    assert deployment.lifecycle() == {}
+    assert list_observations(deployment.database_path) == []
+
+
+def test_help_still_succeeds_and_prints_the_static_help(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The bounded parser narrows ``error()`` only; ``--help`` is untouched.
+
+    Help exits through ``parser.exit()`` rather than ``error()``, and its text
+    is static -- it contains no operator input, so there is nothing to bound.
+    """
+    out, err = io.StringIO(), io.StringIO()
+
+    code = cli.main(["--help"], stdout=out, stderr=err)
+    printed = capsys.readouterr().out
+
+    assert code == cli.EXIT_SUCCESS
+    assert err.getvalue() == ""
+    assert cli.COMMAND_NAME in printed
+    assert "plan" in printed
+    assert "run-once" in printed
+
+
+# --- valid TOML can still fail conversion (correction round 2) --------------
+#
+# TOML has a literal inf, so `collection_interval_seconds = inf` parses fine and
+# then reaches int(float("inf")), which raises OverflowError -- not a ValueError
+# subclass, and so not caught by the round-1 boundary. An ordinary mistake in
+# the operator's own file was being reported as an MGO defect.
+
+
+_OVERFLOWING_CONFIG_FIELD = "collection_interval_seconds"
+
+
+def test_an_infinite_integer_field_is_an_overflow_not_a_value_error() -> None:
+    """Why ``OverflowError`` belongs at the boundary, stated as a fact.
+
+    If this ever becomes a ``ValueError`` the extra entry is redundant rather
+    than wrong -- but the reasoning behind it should fail loudly, not quietly
+    stop being true.
+    """
+    from mgo.core.config import parse_config_text
+
+    text = _MALFORMED_CONFIGS["overflowing value"]
+    assert f"{_OVERFLOWING_CONFIG_FIELD} = inf" in text
+
+    with pytest.raises(OverflowError) as caught:
+        parse_config_text(text)
+
+    assert not isinstance(caught.value, ValueError)
+
+
+@pytest.mark.parametrize("command", [["plan"], ["run-once", "--execute"]])
+def test_an_overflowing_configuration_value_is_an_operator_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """Exit 2 with the fixed sentence, and nothing of the file in it."""
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.rewrite_config(_MALFORMED_CONFIGS["overflowing value"])
+
+    code, _, stderr = _run(deployment, command, monkeypatch)
+
+    assert code == cli.EXIT_REFUSED
+    assert stderr.strip() == cli.REFUSAL_CONFIGURATION_INVALID
+    for leak in (
+        "OverflowError",
+        "inf",
+        "Traceback",
+        _OVERFLOWING_CONFIG_FIELD,
+        str(deployment.config_path),
+        str(deployment.database_path),
+        str(deployment.captures),
+    ):
+        assert leak not in stderr
+
+
+def test_an_overflowing_configuration_value_mutates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A destructive invocation against it touches no media and no row."""
+
+    def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("an overflowing configuration reached the filesystem")
+
+    monkeypatch.setattr(service_module, "_unlink", _explode)
+    deployment = _Deployment(tmp_path, enabled=True)
+    media = deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+    before = deployment.capture_ids()
+    deployment.rewrite_config(_MALFORMED_CONFIGS["overflowing value"])
+
+    code, _, _ = _run(deployment, ["run-once", "--execute"], monkeypatch)
+
+    assert code == cli.EXIT_REFUSED
+    assert media.exists()
+    assert deployment.lifecycle() == {}
+    assert list_observations(deployment.database_path) == []
+    assert deployment.capture_ids() == before
+
+
+# --- the destructive gate wants a literal absolute path (round 2) ----------
+#
+# "~/mgo.toml" is not an absolute path. It is an instruction to look in the
+# executing account's home directory, so the same string names a different
+# configuration under a different account -- the same context-dependence the
+# gate exists to remove, merely a different context from the working directory.
+# Expanding it before the absolute test let it through.
+
+
+_TILDE_PATHS = ["~/mgo.toml", "~someone/mgo.toml", "~/deploy/mgo.toml"]
+
+
+@pytest.mark.parametrize("value", _TILDE_PATHS)
+def test_a_tilde_configuration_path_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """A home-relative value does not identify one deployment either."""
+    deployment = _Deployment(tmp_path, enabled=True)
+    media = deployment.add("cap-old")
+    monkeypatch.setenv(CONFIG_PATH_ENV, value)
+
+    out, err = io.StringIO(), io.StringIO()
+    code = cli.main(["run-once", "--execute"], stdout=out, stderr=err)
+
+    assert code == cli.EXIT_REFUSED
+    assert err.getvalue().strip() == cli.REFUSAL_RELATIVE_CONFIG
+    assert media.exists()
+    assert deployment.lifecycle() == {}
+    assert list_observations(deployment.database_path) == []
+
+
+@pytest.mark.parametrize("value", _TILDE_PATHS)
+def test_a_tilde_path_would_otherwise_have_expanded_to_an_absolute_one(
+    value: str,
+) -> None:
+    """The defect restated as a fact, so the refusal above cannot be vacuous.
+
+    If ``expanduser()`` stopped producing an absolute path on this platform the
+    old gate would have refused anyway, and the regression tests would be
+    proving nothing.
+    """
+    assert not Path(value).is_absolute()
+    assert Path(value).expanduser().is_absolute()
+
+
+@pytest.mark.parametrize("value", _TILDE_PATHS)
+def test_the_tilde_refusal_happens_before_anything_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """No configuration read, no schema read, no catalogue read, no unlink."""
+    _forbid_everything(monkeypatch, f"{value} reached past the gate")
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-old")
+    monkeypatch.setenv(CONFIG_PATH_ENV, value)
+
+    out, err = io.StringIO(), io.StringIO()
+
+    assert (
+        cli.main(["run-once", "--execute"], stdout=out, stderr=err)
+        == cli.EXIT_REFUSED
+    )
+
+
+@pytest.mark.parametrize("value", _TILDE_PATHS)
+def test_the_tilde_refusal_does_not_echo_the_supplied_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """Operator-supplied text, including a home directory, is not repeated."""
+    _Deployment(tmp_path, enabled=True)
+    monkeypatch.setenv(CONFIG_PATH_ENV, value)
+
+    out, err = io.StringIO(), io.StringIO()
+    cli.main(["run-once", "--execute"], stdout=out, stderr=err)
+
+    assert value not in err.getvalue()
+    assert str(Path(value).expanduser()) not in err.getvalue()
+    assert str(Path.home()) not in err.getvalue()
+
+
+def test_a_literal_absolute_path_still_executes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: a real absolute path is what the gate wants, and it runs.
+
+    ``tmp_path`` is absolute on whichever platform this runs on, which is the
+    point -- a genuinely already-expanded path passes, so the correction refuses
+    deferred interpretation rather than home directories.
+    """
+    deployment = _Deployment(tmp_path, enabled=True)
+    old = deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+    assert deployment.config_path.is_absolute()
+    assert "~" not in str(deployment.config_path)
+
+    code, payload, _ = _run(deployment, ["run-once", "--execute"], monkeypatch)
+
+    assert code == cli.EXIT_SUCCESS
+    assert payload["deleted_count"] == 1
+    assert not old.exists()
+
+
+def test_the_general_resolver_still_expands_a_tilde(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``resolve_config_path`` is untouched: the stricter rule is CLI-only.
+
+    The application at large may keep expanding ``~``; it is only the
+    destructive gate that needs an identity it cannot reinterpret.
+    """
+    from mgo.core.config import resolve_config_path
+
+    monkeypatch.setenv(CONFIG_PATH_ENV, "~/mgo.toml")
+
+    resolved = resolve_config_path()
+
+    assert resolved.is_absolute()
+    assert "~" not in str(resolved)
+    assert resolved == (Path.home() / "mgo.toml").resolve()
+
+
+def test_plan_still_accepts_a_tilde_configuration_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``plan`` is read-only and keeps the ordinary resolution rules.
+
+    Proven by pointing ``~`` at a real deployment: the home directory is moved
+    to ``tmp_path`` for the duration, so the expansion resolves to a temporary
+    configuration this test created and to nothing of the user's own.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    deployment = _Deployment(home, enabled=True)
+    deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv(CONFIG_PATH_ENV, "~/mgo.toml")
+    assert Path("~/mgo.toml").expanduser() == deployment.config_path
+
+    out, err = io.StringIO(), io.StringIO()
+    code = cli.main(["plan"], stdout=out, stderr=err)
+
+    assert code == cli.EXIT_SUCCESS
+    assert json.loads(out.getvalue())["candidate_count"] == 1

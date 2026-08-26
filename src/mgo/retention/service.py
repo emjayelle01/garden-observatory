@@ -286,21 +286,35 @@ class RetentionService:
         return self._state.snapshot()
 
     def dry_run(self) -> RetentionPlan:
-        """Return what the policy would do right now. Mutates nothing.
+        """Return what the policy would do right now. No MGO-managed state changes.
 
         Reads the catalogue, evaluates the policy and reports the candidates,
-        the projected reclaim and whether the byte target is reachable. It
-        creates no lifecycle row, modifies none, deletes no file, records no
-        observation, alters no capture and moves no counter.
+        the projected reclaim and whether the byte target is reachable.
+
+        The claim, stated as the separate facts it is made of: no SQL write, no
+        lifecycle row created or modified, no media deleted, no observation
+        recorded, no capture altered, no counter moved, no database or parent
+        directory created, and no journal-mode change.
+
+        What is deliberately *not* claimed is that nothing on the filesystem
+        moves. A database in WAL mode cannot be read at all -- even read-only,
+        even with ``mode=ro`` -- without SQLite's ``-shm`` shared-memory index,
+        so SQLite may create or use that sidecar. That is SQLite's documented
+        read mechanism, not a change this code makes, and the earlier wording
+        ("mutates nothing") papered over the difference. ``immutable=1`` would
+        avoid the sidecar and is deliberately not used: it asserts the file
+        cannot change, which is untrue of a live database and would licence
+        SQLite to ignore concurrent WAL state. Reading a live database through
+        semantics that may miss committed data is the worse trade.
 
         Deliberately available whether or not retention is enabled: previewing a
         policy is how an operator decides whether to enable it, and a read-only
-        preview cannot do harm from either side of that switch.
+        preview is safe from either side of that switch.
 
         The catalogue is read through the repository's genuinely read-only path,
         not the ordinary read-write one. That distinction is the difference
-        between a preview that mutates nothing and a preview that quietly creates
-        a database, creates a directory, or switches a database's journal mode --
+        between the guarantee above and a preview that quietly creates a
+        database, creates a directory, or switches a database's journal mode --
         all of which the read-write helper will do.
         """
         catalogue = self._repository.read_lifecycle_records()
