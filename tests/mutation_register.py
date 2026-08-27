@@ -2593,12 +2593,16 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'the-preview-publishes-the-media-path',
         RETENTION_CLI,
-        '    payload = plan.as_dict()',
-        '    payload = plan.as_dict()\n'
+        # Anchored *after* the allow-list projection, deliberately. Injecting
+        # the path before it is now a no-op -- the projection drops anything
+        # it was not told to publish -- so mutating there would prove the
+        # opposite of what this entry is for.
+        '    payload["retention_enabled"] = retention_enabled',
         '    for _entry, _candidate in zip(\n'
         '        payload["candidates"], plan.candidates, strict=True\n'
         '    ):\n'
-        '        _entry["absolute_path"] = _candidate.absolute_path',
+        '        _entry["absolute_path"] = _candidate.absolute_path\n'
+        '    payload["retention_enabled"] = retention_enabled',
         'plan_leaks_no_path_of_any_kind or plan_output_has_a_deterministic_shape',
         'Absolute media paths enter the operator-facing JSON.',
         suite=RETENTION_CLI_SUITE,
@@ -2607,7 +2611,7 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'the-operator-plan-republishes-the-raw-filename',
         RETENTION_CLI,
-        '        {key: value for key, value in candidate.items() if key != "filename"}',
+        '        {field: candidate[field] for field in _OPERATOR_CANDIDATE_FIELDS}',
         '        dict(candidate)',
         'a_hostile_catalogue_filename_never_reaches_operator_output',
         'An unverified catalogue path is published in operator output.',

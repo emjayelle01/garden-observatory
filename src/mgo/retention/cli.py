@@ -319,6 +319,28 @@ def _build_service(config: MGOConfig) -> RetentionService:
     )
 
 
+#: The only candidate fields the operator command publishes, listed in the
+#: order it builds them.
+#:
+#: An **allow-list**, deliberately, rather than a filename deny-list. A
+#: deny-list publishes everything it has not been told to withhold, so a field
+#: added to :class:`~mgo.retention.models.RetentionCandidate` later reaches
+#: operator output by default -- and whoever adds it has to remember, a second
+#: time and in a different file, that this projection exists. An allow-list
+#: makes silence the default: a new field is published only when someone
+#: decides to publish it here.
+#:
+#: JSON output is emitted with sorted keys regardless, so this order governs
+#: construction rather than presentation; it is fixed so the projection is
+#: deterministic either way.
+_OPERATOR_CANDIDATE_FIELDS = (
+    "capture_id",
+    "captured_at",
+    "filesize_bytes",
+    "policy_reason",
+)
+
+
 def _operator_plan(
     plan: RetentionPlan, *, retention_enabled: bool
 ) -> dict[str, Any]:
@@ -340,13 +362,27 @@ def _operator_plan(
     and the capture id identifies the record completely. The candidate keeps
     every fact a planning decision actually rests on.
 
+    It is omitted by *not being selected*, not by being removed. The projection
+    names the fields it publishes -- :data:`_OPERATOR_CANDIDATE_FIELDS` -- so
+    anything else in ``as_dict()`` is dropped whether or not this code has heard
+    of it. The earlier spelling excluded ``"filename"`` by name, which meant a
+    path-bearing field added to the domain model later would have been published
+    by default, and the omission would have had to be remembered again in
+    another file. Here the default is silence.
+
+    A *missing* safe field is a different matter and is deliberately not
+    tolerated: indexing raises ``KeyError``, which reaches
+    :data:`EXIT_UNEXPECTED` as the internal defect it is. Quietly emitting a
+    short candidate would hide a real bug behind output that still looked
+    plausible.
+
     This is an output projection only. It re-implements no policy and no
     catalogue interpretation, and ``RetentionCandidate.filename`` is untouched --
     destructive execution still needs it, and still validates it before unlink.
     """
     payload = plan.as_dict()
     payload["candidates"] = [
-        {key: value for key, value in candidate.items() if key != "filename"}
+        {field: candidate[field] for field in _OPERATOR_CANDIDATE_FIELDS}
         for candidate in payload["candidates"]
     ]
     payload["retention_enabled"] = retention_enabled

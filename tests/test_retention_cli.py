@@ -23,6 +23,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,7 @@ from mgo.core.database import (
     database_connection,
 )
 from mgo.core.observations import list_observations
+from mgo.retention.models import RetentionPlan
 
 NOW = datetime.now(UTC)
 PAYLOAD = b"jpeg-bytes-stand-in"
@@ -1036,14 +1038,50 @@ def test_the_database_is_never_migrated_by_the_command() -> None:
 # put that string into operator output the contract says carries none.
 
 #: Filenames the capture pipeline would never write, which a damaged or
-#: hand-edited catalogue can nonetheless contain.
+#: hand-edited catalogue can nonetheless contain. The Windows and UNC forms are
+#: the ones that matter most to the *checking*: their backslashes are doubled in
+#: rendered JSON, so a substring search of the document misses them entirely.
 HOSTILE_FILENAMES = [
     "/var/lib/garden-observatory/db/mgo.db",
     "../../secret.jpg",
     "C:\\sensitive\\secret.jpg",
+    "\\\\server\\share\\private\\secret.jpg",
+    "~/private/secret.jpg",
     "/etc/garden-observatory/mgo.toml",
     "../../../captures/private.jpg",
 ]
+
+
+def _decoded_strings(value: Any) -> Iterator[str]:
+    """Yield every mapping key and every string scalar in a *decoded* value.
+
+    Recursive, and deliberately over-inclusive: mapping keys, mapping values and
+    list elements at any depth. The point is to search the decoded structure,
+    where a Windows or UNC path is an ordinary string, rather than the rendered
+    document, where its backslashes are doubled and a substring search silently
+    finds nothing.
+    """
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield key
+            yield from _decoded_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _decoded_strings(item)
+    elif isinstance(value, str):
+        yield value
+
+
+def _assert_absent_from_decoded(payload: Any, hostile: str) -> None:
+    """Assert ``hostile`` occurs nowhere in the decoded structure.
+
+    As an exact value *and* as a substring, in keys as well as values, because a
+    leak does not have to arrive whole or under the key it came from.
+    """
+    strings = list(_decoded_strings(payload))
+    assert strings, "the walk found nothing to inspect, so it proves nothing"
+    for text in strings:
+        assert hostile not in text, (hostile, text)
 
 
 def test_ordinary_plan_output_has_no_filename_key(
@@ -1071,12 +1109,18 @@ def test_ordinary_plan_output_has_no_filename_key(
 def test_a_hostile_catalogue_filename_never_reaches_operator_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hostile: str
 ) -> None:
-    """The raw string appears nowhere in stdout or stderr.
+    """The raw string appears nowhere in the decoded output, or in stderr.
 
-    Checked against the decoded JSON as well as the raw text: a Windows-style
-    filename is backslash-escaped on the way out, so a naive substring search of
-    the rendered document would miss a leak that ``json.loads`` recovers
-    perfectly.
+    The decoded structure is what is searched, recursively, through
+    :func:`_assert_absent_from_decoded`. That distinction is the whole test: a
+    Windows or UNC filename is backslash-escaped on the way out, so a substring
+    search of the *rendered* document misses a leak that is plainly there once
+    decoded. An earlier version of this test tried to close that gap with
+    ``json.dumps(json.loads(rendered))``, which re-encodes to the identical
+    string and therefore repeated the same blind spot -- see
+    ``test_the_decoded_walk_catches_what_a_rendered_search_misses``.
+
+    The raw text is still checked as well, for the values where it does work.
     """
     deployment = _Deployment(tmp_path, enabled=True)
     deployment.add("cap-hostile", filename=hostile)
@@ -1085,13 +1129,9 @@ def test_a_hostile_catalogue_filename_never_reaches_operator_output(
     code, payload, stderr = _run(deployment, ["plan"], monkeypatch)
 
     assert code == cli.EXIT_SUCCESS
-    rendered = json.dumps(payload)
-    assert hostile not in rendered
+    assert hostile not in json.dumps(payload)
     assert hostile not in stderr
-    # And the value is absent from the decoded structure, not merely escaped.
-    assert hostile not in json.dumps(json.loads(rendered))
-    for value in payload["candidates"][0].values():
-        assert str(value) != hostile
+    _assert_absent_from_decoded(payload, hostile)
 
 
 @pytest.mark.parametrize("hostile", HOSTILE_FILENAMES)
@@ -2012,3 +2052,164 @@ def test_plan_still_accepts_a_tilde_configuration_path(
 
     assert code == cli.EXIT_SUCCESS
     assert json.loads(out.getvalue())["candidate_count"] == 1
+
+
+# --- the two review findings, closed (final micro-correction) ---------------
+
+
+@pytest.mark.parametrize("hostile", HOSTILE_FILENAMES)
+def test_the_decoded_walk_catches_what_a_rendered_search_misses(
+    hostile: str,
+) -> None:
+    """The privacy check is effective, proven against a deliberately leaky payload.
+
+    A check that never fires proves nothing, and this one very nearly did not.
+    The superseded assertion pair was::
+
+        assert hostile not in rendered
+        assert hostile not in json.dumps(json.loads(rendered))
+
+    The second is byte-identical to the first -- decoding and re-encoding
+    reproduces the same escaping -- so both miss a Windows or UNC path
+    completely. Here a payload that *does* leak is built and fed to both, so the
+    gap is a fact in the suite rather than a claim in a docstring.
+    """
+    leaky = {
+        "candidate_count": 1,
+        "candidates": [
+            {
+                "capture_id": "cap-hostile",
+                "captured_at": "2024-01-01T00:00:00+00:00",
+                "filesize_bytes": 19,
+                "policy_reason": "age",
+                "filename": hostile,
+            }
+        ],
+        "nested": {"deeper": [{"anywhere": hostile}]},
+    }
+    rendered = json.dumps(leaky)
+
+    # The walk finds it, wherever it is and however it renders.
+    with pytest.raises(AssertionError):
+        _assert_absent_from_decoded(leaky, hostile)
+
+    # And it finds it under a *key* as well as under a value.
+    with pytest.raises(AssertionError):
+        _assert_absent_from_decoded({hostile: "value"}, hostile)
+
+    # A rendered-text search is only reliable when nothing needed escaping;
+    # for the backslash forms it silently reports the payload as clean.
+    escapes = "\\" in hostile
+    assert (hostile not in rendered) is escapes
+    assert (hostile not in json.dumps(json.loads(rendered))) is escapes
+    # The old round-trip really was the same string, not a stronger check.
+    assert json.dumps(json.loads(rendered)) == rendered
+
+
+def test_an_unexpected_path_bearing_field_is_omitted_by_the_allow_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A field this build has never heard of is dropped, not published.
+
+    This is what an allow-list buys over the filename deny-list it replaced.
+    ``as_dict()`` is widened here to carry both ``filename`` and a
+    ``source_path`` that no current candidate has -- the shape a future domain
+    change would produce -- and the operator output still contains exactly the
+    four safe fields.
+
+    The deny-list is checked against the same candidate at the end: it would
+    have withheld ``filename`` and published ``source_path``, which is the whole
+    argument for the change.
+    """
+    hostile_filename = "C:\\sensitive\\secret.jpg"
+    hostile_path = "\\\\server\\share\\private\\secret.jpg"
+    original = RetentionPlan.as_dict
+    widened: list[dict[str, Any]] = []
+
+    def _as_dict_with_a_future_field(self: RetentionPlan) -> dict[str, Any]:
+        payload = original(self)
+        for entry in payload["candidates"]:
+            entry["filename"] = hostile_filename
+            entry["source_path"] = hostile_path
+            widened.append(dict(entry))
+        return payload
+
+    monkeypatch.setattr(RetentionPlan, "as_dict", _as_dict_with_a_future_field)
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+
+    code, payload, stderr = _run(deployment, ["plan"], monkeypatch)
+
+    assert code == cli.EXIT_SUCCESS
+    assert widened, "the widened projection was never exercised"
+
+    candidate = payload["candidates"][0]
+    assert set(candidate) == {
+        "capture_id",
+        "captured_at",
+        "filesize_bytes",
+        "policy_reason",
+    }
+    for hostile in (hostile_filename, hostile_path):
+        _assert_absent_from_decoded(payload, hostile)
+        assert hostile not in stderr
+
+    # The candidate is still selected, and its safe values are still right:
+    # omission, not exclusion, and not corruption either.
+    assert payload["candidate_count"] == 1
+    assert candidate["capture_id"] == "cap-old"
+    assert candidate["policy_reason"] == "age"
+    assert candidate["filesize_bytes"] == len(PAYLOAD)
+    assert candidate["captured_at"]
+
+    # Why the allow-list is stronger: the deny-list would have let the new
+    # field straight through.
+    deny_listed = {
+        key: value for key, value in widened[0].items() if key != "filename"
+    }
+    assert "filename" not in deny_listed
+    assert deny_listed["source_path"] == hostile_path
+
+
+def test_the_operator_field_list_is_exactly_the_four_safe_fields() -> None:
+    """The allow-list itself is pinned, so widening it is a visible decision."""
+    assert cli._OPERATOR_CANDIDATE_FIELDS == (
+        "capture_id",
+        "captured_at",
+        "filesize_bytes",
+        "policy_reason",
+    )
+    assert "filename" not in cli._OPERATOR_CANDIDATE_FIELDS
+    assert "absolute_path" not in cli._OPERATOR_CANDIDATE_FIELDS
+
+
+def test_a_missing_safe_field_is_an_internal_defect_not_a_silent_omission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dropping a *required* field must fail loudly, not shrink the candidate.
+
+    The allow-list indexes rather than ``.get``s, so a candidate that has lost a
+    safe field is a bug in this build and exits 5. Emitting a short candidate
+    would hide it behind output that still looked plausible.
+    """
+    original = RetentionPlan.as_dict
+
+    def _as_dict_missing_a_field(self: RetentionPlan) -> dict[str, Any]:
+        payload = original(self)
+        for entry in payload["candidates"]:
+            entry.pop("policy_reason")
+        return payload
+
+    monkeypatch.setattr(RetentionPlan, "as_dict", _as_dict_missing_a_field)
+    deployment = _Deployment(tmp_path, enabled=True)
+    deployment.add("cap-old")
+    deployment.add("cap-new", days_old=0.0)
+
+    code, payload, stderr = _run(deployment, ["plan"], monkeypatch)
+
+    assert code == cli.EXIT_UNEXPECTED
+    assert payload == {}
+    assert stderr.strip() == cli.UNEXPECTED_FAILURE
+    assert "KeyError" not in stderr
+    assert "Traceback" not in stderr

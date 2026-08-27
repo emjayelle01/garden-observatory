@@ -711,3 +711,160 @@ No new dependency, no migration, retention still disabled and `event_capture`
 still disabled in tracked configuration, no production retention bound chosen,
 no Raspberry Pi access, no deployment, no production change, no production media
 deleted, and Task 14.3 not started.
+
+
+---
+
+## 17. Final micro-correction — independent review findings L-1 and L-2
+
+Independent final review of `459b1715` confirmed all seven earlier corrections
+fixed and raised no Critical, High or Medium finding. Three Low findings were
+raised; two are corrected here in a fourth normal commit. None of the three
+existing commits was amended.
+
+### 17.1 L-1 — the decoded-JSON privacy assertion did not decode
+
+`test_a_hostile_catalogue_filename_never_reaches_operator_output` claimed to
+check the decoded structure "as well as the raw text". The line implementing
+that claim was:
+
+```python
+assert hostile not in json.dumps(json.loads(rendered))
+```
+
+`json.dumps(json.loads(x))` reproduces `x` byte for byte, so it re-applied the
+same escaping and repeated the same blind spot. Against a payload that *does*
+leak `C:\sensitive\secret.jpg`:
+
+```
+assertion 1  'hostile not in rendered'    -> PASSES (leak undetected)
+assertion 2  round-trip re-encode         -> PASSES (leak undetected)
+assertion 3  per-candidate value equality -> detects
+```
+
+Only the third fired, and only because that leak happened to be an exact
+candidate *value*. A hostile string under a different key, at another depth, or
+embedded in a longer value would have passed all three.
+
+**Corrected** with `_decoded_strings()`, a small recursive generator in the test
+module that yields every mapping key, every mapping value, every list element
+and every string scalar at any depth, and `_assert_absent_from_decoded()`, which
+asserts the hostile value occurs in none of them — as an exact value *and* as a
+substring, in keys as well as values, because a leak need not arrive whole or
+under the key it came from. The raw-text check is retained where it works.
+
+`test_the_decoded_walk_catches_what_a_rendered_search_misses` makes the gap a
+fact in the suite rather than a claim in a docstring: it builds a payload that
+genuinely leaks, proves the walk raises for it (under a value, nested, and under
+a *key*), proves the rendered-text search reports the backslash forms as clean,
+and asserts `json.dumps(json.loads(rendered)) == rendered` directly. A privacy
+check that cannot fire proves nothing, and this one very nearly did not.
+
+Two hostile forms were added to `HOSTILE_FILENAMES` — a **UNC** path and a
+**tilde-prefixed** path — so the parametrised privacy and still-selected tests
+now cover absolute POSIX, database and configuration paths, traversal, deeper
+traversal, Windows drive-letter, UNC and tilde.
+
+No production code was added to serve the test.
+
+### 17.2 L-2 — the operator projection was a deny-list
+
+```python
+{key: value for key, value in candidate.items() if key != "filename"}
+```
+
+published everything it had not been told to withhold. A path-bearing field
+added to the domain model later would have reached operator output by default,
+and the omission would have had to be remembered a second time, in another file.
+
+**Corrected** to an explicit allow-list at the CLI boundary:
+
+```python
+_OPERATOR_CANDIDATE_FIELDS = (
+    "capture_id",
+    "captured_at",
+    "filesize_bytes",
+    "policy_reason",
+)
+...
+{field: candidate[field] for field in _OPERATOR_CANDIDATE_FIELDS}
+```
+
+The default is now silence: a new field is published only when someone decides
+to publish it here. JSON is emitted with sorted keys regardless, so the tuple
+governs construction rather than presentation, and it is fixed so the projection
+is deterministic either way.
+
+A *missing* safe field is treated differently on purpose. The projection indexes
+rather than `.get`s, so a candidate that has lost one raises `KeyError` and
+reaches `EXIT_UNEXPECTED` as the internal defect it is; emitting a short
+candidate would hide a real bug behind output that still looked plausible.
+`test_a_missing_safe_field_is_an_internal_defect_not_a_silent_omission` proves
+exit 5, the fixed sentence, and no `KeyError` or traceback in stderr.
+
+`test_an_unexpected_path_bearing_field_is_omitted_by_the_allow_list` widens
+`as_dict()` to carry both `filename` and a `source_path` no current candidate
+has — the shape a future domain change would produce — and proves the output
+still carries exactly the four safe fields, with neither hostile value anywhere
+in the decoded structure. It then applies the *old* deny-list to the same
+candidate and shows it would have withheld `filename` and published
+`source_path`, which is the whole argument for the change. The same test
+re-confirms the candidate is still selected with correct `capture_id`,
+`policy_reason`, `filesize_bytes` and `captured_at` — omission, not exclusion,
+and not corruption either.
+
+`RetentionPlan.as_dict()`, `RetentionCandidate`, policy selection, candidate
+count, safe values, `plan`'s freedom from filesystem work and destructive path
+validation are all unchanged.
+
+### 17.3 Mutation re-anchoring
+
+Both operator-privacy mutations had to move, and the reason differs:
+
+| Mutation | State against the new code | Action |
+| --- | --- | --- |
+| `the-operator-plan-republishes-the-raw-filename` | **STALE** — the deny-list line it pinned no longer exists | Re-anchored to the allow-list comprehension, still reverting to `dict(candidate)` |
+| `the-preview-publishes-the-media-path` | **NOT DETECTED** — its anchor still applied, but the allow-list strips the injected `absolute_path` before output | Re-anchored *after* the projection, so it publishes the media path again as it always meant to |
+
+The second is the more instructive: a mutation that goes quietly undetected is
+worse than one that goes stale, because the register still reports it as an
+entry while it has stopped testing anything. Verified individually before the
+full run: `2/2 detected`.
+
+Neither was deleted, weakened or duplicated, and no new mutation was added for
+the same behaviour. **The total remains 254.**
+
+### 17.4 L-3 — reviewed, no change required
+
+The review noted that `_BoundedParser.error()` raises the private `_Refusal`,
+so a caller doing `build_parser().parse_args(argv)` receives it where argparse's
+contract is `SystemExit`.
+
+Reviewed and accepted as non-blocking for Task 14.2:
+
+* `build_parser()` is exposed as an inspection and testing seam, and its
+  docstring says so;
+* the supported production entry boundary is `main()`, which handles the
+  refusal and writes the fixed sentence to the caller's stream;
+* no other production caller invokes `build_parser().parse_args()` — `main()` is
+  the only one in the codebase;
+* no Task 14.2 change is required.
+
+`build_parser()` stays in `__all__`, `_BoundedParser.error()` keeps raising the
+bounded refusal rather than reverting to argparse's diagnostics, and no
+operator-value disclosure is reintroduced. Redesigning the public parser API is
+out of scope for this task.
+
+### 17.5 Micro-correction validation
+
+Counts moved only upward, and only through added coverage:
+
+| Measure | Before | After |
+| --- | --- | --- |
+| `tests/test_retention_cli.py` | 149 | 163 |
+| Focused (11 suites) | 541 | 555 |
+| Full suite | 2991 passed, 12 skipped | 3005 passed, 12 skipped |
+| Mutation register | 254/254 | 254/254 |
+
+The same 12 platform skips, no new skip, no `xfail`, no weakened assertion. See
+the completion report for the run output.
