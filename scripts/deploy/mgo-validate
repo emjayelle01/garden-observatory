@@ -117,6 +117,36 @@ readonly MGO_LOCK_FD=9
 # Preview vocabulary. Only these three describe a settled camera; the transient
 # pair describe one mid-transition, which is not a baseline anything may be
 # deployed against.
+# The read-only schema probe, run by the deployed build's own interpreter.
+#
+# Read-only three separate ways, because this runs against the live production
+# database while the service may still be serving from it: the URI is
+# ``mode=ro``, the connection is put in ``query_only``, and the only statement
+# is a SELECT. ``immutable=1`` is deliberately NOT used -- it asserts the file
+# cannot change, which is untrue of a live database and would licence SQLite to
+# ignore concurrent WAL state.
+#
+# It prints one integer and nothing else. Every failure -- an unreadable
+# database, an absent or malformed history, an unparsable configuration -- exits
+# non-zero with stderr discarded, so the caller learns "unknown" and never a
+# path, a value or an exception class.
+#
+# The database path is resolved through the application's own configuration
+# loader rather than being reconstructed here, and no caller can supply it.
+readonly MGO_SCHEMA_PROBE='import sqlite3
+from mgo.core.config import load_config
+
+path = load_config().storage.database_path
+connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+try:
+    connection.execute("PRAGMA query_only = ON")
+    recorded = connection.execute(
+        "SELECT MAX(version) FROM schema_migrations"
+    ).fetchone()[0]
+finally:
+    connection.close()
+print(int(recorded))'
+
 readonly MGO_STABLE_PREVIEW_STATES="running stopped failed"
 readonly MGO_TRANSIENT_PREVIEW_STATES="starting stopping"
 
@@ -129,6 +159,7 @@ readonly EX_PRECONDITION=65 # the host or repository is not fit to deploy
 readonly EX_DEPLOY=70       # deployment failed; production was restored
 readonly EX_BUSY=75         # another control-plane action holds the lock
 readonly EX_ROLLBACK=78     # deployment failed AND restoration failed
+readonly EX_MANUAL_RECOVERY=79 # rollback REFUSED; the schema moved
 
 # The stage a failed rollback stopped at, for the operator-facing message.
 ROLLBACK_STAGE=""
@@ -1193,6 +1224,137 @@ require_runtime_can_execute() {
         || return 1
 }
 
+# --- schema compatibility --------------------------------------------------
+#
+# Task 14.3A. Once a restarted build has applied its migrations, the database
+# is at the NEW schema. Restoring the previous commit then puts a build that
+# cannot open that database back into production: MGO refuses a schema newer
+# than the running build supports, so the service will not start and the
+# gateway's own restart-and-verify turns one failed deployment into an outage
+# needing a manual database restore.
+#
+# This gateway has no database recovery capability and deliberately does not
+# gain one here. What it gains is the ability to decline to create that pair.
+
+# The schema version a checked-out build supports, from the build itself.
+#
+# Asked of the deployed interpreter rather than assumed, because the whole
+# question is which code is present. Runs as the unprivileged runtime account
+# in an empty environment for the same reason the runtime probe does: an
+# inherited PYTHONPATH or VIRTUAL_ENV could answer for a different application
+# than the one about to run.
+build_supported_schema() {
+    local account="$1"
+    local repository="$2"
+    local home
+    local value
+
+    home="$(account_home "$account")" || return 1
+
+    value="$(runuser -u "$account" -- env -i \
+        "HOME=$home" \
+        "USER=$account" \
+        "LOGNAME=$account" \
+        "PATH=/usr/bin:/bin" \
+        "LC_ALL=C" \
+        "MGO_CONFIG_PATH=$MGO_PRODUCTION_CONFIG" \
+        "$repository/.venv/bin/python" -c \
+        'from mgo.core.database import CURRENT_SCHEMA_VERSION
+print(CURRENT_SCHEMA_VERSION)' 2>/dev/null)" || return 1
+
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$value"
+}
+
+# The schema version the live database currently records. Read-only; see
+# MGO_SCHEMA_PROBE. Non-zero means "could not be established", never a guess.
+database_schema_version() {
+    local account="$1"
+    local repository="$2"
+    local home
+    local value
+
+    home="$(account_home "$account")" || return 1
+
+    value="$(runuser -u "$account" -- env -i \
+        "HOME=$home" \
+        "USER=$account" \
+        "LOGNAME=$account" \
+        "PATH=/usr/bin:/bin" \
+        "LC_ALL=C" \
+        "MGO_CONFIG_PATH=$MGO_PRODUCTION_CONFIG" \
+        "$repository/.venv/bin/python" -c "$MGO_SCHEMA_PROBE" 2>/dev/null)" \
+        || return 1
+
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$value"
+}
+
+# May the repository be restored to the build that supports $baseline_schema?
+#
+# Only on proven equality. Three cases are refused and the reasoning differs:
+#
+#   * higher  -- the database has moved beyond the baseline build, which is the
+#                defect this exists for;
+#   * lower   -- nothing in this architecture explains a database going
+#                backwards during a deployment, so it is not understood, and
+#                "not understood" is not "safe";
+#   * unknown -- a probe that could not answer is not a probe that answered yes.
+#
+# The guarantee is narrow and stated as such: equal recorded schema versions
+# mean the baseline build will *open* this database, not that arbitrary future
+# data transformations are reversible. A migration that rewrote rows within one
+# version, or a build that changed how it reads existing rows, is outside what
+# a version number can promise, and outside what this gateway claims.
+repository_rollback_is_safe() {
+    local baseline_schema="$1"
+    local actual_schema="$2"
+
+    [[ "$baseline_schema" =~ ^[0-9]+$ ]] || return 1
+    [[ "$actual_schema" =~ ^[0-9]+$ ]] || return 1
+    [[ "$actual_schema" == "$baseline_schema" ]]
+}
+
+# Stop, unless the previous build can still open the database as it stands.
+#
+# Returns cleanly when restoration is safe, and otherwise never returns: it
+# exits, so no caller can proceed past it by ignoring a status. Nothing here
+# restores, restarts, resynchronises or writes anything -- the point is the
+# actions it declines to take.
+#
+# The deployed code and the database are deliberately left exactly as they are.
+# The deployed build is the one that matches this database; putting the previous
+# one back would produce a service that cannot start. There is no retry and no
+# restart, so an unhealthy service stays where an operator can see it instead of
+# being flapped.
+refuse_rollback_if_schema_advanced() {
+    local baseline_schema="$1"
+    local actual_schema
+    local deployed_schema
+
+    # The service has already run the target build once, so its migrations have
+    # already been applied. Establish what the database actually records before
+    # deciding whether the previous build may be put back in front of it.
+    actual_schema="$(database_schema_version "$MGO_RUNTIME_ACCOUNT" \
+        "$MGO_REPOSITORY")" || actual_schema=""
+
+    if repository_rollback_is_safe "$baseline_schema" "$actual_schema"; then
+        return 0
+    fi
+
+    deployed_schema="$(build_supported_schema "$MGO_RUNTIME_ACCOUNT" \
+        "$MGO_REPOSITORY")" || deployed_schema=""
+    if [[ -n "$actual_schema" && -n "$deployed_schema" \
+        && "$deployed_schema" -ge "$actual_schema" ]]; then
+        warn "the build now in place supports the database as it now stands"
+    else
+        warn "whether the build now in place supports the database as it now stands could not be established"
+    fi
+
+    die "$EX_MANUAL_RECOVERY" \
+        "deployment failed after the restart and automatic repository rollback was REFUSED, because the database is not at the schema version the previous build expects; the code in place, the environment and the database were all left untouched, and manual recovery or a compatible fix-forward is required"
+}
+
 # --- restart and recovery --------------------------------------------------
 
 restart_service() {
@@ -1607,8 +1769,12 @@ fail_after_restart() {
     local reason="$1"
     local previous_sha="$2"
     local previous_preview="$3"
+    local baseline_schema="$4"
 
     warn "deployment failed after the restart: $reason"
+
+    refuse_rollback_if_schema_advanced "$baseline_schema"
+
     warn "restoring $previous_sha"
 
     if ! rollback_repository "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
@@ -1679,6 +1845,8 @@ action_deploy_main() {
     local previous_pid
     local previous_timestamp
     local recovered
+    local baseline_schema
+    local target_schema
 
     # 0. exclusive control plane, before a single mutable fact is read.
     #
@@ -1703,6 +1871,17 @@ action_deploy_main() {
             "the preview status endpoint is not answering"
 
     require_uv_available "$MGO_ADMIN_ACCOUNT"
+
+    # Captured while the *previous* build is still the checked-out one: after
+    # the fast-forward there is no longer anything on disk that can answer this,
+    # and it is the value every later rollback decision is measured against.
+    # Established before a single mutation, so a build that cannot answer stops
+    # the deployment rather than a restart.
+    baseline_schema="$(build_supported_schema "$MGO_RUNTIME_ACCOUNT" \
+        "$MGO_REPOSITORY")" \
+        || die "$EX_PRECONDITION" \
+            "the schema version supported by the deployed build could not be established"
+    log "previous build expects schema $baseline_schema"
 
     # Captured before anything moves. These are the only values a rollback
     # will ever restore to; none of them can be supplied by a caller.
@@ -1788,16 +1967,28 @@ action_deploy_main() {
             "$head" "$previous_pid" "$previous_timestamp" "$previous_preview"
     fi
 
+    # Before the restart, because the restart is what applies the migrations. A
+    # target that cannot say what schema it expects is refused here, where the
+    # database has not yet been exposed to it and the ordinary rollback is still
+    # safe -- rather than after it has already moved the schema.
+    if ! target_schema="$(build_supported_schema "$MGO_RUNTIME_ACCOUNT" \
+        "$MGO_REPOSITORY")"; then
+        fail_before_restart \
+            "the schema version supported by the target build could not be established" \
+            "$head" "$previous_pid" "$previous_timestamp" "$previous_preview"
+    fi
+    log "target build expects schema $target_schema"
+
     log "restarting $MGO_SERVICE"
     if ! restart_service "$MGO_SERVICE"; then
         fail_after_restart "the service restart failed" \
-            "$head" "$previous_preview"
+            "$head" "$previous_preview" "$baseline_schema"
     fi
 
     if ! recovered="$(await_recovery "$MGO_SERVICE" "$MGO_HEALTH_URL" \
         "$MGO_RECOVERY_TIMEOUT_SECONDS")"; then
         fail_after_restart "the service did not recover within the bound" \
-            "$head" "$previous_preview"
+            "$head" "$previous_preview" "$baseline_schema"
     fi
     log "recovered in ${recovered}s"
 
@@ -1805,13 +1996,13 @@ action_deploy_main() {
         "$MGO_PREVIEW_STATUS_URL" "$MGO_PREVIEW_START_URL" \
         "$MGO_PREVIEW_TIMEOUT_SECONDS"; then
         fail_after_restart "the preview state could not be restored" \
-            "$head" "$previous_preview"
+            "$head" "$previous_preview" "$baseline_schema"
     fi
 
     # Nothing has been claimed yet. This is the stage entitled to claim it.
     if ! final_verification "$approved" "$previous_preview"; then
         fail_after_restart "final verification failed" \
-            "$head" "$previous_preview"
+            "$head" "$previous_preview" "$baseline_schema"
     fi
 
     log "deployed $approved"

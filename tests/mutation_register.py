@@ -1230,7 +1230,7 @@ MUTATIONS: tuple[Mutation, ...] = (
         GATEWAY,
         '    if ! final_verification "$approved" "$previous_preview"; then\n'
         '        fail_after_restart "final verification failed" \\\n'
-        '            "$head" "$previous_preview"\n'
+        '            "$head" "$previous_preview" "$baseline_schema"\n'
         '    fi',
         '    true',
         'runs_after_preview_restoration or no_success_is_printed',

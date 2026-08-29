@@ -7618,3 +7618,457 @@ def test_sourcing_the_gateway_runs_no_action() -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "sourced"
+
+
+# --- schema-aware post-restart recovery (Task 14.3A) ------------------------
+#
+# The Critical defect: once the target build has started once, it has already
+# applied its migrations, so the database is at the NEW schema. Restoring the
+# repository to the baseline commit then starts a build that cannot open that
+# database -- the old code refuses a schema newer than it supports -- so the
+# "rollback" ends with old code, a newer database and a service that will not
+# start. The gateway has no database recovery capability and must not gain one;
+# what it must do is stop actively creating that pair.
+
+
+SCHEMA_PROBE_DOUBLES = (
+    "rollback_repository() { printf 'ROLLBACK_CALLED\n'; return 0; }\n"
+    "restart_service() { printf 'RESTART_CALLED\n'; return 0; }\n"
+    "await_recovery() { printf 'AWAIT_CALLED\n'; return 0; }\n"
+    "restore_preview_state() { printf 'PREVIEW_RESTORE_CALLED\n'; return 0; }\n"
+    "sync_environment() { printf 'SYNC_CALLED\n'; return 0; }\n"
+    "service_is_active() { return 0; }\n"
+    "endpoint_is_ok() { return 0; }\n"
+)
+
+
+def _fail_after_restart(
+    *,
+    baseline_schema: str,
+    actual_schema: str,
+    extra: str = "",
+) -> subprocess.CompletedProcess[str]:
+    """Drive the post-restart failure boundary with a doubled schema probe.
+
+    ``database_schema_version`` is redefined rather than stubbed at a lower
+    level so the test exercises the real decision the gateway makes, not a
+    helper's return value. An empty ``actual_schema`` stands for a probe that
+    could not establish anything.
+    """
+    probe = (
+        "database_schema_version() { "
+        f'printf "%s" "{actual_schema}"; '
+        f"[ -n \"{actual_schema}\" ]; }}\n"
+    )
+    preamble = SCHEMA_PROBE_DOUBLES + probe + extra
+    call = (
+        'fail_after_restart "final verification failed" '
+        f'"{"a" * 40}" "running" "{baseline_schema}" || true\n'
+    )
+    return call_gateway_function(call, preamble=preamble)
+
+
+def test_an_advanced_database_schema_blocks_automatic_repository_rollback() -> None:
+    """The Critical Task 14.3 defect, as an executable regression.
+
+    Baseline supports schema 2; the restarted target applied migration 003 and
+    the live database is now at 3. Restoring the baseline commit would put a
+    build that cannot open that database back into production, and the gateway's
+    own restart-and-verify would then fail -- turning a recoverable deployment
+    failure into an outage needing a manual database restore.
+
+    So the repository rollback must not happen at all.
+    """
+    result = _fail_after_restart(baseline_schema="2", actual_schema="3")
+
+    assert "ROLLBACK_CALLED" not in result.stdout, result.stdout
+    assert "SYNC_CALLED" not in result.stdout, result.stdout
+    assert "RESTART_CALLED" not in result.stdout, result.stdout
+    assert "PREVIEW_RESTORE_CALLED" not in result.stdout, result.stdout
+
+
+def test_an_unchanged_schema_still_performs_the_ordinary_rollback() -> None:
+    """The control. Migration never ran, or ran and rolled back atomically.
+
+    Without this the correction could pass by refusing every rollback, which
+    would be a different defect wearing the same test's clothes.
+    """
+    result = _fail_after_restart(baseline_schema="2", actual_schema="2")
+
+    assert "ROLLBACK_CALLED" in result.stdout, result.stdout
+    assert "RESTART_CALLED" in result.stdout, result.stdout
+    assert "PREVIEW_RESTORE_CALLED" in result.stdout, result.stdout
+
+
+def test_an_advanced_schema_refusal_never_touches_the_baseline_environment(
+) -> None:
+    """Not the checkout, not the venv, not the service. Fail-on-call seams."""
+    forbid = (
+        'restore_checkout() { printf "FORBIDDEN_CHECKOUT\n"; }\n'
+        'sync_environment() { printf "FORBIDDEN_SYNC\n"; }\n'
+        'restart_service() { printf "FORBIDDEN_RESTART\n"; }\n'
+        'await_recovery() { printf "FORBIDDEN_AWAIT\n"; }\n'
+        'restore_preview_state() { printf "FORBIDDEN_PREVIEW\n"; }\n'
+    )
+    result = _fail_after_restart(
+        baseline_schema="2", actual_schema="3", extra=forbid
+    )
+
+    for forbidden in (
+        "FORBIDDEN_CHECKOUT",
+        "FORBIDDEN_SYNC",
+        "FORBIDDEN_RESTART",
+        "FORBIDDEN_AWAIT",
+        "FORBIDDEN_PREVIEW",
+        "ROLLBACK_CALLED",
+    ):
+        assert forbidden not in result.stdout, (forbidden, result.stdout)
+
+
+def test_an_advanced_schema_refusal_never_writes_the_database() -> None:
+    """No database mutation seam exists, and none may be reached.
+
+    The probe itself is a seam here: if the refusal path ever reached for a
+    writable connection it would have to go through a helper, and every helper
+    the gateway has for the database is doubled to fail on call.
+    """
+    forbid = (
+        'sqlite3() { printf "FORBIDDEN_SQLITE\n"; }\n'
+        'cp() { printf "FORBIDDEN_COPY\n"; }\n'
+        'mv() { printf "FORBIDDEN_MOVE\n"; }\n'
+        'rm() { printf "FORBIDDEN_REMOVE\n"; }\n'
+    )
+    result = _fail_after_restart(
+        baseline_schema="2", actual_schema="3", extra=forbid
+    )
+
+    for forbidden in (
+        "FORBIDDEN_SQLITE",
+        "FORBIDDEN_COPY",
+        "FORBIDDEN_MOVE",
+        "FORBIDDEN_REMOVE",
+    ):
+        assert forbidden not in result.stdout, (forbidden, result.stdout)
+
+
+@pytest.mark.parametrize(
+    "actual",
+    ["", "not-a-number", "3.0", "two", "-1", " ", "2 3"],
+)
+def test_an_unknown_or_malformed_schema_fails_closed(actual: str) -> None:
+    """A probe that could not answer is not a probe that answered yes."""
+    result = _fail_after_restart(baseline_schema="2", actual_schema=actual)
+
+    assert "ROLLBACK_CALLED" not in result.stdout, (actual, result.stdout)
+    assert "RESTART_CALLED" not in result.stdout, (actual, result.stdout)
+
+
+@pytest.mark.parametrize("baseline", ["", "not-a-number", " "])
+def test_an_unknown_baseline_schema_fails_closed(baseline: str) -> None:
+    """The baseline half is held to the same standard as the actual half."""
+    result = _fail_after_restart(baseline_schema=baseline, actual_schema="2")
+
+    assert "ROLLBACK_CALLED" not in result.stdout, (baseline, result.stdout)
+    assert "RESTART_CALLED" not in result.stdout, (baseline, result.stdout)
+
+
+def test_a_lower_schema_is_not_silently_treated_as_safe() -> None:
+    """Nothing explains a database going backwards, so it is not understood.
+
+    "Not understood" is not "safe": a lower recorded version during a
+    deployment means something happened that this architecture does not model,
+    and restarting an older build against it is exactly the guess to refuse.
+    """
+    result = _fail_after_restart(baseline_schema="3", actual_schema="2")
+
+    assert "ROLLBACK_CALLED" not in result.stdout, result.stdout
+    assert "RESTART_CALLED" not in result.stdout, result.stdout
+
+
+def test_the_refusal_uses_the_manual_recovery_exit_code() -> None:
+    """A distinct, bounded classification -- not a claim of restoration."""
+    source = _read(GATEWAY)
+
+    assert "readonly EX_MANUAL_RECOVERY=79" in source
+    refusal = source[
+        source.index("refuse_rollback_if_schema_advanced()") : source.index(
+            "# --- restart and recovery"
+        )
+    ]
+    assert 'die "$EX_MANUAL_RECOVERY"' in refusal
+    assert "REFUSED" in refusal
+
+
+def test_the_refusal_message_does_not_claim_a_successful_rollback() -> None:
+    """The operator must not be told production was restored when it was not."""
+    source = _read(GATEWAY)
+    refusal = source[
+        source.index("refuse_rollback_if_schema_advanced()") : source.index(
+            "# --- restart and recovery"
+        )
+    ]
+
+    assert "rollback succeeded" not in refusal
+    assert "production was restored" not in refusal
+    assert "was REFUSED" in refusal
+    assert "manual recovery" in refusal
+
+
+def test_the_refusal_message_discloses_nothing_sensitive() -> None:
+    """Fixed sentences only: no path, no value, no exception, no SQL.
+
+    The *messages* are what an operator sees, so the messages are what is
+    asserted -- not the code around them, which legitimately references
+    ``$MGO_REPOSITORY`` to run the probe and would make a whole-block search
+    fail for the wrong reason.
+    """
+    source = _read(GATEWAY)
+    refusal = source[
+        source.index("refuse_rollback_if_schema_advanced()") : source.index(
+            "# --- restart and recovery"
+        )
+    ]
+
+    messages = [
+        line.strip()
+        for line in refusal.splitlines()
+        if line.strip().startswith(('warn "', '"deployment failed after'))
+    ]
+    assert len(messages) >= 3, messages
+
+    for message in messages:
+        for leak in (
+            "/opt/",
+            "/etc/",
+            "/var/",
+            "$MGO_REPOSITORY",
+            "$MGO_PRODUCTION_CONFIG",
+            "$actual_schema",
+            "$baseline_schema",
+            "$deployed_schema",
+            "Traceback",
+            "sqlite3",
+            "SELECT",
+        ):
+            assert leak not in message, (leak, message)
+
+
+def test_the_schema_probe_is_read_only_three_ways() -> None:
+    """mode=ro, query_only and SELECT-only -- and never immutable=1."""
+    source = _read(GATEWAY)
+    probe = source[
+        source.index("readonly MGO_SCHEMA_PROBE=") : source.index(
+            "readonly MGO_STABLE_PREVIEW_STATES"
+        )
+    ]
+
+    assert "mode=ro" in probe
+    assert "PRAGMA query_only = ON" in probe
+    assert "SELECT MAX(version) FROM schema_migrations" in probe
+    assert "immutable=1" not in probe
+    for forbidden in (
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "DROP",
+        "CREATE",
+        "ALTER",
+        "ATTACH",
+        "VACUUM",
+        "wal_checkpoint",
+        "journal_mode",
+        "apply_migrations",
+    ):
+        assert forbidden not in probe, forbidden
+
+
+def test_the_schema_probes_run_unprivileged_in_an_empty_environment() -> None:
+    """As the runtime account, with env -i -- not as root, not inheriting."""
+    source = _read(GATEWAY)
+    for name in ("build_supported_schema()", "database_schema_version()"):
+        body = source[source.index(name) :]
+        body = body[: body.index("\n}\n")]
+        assert 'runuser -u "$account"' in body, name
+        assert "env -i" in body, name
+        assert "2>/dev/null" in body, name
+        for inherited in ("PYTHONPATH", "VIRTUAL_ENV", "PYTHONHOME"):
+            assert inherited not in body, (name, inherited)
+
+
+def test_the_schema_probes_refuse_a_non_numeric_answer() -> None:
+    """Anything that is not a plain integer is "unknown", not a value."""
+    source = _read(GATEWAY)
+    for name in ("build_supported_schema()", "database_schema_version()"):
+        body = source[source.index(name) :]
+        body = body[: body.index("\n}\n")]
+        assert '[[ "$value" =~ ^[0-9]+$ ]] || return 1' in body, name
+
+
+@pytest.mark.parametrize(
+    ("baseline", "actual", "safe"),
+    [
+        ("2", "2", True),
+        ("3", "3", True),
+        ("2", "3", False),
+        ("3", "2", False),
+        ("2", "", False),
+        ("", "2", False),
+        ("2", "x", False),
+        ("x", "2", False),
+        ("2", "2.0", False),
+        ("", "", False),
+    ],
+)
+def test_the_compatibility_rule_permits_only_proven_equality(
+    baseline: str, actual: str, safe: bool
+) -> None:
+    """The decision itself, exercised directly across its whole domain."""
+    # ``&&``/``||`` rather than ``$?``: the gateway sets ``errexit`` when it is
+    # sourced, so an honest non-zero return would otherwise abort the harness
+    # before the result could be printed.
+    result = call_gateway_function(
+        f'repository_rollback_is_safe "{baseline}" "{actual}" '
+        '&& rc=0 || rc=$?\n'
+        'printf "rc=%s\n" "$rc"'
+    )
+
+    assert f"rc={0 if safe else 1}" in result.stdout, (
+        baseline,
+        actual,
+        result.stdout,
+    )
+
+
+def test_the_gateway_exposes_no_new_public_action() -> None:
+    """No restore, no rollback-database, no operator database surface."""
+    source = _read(GATEWAY)
+    accepted = source[source.index("case \"$action\" in") :]
+    accepted = accepted[: accepted.index("esac")]
+
+    assert "show-approval | deploy-main | restart-api" in accepted
+    for forbidden in (
+        "restore",
+        "rollback-database",
+        "restore-database",
+        "recover",
+        "migrate",
+    ):
+        assert forbidden not in accepted, forbidden
+
+
+def test_the_gateway_accepts_no_database_path_argument() -> None:
+    """The database is never caller-supplied, and never named on a command."""
+    source = _read(GATEWAY)
+
+    assert "--database" not in source
+    assert "--db" not in source
+    assert "MGO_DATABASE" not in source
+
+
+def test_the_baseline_schema_is_established_before_any_mutation() -> None:
+    """Ordering is the whole safety property, so it is asserted directly.
+
+    The baseline probe must sit before the fetch and the fast-forward: after
+    the fast-forward nothing on disk can answer what the previous build
+    supported, and a build that cannot answer must stop the deployment rather
+    than a restart.
+    """
+    source = _read(GATEWAY)
+    body = source[source.index("action_deploy_main()") :]
+
+    baseline = body.index("baseline_schema=\"$(build_supported_schema")
+    fetch = body.index("fetch --no-tags")
+    merge = body.index("merge --ff-only")
+    restart = body.index('log "restarting $MGO_SERVICE"')
+
+    assert baseline < fetch < merge < restart
+
+
+def test_the_target_schema_is_established_before_the_restart() -> None:
+    """Checked while the ordinary rollback is still safe."""
+    source = _read(GATEWAY)
+    body = source[source.index("action_deploy_main()") :]
+
+    target = body.index("target_schema=\"$(build_supported_schema")
+    restart = body.index('log "restarting $MGO_SERVICE"')
+    assert target < restart
+
+    # Bounded to the capture block itself, not a fixed character window: a
+    # window wide enough to be safe today reaches into the restart section and
+    # asserts the opposite of what it means.
+    failure = body[target : body.index('log "target build expects schema')]
+    assert "fail_before_restart" in failure
+    assert "fail_after_restart" not in failure
+
+
+def test_an_unknown_baseline_schema_stops_before_the_repository_moves() -> None:
+    """It is a precondition failure, so nothing has been mutated to restore."""
+    source = _read(GATEWAY)
+    body = source[source.index("action_deploy_main()") :]
+    probe = body.index("baseline_schema=\"$(build_supported_schema")
+    failure = body[probe : probe + 500]
+
+    assert 'die "$EX_PRECONDITION"' in failure
+    assert "fail_before_restart" not in failure
+    assert "fail_after_restart" not in failure
+
+
+def test_every_post_restart_failure_passes_the_baseline_schema() -> None:
+    """A call site that forgot it would silently fail closed forever."""
+    source = _read(GATEWAY)
+    body = source[source.index("action_deploy_main()") :]
+
+    call_sites = body.count('fail_after_restart "')
+    assert call_sites == 4, call_sites
+    assert body.count('"$head" "$previous_preview" "$baseline_schema"') == 4
+
+
+def test_the_pre_restart_failure_path_is_unchanged() -> None:
+    """fail_before_restart keeps its signature and its unconditional rollback.
+
+    Before the restart the target has never opened the database, so the
+    baseline build still matches it and the ordinary restoration is correct.
+    """
+    source = _read(GATEWAY)
+    body = source[
+        source.index("fail_before_restart()") : source.index(
+            "rollback_repository_state_is_intact()"
+        )
+    ]
+
+    assert "rollback_repository" in body
+    assert "database_schema_version" not in body
+    assert "repository_rollback_is_safe" not in body
+    assert "EX_MANUAL_RECOVERY" not in body
+
+
+def test_the_refusal_leaves_the_transaction_lock_released() -> None:
+    """die exits the shell, which closes the lock descriptor as before."""
+    source = _read(GATEWAY)
+    refusal = source[
+        source.index("refuse_rollback_if_schema_advanced()") : source.index(
+            "# --- restart and recovery"
+        )
+    ]
+
+    # It exits rather than returning a status, so no caller can carry on past
+    # the refusal, and the exit closes the lock descriptor exactly as before.
+    # ``return 0`` does appear -- on the safe path, which is the point.
+    assert 'die "$EX_MANUAL_RECOVERY"' in refusal
+    assert refusal.rstrip().endswith("}")
+
+
+def test_the_deployed_build_compatibility_note_is_bounded() -> None:
+    """Two fixed sentences, neither of which names anything."""
+    source = _read(GATEWAY)
+    refusal = source[
+        source.index("refuse_rollback_if_schema_advanced()") : source.index(
+            "# --- restart and recovery"
+        )
+    ]
+
+    assert "the build now in place supports the database as it now stands" in refusal
+    assert (
+        "whether the build now in place supports the database as it now "
+        "stands could not be established" in refusal
+    )

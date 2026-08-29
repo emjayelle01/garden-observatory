@@ -872,6 +872,14 @@ validation, and neither makes the event-capture pipeline ready for permanent
 unattended enablement — event capture remains disabled in production, Task 13.2
 was point-in-time physical validation only, and long-term unattended behaviour
 remains unproven. There is still no scheduler and no destructive HTTP endpoint.
+
+**Deployment of the retention code to the Pi remains blocked** pending review
+and merge of the Task 14.3A schema-aware deployment-recovery correction: a
+deployment that advances the database schema and then fails would otherwise
+have had its repository automatically rolled back to a build that cannot open
+the migrated database. See
+[`docs/tasks/Task-014-3A-Schema-Aware-Deployment-Recovery.md`](docs/tasks/Task-014-3A-Schema-Aware-Deployment-Recovery.md).
+
 Full semantics, policy, state machine, recovery, safety rules, the command
 contract and error categories live in
 [`docs/Retention.md`](docs/Retention.md).

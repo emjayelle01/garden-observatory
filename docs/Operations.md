@@ -692,6 +692,92 @@ journalctl -u mgo.service
 journalctl --disk-usage
 ```
 
+## 5.7 Schema-aware deployment recovery
+
+`mgo-validate deploy-main` restores the previous commit when a deployment fails.
+Since Task 14.3A it will **refuse to do so when the database schema has moved**,
+and understanding why is the difference between a recoverable failed deployment
+and an outage.
+
+A deployment that reaches the service restart has, by that point, already let
+the new build start once — and MGO applies its migrations first, before it
+serves anything. So the database is at the **new** schema before any later step
+can fail. Restoring the previous commit at that point puts a build that cannot
+open that database back into production: MGO refuses a schema newer than the
+running build supports, so the service does not start, and the gateway's own
+restart-and-verify then fails too. The result used to be old code, a newer
+database, and a service that would not come up.
+
+The gateway now establishes three facts:
+
+| Fact | When |
+| --- | --- |
+| The schema the **previous** build supports | Before the fetch and the fast-forward, while that build is still the one on disk |
+| The schema the **target** build supports | After the dependency sync, before the restart |
+| The schema the **database** actually records | Only if a failure occurs after the restart |
+
+Repository rollback then proceeds **only** when the recorded database schema is
+exactly the version the previous build supports. A higher version is the case
+this exists for. A lower version is not understood — nothing in this
+architecture explains a database going backwards mid-deployment — and an
+unreadable or malformed answer is not an answer. All three refuse, because
+"not proven safe" is the only useful reading of any of them.
+
+Note the limit of the guarantee: equal schema versions mean the previous build
+will *open* this database. They do not mean arbitrary data transformations are
+reversible. A migration that rewrote rows within one version, or a build that
+changed how it interprets existing rows, is outside what a version number can
+promise, and the gateway claims nothing about it.
+
+### What the refusal does, and does not do
+
+On refusal the gateway **stops**. It does not restore the checkout, does not
+resynchronise the previous environment, does not restart anything, and does not
+touch the database. Whatever is deployed stays deployed, because the deployed
+build is the one that matches the database. If that service is healthy — the
+usual case, since the failure was in preview restoration or final verification —
+it is left running. If it is unhealthy it is still left alone rather than
+restarted in a loop.
+
+It exits with a distinct status (`79`) and says plainly that rollback was
+**refused** and that manual recovery or a compatible fix-forward is required. It
+never reports a successful rollback, and the message names no path, value or
+exception.
+
+**The gateway still does not restore databases.** It has no `restore` action, no
+`rollback-database` action, and no way to name a database on the command line.
+This correction only stops it from actively creating the incompatible pair; the
+manual disaster-recovery procedure in §6 remains the only recovery path.
+
+### Before any schema-changing deployment
+
+The schema probe is read-only, and read-only three ways: `mode=ro`,
+`PRAGMA query_only`, and a single `SELECT`. It never uses `immutable=1`, which
+would assert that a live database cannot change. It runs as the unprivileged
+runtime account in an empty environment, using the deployed build's own
+interpreter, and it prints one integer or fails.
+
+None of that is a substitute for a recovery set. Before deploying a release that
+advances the schema:
+
+* take a **fresh backup**, and
+* run `restore-test` against **that exact set**, and
+* have an operator present for the whole window.
+
+`restore-test` proves a backup can be recovered *in isolation*. It does not
+prove a **production** restoration: it copies into a temporary directory, checks
+integrity, schema soundness, row counts against the manifest and the
+configuration checksum, and then stops. It never starts a service from the
+restored database, never reproduces production ownership or paths, and never
+touches production. **Production restoration remains unrehearsed until someone
+rehearses it.** Backup present, backup fresh, backup verified in isolation and
+production restoration proven are four different statements, and only the first
+three are currently true.
+
+Backups also do not include capture media.
+
+---
+
 ## 6. Restore: the deliberate boundary
 
 **There is no `restore` command, and that is a design decision.**
