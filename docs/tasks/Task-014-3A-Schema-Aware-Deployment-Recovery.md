@@ -1,6 +1,6 @@
 # Task 14.3A — Schema-Aware Deployment Recovery
 
-**Status: implementation complete, validated off-Pi, awaiting review.**
+**Status: implementation complete and independently reviewed once; two Medium findings corrected. Awaiting an independent review of the correction round.**
 
 **Not merged. Not installed. No Raspberry Pi access. No production change. No
 deployment. Task 14.3 deployment remains BLOCKED until this correction is
@@ -233,6 +233,161 @@ and no destructive HTTP endpoint.
 
 **No Raspberry Pi access. No deployment. No production change. No approval-SHA
 change. No backup or restore run. No media read or deleted.**
+
+---
+
+## 8A. Correction round: the independent review's findings
+
+The first independent review of `34a4c590` confirmed the Critical defect was
+genuinely closed -- the safety property held in every state it could construct,
+including the malformed ones -- and raised **two Medium findings**, both about
+the *bounded contract* rather than the safety guarantee. Neither could have
+caused an unsafe rollback. Both are corrected here.
+
+### F-1 -- the read-only URI was built by raw interpolation
+
+The probe interpolated its path straight into the URI:
+
+```python
+connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+```
+
+`mgo.core.database.connect_readonly` has always percent-encoded the path first,
+and the probe should never have been the weaker of the two. SQLite starts the
+query string at the **first** `?`, truncates at `#` and decodes `%`, so the
+filename could rewrite the URI built around it -- a configured path ending
+`?mode=rw&` parses as a read-**write** open of a truncated name. `mode=ro` is
+only a guarantee if the path cannot carry URI syntax.
+
+Not a privilege boundary: the path comes from the root-owned production
+configuration and can never be supplied by a caller. That is why it was Medium
+and not High. It is still two constructions of the same URI in one repository,
+only one of which was safe.
+
+**Corrected** to the established pattern, on its own line so the intent is
+legible:
+
+```python
+database_path = load_config().storage.database_path
+encoded_path = quote(database_path.as_posix(), safe="/:")
+connection = sqlite3.connect(
+    f"file:{encoded_path}?mode=ro", uri=True, timeout=10
+)
+```
+
+Every other probe protection is unchanged: deployed interpreter, runtime
+account, `runuser` with `env -i`, standard library only, `PRAGMA query_only`,
+one `SELECT`, `try/finally`, no `immutable=1`, no external `sqlite3`, no
+caller-supplied database argument.
+
+### F-2 -- arithmetic on operands the boundary had not validated
+
+The support note compared two strings that had only been checked for
+emptiness:
+
+```bash
+if [[ -n "$actual_schema" && -n "$deployed_schema" \
+    && "$deployed_schema" -ge "$actual_schema" ]]; then
+```
+
+`[[ x -ge y ]]` evaluates its operands **arithmetically**, so a non-numeric one
+is read as a variable name -- and under `set -u` that aborted the shell before
+the refusal could print. Measured against the pre-correction gateway: a
+malformed value on *either* half produced **exit 1**, no fixed sentence, and
+the offending value plus a gateway source line on stderr
+(`mgo-validate: line 1348: not-a-number: unbound variable`). A decimal or
+space-separated value reached exit 79 but still leaked a raw Bash arithmetic
+error. **Rollback was never reached in any case** -- the safety property was
+intact throughout -- but the bounded operator contract was not, and the code's
+own docstring promises it.
+
+The path was not reachable through the shipped `database_schema_version`, which
+validates `^[0-9]+$`. That is precisely the problem: a boundary whose whole job
+is to fail safely was relying on a distant function's validation for its own
+local robustness.
+
+**Corrected** by validating both operands immediately before the comparison,
+and forcing base 10 so a leading zero is never read as octal (`008` used to be
+an arithmetic error outright):
+
+```bash
+if [[ "$actual_schema" =~ ^[0-9]+$ && "$deployed_schema" =~ ^[0-9]+$ ]]; then
+    if ((10#$deployed_schema >= 10#$actual_schema)); then
+```
+
+The correction also revealed a gap the review's table made explicit: with two
+notes, an **established negative** -- the build in place demonstrably does not
+support the database -- was reported as "could not be established", which
+understates what the gateway knows. There are three outcomes, so there are now
+three notes.
+
+### F-2b -- the tests passed for the wrong reason
+
+Every `EX_MANUAL_RECOVERY` assertion in the module was source-text inspection,
+and the malformed-schema tests asserted only the *absence* of the rollback and
+restart seams. For `not-a-number` those seams were absent because the shell had
+**crashed**, not because the refusal had handled it. Absent-because-it-refused
+and absent-because-it-crashed are the same evidence for two opposite outcomes,
+which is why F-2 survived the first round. **No test executed the refusal and
+asserted exit 79.**
+
+### The correction round's tests
+
+**+34 tests**, 820 to 854. Again purely additive: the diff removes no
+pre-existing line, and no existing assertion was weakened, broadened or
+deleted.
+
+* the probe run against a real temporary database whose **filename** carries
+  `#`, `%`, `&` and `=` -- it reads the right version, writes nothing, and
+  leaves the workspace byte-identical with no alternate file created;
+* the `?mode=rw&` case driven through the shipped probe, using a configured
+  path that need not name a real file, so it runs on every platform: the probe
+  must fail to open it and must not reach the real database -- and the same
+  test then shows, at the SQLite level, that raw interpolation opens that real
+  database **read-write**;
+* the source contract, compared against `connect_readonly` with quote style
+  normalised so the two cannot silently diverge again;
+* every malformed value -- `not-a-number`, `two`, `3.0`, `2 3`, `-1`, empty,
+  whitespace, leading and trailing whitespace, `0x2`, `2;rm` -- on **both** the
+  actual and the deployed half, each asserting exit **79**, the fixed sentence,
+  exactly one note matched as a whole line, no Bash diagnostic, no gateway
+  source line, the value absent from both streams, and no recovery seam;
+* the three-outcome note table, including the established negative;
+* `008` compared in base 10;
+* a structural backstop that the regex guard cannot be moved after the
+  comparison;
+* the equal-schema control, now asserting the exit status too, so the
+  correction cannot pass by refusing everything.
+
+Each was run against a deliberately broken gateway before being trusted: raw
+interpolation restored (all four F-1 tests fail), the pre-correction arithmetic
+restored (18 fail), exit 79 changed to 78 (28 fail), the refusal returning
+instead of terminating (35 fail), and base-10 forcing removed (2 fail).
+
+One note-matching bug of my own is worth recording, because it is the same
+class of error as F-2b: `"the build now in place supports..."` is a substring
+of `"whether the build now in place supports..."`, so a containment count
+reported two notes for every conservative one. The assertion matches whole
+lines instead.
+
+### Mutation register
+
+**No entry went stale.** No register anchor referenced either changed region,
+which was verified by search and then by the full run. **The total stays 254**
+and no artificial entry was added.
+
+### What has not changed
+
+The Critical defect remains closed and its regression test is untouched. No
+migration, no `src/` change, no dependency, no configuration, no sudoers or
+systemd content, no backup or restore implementation, no new gateway action, no
+caller-supplied database argument. `docs/Operations.md` and `README.md` are
+unchanged: they already described this contract correctly, and this round made
+the implementation and the tests meet it.
+
+**No Raspberry Pi access. No deployment. No production change. Task 14.3
+deployment remains not started.** The feature stays blocked from PR creation
+until an independent review of this correction round passes.
 
 ---
 

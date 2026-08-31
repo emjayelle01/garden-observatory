@@ -28,7 +28,9 @@ from __future__ import annotations
 import ast
 import importlib.util
 import os
+import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -36,7 +38,7 @@ from typing import NamedTuple
 
 import pytest
 
-from mgo.core.config import PROJECT_ROOT
+from mgo.core.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT
 
 DEPLOY_DIRECTORY = PROJECT_ROOT / "scripts" / "deploy"
 GATEWAY = DEPLOY_DIRECTORY / "mgo-validate"
@@ -8072,3 +8074,405 @@ def test_the_deployed_build_compatibility_note_is_bounded() -> None:
         "whether the build now in place supports the database as it now "
         "stands could not be established" in refusal
     )
+# --- F-1: the read-only URI the probe actually builds -----------------------
+#
+# The probe interpolated its path into the URI raw. SQLite starts the query
+# string at the first "?", truncates the path at "#" and decodes "%", so the
+# filename could rewrite the URI built around it -- and "mode=ro" is only a
+# guarantee if it cannot. mgo.core.database.connect_readonly has always
+# percent-encoded the path before interpolating it; the probe now does the same
+# thing the same way, rather than a second, weaker thing three files away.
+
+
+def _schema_probe_program() -> str:
+    """The probe exactly as shipped, unwrapped from its Bash single quotes."""
+    source = _read(GATEWAY)
+    block = source[
+        source.index("readonly MGO_SCHEMA_PROBE=") : source.index(
+            "readonly MGO_STABLE_PREVIEW_STATES"
+        )
+    ]
+    return block[block.index("'") + 1 : block.rindex("'")]
+
+
+#: A filename legal on every platform this suite runs on, in which every
+#: character is one the URI would otherwise misread: "#" opens a fragment,
+#: "%" introduces a percent escape, and "&"/"=" are query syntax. "?" cannot
+#: appear in a Windows filename at all, so the query-delimiter case -- the
+#: worst of them -- is proved separately below, without needing such a file to
+#: exist.
+HOSTILE_DB_NAME = "mgo#frag %2f 100% x&mode=rw&y=.db"
+
+
+def _make_database(path: Path, version: int) -> None:
+    """A minimal database the probe can answer about, in the test workspace."""
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute("CREATE TABLE schema_migrations (version INTEGER)")
+        connection.execute(
+            "INSERT INTO schema_migrations (version) VALUES (?)", (version,)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _config_for(database: Path, workspace: Path) -> Path:
+    """The repository's own default config, pointed at one temporary database.
+
+    Rewriting the shipped default rather than inventing a config keeps this
+    test honest about the shape the loader actually reads.
+    """
+    return _config_for_raw_path(database.as_posix(), workspace)
+
+
+def _config_for_raw_path(database_path: str, workspace: Path) -> Path:
+    """As above, but for a configured path that need not name a real file."""
+    text = _read(DEFAULT_CONFIG_PATH)
+    for key, value in (
+        ("database_path", database_path),
+        ("data_directory", (workspace / "data").as_posix()),
+        ("log_directory", (workspace / "logs").as_posix()),
+    ):
+        replaced = re.sub(
+            f"^{key} = .*$",
+            f'{key} = "{value}"',
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        assert replaced != text, key
+        text = replaced
+
+    destination = workspace / "probe.toml"
+    destination.write_text(text, encoding="utf-8")
+    return destination
+
+
+def _run_schema_probe(config: Path) -> subprocess.CompletedProcess[str]:
+    """Run the shipped probe program against one temporary configuration."""
+    environment = dict(os.environ)
+    environment["MGO_CONFIG_PATH"] = str(config)
+    return subprocess.run(
+        [sys.executable, "-c", _schema_probe_program()],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+    )
+
+
+def test_the_schema_probe_percent_encodes_the_database_path() -> None:
+    """The source contract, stated as the application already states it."""
+    probe = _schema_probe_program()
+
+    assert ".as_posix()" in probe
+    assert 'quote(database_path.as_posix(), safe="/:")' in probe
+    assert "from urllib.parse import quote" in probe
+    # Exactly one real query delimiter, and it introduces mode=ro.
+    assert 'f"file:{encoded_path}?mode=ro"' in probe
+    assert probe.count("?mode=ro") == 1
+    assert "immutable=1" not in probe
+
+    # The same construction the application uses, so the two cannot silently
+    # diverge again. Quote style differs -- connect_readonly builds its URI
+    # inside an f-string and the probe on its own line -- so compare the call
+    # with the quoting normalised rather than the character sequence.
+    database_source = _read(PROJECT_ROOT / "src" / "mgo" / "core" / "database.py")
+    call = "quote(database_path.as_posix(), safe='/:')"
+    assert call in database_source.replace('"', "'")
+    assert call in probe.replace('"', "'")
+
+
+def test_the_schema_probe_reads_a_database_whose_name_carries_uri_syntax(
+    tmp_path: Path,
+) -> None:
+    """Behavioural, not textual: the intended file is opened and read.
+
+    Under raw interpolation the "#" alone truncates the path at a fragment, so
+    this cannot pass without the quoting.
+    """
+    database = tmp_path / HOSTILE_DB_NAME
+    _make_database(database, 7)
+
+    result = _run_schema_probe(_config_for(database, tmp_path))
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "7", result.stdout
+    assert result.stderr == "", result.stderr
+    # The special characters are part of the filename, not URI options.
+    assert database.exists()
+    assert database.name == HOSTILE_DB_NAME
+
+
+def test_the_schema_probe_creates_no_alternate_file_and_changes_nothing(
+    tmp_path: Path,
+) -> None:
+    """A misparsed URI would open -- and create -- some *other* path.
+
+    So the evidence is the workspace itself: same entries, same bytes.
+    """
+    database = tmp_path / HOSTILE_DB_NAME
+    _make_database(database, 5)
+    config = _config_for(database, tmp_path)
+
+    before_entries = sorted(p.name for p in tmp_path.iterdir())
+    before_bytes = database.read_bytes()
+
+    result = _run_schema_probe(config)
+
+    assert result.returncode == 0, result.stderr
+    assert sorted(p.name for p in tmp_path.iterdir()) == before_entries
+    assert database.read_bytes() == before_bytes
+
+
+def test_a_query_shaped_path_cannot_become_a_read_write_open(
+    tmp_path: Path,
+) -> None:
+    """The worst case, driven through the shipped probe.
+
+    A path ending "?mode=rw&" is a filename on POSIX, and the configuration
+    loader takes it verbatim on any platform, so no such file has to exist for
+    this to be the probe's real input. Interpolated raw it stops being a
+    filename: SQLite reads the first "?" as the start of the query, so the URI
+    becomes a read-WRITE open of the truncated name -- the real database.
+    Percent-encoded, the whole string stays the filename, nothing of that name
+    exists, and mode=ro will not create it.
+    """
+    real = tmp_path / "mgo.db"
+    _make_database(real, 3)
+    hostile = f"{real.as_posix()}?mode=rw&unused="
+    config = _config_for_raw_path(hostile, tmp_path)
+    before_entries = sorted(p.name for p in tmp_path.iterdir())
+
+    result = _run_schema_probe(config)
+
+    # It must not have reached the real database at all.
+    assert result.returncode != 0, result.stdout
+    assert "3" not in result.stdout, result.stdout
+    assert "unable to open database file" in result.stderr, result.stderr
+    assert sorted(p.name for p in tmp_path.iterdir()) == before_entries
+
+    # And what raw interpolation would have done instead, to the real file.
+    raw_uri = f"file:{hostile}?mode=ro"
+    connection = sqlite3.connect(raw_uri, uri=True)
+    try:
+        connection.execute("CREATE TABLE proof_of_a_read_write_open (x)")
+        connection.commit()
+    finally:
+        connection.close()
+
+    connection = sqlite3.connect(str(real))
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        connection.close()
+    assert "proof_of_a_read_write_open" in tables, (
+        "raw interpolation did not open the real database read-write, so this "
+        "test is no longer demonstrating the defect it was written for"
+    )
+
+
+# --- F-2: the refusal validates its own operands ----------------------------
+#
+# [[ x -ge y ]] evaluates arithmetically, so a non-numeric operand is read as a
+# variable name; under the gateway's `set -u` that aborted the shell before the
+# refusal could print, producing exit 1, no fixed sentence, and the offending
+# value plus a gateway source line on stderr. Rollback was still never reached
+# -- the safety property held -- but the bounded operator contract did not, and
+# the tests passed anyway because they only asserted that the seams were
+# absent. Absent-because-it-refused and absent-because-it-crashed are not the
+# same result, so these assert the exit status and the output.
+
+
+EX_MANUAL_RECOVERY = 79
+
+REFUSAL_SENTENCE = (
+    "deployment failed after the restart and automatic repository rollback "
+    "was REFUSED"
+)
+SUPPORT_NOTES = (
+    "the build now in place supports the database as it now stands",
+    "the build now in place does not support the database as it now stands",
+    "whether the build now in place supports the database as it now stands "
+    "could not be established",
+)
+BASH_DIAGNOSTICS = (
+    "unbound variable",
+    "syntax error",
+    "expression recursion",
+    "arithmetic",
+    "Traceback",
+)
+RECOVERY_SEAMS = (
+    "ROLLBACK_CALLED",
+    "RESTART_CALLED",
+    "AWAIT_CALLED",
+    "PREVIEW_RESTORE_CALLED",
+    "SYNC_CALLED",
+)
+
+
+def _refuse(
+    *,
+    baseline_schema: str,
+    actual_schema: str,
+    deployed_schema: str,
+) -> subprocess.CompletedProcess[str]:
+    """Drive the real refusal with both probes doubled, and keep the status."""
+    return _fail_after_restart(
+        baseline_schema=baseline_schema,
+        actual_schema=actual_schema,
+        extra=(
+            "build_supported_schema() { "
+            f'printf "%s" "{deployed_schema}"; '
+            f'[ -n "{deployed_schema}" ]; }}\n'
+        ),
+    )
+
+
+def _assert_bounded_refusal(
+    result: subprocess.CompletedProcess[str],
+    *,
+    expected_note: str,
+) -> None:
+    """The whole exit-79 contract, asserted on what the process actually did."""
+    output = result.stdout + result.stderr
+
+    assert result.returncode == EX_MANUAL_RECOVERY, (result.returncode, output)
+    assert REFUSAL_SENTENCE in result.stderr, output
+
+    # Matched whole line, not by substring: "the build now in place supports
+    # ..." is a substring of "whether the build now in place supports ...", so
+    # a containment count would report two notes for every conservative one.
+    emitted = [
+        line.removeprefix("mgo-validate: ").strip()
+        for line in result.stderr.splitlines()
+    ]
+    assert [note for note in SUPPORT_NOTES if note in emitted] == [expected_note], (
+        emitted
+    )
+
+    for diagnostic in BASH_DIAGNOSTICS:
+        assert diagnostic not in output, (diagnostic, output)
+    assert not re.search(r"mgo-validate: line \d+", output), output
+    assert "mgo-validate:" not in result.stdout, output
+
+    for seam in RECOVERY_SEAMS:
+        assert seam not in output, (seam, output)
+
+
+MALFORMED_SCHEMA_VALUES = (
+    "not-a-number",
+    "two",
+    "3.0",
+    "2 3",
+    "-1",
+    "",
+    " ",
+    " 3",
+    "3 ",
+    "0x2",
+    "2;rm",
+)
+
+
+@pytest.mark.parametrize("value", MALFORMED_SCHEMA_VALUES)
+def test_a_malformed_actual_schema_refuses_with_the_whole_bounded_contract(
+    value: str,
+) -> None:
+    """Exit 79, the fixed sentence, one conservative note, and no diagnostic."""
+    result = _refuse(baseline_schema="2", actual_schema=value, deployed_schema="2")
+
+    _assert_bounded_refusal(result, expected_note=SUPPORT_NOTES[2])
+    if value.strip():
+        assert value not in result.stdout + result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("value", MALFORMED_SCHEMA_VALUES)
+def test_a_malformed_deployed_schema_refuses_with_the_whole_bounded_contract(
+    value: str,
+) -> None:
+    """The other operand. Either one alone used to abort the shell."""
+    result = _refuse(baseline_schema="2", actual_schema="3", deployed_schema=value)
+
+    _assert_bounded_refusal(result, expected_note=SUPPORT_NOTES[2])
+    if value.strip():
+        assert value not in result.stdout + result.stderr, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("actual", "deployed", "note"),
+    (
+        ("3", "3", SUPPORT_NOTES[0]),
+        ("3", "4", SUPPORT_NOTES[0]),
+        ("3", "2", SUPPORT_NOTES[1]),
+        ("3", "", SUPPORT_NOTES[2]),
+        ("", "3", SUPPORT_NOTES[2]),
+    ),
+)
+def test_the_support_note_states_exactly_what_was_established(
+    actual: str, deployed: str, note: str
+) -> None:
+    """Three outcomes, not two: supported, not supported, and not established.
+
+    "Does not support" is a fact the operator can act on. Reporting it as
+    "could not be established" would understate what the gateway knows.
+    """
+    result = _refuse(
+        baseline_schema="2", actual_schema=actual, deployed_schema=deployed
+    )
+
+    _assert_bounded_refusal(result, expected_note=note)
+
+
+def test_a_leading_zero_is_compared_in_base_ten_not_octal() -> None:
+    """Bash arithmetic reads 010 as 8 and rejects 008 outright.
+
+    Both would be wrong about a schema version, so the comparison forces
+    base 10 -- after the regex, never instead of it.
+    """
+    result = _refuse(baseline_schema="2", actual_schema="008", deployed_schema="9")
+
+    _assert_bounded_refusal(result, expected_note=SUPPORT_NOTES[0])
+
+
+def test_the_refusal_validates_both_operands_before_any_arithmetic() -> None:
+    """Structural backstop: the regex guard cannot be moved after the compare."""
+    source = _read(GATEWAY)
+    refusal = source[
+        source.index("refuse_rollback_if_schema_advanced()") : source.index(
+            "# --- restart and recovery"
+        )
+    ]
+
+    guard = '[[ "$actual_schema" =~ ^[0-9]+$ && "$deployed_schema" =~ ^[0-9]+$ ]]'
+    comparison = "((10#$deployed_schema >= 10#$actual_schema))"
+
+    assert guard in refusal
+    assert comparison in refusal
+    assert refusal.index(guard) < refusal.index(comparison)
+    # The form that evaluated unvalidated operands arithmetically is gone.
+    assert '"$deployed_schema" -ge "$actual_schema"' not in refusal
+
+
+def test_the_equal_schema_control_still_exits_the_ordinary_rollback_way() -> None:
+    """The control, now including the status.
+
+    Without an asserted exit code the correction could pass by refusing every
+    rollback while the seam assertions were satisfied by something else.
+    """
+    result = _refuse(baseline_schema="2", actual_schema="2", deployed_schema="2")
+
+    assert result.returncode != EX_MANUAL_RECOVERY, result.stderr
+    assert REFUSAL_SENTENCE not in result.stderr, result.stderr
+    assert "ROLLBACK_CALLED" in result.stdout, result.stdout
+    assert "RESTART_CALLED" in result.stdout, result.stdout
+    assert "PREVIEW_RESTORE_CALLED" in result.stdout, result.stdout

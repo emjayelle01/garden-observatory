@@ -134,10 +134,22 @@ readonly MGO_LOCK_FD=9
 # The database path is resolved through the application's own configuration
 # loader rather than being reconstructed here, and no caller can supply it.
 readonly MGO_SCHEMA_PROBE='import sqlite3
+from urllib.parse import quote
+
 from mgo.core.config import load_config
 
-path = load_config().storage.database_path
-connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+# The path is percent-encoded before it is interpolated, exactly as
+# mgo.core.database.connect_readonly does it. Interpolating it raw would let
+# the path itself carry URI syntax: SQLite starts the query at the first "?",
+# so a path containing "?mode=rw&" would parse as a read-WRITE open of a
+# truncated name, "#" would silently truncate the path at a fragment, and "%"
+# would misdecode. mode=ro is only a guarantee if the filename cannot rewrite
+# the URI around it.
+database_path = load_config().storage.database_path
+encoded_path = quote(database_path.as_posix(), safe="/:")
+connection = sqlite3.connect(
+    f"file:{encoded_path}?mode=ro", uri=True, timeout=10
+)
 try:
     connection.execute("PRAGMA query_only = ON")
     recorded = connection.execute(
@@ -1344,9 +1356,20 @@ refuse_rollback_if_schema_advanced() {
 
     deployed_schema="$(build_supported_schema "$MGO_RUNTIME_ACCOUNT" \
         "$MGO_REPOSITORY")" || deployed_schema=""
-    if [[ -n "$actual_schema" && -n "$deployed_schema" \
-        && "$deployed_schema" -ge "$actual_schema" ]]; then
-        warn "the build now in place supports the database as it now stands"
+    # Both operands are validated here, immediately before the arithmetic,
+    # rather than on the strength of whatever produced them. [[ x -ge y ]]
+    # evaluates its operands *arithmetically*, so a non-numeric one is read as
+    # a variable name -- and under this script's `set -u` that aborts the shell
+    # before the refusal below can be printed, turning a bounded exit 79 into
+    # exit 1 with the offending value and a Bash source line on stderr. A
+    # boundary whose whole job is to fail safely cannot delegate its own input
+    # checking. Base 10 is forced so a leading zero is never read as octal.
+    if [[ "$actual_schema" =~ ^[0-9]+$ && "$deployed_schema" =~ ^[0-9]+$ ]]; then
+        if ((10#$deployed_schema >= 10#$actual_schema)); then
+            warn "the build now in place supports the database as it now stands"
+        else
+            warn "the build now in place does not support the database as it now stands"
+        fi
     else
         warn "whether the build now in place supports the database as it now stands could not be established"
     fi
