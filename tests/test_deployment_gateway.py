@@ -177,6 +177,44 @@ def _validate_approval(
     )
 
 
+def _safe_approval_object(
+    path: Path, *, owner: str = "0", mode: str = "644"
+) -> subprocess.CompletedProcess[str]:
+    return call_gateway_function(
+        f'require_safe_approval_object "{_posix(path)}"',
+        preamble=_stat_double(owner=owner, mode=mode),
+    )
+
+
+def _metadata_doubles(*, fail: str = "") -> str:
+    """Stand in for ``chown``/``chmod --reference``.
+
+    Git Bash on Windows has no meaningful POSIX owner, so the real calls cannot
+    be exercised here. What matters to the contract is the *ordering* — metadata
+    is copied from the object being replaced before the rename — and that a
+    failure at either step leaves the approval file alone. ``fail`` drives the
+    second half.
+    """
+    return (
+        f"chown() {{ return {1 if fail == 'chown' else 0}; }}\n"
+        f"chmod() {{ return {1 if fail == 'chmod' else 0}; }}\n"
+    )
+
+
+def _clear_approval(
+    path: Path,
+    *,
+    owner: str = "0",
+    mode: str = "644",
+    fail: str = "",
+) -> subprocess.CompletedProcess[str]:
+    """Clear one approval file in isolation, never a production path."""
+    return call_gateway_function(
+        f'clear_approval_file "{_posix(path)}"',
+        preamble=_stat_double(owner=owner, mode=mode) + _metadata_doubles(fail=fail),
+    )
+
+
 # --------------------------------------------------------------------------
 # approval-file contract
 # --------------------------------------------------------------------------
@@ -456,7 +494,10 @@ def test_the_production_call_sites_pass_the_real_uid_and_sudo_caller() -> None:
     source = _read(GATEWAY)
     call = 'require_root_caller "$MGO_ADMIN_ACCOUNT" "$EUID" "${SUDO_USER:-}"'
 
-    assert source.count(call) == 3
+    # One per public action, including clear-approval: revocation is privileged
+    # too, and an action that skipped this check would be reachable by anyone
+    # who could reach the gateway at all.
+    assert source.count(call) == 4
 
 
 def test_git_is_routed_through_the_unprivileged_runner() -> None:
@@ -703,6 +744,198 @@ def test_only_the_service_restart_runs_at_the_root_boundary() -> None:
         if "runtime_account" in stripped and "runuser" in stripped:
             assert "git" not in stripped
             assert "uv" not in stripped
+
+
+# --------------------------------------------------------------------------
+# clear-approval (Task 14.3D)
+#
+# Revocation, and only revocation. Every test below drives a temporary approval
+# path; none names or resolves the production approval file.
+# --------------------------------------------------------------------------
+
+
+def test_clearing_a_valid_approval_empties_it(approval_file: Path) -> None:
+    """The authority is removed, and the file it lived in survives."""
+    result = _clear_approval(approval_file)
+
+    assert result.returncode == 0, result.stderr
+    assert approval_file.exists()
+    assert approval_file.read_bytes() == b""
+
+
+def test_clearing_never_prints_the_approved_sha(approval_file: Path) -> None:
+    """A revocation has no reason to hold, log or echo what it revoked."""
+    result = _clear_approval(approval_file)
+
+    assert APPROVED_SHA not in result.stdout
+    assert APPROVED_SHA not in result.stderr
+
+
+def test_clearing_an_already_empty_approval_succeeds(tmp_path: Path) -> None:
+    """Idempotent: already clear is the state this action exists to produce."""
+    empty = _write_approval(tmp_path / "claude-approved-sha", "")
+
+    result = _clear_approval(empty)
+
+    assert result.returncode == 0, result.stderr
+    assert empty.read_bytes() == b""
+
+
+def test_clearing_a_symlinked_approval_is_refused(tmp_path: Path) -> None:
+    """A symlink would let its parent's owner choose what root truncates."""
+    real = _write_approval(tmp_path / "real", f"{APPROVED_SHA}\n")
+    link = tmp_path / "claude-approved-sha"
+    try:
+        link.symlink_to(real)
+    except (OSError, NotImplementedError):  # pragma: no cover - POSIX only
+        pytest.skip("this filesystem does not support symlinks")
+
+    result = _clear_approval(link)
+
+    assert result.returncode != 0
+    assert real.read_bytes() == f"{APPROVED_SHA}\n".encode()
+
+
+def test_the_clear_symlink_refusal_precedes_the_regular_file_check() -> None:
+    """The executed symlink test skips where symlinks cannot be created.
+
+    Asserted against the shipped text for the same reason the validator's
+    equivalent is: a mutation that deletes the ``-L`` guard is otherwise caught
+    by nothing on a host that skips the executed case, which is exactly the
+    silent hole the register exists to expose.
+    """
+    body = _function_body(
+        "require_safe_approval_object()", "# Revoke deployment authority"
+    )
+    symlink_index = body.index('[[ ! -L "$path" ]]')
+    regular_index = body.index('[[ -f "$path" ]]')
+
+    assert symlink_index < regular_index
+
+
+def test_clearing_a_directory_is_refused(tmp_path: Path) -> None:
+    """Only a regular file is an approval object."""
+    directory = tmp_path / "claude-approved-sha"
+    directory.mkdir()
+
+    result = _clear_approval(directory)
+
+    assert result.returncode != 0
+    assert directory.is_dir()
+
+
+def test_clearing_a_non_root_owned_approval_is_refused(approval_file: Path) -> None:
+    """Ownership decides whether the write lands where it was inspected."""
+    result = _clear_approval(approval_file, owner="1001")
+
+    assert result.returncode != 0
+    assert approval_file.read_bytes() == f"{APPROVED_SHA}\n".encode()
+
+
+@pytest.mark.parametrize("mode", ["666", "664", "622", "646"])
+def test_clearing_a_group_or_world_writable_approval_is_refused(
+    approval_file: Path, mode: str
+) -> None:
+    """An approval anyone can write is not one root should act on."""
+    result = _clear_approval(approval_file, mode=mode)
+
+    assert result.returncode != 0
+    assert approval_file.read_bytes() == f"{APPROVED_SHA}\n".encode()
+
+
+@pytest.mark.parametrize("fail", ["chown", "chmod"])
+def test_a_metadata_failure_leaves_the_approval_untouched(
+    approval_file: Path, fail: str
+) -> None:
+    """Failing halfway must not publish a file with the wrong owner or mode."""
+    result = _clear_approval(approval_file, fail=fail)
+
+    assert result.returncode != 0
+    assert approval_file.read_bytes() == f"{APPROVED_SHA}\n".encode()
+
+
+def test_the_clearing_path_copies_metadata_before_it_renames() -> None:
+    """Order is the contract: a rename first would publish mktemp's 0600."""
+    body = _function_body("clear_approval_file()", "# --- repository preconditions")
+
+    assert body.index('chown --reference="$path"') < body.index("mv -f")
+    assert body.index('chmod --reference="$path"') < body.index("mv -f")
+    assert "discard_temporary" in body
+
+
+def test_the_clearing_temporary_is_created_beside_the_approval_file() -> None:
+    """A rename out of /run into /etc would cross a filesystem and not be atomic."""
+    body = _function_body("clear_approval_file()", "# --- repository preconditions")
+
+    assert 'make_temporary_file "$directory"' in body
+    assert "MGO_ROOT_TMPDIR" not in body
+
+
+def test_clear_approval_can_only_remove_authority() -> None:
+    """No parameter for replacement content, and no path that writes a byte."""
+    body = _function_body("clear_approval_file()", "# --- repository preconditions")
+    action = _function_body("action_clear_approval()", "# --- entry point")
+
+    for granting in ("printf", "echo", "tee", "cat "):
+        assert granting not in body, granting
+    assert "validate_approval_file" not in action
+
+
+def test_clear_approval_touches_no_other_production_seam() -> None:
+    """Revocation is not deployment: no Git, no uv, no systemd, no database."""
+    action = _function_body("action_clear_approval()", "# --- entry point")
+
+    for forbidden in (
+        "git_admin",
+        "sync_environment",
+        "restart_service",
+        "systemctl",
+        "MGO_REPOSITORY",
+        "MGO_SERVICE",
+        "MGO_PRODUCTION_CONFIG",
+        "restore_checkout",
+        "sqlite3",
+    ):
+        assert forbidden not in action, forbidden
+
+
+def test_clear_approval_reports_both_clear_outcomes_as_success() -> None:
+    """Cleared and already-clear are both exit 0, and say which happened."""
+    action = _function_body("action_clear_approval()", "# --- entry point")
+
+    assert "already clear" in action
+    assert "deployment approval cleared" in action
+    assert action.count("return 0") == 2
+
+
+def test_the_safe_approval_object_check_refuses_before_it_writes() -> None:
+    """Safety is decided on the object, not on what the write later reports."""
+    body = _function_body("clear_approval_file()", "# --- repository preconditions")
+
+    assert body.index("require_safe_approval_object") < body.index(
+        "make_temporary_file"
+    )
+
+
+def test_an_empty_approval_is_safe_but_not_valid(tmp_path: Path) -> None:
+    """The two questions are deliberately different functions.
+
+    ``validate_approval_file`` refuses an empty file because empty authorises
+    nothing; ``require_safe_approval_object`` accepts it because an empty file is
+    a safe thing to clear. Sharing one function would break one of the two.
+    """
+    empty = _write_approval(tmp_path / "claude-approved-sha", "")
+
+    assert _safe_approval_object(empty).returncode == 0
+    assert _validate_approval(empty).returncode == EX_REQUEST
+
+
+def test_clear_approval_is_dispatched_without_extra_arguments() -> None:
+    """One word in, like every other action."""
+    result = run_bash(f'"{_posix(GATEWAY)}" clear-approval extra')
+
+    assert result.returncode == EX_REQUEST
+    assert "no arguments" in result.stderr
 
 
 # --------------------------------------------------------------------------
@@ -1960,8 +2193,13 @@ def test_no_feature_branch_constant_survives() -> None:
     assert "FEATURE_BRANCH" not in source
 
 
-def test_the_gateway_exposes_exactly_three_public_actions() -> None:
-    """A closed set: the action parser is the whole input surface."""
+def test_the_gateway_exposes_exactly_four_public_actions() -> None:
+    """A closed set: the action parser is the whole input surface.
+
+    ``clear-approval`` joined the set in Task 14.3D. It is the fourth and, so
+    far, the last: it revokes deployment authority and cannot grant it, which is
+    what let it be added without widening what the gateway can do to production.
+    """
     source = _read(GATEWAY)
     case_body = source[source.index('case "$action" in') :]
     actions = {
@@ -1970,7 +2208,12 @@ def test_the_gateway_exposes_exactly_three_public_actions() -> None:
         if line.startswith("        ") and line.strip().endswith(")")
     }
 
-    assert {"show-approval", "deploy-main", "restart-api"} <= actions
+    assert {
+        "show-approval",
+        "clear-approval",
+        "deploy-main",
+        "restart-api",
+    } <= actions
     assert "install" in actions  # present only to be refused
 
 
@@ -2086,10 +2329,15 @@ def test_the_lock_directory_is_created_when_absent(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "action", ["action_deploy_main", "action_restart_api"]
+    "action",
+    ["action_deploy_main", "action_restart_api", "action_clear_approval"],
 )
 def test_every_mutating_action_takes_the_lock_first(action: str) -> None:
-    """deploy-main and restart-api contend for the same checkout and service."""
+    """deploy-main and restart-api contend for the same checkout and service.
+
+    clear-approval contends for the authority both of them read: revoking it
+    mid-transaction would change the answer under a running deployment.
+    """
     body = _function_body(f"{action}()", "\n}\n")
     executable = [
         line.strip()
@@ -4471,8 +4719,15 @@ def test_show_approval_prepares_nothing_and_changes_nothing() -> None:
 
     assert "prepare_root_tmpdir" not in show
     assert "acquire_transaction_lock" not in show
-    # Prepared per action, and only for the two that mutate anything.
-    assert body.count("prepare_root_tmpdir") == 2
+    # Prepared per action, and only for the two whose work needs a root-owned
+    # scratch directory. clear-approval mutates but is not among them: its only
+    # temporary must live beside the approval file to be renamed atomically.
+    called = [
+        line
+        for line in body.splitlines()
+        if "prepare_root_tmpdir" in line and not line.strip().startswith("#")
+    ]
+    assert len(called) == 2, called
 
     action = _function_body("action_show_approval()", "action_restart_api()")
     for forbidden in ("mktemp", "mkdir", "acquire_transaction_lock", "chmod"):
@@ -7947,7 +8202,7 @@ def test_the_gateway_exposes_no_new_public_action() -> None:
     accepted = source[source.index("case \"$action\" in") :]
     accepted = accepted[: accepted.index("esac")]
 
-    assert "show-approval | deploy-main | restart-api" in accepted
+    assert "show-approval | clear-approval | deploy-main | restart-api" in accepted
     for forbidden in (
         "restore",
         "rollback-database",

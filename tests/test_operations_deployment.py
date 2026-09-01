@@ -4305,3 +4305,190 @@ def test_the_historical_findings_keep_their_original_wording() -> None:
         history
     )
     assert "Pi validation had not resumed" not in _front_matter()
+
+
+# --- Task 14.3D: the post-schema-advancement recovery contract ---------------
+#
+# These assert the *structure* of the procedure rather than its prose: that the
+# section exists, that both older sections route to it, and above all that the
+# ordering which makes it safe is the ordering written down. Paragraph snapshots
+# would break on every wording improvement and prove nothing about safety, so
+# the assertions are anchors and relative positions.
+
+RECOVERY_HEADING = "### 6.2 Post-schema-advancement deployment recovery"
+CORRUPTION_HEADING = "### 6.1 Disaster-recovery outline"
+SCHEMA_AWARE_HEADING = "## 5.7 Schema-aware deployment recovery"
+LOGGING_HEADING = "## 7. Logging"
+
+
+def _recovery() -> str:
+    """The post-schema-advancement procedure, exclusive of its neighbours."""
+    return _span(_read(DOCUMENTATION), RECOVERY_HEADING, LOGGING_HEADING)
+
+
+def _corruption() -> str:
+    """The database-corruption outline."""
+    return _span(_read(DOCUMENTATION), CORRUPTION_HEADING, RECOVERY_HEADING)
+
+
+def _schema_aware() -> str:
+    """The gateway's exit-79 refusal, as documented."""
+    return _span(_read(DOCUMENTATION), SCHEMA_AWARE_HEADING, "## 6. Restore")
+
+
+def test_the_post_schema_recovery_section_exists() -> None:
+    """A real, normally numbered section -- there is no such thing as 6-B."""
+    text = _read(DOCUMENTATION)
+
+    assert RECOVERY_HEADING in text
+    assert "6-B" not in text
+
+
+def test_the_two_recovery_procedures_are_distinguished() -> None:
+    """Corruption and deployment recovery are different problems."""
+    corruption = _corruption()
+    recovery = _recovery()
+
+    assert "corrupt or lost database" in corruption
+    assert "6.2" in corruption
+    assert "79" in corruption
+    assert "exited 79" in recovery
+
+
+def test_the_schema_aware_section_routes_exit_79_to_the_new_procedure() -> None:
+    """5.7 used to say 6 was the only path; 6.1 cannot recover this failure."""
+    schema_aware = _schema_aware()
+
+    assert "6.2" in schema_aware
+    assert "remains the only recovery path" not in schema_aware
+
+
+def test_the_recovery_explains_why_starting_early_undoes_it() -> None:
+    """The defect is named, so the ordering is not mistaken for ceremony."""
+    recovery = _recovery()
+
+    assert "migrations at startup" in recovery
+    assert "Stage I has passed" in recovery
+
+
+def test_the_recovery_requires_an_exact_recovery_set() -> None:
+    """A named stem, never whichever set happens to be newest."""
+    recovery = _recovery()
+
+    assert "RECOVERY_STEM" in recovery
+    assert "latest" in recovery
+    assert "not a default" in recovery
+
+
+def test_the_recovery_requires_both_verify_and_restore_test() -> None:
+    """Existence is not proof, and one proof is not the other."""
+    recovery = _recovery()
+
+    assert "backup-database.sh verify" in recovery
+    assert "backup-database.sh restore-test" in recovery
+
+
+def test_the_recovery_restores_code_and_dependencies_before_starting() -> None:
+    """The whole correction, expressed as an ordering assertion."""
+    recovery = _recovery()
+
+    reset = recovery.index("git -C /opt/garden-observatory reset --hard")
+    sync = recovery.index("uv sync --frozen")
+    start = recovery.index("systemctl start mgo.service")
+
+    assert reset < start
+    assert sync < start
+
+
+def test_the_recovery_clears_approval_before_it_stops_the_service() -> None:
+    """Revocation happens while a failed proof still costs nothing."""
+    recovery = _recovery()
+
+    clear = recovery.index("mgo-validate clear-approval")
+    stop = recovery.index("systemctl stop mgo.service")
+
+    assert clear < stop
+
+
+def test_the_recovery_preserves_the_failed_database_and_its_sidecars() -> None:
+    """WAL and SHM are evidence; deleting them destroys committed pages."""
+    recovery = _recovery()
+
+    assert "mgo.db.failed" in recovery
+    assert "mgo.db-wal.failed" in recovery
+    assert "mgo.db-shm.failed" in recovery
+    assert "never deleted" in recovery
+
+
+def test_the_recovery_evidence_path_is_unique_and_collision_checked() -> None:
+    """A fixed name lets a second attempt erase the first attempt's evidence."""
+    recovery = _recovery()
+
+    assert "RECOVERY_STAMP" in recovery
+    assert "recovery-evidence" in recovery
+    assert "test ! -e" in recovery
+
+
+def test_the_new_procedure_does_not_use_the_fixed_damaged_filename() -> None:
+    """6.1 may keep it; a procedure that can run twice may not."""
+    assert "mgo.db.damaged" not in _recovery()
+    assert "mgo.db.damaged" in _corruption()
+
+
+def test_the_recovery_deletes_no_sidecar() -> None:
+    """The old outline removed them with rm -f. This one must not."""
+    recovery = _recovery()
+
+    assert "rm -f /var/lib/garden-observatory/db/mgo.db-wal" not in recovery
+    assert "rm -f" not in recovery
+
+
+def test_the_recovery_states_database_ownership_and_mode() -> None:
+    """Inherited from a umask is not a contract."""
+    recovery = _recovery()
+
+    assert "chown mgo:mgo /var/lib/garden-observatory/db/mgo.db" in recovery
+    assert "chmod 0640 /var/lib/garden-observatory/db/mgo.db" in recovery
+
+
+def test_the_recovery_publishes_the_database_through_a_temporary() -> None:
+    """A half-copied database must never be reachable at the live path."""
+    recovery = _recovery()
+
+    incoming = recovery.index("mgo.db.incoming")
+    rename = recovery.index(
+        "mv /var/lib/garden-observatory/db/mgo.db.incoming"
+    )
+
+    assert incoming < rename
+
+
+def test_the_recovery_gate_is_offline_and_read_only() -> None:
+    """Checking a schema by migrating to it is not checking it."""
+    recovery = _recovery()
+
+    assert "mode=ro" in recovery
+    assert "PRAGMA query_only" in recovery
+    assert "would apply one" in recovery
+
+
+def test_the_recovery_validates_after_starting() -> None:
+    """Started is not recovered."""
+    recovery = _recovery()
+
+    for check in ("NRestarts", "/database/status", "preview", "media aggregates"):
+        assert check in recovery, check
+
+
+def test_the_recovery_preserves_evidence_afterwards() -> None:
+    """Evidence outlives the incident, and the gap is stated."""
+    recovery = _recovery()
+
+    assert "observation gap" in recovery
+    assert "separately authorised" in recovery
+    assert "escalate rather than retrying" in recovery
+
+
+def test_the_recovery_never_reads_media_content() -> None:
+    """Aggregates only, the same boundary every other procedure keeps."""
+    assert "never by reading media" in _recovery()

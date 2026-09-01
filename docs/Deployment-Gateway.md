@@ -34,7 +34,8 @@ thing, and everything else is pushed back down to an unprivileged account.
 
 ## 1a. One control plane, one lock
 
-Every mutating action — `deploy-main`, `restart-api` and the installer — takes
+Every mutating action — `deploy-main`, `restart-api`, `clear-approval` and the
+installer — takes
 one exclusive lock before it reads anything mutable:
 
 ```text
@@ -56,7 +57,8 @@ between the restart and the final verification is the same class of problem.
   the restart and the final check is not a lock.
 - **No PID file, no staleness protocol.** `flock` is released by the kernel
   when the holder exits, however it exits.
-- `show-approval` is read-only and is never blocked.
+- `show-approval` is read-only and is never blocked. `clear-approval` mutates
+  the authority the other two read, so it does take the lock.
 
 **The lock file is itself a security boundary.** Any unprivileged process that
 can open it read-only can hold an exclusive `flock` on it and deny every
@@ -127,13 +129,32 @@ as shell input.
 must be on `main`, must be clean, and must have `origin` pointing at this
 repository.
 
-## 4. The three actions
+## 4. The four actions
 
 | Action | Does | Never does |
 | ------ | ---- | ---------- |
 | `show-approval` | Prints the approved SHA on stdout, alone | Anything else |
+| `clear-approval` | Empties the approval file, revoking deployment authority | Installs, replaces or widens an approval; prints the SHA; touches the checkout, service, database, configuration, backups or media |
 | `deploy-main` | Deploys `origin/main` at the approved SHA, transactionally | Deploys any other ref, merges, rebases, resets forward, pushes |
 | `restart-api` | Restarts the service at the already-deployed approved SHA, on **whatever branch is checked out** | Fetches, merges, syncs, starts preview, captures |
+
+`clear-approval` was added by Task 14.3D, for the manual recovery in
+`docs/Operations.md` §6.2. After a deployment fails past the restart and
+rollback is refused (exit **79**), the approval that authorised the failed
+attempt is still installed, and recovery has to take that authority away before
+it stops the service -- otherwise a later `deploy-main` or `restart-api` could
+act on it. Doing that by hand meant editing a root-owned file under `/etc` during
+an incident, with no symlink check and no atomicity.
+
+It is deliberately **asymmetric**: there is no parameter for replacement content
+and no code path that writes a byte, so the action can only ever remove
+authority. Installing an approval remains a deliberate act by a human with root,
+because an action that could both grant and revoke would make the gateway
+sufficient to authorise its own deployment. It is **idempotent** -- absent and
+already-empty are both success and neither is a write -- because recovery
+procedures get re-run under pressure. It takes the control-plane lock, since
+revoking the authority `deploy-main` and `restart-api` read would otherwise
+change the answer underneath a running transaction.
 
 `restart-api` is deliberately **branch-aware** where `deploy-main` is
 main-only. It also serves separately authorised Pi validation of an approved

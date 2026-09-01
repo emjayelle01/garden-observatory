@@ -647,6 +647,81 @@ validate_approval_file() {
     printf '%s\n' "$content"
 }
 
+# Prove the approval object is safe to act on, without judging its *content*.
+#
+# validate_approval_file answers "is this a usable deployment authority", and
+# refuses an empty file because an empty file authorises nothing. Revocation
+# needs the other half of that question — "is this object safe to write" — and
+# must succeed precisely when the authority is absent or already empty. Sharing
+# one function would mean either clear-approval refusing to be idempotent or
+# validate_approval_file accepting an empty authority; both are worse than two
+# functions that each say one thing.
+#
+# The checks that remain are the ones that decide whether a write lands where it
+# was inspected: symlink first, then regular file, then root ownership, then no
+# group or world write. A symlinked approval path would let anyone who can write
+# the link's parent choose which file root truncates.
+require_safe_approval_object() {
+    local path="$1"
+    local owner
+    local mode
+
+    [[ ! -L "$path" ]] || return 1
+    [[ -f "$path" ]] || return 1
+
+    owner="$(stat -c '%u' "$path")" || return 1
+    [[ "$owner" == "0" ]] || return 1
+
+    # Normalised to the trailing three digits for the same reason the validator
+    # does it: stat reports a setuid or sticky bit as a fourth leading digit.
+    mode="$(stat -c '%a' "$path")" || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    mode="${mode: -3}"
+    case "${mode:1:1}" in
+        [2367]) return 1 ;;
+    esac
+    case "${mode:2:1}" in
+        [2367]) return 1 ;;
+    esac
+}
+
+# Revoke deployment authority. It can only ever remove authority.
+#
+# There is no parameter for replacement content and no code path that writes a
+# byte: the only thing this produces is an empty file. That asymmetry is the
+# point. Installing an approval stays a deliberate act performed by a human with
+# root, because an action that could both grant and revoke would make the
+# gateway itself sufficient to authorise a deployment.
+#
+# Atomic where the filesystem allows it. The temporary is created in the
+# approval file's own directory, so the rename cannot cross a filesystem
+# boundary and no observer can see a partially written authority file. Owner and
+# mode are copied from the object being replaced rather than chosen here, so
+# revocation can never widen access to the path it clears.
+#
+# The approval SHA is never read, printed or logged. Revocation does not need to
+# know what it is revoking.
+clear_approval_file() {
+    local path="$1"
+    local directory
+    local temporary
+
+    directory="$(dirname "$path")"
+    [[ ! -L "$directory" ]] || return 1
+    [[ -d "$directory" ]] || return 1
+
+    require_safe_approval_object "$path" || return 1
+
+    temporary="$(make_temporary_file "$directory")" || return 1
+
+    if ! chown --reference="$path" "$temporary" \
+        || ! chmod --reference="$path" "$temporary" \
+        || ! mv -f "$temporary" "$path"; then
+        discard_temporary "$temporary"
+        return 1
+    fi
+}
+
 # --- repository preconditions ----------------------------------------------
 
 require_repository_preconditions() {
@@ -2033,6 +2108,52 @@ action_deploy_main() {
     log "activated $(service_active_enter_timestamp "$MGO_SERVICE")"
 }
 
+# Revoke a failed deployment's approval, so the next action cannot inherit it.
+#
+# Added by Task 14.3D. After a deployment fails past the restart and rollback is
+# refused (exit 79), the approval that authorised the failed attempt is still
+# installed. Manual recovery must be able to take that authority away before it
+# stops the service, or a later deploy-main or restart-api could act on the very
+# approval whose deployment just failed. Doing it by hand meant editing a
+# root-owned file in /etc under incident pressure, with no symlink check and no
+# atomicity -- which is exactly the class of step this gateway exists to remove.
+#
+# It takes the control-plane lock. Clearing the authority that deploy-main and
+# restart-api read while one of them is mid-transaction would change the answer
+# underneath a running deployment, so revocation serialises against them on the
+# same mutex.
+#
+# Idempotent by design: absent and already-empty are the state this action
+# exists to produce, so both are success and neither is a write. Recovery
+# procedures are re-run under pressure, and a revocation that failed the second
+# time would push an operator toward doing it by hand.
+action_clear_approval() {
+    acquire_transaction_lock "$MGO_LOCK_FILE"
+
+    if [[ ! -e "$MGO_APPROVAL_FILE" && ! -L "$MGO_APPROVAL_FILE" ]]; then
+        log "no approval file is installed; deployment approval is already clear"
+        return 0
+    fi
+
+    require_safe_approval_object "$MGO_APPROVAL_FILE" \
+        || die "$EX_REQUEST" \
+            "the approval file is not a root-owned regular file that is safe to clear; nothing was modified"
+
+    # -s rather than a content read: whether authority is present is a question
+    # about length, and answering it by reading the SHA would put the value in a
+    # variable this action has no reason to hold.
+    if [[ ! -s "$MGO_APPROVAL_FILE" ]]; then
+        log "deployment approval is already clear"
+        return 0
+    fi
+
+    clear_approval_file "$MGO_APPROVAL_FILE" \
+        || die "$EX_PRECONDITION" \
+            "the approval file could not be cleared; it was left as it was"
+
+    log "deployment approval cleared"
+}
+
 # --- entry point -----------------------------------------------------------
 
 main() {
@@ -2068,7 +2189,7 @@ main() {
         || die "$EX_REQUEST" "this gateway takes no arguments beyond an action"
 
     case "$action" in
-        show-approval | deploy-main | restart-api) ;;
+        show-approval | clear-approval | deploy-main | restart-api) ;;
         install)
             # Removed deliberately. The old action provisioned service identity
             # while its name promised code deployment, and it could not deploy
@@ -2078,7 +2199,7 @@ main() {
             ;;
         *)
             die "$EX_REQUEST" \
-                "unsupported action; expected show-approval, deploy-main or restart-api"
+                "unsupported action; expected show-approval, clear-approval, deploy-main or restart-api"
             ;;
     esac
 
@@ -2099,6 +2220,16 @@ main() {
             require_root_caller "$MGO_ADMIN_ACCOUNT" "$EUID" "${SUDO_USER:-}"
             prepare_root_tmpdir "$MGO_ROOT_TMPDIR" "$MGO_ROOT_TMPDIR_PARENT"
             action_restart_api
+            ;;
+        clear-approval)
+            # The root temporary directory is deliberately not prepared here.
+            # The only temporary this action creates lives in the approval
+            # file's own directory, because a rename out of /run into /etc would
+            # cross a filesystem boundary and stop being atomic. It does take
+            # the lock, so it is listed with the mutating actions rather than
+            # beside show-approval.
+            require_root_caller "$MGO_ADMIN_ACCOUNT" "$EUID" "${SUDO_USER:-}"
+            action_clear_approval
             ;;
     esac
 }
