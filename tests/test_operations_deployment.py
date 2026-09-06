@@ -4305,3 +4305,554 @@ def test_the_historical_findings_keep_their_original_wording() -> None:
         history
     )
     assert "Pi validation had not resumed" not in _front_matter()
+
+
+# --- Task 14.3D: the post-schema-advancement recovery contract ---------------
+#
+# These assert the *structure* of the procedure rather than its prose: that the
+# section exists, that both older sections route to it, and above all that the
+# ordering which makes it safe is the ordering written down. Paragraph snapshots
+# would break on every wording improvement and prove nothing about safety, so
+# the assertions are anchors and relative positions.
+
+RECOVERY_HEADING = "### 6.2 Post-schema-advancement deployment recovery"
+CORRUPTION_HEADING = "### 6.1 Disaster-recovery outline"
+SCHEMA_AWARE_HEADING = "## 5.7 Schema-aware deployment recovery"
+LOGGING_HEADING = "## 7. Logging"
+
+
+def _recovery() -> str:
+    """The post-schema-advancement procedure, exclusive of its neighbours."""
+    return _span(_read(DOCUMENTATION), RECOVERY_HEADING, LOGGING_HEADING)
+
+
+def _corruption() -> str:
+    """The database-corruption outline."""
+    return _span(_read(DOCUMENTATION), CORRUPTION_HEADING, RECOVERY_HEADING)
+
+
+def _schema_aware() -> str:
+    """The gateway's exit-79 refusal, as documented."""
+    return _span(_read(DOCUMENTATION), SCHEMA_AWARE_HEADING, "## 6. Restore")
+
+
+def test_the_post_schema_recovery_section_exists() -> None:
+    """A real, normally numbered section -- there is no such thing as 6-B."""
+    text = _read(DOCUMENTATION)
+
+    assert RECOVERY_HEADING in text
+    assert "6-B" not in text
+
+
+def test_the_two_recovery_procedures_are_distinguished() -> None:
+    """Corruption and deployment recovery are different problems."""
+    corruption = _corruption()
+    recovery = _recovery()
+
+    assert "corrupt or lost database" in corruption
+    assert "6.2" in corruption
+    assert "79" in corruption
+    assert "exited 79" in recovery
+
+
+def test_the_schema_aware_section_routes_exit_79_to_the_new_procedure() -> None:
+    """5.7 used to say 6 was the only path; 6.1 cannot recover this failure."""
+    schema_aware = _schema_aware()
+
+    assert "6.2" in schema_aware
+    assert "remains the only recovery path" not in schema_aware
+
+
+def test_the_recovery_explains_why_starting_early_undoes_it() -> None:
+    """The defect is named, so the ordering is not mistaken for ceremony."""
+    recovery = _recovery()
+
+    assert "migrations at startup" in recovery
+    assert "Stage I has passed" in recovery
+
+
+def test_the_recovery_requires_an_exact_recovery_set() -> None:
+    """A named stem, never whichever set happens to be newest."""
+    recovery = _recovery()
+
+    assert "RECOVERY_STEM" in recovery
+    assert "latest" in recovery
+    assert "not a default" in recovery
+
+
+def test_the_recovery_requires_both_verify_and_restore_test() -> None:
+    """Existence is not proof, and one proof is not the other."""
+    recovery = _recovery()
+
+    assert "backup-database.sh verify" in recovery
+    assert "backup-database.sh restore-test" in recovery
+
+
+def test_the_recovery_restores_code_and_dependencies_before_starting() -> None:
+    """The whole correction, expressed as an ordering assertion."""
+    recovery = _recovery()
+
+    reset = recovery.index("git -C /opt/garden-observatory reset --hard")
+    sync = recovery.index("uv sync --frozen")
+    start = recovery.index("systemctl start mgo.service")
+
+    assert reset < start
+    assert sync < start
+
+
+def test_the_recovery_clears_approval_before_it_stops_the_service() -> None:
+    """Revocation happens while a failed proof still costs nothing."""
+    recovery = _recovery()
+
+    clear = recovery.index("mgo-validate clear-approval")
+    stop = recovery.index("systemctl stop mgo.service")
+
+    assert clear < stop
+
+
+def test_the_recovery_preserves_the_failed_database_and_its_sidecars() -> None:
+    """WAL and SHM are evidence; deleting them destroys committed pages."""
+    recovery = _recovery()
+
+    assert "mgo.db.failed" in recovery
+    assert "mgo.db-wal.failed" in recovery
+    assert "mgo.db-shm.failed" in recovery
+    assert "never deleted" in recovery
+
+
+def test_the_recovery_evidence_path_is_unique_and_collision_checked() -> None:
+    """A fixed name lets a second attempt erase the first attempt's evidence."""
+    recovery = _recovery()
+
+    assert "RECOVERY_STAMP" in recovery
+    assert "recovery-evidence" in recovery
+    assert "test ! -e" in recovery
+
+
+def test_the_new_procedure_does_not_use_the_fixed_damaged_filename() -> None:
+    """6.1 may keep it; a procedure that can run twice may not."""
+    assert "mgo.db.damaged" not in _recovery()
+    assert "mgo.db.damaged" in _corruption()
+
+
+def test_the_recovery_deletes_no_sidecar() -> None:
+    """The old outline removed them with rm -f. This one must not."""
+    recovery = _recovery()
+
+    assert "rm -f /var/lib/garden-observatory/db/mgo.db-wal" not in recovery
+    assert "rm -f" not in recovery
+
+
+def test_the_recovery_states_database_ownership_and_mode() -> None:
+    """Inherited from a umask is not a contract."""
+    recovery = _recovery()
+
+    assert "chown mgo:mgo /var/lib/garden-observatory/db/mgo.db" in recovery
+    assert "chmod 0640 /var/lib/garden-observatory/db/mgo.db" in recovery
+
+
+def test_the_recovery_publishes_the_database_through_a_temporary() -> None:
+    """A half-copied database must never be reachable at the live path."""
+    recovery = _recovery()
+
+    incoming = recovery.index("mgo.db.incoming")
+    rename = recovery.index(
+        "mv /var/lib/garden-observatory/db/mgo.db.incoming"
+    )
+
+    assert incoming < rename
+
+
+def test_the_recovery_gate_is_offline_and_read_only() -> None:
+    """Checking a schema by migrating to it is not checking it."""
+    recovery = _recovery()
+
+    assert "mode=ro" in recovery
+    assert "PRAGMA query_only" in recovery
+    assert "would apply one" in recovery
+
+
+def test_the_recovery_validates_after_starting() -> None:
+    """Started is not recovered."""
+    recovery = _recovery()
+
+    for check in ("NRestarts", "/database/status", "preview", "media aggregates"):
+        assert check in recovery, check
+
+
+def test_the_recovery_preserves_evidence_afterwards() -> None:
+    """Evidence outlives the incident, and the gap is stated."""
+    recovery = _recovery()
+
+    assert "observation gap" in recovery
+    assert "separately authorised" in recovery
+    assert "escalate rather than retrying" in recovery
+
+
+def test_the_recovery_never_reads_media_content() -> None:
+    """Aggregates only, the same boundary every other procedure keeps."""
+    assert "never by reading media" in _recovery()
+
+
+# --- Task 14.3F: the corrections the independent review required --------------
+#
+# Task 14.3E blocked PR #15 on three MEDIUM findings: the recovery account
+# boundary was unstated and Stage C was unreachable for the operator who can run
+# the rest; the stages that *prove* things carried prose where the stages that
+# *mutate* things carried commands; and the ordering assertions covered only the
+# code half of the correction, so a future edit could move the database
+# restoration after the service start without failing anything.
+#
+# These assertions are deliberately anchored on command text inside fenced
+# blocks rather than on prose, so they cannot pass on a sentence that merely
+# mentions the right words.
+
+
+def _fenced_bash_blocks(text: str) -> list[str]:
+    """Every ```bash block in a section, as a list of block bodies."""
+    blocks = []
+    remainder = text
+    while "```bash" in remainder:
+        _, _, remainder = remainder.partition("```bash")
+        body, closing, remainder = remainder.partition("```")
+        assert closing, "an unterminated bash block"
+        blocks.append(body)
+    return blocks
+
+
+# --- MEDIUM-1: the execution-account boundary --------------------------------
+
+GATEWAY_THROUGH_CLAUDE = (
+    "sudo -u claude -- sudo -n /usr/local/sbin/mgo-validate clear-approval"
+)
+
+
+def test_the_recovery_declares_its_execution_account_boundary() -> None:
+    """Two accounts, and which stage needs which is not left to memory."""
+    recovery = _recovery()
+
+    assert "Which account runs which stage" in recovery
+    assert "full `sudo`" in recovery
+    # The gateway's caller gate, named as the reason rather than as a rule.
+    assert "SUDO_USER" in recovery
+
+
+def test_the_recovery_states_that_direct_root_gateway_calls_are_refused() -> None:
+    """A refusal an operator can predict is not a fault they will misread."""
+    recovery = _recovery()
+
+    assert "Direct root invocation of the gateway is refused" in recovery
+    assert "no sudo caller recorded" in recovery
+    assert "only the claude account may use this gateway" in recovery
+
+
+def test_stage_c_reaches_the_gateway_through_claude() -> None:
+    """The exact command, inside a runnable block -- not described in prose."""
+    recovery = _recovery()
+    blocks = _fenced_bash_blocks(recovery)
+
+    assert any(GATEWAY_THROUGH_CLAUDE in block for block in blocks), (
+        "the account-transition command must appear in a runnable bash block"
+    )
+    # And never the bare form that a full-sudo operator's account cannot run.
+    for block in blocks:
+        for line in block.splitlines():
+            stripped = line.strip()
+            if "mgo-validate clear-approval" in stripped:
+                assert stripped.startswith("sudo -u claude -- "), stripped
+
+
+def test_stage_c_names_the_account_the_gateway_requires() -> None:
+    """Stage C itself says claude, so the boundary is where the command is."""
+    stage_c = _span(_recovery(), "#### Stage C", "#### Stage D")
+
+    assert "claude" in stage_c
+    assert GATEWAY_THROUGH_CLAUDE in stage_c
+
+
+def test_the_recovery_forbids_editing_the_approval_file_directly() -> None:
+    """The gateway is the point; a root-side bypass discards every guarantee."""
+    recovery = _recovery()
+
+    assert "Do not work around a refusal by editing the approval file" in recovery
+    assert "redirection" in recovery
+
+
+def test_failing_to_clear_approval_remains_a_stop_condition() -> None:
+    """Unchanged by the account correction, and asserted so it stays."""
+    stage_c = _span(_recovery(), "#### Stage C", "#### Stage D")
+
+    assert "**If approval cannot be cleared, stop here**" in stage_c
+    assert "before the service is stopped" in stage_c
+
+
+# --- MEDIUM-2: literal, non-mutating verification commands -------------------
+
+
+def test_the_read_only_probe_is_an_executable_block_not_prose() -> None:
+    """The decisive gate must be runnable, not described.
+
+    Task 14.3E found ``mode=ro`` and ``PRAGMA query_only`` present only in
+    prose, which let an operator improvise ``sqlite3 <file>`` -- a read-WRITE
+    open that creates the very sidecars Stage I requires to be absent.
+    """
+    blocks = _fenced_bash_blocks(_recovery())
+
+    probes = [
+        block
+        for block in blocks
+        if "mode=ro" in block and "PRAGMA query_only" in block
+    ]
+
+    assert probes, "no runnable block performs the read-only probe"
+    probe = probes[0]
+    # Percent-encoded, exactly as the gateway's own probe builds its URI.
+    assert "quote(" in probe
+    assert "uri=True" in probe
+    # Read back, not merely set: a build that ignored the pragma must stop us.
+    assert 'connection.execute("PRAGMA query_only").fetchone()[0] != 1' in probe
+    assert "integrity_check" in probe
+    assert "schema_migrations" in probe
+
+
+def test_the_recovery_forbids_a_bare_sqlite_open() -> None:
+    """Named, because the wrong command is the plausible one."""
+    recovery = _recovery()
+
+    assert "Never open the restored database with a bare filename" in recovery
+
+
+def test_stage_b_proves_the_manifest_schema_with_a_command() -> None:
+    """The chosen stem's manifest, bounded fields, and a hard failure."""
+    stage_b = _span(_recovery(), "#### Stage B", "#### Stage C")
+    blocks = _fenced_bash_blocks(stage_b)
+
+    manifest = [
+        block
+        for block in blocks
+        if "manifest.json" in block and "json.load" in block
+    ]
+    assert manifest, "no runnable block reads the chosen manifest"
+    command = manifest[0]
+
+    assert "$RECOVERY_STEM" in command
+    assert "schema_version" in command
+    assert "expected_schema_version" in command
+    assert "sys.exit(" in command
+    # Bounded output: never the whole manifest, never the configuration.
+    assert "print(m)" not in command
+    assert "json.dumps(m)" not in command
+
+
+def test_stage_i_proves_configuration_with_the_repositorys_own_import() -> None:
+    """The gateway's own pre-restart proof, not an invented validator."""
+    stage_i = _span(_recovery(), "#### Stage I", "#### Stage J")
+    blocks = _fenced_bash_blocks(stage_i)
+
+    config = [block for block in blocks if "load_config" in block]
+    assert config, "no runnable block validates the configuration"
+    command = config[0]
+
+    assert "MGO_CONFIG_PATH=/etc/garden-observatory/mgo.toml" in command
+    assert "import mgo.api.app" in command
+    assert "database_path_matches" in command
+
+
+def test_stage_i_covers_every_condition_its_table_requires() -> None:
+    """A table of conditions with no commands is what MEDIUM-2 was."""
+    stage_i = _span(_recovery(), "#### Stage I", "#### Stage J")
+
+    for marker in (
+        "**I.1",  # repository, dependencies, branch
+        "**I.2",  # read-only database probe
+        "**I.3",  # schema the restored build supports
+        "**I.4",  # configuration and application compatibility
+        "**I.5",  # activation path and restored metadata
+        "**I.6",  # Stage D evidence
+        "**I.7",  # approval still clear
+    ):
+        assert marker in stage_i, marker
+
+    assert "CURRENT_SCHEMA_VERSION" in stage_i
+    assert "mgo.db-wal" in stage_i and "mgo.db-shm" in stage_i
+    assert "Any failure in I.1 to I.7 leaves the service stopped" in stage_i
+
+
+def test_stage_j_covers_every_post_start_condition_with_a_command() -> None:
+    """Every mandatory condition has a command or a named earlier value."""
+    stage_j = _span(_recovery(), "#### Stage J", "#### Stage K")
+    blocks = _fenced_bash_blocks(stage_j)
+    joined = "\n".join(blocks)
+
+    for command in (
+        "systemctl show mgo.service",  # state, MainPID, NRestarts
+        "/version",  # running build
+        "/health",  # health
+        "/database/status",  # schema, integrity, migrations
+        "/camera/preview/status",  # preview
+        "/motion/status",  # motion
+        "/event-capture/status",  # event capture
+        "/retention/status",  # build-appropriate retention
+        "/captures",  # protected evidence, media bytes
+        "sha256sum /etc/garden-observatory/mgo.toml",  # configuration hash
+        "mgo-validate show-approval",  # approval still clear
+    ):
+        assert command in joined, command
+
+    # GET only. No API check may write.
+    for verb in ("-X POST", "-X PUT", "-X DELETE", "--data"):
+        assert verb not in joined, verb
+
+
+def test_stage_j_reports_media_by_aggregate_only() -> None:
+    """Counts and bytes; never a filename, never a stored path."""
+    stage_j = _span(_recovery(), "#### Stage J", "#### Stage K")
+    blocks = _fenced_bash_blocks(stage_j)
+
+    aggregate = [block for block in blocks if "filesize_bytes" in block]
+    assert aggregate, "no runnable block aggregates the catalogue"
+    command = aggregate[0]
+
+    assert "catalogued_captures=" in command
+    assert "catalogued_bytes=" in command
+    assert "filename" not in command
+
+
+# --- MEDIUM-3: the complete restoration ordering -----------------------------
+
+STAGE_HEADINGS = [
+    "#### Stage A -- recognise and freeze the failure",
+    "#### Stage B -- select and prove the exact recovery set",
+    "#### Stage C -- revoke the failed deployment's approval",
+    "#### Stage D -- stop the service and preserve the failed state",
+    "#### Stage E -- restore the old application code",
+    "#### Stage F -- restore compatible dependencies",
+    "#### Stage G -- restore configuration only if the deployment changed it",
+    "#### Stage H -- restore the database",
+    "#### Stage I -- pre-start compatibility gate",
+    "#### Stage J -- controlled start and validation",
+    "#### Stage K -- preserve evidence and close deliberately",
+]
+
+# Every anchor below occurs exactly once in the section, which is asserted
+# before any of them is used as an index. Without that, ``str.index`` would
+# silently answer for a first occurrence in prose and the ordering proof would
+# be worthless.
+ORDERED_ANCHORS = [
+    "sudo systemctl stop mgo.service",
+    # The evidence move itself: "mgo.db.failed" alone appears five times in the
+    # section, so it is a label rather than an anchor.
+    'sudo -u mgo mv /var/lib/garden-observatory/db/mgo.db "',
+    "git -C /opt/garden-observatory reset --hard",
+    "uv sync --frozen",
+    "install -o root -g mgo -m 0640",
+    # The publication and the rename, as unique commands: the bare name
+    # "mgo.db.incoming" appears three times across Stage H's prose.
+    'install -m 0640 "/var/backups/garden-observatory/$RECOVERY_STEM.db"',
+    "sudo -u mgo mv /var/lib/garden-observatory/db/mgo.db.incoming",
+    "chown mgo:mgo /var/lib/garden-observatory/db/mgo.db",
+    "chmod 0640 /var/lib/garden-observatory/db/mgo.db",
+    "#### Stage I -- pre-start compatibility gate",
+    "sudo systemctl start mgo.service",
+]
+
+
+def test_the_recovery_stages_appear_in_order() -> None:
+    """A to K, once each, in sequence."""
+    recovery = _recovery()
+
+    for heading in STAGE_HEADINGS:
+        assert recovery.count(heading) == 1, heading
+
+    positions = [recovery.index(heading) for heading in STAGE_HEADINGS]
+    assert positions == sorted(positions)
+
+
+def test_the_recovery_starts_the_service_once_and_never_restarts_it() -> None:
+    """One start command, and nothing earlier that could start the service."""
+    recovery = _recovery()
+
+    assert recovery.count("sudo systemctl start mgo.service") == 1
+    assert "systemctl restart" not in recovery
+    # The only ``systemctl start`` anywhere in the section is that one command.
+    assert recovery.count("systemctl start") == 1
+
+
+def test_the_complete_restoration_ordering_precedes_the_service_start() -> None:
+    """The whole correction, as one ordering proof.
+
+    This is what MEDIUM-3 was about: the previous assertions covered only code
+    and dependencies, so moving the database restoration or the compatibility
+    gate after the start would have failed nothing.
+    """
+    recovery = _recovery()
+
+    for anchor in ORDERED_ANCHORS:
+        assert recovery.count(anchor) == 1, f"{anchor} is not a unique anchor"
+
+    positions = [recovery.index(anchor) for anchor in ORDERED_ANCHORS]
+    assert positions == sorted(positions), dict(
+        zip(ORDERED_ANCHORS, positions, strict=True)
+    )
+
+    start = recovery.index("sudo systemctl start mgo.service")
+    assert recovery.index("mgo.db.incoming") < start
+    assert recovery.index("#### Stage I -- pre-start compatibility gate") < start
+
+
+def test_the_rejected_ordering_is_documented_as_rejected() -> None:
+    """Naming the wrong order is what stops it being reintroduced."""
+    recovery = _recovery()
+
+    assert "The rejected ordering, recorded so it is not reintroduced" in recovery
+    assert (
+        "stop service -> preserve database -> restore database -> start service"
+        " -> restore code" in recovery
+    )
+    assert "re-applies migration 003" in recovery
+
+
+# --- LOW findings ------------------------------------------------------------
+
+
+def test_stage_e_verifies_the_branch_as_well_as_the_commit() -> None:
+    """rev-parse and status cannot reveal a detached HEAD; this can."""
+    stage_e = _span(_recovery(), "#### Stage E", "#### Stage F")
+    blocks = _fenced_bash_blocks(stage_e)
+
+    assert any(
+        "git -C /opt/garden-observatory branch --show-current" in block
+        for block in blocks
+    )
+    assert "prints **nothing** when `HEAD` is detached" in stage_e
+    # The commit and cleanliness checks are retained, not replaced.
+    assert any("rev-parse HEAD" in block for block in blocks)
+    assert any(
+        "status --porcelain --untracked-files=all" in block for block in blocks
+    )
+
+
+def test_the_exact_set_prohibition_is_pinned_not_merely_mentioned() -> None:
+    """``"latest" in recovery`` also passed for a runbook recommending it."""
+    recovery = _recovery()
+
+    assert 'Never "the latest"' in recovery
+
+
+def test_the_recovery_records_its_residual_limitations() -> None:
+    """The review's notes, kept where an operator will meet them."""
+    recovery = _recovery()
+
+    assert "has never been executed" in recovery
+    assert "interrupted `clear-approval` can leave an inert temporary" in recovery
+    assert "residual time-of-check window" in recovery
+    assert "Media is not in a recovery set" in recovery
+    assert "share a filesystem" in recovery
+
+
+def test_stage_b_states_which_build_runs_the_proofs() -> None:
+    """The proofs must precede Stage E, so they use the failed build's tooling."""
+    stage_b = _span(_recovery(), "#### Stage B", "#### Stage C")
+
+    assert "the failed build's" in stage_b
+    assert "refuses production data locations" in stage_b

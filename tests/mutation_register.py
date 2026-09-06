@@ -1028,10 +1028,101 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'install-action-restored',
         GATEWAY,
-        '        show-approval | deploy-main | restart-api) ;;',
-        '        show-approval | deploy-main | restart-api | install) ;;',
-        'install_action_is_rejected or exposes_exactly_three_public_actions',
+        '        show-approval | clear-approval | deploy-main | restart-api) ;;',
+        '        show-approval | clear-approval | deploy-main | restart-api'
+        ' | install) ;;',
+        'install_action_is_rejected or exposes_exactly_four_public_actions',
         'The action whose name lied is accepted again.',
+    ),
+    # --- Task 14.3D: clear-approval ---------------------------------------
+    Mutation(
+        'clear-approval-follows-a-symlink',
+        GATEWAY,
+        '    [[ ! -L "$path" ]] || return 1\n'
+        '    [[ -f "$path" ]] || return 1\n',
+        '    [[ -f "$path" ]] || return 1\n',
+        'clearing_a_symlinked_approval_is_refused or clear_symlink_refusal_precedes',
+        'Revocation follows a symlink and truncates whatever it points at.',
+    ),
+    Mutation(
+        'clear-approval-accepts-a-non-root-owner',
+        GATEWAY,
+        '    owner="$(stat -c \'%u\' "$path")" || return 1\n'
+        '    [[ "$owner" == "0" ]] || return 1\n'
+        '\n'
+        '    # Normalised to the trailing three digits',
+        '    owner="$(stat -c \'%u\' "$path")" || return 1\n'
+        '    true\n'
+        '\n'
+        '    # Normalised to the trailing three digits',
+        'clearing_a_non_root_owned_approval_is_refused',
+        'An approval owned by anyone is cleared by root on their behalf.',
+    ),
+    Mutation(
+        'clear-approval-renames-before-copying-metadata',
+        GATEWAY,
+        '    if ! chown --reference="$path" "$temporary" \\\n'
+        '        || ! chmod --reference="$path" "$temporary" \\\n'
+        '        || ! mv -f "$temporary" "$path"; then',
+        '    if ! mv -f "$temporary" "$path" \\\n'
+        '        || ! chown --reference="$path" "$temporary" \\\n'
+        '        || ! chmod --reference="$path" "$temporary"; then',
+        'copies_metadata_before_it_renames',
+        "The cleared approval is published with mktemp's 0600 rather than "
+        'the mode it replaced.',
+    ),
+    Mutation(
+        'clear-approval-skips-the-lock',
+        GATEWAY,
+        'action_clear_approval() {\n'
+        '    acquire_transaction_lock "$MGO_LOCK_FILE"\n',
+        'action_clear_approval() {\n'
+        '    true\n',
+        'every_mutating_action_takes_the_lock_first',
+        'Authority is revoked underneath a running deployment.',
+    ),
+    Mutation(
+        'clear-approval-writes-content',
+        GATEWAY,
+        '    temporary="$(make_temporary_file "$directory")" || return 1\n',
+        '    temporary="$(make_temporary_file "$directory")" || return 1\n'
+        '    printf \'%s\\n\' "granted" >"$temporary"\n',
+        'clear_approval_can_only_remove_authority',
+        'The revocation path grows a way to write content, so the gateway '
+        'could grant authority as well as remove it.',
+    ),
+    # Task 14.3F. Both parent checks were shipped without a detector, so either
+    # could have been deleted unnoticed. Each anchor carries the following
+    # require_safe_approval_object line, because the identical two lines also
+    # appear in require_secure_lock_object and a register anchor must be unique.
+    Mutation(
+        'clear-approval-parent-symlink-guard-removed',
+        GATEWAY,
+        '    [[ ! -L "$directory" ]] || return 1\n'
+        '    [[ -d "$directory" ]] || return 1\n'
+        '\n'
+        '    require_safe_approval_object',
+        '    [[ -d "$directory" ]] || return 1\n'
+        '\n'
+        '    require_safe_approval_object',
+        'clearing_parent_symlink_check_precedes '
+        'or clearing_parent_checks_come_before',
+        'A symlinked approval directory chooses which directory root writes '
+        'the replacement into.',
+    ),
+    Mutation(
+        'clear-approval-parent-directory-guard-removed',
+        GATEWAY,
+        '    [[ -d "$directory" ]] || return 1\n'
+        '\n'
+        '    require_safe_approval_object',
+        '    true\n'
+        '\n'
+        '    require_safe_approval_object',
+        'clearing_parent_directory_check_precedes '
+        'or clearing_parent_checks_come_before',
+        'The temporary is created in something that is not a directory, and '
+        'the failure is discovered by mktemp rather than by the guard.',
     ),
     Mutation(
         'extra-arguments-accepted',
@@ -1048,8 +1139,8 @@ MUTATIONS: tuple[Mutation, ...] = (
         GATEWAY,
         '        *)\n'
         '            die "$EX_REQUEST" \\\n'
-        '                "unsupported action; expected show-approval, deploy-main or '
-        'restart-api"\n'
+        '                "unsupported action; expected show-approval, '
+        'clear-approval, deploy-main or restart-api"\n'
         '            ;;',
         '        *) ;;',
         'unsupported_action',
