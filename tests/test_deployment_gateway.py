@@ -917,6 +917,38 @@ def test_the_safe_approval_object_check_refuses_before_it_writes() -> None:
     )
 
 
+def test_the_clearing_parent_symlink_check_precedes_the_temporary() -> None:
+    """A symlinked parent would decide which directory root writes into.
+
+    Task 14.3E found this guard carried no test and no mutation, so it could
+    have been deleted unnoticed. It is asserted structurally because a symlinked
+    directory cannot be created on every filesystem the suite runs on, which is
+    the same reason the object-level symlink guard has a structural assertion.
+    """
+    body = _function_body("clear_approval_file()", "# --- repository preconditions")
+
+    assert body.index('[[ ! -L "$directory" ]]') < body.index("make_temporary_file")
+
+
+def test_the_clearing_parent_directory_check_precedes_the_temporary() -> None:
+    """The temporary is created *in* that directory, so it must be one."""
+    body = _function_body("clear_approval_file()", "# --- repository preconditions")
+
+    assert body.index('[[ -d "$directory" ]]') < body.index("make_temporary_file")
+
+
+def test_the_clearing_parent_checks_come_before_the_object_check() -> None:
+    """Resolve the container first: the object check reads a path inside it."""
+    body = _function_body("clear_approval_file()", "# --- repository preconditions")
+
+    assert body.index('[[ ! -L "$directory" ]]') < body.index(
+        "require_safe_approval_object"
+    )
+    assert body.index('[[ -d "$directory" ]]') < body.index(
+        "require_safe_approval_object"
+    )
+
+
 def test_an_empty_approval_is_safe_but_not_valid(tmp_path: Path) -> None:
     """The two questions are deliberately different functions.
 

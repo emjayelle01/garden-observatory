@@ -795,16 +795,23 @@ adds nothing but a friendlier name and a clear error when the gateway is absent.
 
 4. Read the output. A successful deployment reports the recovery time, the new
    `MainPID` and the activation timestamp.
-5. **Matthew** clears the approval file when the deployment window closes.
+5. **Matthew** clears the approval file when the deployment window closes. From
+   the `claude` account that is `mgo-validate clear-approval`, which is
+   symlink-checked, atomic and locked; a root-side edit of the file is none of
+   those. `docs/Operations.md` §6.2 Stage C uses the gateway for exactly that
+   reason, and shows how a full-`sudo` operator reaches it through `claude`.
 
 ## 16. Failure and recovery
 
 | Exit | Meaning | What to do |
 | ---- | ------- | ---------- |
-| 64 | Bad request, or the approval file is missing, malformed or unsafely permissioned | Fix the approval file; the message says which property failed |
-| 65 | A precondition failed — dirty tree, wrong branch, stash, operation in progress, wrong remote, service down, remote SHA does not match the approval, not a fast-forward, or an unsafe lock or temporary directory. From the **installer**, also: stale transaction state from a run that did not finish | Resolve the named condition. Nothing was deployed. For stale transaction state, inspect `/run/mgo-validate-install` and remove the leftover workspace deliberately |
+| 0 | Success. From `clear-approval` specifically, also the **already-clear** outcomes: the approval file was absent, or was already empty. Both are success and neither is a write | Nothing. That is the state `clear-approval` exists to produce |
+| 64 | Bad request — an unsupported action, an extra argument, or a caller who is not root by way of `claude`. Also, for the actions that **require** approval (`show-approval`, `deploy-main`, `restart-api`), an approval file that is missing, empty, malformed or unsafely permissioned. For `clear-approval` a missing or empty approval is exit **0** instead, and 64 means only that the approval *object* is unsafe to clear — a symlink, not a regular file, not root-owned, or group- or world-writable — and nothing was modified | Fix the approval file; the message says which property failed |
+| 65 | A precondition failed — dirty tree, wrong branch, stash, operation in progress, wrong remote, service down, remote SHA does not match the approval, not a fast-forward, or an unsafe lock or temporary directory. From `clear-approval`, also: the cleared object could not be published, and the approval was left exactly as it was. From the **installer**, also: stale transaction state from a run that did not finish | Resolve the named condition. Nothing was deployed. For stale transaction state, inspect `/run/mgo-validate-install` and remove the leftover workspace deliberately |
 | 70 | The deployment failed and production was restored | Read the reason, fix it, deploy again. Production is where it started |
+| 75 | Another control-plane action holds the lock. `deploy-main`, `restart-api`, `clear-approval` and the installer all contend for it; `show-approval` never does | Wait for the other action to finish and look at what it is doing. Nothing was changed |
 | 78 | The deployment failed **and** the rollback failed | **Stop.** The message names the stage that failed. Do not re-run the gateway; inspect the checkout, the service and the journal by hand |
+| 79 | The deployment failed after the restart and rollback was **REFUSED**, because the database no longer records the schema the previous build supports. Nothing was restored, restarted or touched | **Stop and use `docs/Operations.md` §6.2**, the post-schema-advancement recovery procedure. §6.1 is the wrong procedure for this failure and will be undone by re-migration |
 
 The gateway never retries by itself and never loops. One deployment attempt, at
 most one rollback attempt, then it reports and stops.

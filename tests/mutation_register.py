@@ -1091,6 +1091,39 @@ MUTATIONS: tuple[Mutation, ...] = (
         'The revocation path grows a way to write content, so the gateway '
         'could grant authority as well as remove it.',
     ),
+    # Task 14.3F. Both parent checks were shipped without a detector, so either
+    # could have been deleted unnoticed. Each anchor carries the following
+    # require_safe_approval_object line, because the identical two lines also
+    # appear in require_secure_lock_object and a register anchor must be unique.
+    Mutation(
+        'clear-approval-parent-symlink-guard-removed',
+        GATEWAY,
+        '    [[ ! -L "$directory" ]] || return 1\n'
+        '    [[ -d "$directory" ]] || return 1\n'
+        '\n'
+        '    require_safe_approval_object',
+        '    [[ -d "$directory" ]] || return 1\n'
+        '\n'
+        '    require_safe_approval_object',
+        'clearing_parent_symlink_check_precedes '
+        'or clearing_parent_checks_come_before',
+        'A symlinked approval directory chooses which directory root writes '
+        'the replacement into.',
+    ),
+    Mutation(
+        'clear-approval-parent-directory-guard-removed',
+        GATEWAY,
+        '    [[ -d "$directory" ]] || return 1\n'
+        '\n'
+        '    require_safe_approval_object',
+        '    true\n'
+        '\n'
+        '    require_safe_approval_object',
+        'clearing_parent_directory_check_precedes '
+        'or clearing_parent_checks_come_before',
+        'The temporary is created in something that is not a directory, and '
+        'the failure is discovered by mktemp rather than by the guard.',
+    ),
     Mutation(
         'extra-arguments-accepted',
         GATEWAY,

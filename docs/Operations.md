@@ -906,6 +906,46 @@ Stage I has passed.**
 Every stage is manual, and each one can stop. Stopping leaves the service down
 and the evidence intact, which is always recoverable; guessing is not.
 
+**The rejected ordering, recorded so it is not reintroduced:**
+
+```text
+stop service -> preserve database -> restore database -> start service -> restore code
+```
+
+That sequence starts the new build against a restored schema-2 database, which
+re-applies migration 003 within seconds and silently undoes the recovery. It is
+the reason for every ordering rule below.
+
+#### Which account runs which stage
+
+This procedure needs **two** accounts, and the boundary is not cosmetic.
+
+| Stages | Account | Why |
+| --- | --- | --- |
+| A, B, D, E, F, G, H, I, J, K | the recovery operator, with full `sudo` | They run `systemctl`, `install`, and commands as `mgo` and as `claude`. The `claude` account cannot do any of it: its entire sudo grant is the single command `/usr/local/sbin/mgo-validate` |
+| C, and the approval checks in I and J | the gateway, reached **through `claude`** | `mgo-validate` refuses every caller whose `SUDO_USER` is not `claude` |
+
+**Direct root invocation of the gateway is refused, deliberately.** Running
+`sudo -n /usr/local/sbin/mgo-validate clear-approval` from a full-`sudo`
+operator account exits **64** (`only the claude account may use this gateway`),
+and running it as root with no `sudo` at all exits **64** as well
+(`no sudo caller recorded; invoke through sudo`). That is the gateway's design, not a
+fault, and it is why the recovery operator reaches it through `claude`:
+
+```bash
+sudo -u claude -- sudo -n /usr/local/sbin/mgo-validate clear-approval
+```
+
+The outer `sudo -u claude` becomes `claude`; the inner `sudo -n` re-enters root
+and records `SUDO_USER=claude`, which is exactly the pair
+(`EUID=0`, `SUDO_USER=claude`) the gateway requires. The `--` ends the outer
+command's option parsing so the inner `-n` belongs to the inner `sudo`.
+
+**Do not work around a refusal by editing the approval file directly.** No
+`rm`, no truncation, no `>` redirection, no editor. The gateway is what makes
+revocation symlink-checked, atomic and locked; a root-side bypass discards all
+three during an incident, which is when they matter most.
+
 #### Stage A -- recognise and freeze the failure
 
 1. Confirm the gateway really exited **79** and said rollback was *refused*. A
@@ -938,10 +978,10 @@ already unhealthy it is still left alone rather than restarted in a loop.
 
 #### Stage B -- select and prove the exact recovery set
 
-Recovery uses **one named recovery set, chosen deliberately**. Never "the
-latest": after a failed schema-advancing deployment the newest set on disk may
-well have been taken *after* the migration, at the schema you are recovering
-from.
+Recovery uses **one named recovery set, chosen deliberately**.
+Never "the latest" — after a failed schema-advancing deployment the newest set
+on disk may well have been taken *after* the migration, at the schema you are
+recovering from.
 
 1. List the sets and choose one whose manifest records the schema the **old**
    build supports.
@@ -973,6 +1013,18 @@ from.
 4. Read the manifest and confirm its `schema_version` equals the schema the
    **old** application supports. A set at the advanced schema cannot recover
    this failure, and restoring one would leave you exactly where you started.
+
+   This reads only the chosen stem's manifest, prints only the four fields the
+   decision needs, and fails loudly on a missing, malformed or non-numeric
+   `schema_version` rather than defaulting to anything.
+
+   ```bash
+   sudo -u mgo /usr/bin/python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); v=m.get("schema_version"); e=m.get("expected_schema_version"); ok=lambda n: isinstance(n,int) and not isinstance(n,bool); sys.exit("schema_version or expected_schema_version is missing or not an integer") if not (ok(v) and ok(e)) else None; print("schema_version=%d" % v); print("expected_schema_version=%d" % e); print("integrity=%s" % m["integrity"]); print("journal_mode_of_backup=%s" % m["journal_mode_of_backup"]); print("table_row_count_total=%d" % sum(m["table_row_counts"].values())); print("database_sha256=%s" % m["sha256"])' "/var/backups/garden-observatory/$RECOVERY_STEM.manifest.json"
+   ```
+
+   Compare the printed `schema_version` against the **old** build's supported
+   schema, which Stage I re-establishes from the build itself. They must be
+   equal. Never print the whole manifest or the configuration snapshot.
 5. Record the SHA-256 of all three files.
 
    ```bash
@@ -995,6 +1047,16 @@ from.
 9. **If any of this fails, stop.** The service is still running and nothing has
    been disturbed. Choose another set and start Stage B again, or escalate.
 
+`verify` and `restore-test` here run from **the failed build's** checkout and
+virtual environment, because Stage E has not happened yet and must not happen
+yet: both proofs have to complete while the service is still up, so that a
+failed proof costs nothing. That is deliberate. Both commands are read-only with
+respect to production -- `restore-test` copies into a temporary directory and
+refuses production data locations -- so running them from the newer tooling
+cannot alter the set, the database or the service. Stage I re-establishes the
+schema question against the **restored old build**, which is the build whose
+answer actually matters.
+
 #### Stage C -- revoke the failed deployment's approval
 
 The approval that authorised the failed deployment is still installed. Clear it
@@ -1002,19 +1064,29 @@ now, while the service is still up and nothing has been mutated, so that no
 later `deploy-main` or `restart-api` can act on the authority of a deployment
 that has just failed.
 
+Run it **through `claude`**, as "Which account runs which stage" above sets out.
+The recovery operator's own account cannot call the gateway directly: only
+`claude` may, and root with no `sudo` may not either.
+
 ```bash
-sudo -n /usr/local/sbin/mgo-validate clear-approval
+sudo -u claude -- sudo -n /usr/local/sbin/mgo-validate clear-approval
 ```
 
 ```bash
-sudo -n /usr/local/sbin/mgo-validate show-approval
+sudo -u claude -- sudo -n /usr/local/sbin/mgo-validate show-approval
 ```
 
 `clear-approval` revokes and can never grant: it takes no argument, writes no
 content, and its only outcome is an empty approval file. It is idempotent, so
 running it twice is safe, and it takes the control-plane lock, so it cannot race
-a deployment. `show-approval` should now refuse, which is what "no approval
-installed" looks like.
+a deployment. `show-approval` should now refuse with exit **64**, which is what
+"no approval installed" looks like.
+
+Exit **0** from `clear-approval` means the approval is now empty, or was already
+absent or already empty. Exit **64** means the approval object is not a
+root-owned regular file safe to clear and nothing was modified. Exit **65**
+means the clear itself failed and the file was left as it was. Exit **75**
+means another control-plane action holds the lock.
 
 **If approval cannot be cleared, stop here** -- before the service is stopped.
 An unrecoverable approval state is a reason to escalate, not to proceed into an
@@ -1115,10 +1187,23 @@ sudo -u claude git -C /opt/garden-observatory rev-parse HEAD
 sudo -u claude git -C /opt/garden-observatory status --porcelain --untracked-files=all
 ```
 
-`HEAD` must equal the recorded previous SHA exactly, and the status output must
-be empty. A dirty tree, a detached `HEAD`, a missing object or an operation in
-progress is a stop condition: leave the service down, keep the evidence, and
-escalate.
+```bash
+sudo -u claude git -C /opt/garden-observatory branch --show-current
+```
+
+`HEAD` must equal the recorded previous SHA exactly, the status output must be
+empty, and the branch command must print exactly:
+
+```text
+main
+```
+
+`branch --show-current` prints **nothing** when `HEAD` is detached, which is why
+it is asked separately: neither `rev-parse HEAD` nor `status --porcelain`
+reveals a detached `HEAD`, and the gateway's own rollback verifies the branch for
+the same reason. Blank output, a detached `HEAD`, another branch name, a dirty
+tree, a missing object or an operation in progress is a stop condition: leave the
+service down, keep the evidence, and escalate.
 
 #### Stage F -- restore compatible dependencies
 
@@ -1243,6 +1328,140 @@ The integrity and schema checks are read-only and must stay that way: open the
 restored file with SQLite's `mode=ro` URI and `PRAGMA query_only`, exactly as the
 gateway's own schema probe does. Do not run a migration command to "check" the
 schema -- that would apply one.
+**Never open the restored database with a bare filename** --
+`sqlite3 /var/lib/garden-observatory/db/mgo.db` opens it read-write, and on a
+WAL database that creates the very `-wal`/`-shm` sidecars this stage requires to
+be absent.
+
+**I.1 -- repository, dependencies and branch.** Re-assert Stage E and Stage F
+rather than remembering them.
+
+```bash
+sudo -u claude git -C /opt/garden-observatory rev-parse HEAD
+```
+
+```bash
+sudo -u claude git -C /opt/garden-observatory status --porcelain --untracked-files=all
+```
+
+```bash
+sudo -u claude git -C /opt/garden-observatory branch --show-current
+```
+
+`HEAD` must equal the recorded previous SHA, the status output must be empty, and
+the branch must be `main`.
+
+**I.2 -- the restored database, read-only.** Derived from the gateway's own
+schema probe: the path is percent-encoded before it is interpolated, so a path
+carrying URI syntax cannot rewrite the URI around it; the connection is opened
+`mode=ro`; `PRAGMA query_only = ON` is set **and read back as 1** before any
+`SELECT`, so a build that silently ignored the pragma stops the procedure
+instead of being trusted. A published recovery set is written in
+`journal_mode=DELETE` precisely so a single `.db` file needs no sidecars, which
+is what makes this read-only open safe with the service stopped -- it is the
+same open the repository's own `verify` performs.
+
+```bash
+sudo -u mgo /opt/garden-observatory/.venv/bin/python - <<'PROBE'
+import sqlite3
+import sys
+from urllib.parse import quote
+
+path = "/var/lib/garden-observatory/db/mgo.db"
+connection = sqlite3.connect(
+    f"file:{quote(path, safe='/:')}?mode=ro", uri=True, timeout=10
+)
+try:
+    connection.execute("PRAGMA query_only = ON")
+    if connection.execute("PRAGMA query_only").fetchone()[0] != 1:
+        sys.exit("query_only was not accepted; stop and escalate")
+    print("query_only=1")
+    print("integrity=%s" % connection.execute("PRAGMA integrity_check").fetchone()[0])
+    versions = [row[0] for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")]
+    print("schema_version=%d" % max(versions))
+    print("migrations=%s" % ",".join(str(v) for v in versions))
+finally:
+    connection.close()
+PROBE
+```
+
+`integrity` must be `ok`, and `query_only` must print `1`.
+
+**I.3 -- the schema the restored build supports.** Asked of the build itself,
+exactly as the gateway asks it, so the comparison is between two measured values
+and not between a measurement and a memory.
+
+```bash
+sudo -u mgo /opt/garden-observatory/.venv/bin/python -c 'from mgo.core.database import CURRENT_SCHEMA_VERSION
+print(CURRENT_SCHEMA_VERSION)'
+```
+
+`schema_version` from I.2 must **equal** this number, and must equal the
+`schema_version` the Stage B manifest recorded. The `migrations` list from I.2
+must be the contiguous inventory that schema expects -- `1,2` for schema 2 --
+with no gap and nothing beyond it.
+
+**I.4 -- configuration and application compatibility.** The repository's own
+proof, the same one the gateway runs before it will restart anything: import the
+configuration loader and the application with the production configuration
+selector, as the runtime account, using the restored build's interpreter. It
+parses and validates the configuration and proves the old build can load against
+it. It starts nothing, opens no camera, enters no lifespan and writes nothing.
+
+```bash
+sudo -u mgo /usr/bin/env MGO_CONFIG_PATH=/etc/garden-observatory/mgo.toml /opt/garden-observatory/.venv/bin/python -c 'from mgo.core.config import load_config
+config = load_config()
+print("configuration=loaded")
+print("database_path_matches=%s" % (config.storage.database_path.as_posix() == "/var/lib/garden-observatory/db/mgo.db"))
+import mgo.api.app
+print("application=imports")'
+```
+
+All three lines must print, and `database_path_matches` must be `True`. No
+configuration value is printed.
+
+**I.5 -- activation path and restored file metadata.** No stale sidecar may
+exist, and the restored database must carry the ownership and mode Stage H set.
+
+```bash
+sudo -u mgo ls -l /var/lib/garden-observatory/db/
+```
+
+```bash
+sudo stat -c '%n %F %U:%G %a %s' /var/lib/garden-observatory/db/mgo.db
+```
+
+```bash
+sudo -u mgo sha256sum /var/lib/garden-observatory/db/mgo.db
+```
+
+The directory must contain `mgo.db` and **no** `mgo.db-wal` and **no**
+`mgo.db-shm`. The `stat` line must read regular file, `mgo:mgo`, `640`. The hash
+must equal the backup hash recorded in Stage B.
+
+**I.6 -- Stage D evidence still intact.**
+
+```bash
+sudo -u mgo sha256sum "/var/lib/garden-observatory/recovery-evidence/$RECOVERY_STAMP/mgo.db.failed"
+```
+
+```bash
+sudo -u mgo stat -c '%n %s %U:%G %a' "/var/lib/garden-observatory/recovery-evidence/$RECOVERY_STAMP/mgo.db.failed"
+```
+
+Both must match what Stage D recorded, byte for byte.
+
+**I.7 -- deployment approval still clear.**
+
+```bash
+sudo -u claude -- sudo -n /usr/local/sbin/mgo-validate show-approval
+```
+
+This must refuse with exit **64**. Anything that prints a SHA means authority is
+still installed: return to Stage C and do not start the service.
+
+**Any failure in I.1 to I.7 leaves the service stopped.** Do not start it to
+"see what happens" -- starting is the one step this stage exists to gate.
 
 #### Stage J -- controlled start and validation
 
@@ -1250,37 +1469,116 @@ schema -- that would apply one.
 sudo systemctl start mgo.service
 ```
 
-Then confirm, and write down, every one of these:
+Every API check below is a **GET**. Nothing in this stage writes, and nothing
+opens the database directly -- the application is running now and owns it.
 
-- `systemctl` active state, sub-state and result;
-- `MainPID`, `NRestarts` and the active-enter timestamp;
-- the running application version or exact SHA;
-- `/health` returns 200 and reports healthy;
-- `/database/status` reports the expected schema and `integrity: ok`;
-- the applied-migration inventory matches that schema;
-- preview state and producer count;
-- motion state;
-- event-capture state;
-- whether the retention endpoint is available -- which depends on the restored
-  build, and its absence on an older build is correct, not a fault;
-- protected capture-evidence counts and catalogued bytes;
-- the configuration hash and section inventory; and
-- media aggregates, by count and total bytes only -- never by reading media.
+**J.1 -- service state, PID and restart counters.**
+
+```bash
+sudo systemctl show mgo.service -p ActiveState -p SubState -p Result -p MainPID -p NRestarts -p ActiveEnterTimestamp
+```
+
+`ActiveState=active`, `SubState=running`, `Result=success`, and **`NRestarts=0`**
+for this start. A non-zero `NRestarts` means the unit is restarting in a loop:
+stop it and escalate rather than watching it cycle.
+
+**J.2 -- the running build.**
+
+```bash
+curl -s http://127.0.0.1:8080/version
+```
+
+The reported version or SHA must be the **old** build restored in Stage E, not
+the build that failed.
+
+**J.3 -- health, schema and migration inventory.**
 
 ```bash
 curl -s http://127.0.0.1:8080/health
 ```
 
 ```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/health
+```
+
+```bash
 curl -s http://127.0.0.1:8080/database/status
 ```
 
-Finally, confirm the failed deployment's approval is **still clear**. A recovery
-that ends with live deployment authority installed is not finished.
+`/health` must return **200** and report healthy. `/database/status` must report
+`integrity: ok` and the same schema version I.2 and I.3 agreed on, with the same
+applied-migration inventory. If any of the three disagrees with Stage I, the
+application has changed the database since the gate passed -- stop and escalate.
+
+**J.4 -- preview, motion and event capture.**
 
 ```bash
-sudo -n /usr/local/sbin/mgo-validate show-approval
+curl -s http://127.0.0.1:8080/camera/preview/status
 ```
+
+```bash
+curl -s http://127.0.0.1:8080/motion/status
+```
+
+```bash
+curl -s http://127.0.0.1:8080/event-capture/status
+```
+
+Record preview state and producer count, motion state and event-capture state.
+Compare them against what Stage A recorded: recovery restores the previous
+build, not a different configuration, so an unexplained change is a finding.
+
+**J.5 -- retention, appropriate to the restored build.**
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/retention/status
+```
+
+**404 is a correct answer on a build older than Task 14.1**, not a fault. If it
+returns 200, read it and record `enabled` and `state`:
+
+```bash
+curl -s http://127.0.0.1:8080/retention/status
+```
+
+**J.6 -- protected capture evidence and media aggregates.** Record media
+aggregates, by count and total bytes only -- never by reading media. The
+aggregate is computed from the catalogue and printed as two numbers, so no
+filename and no stored path is displayed.
+
+```bash
+curl -s http://127.0.0.1:8080/captures | /usr/bin/python3 -c 'import json,sys; r=json.load(sys.stdin); print("catalogued_captures=%d" % len(r)); print("catalogued_bytes=%d" % sum(c["filesize_bytes"] for c in r))'
+```
+
+The protected Task 13.2 acceptance captures are part of this catalogue and must
+still be present: the count must be **at least** the count Stage A recorded.
+Recovery restores a database from before the failure, so a count *lower* than the
+backup's `table_row_count_total` expectation is the observation gap Stage K
+records -- a count lower than Task 13.2's protected evidence is not, and is a
+stop condition.
+
+**J.7 -- configuration hash and section inventory.**
+
+```bash
+sudo sha256sum /etc/garden-observatory/mgo.toml
+```
+
+```bash
+sudo grep -c '^\[' /etc/garden-observatory/mgo.toml
+```
+
+The hash must equal whichever value Stage G established -- the untouched live
+hash if configuration was not restored, or the snapshot hash if it was. The
+section count is a shape check only; **do not print the file's contents.**
+
+**J.8 -- deployment approval still clear.** A recovery that ends with live
+deployment authority installed is not finished.
+
+```bash
+sudo -u claude -- sudo -n /usr/local/sbin/mgo-validate show-approval
+```
+
+This must refuse with exit **64**, exactly as it did in I.7.
 
 #### Stage K -- preserve evidence and close deliberately
 
@@ -1300,6 +1598,34 @@ sudo -n /usr/local/sbin/mgo-validate show-approval
 
 Deciding what to do with the preserved evidence is a separate decision, taken
 after the recovery is confirmed good -- never during it.
+
+#### What this procedure does not cover
+
+Stated so they are not discovered during an incident:
+
+- **This procedure has never been executed.** It is a reviewed document, not a
+  rehearsed drill. Production restoration remains unrehearsed.
+- **An interrupted `clear-approval` can leave an inert temporary.** If the
+  gateway is killed between creating its temporary and renaming it, a
+  root-owned `0600` file named `mgo-validate.XXXXXX` remains beside the approval
+  file. It grants nothing and is not read by anything; remove it deliberately,
+  and only after the recovery is closed.
+- **A residual time-of-check window exists inside `clear-approval`**, between
+  proving the approval object safe and copying its metadata. It is not reachable
+  by an unprivileged actor, because the approval file's parent directory is
+  root-owned; only another process already running as root could enter it, and
+  such a process already holds every capability the gateway has.
+- **The gateway's approval handling is proven by unit-level execution against
+  temporary paths, not against a real `/etc` on the Pi.** Windows cannot create
+  the POSIX ownership and symlink cases, so those are covered by structural
+  assertions on the shipped text and by the mutation register rather than by
+  executed cases on that platform.
+- **Media is not in a recovery set** and cannot be restored from one. J.6 counts
+  what the catalogue records; it cannot bring back a deleted file.
+- **Backups share a filesystem with the database and media**, so device failure
+  is uncovered by any of this.
+- **Equal schema versions mean the old build will _open_ the database.** They do
+  not mean arbitrary data transformations are reversible.
 
 ## 7. Logging
 
