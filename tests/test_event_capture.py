@@ -41,6 +41,7 @@ from mgo.event_capture import (
     SUCCESS_STATUS,
     SUCCESS_SUMMARY,
     WORKER_TASK_NAME,
+    AdmissionDecision,
     EventCaptureErrorCategory,
     EventCaptureRuntimeState,
     EventCaptureService,
@@ -108,12 +109,20 @@ class _FakeWorkflow:
         self._release = release
         self.calls = 0
         self.metadata: list[dict[str, Any] | None] = []
+        self.guards: list[Any] = []
 
     def capture(
-        self, *, extra_metadata: dict[str, Any] | None = None
+        self,
+        *,
+        extra_metadata: dict[str, Any] | None = None,
+        publication_guard: Any = None,
     ) -> Capture:
         self.calls += 1
         self.metadata.append(extra_metadata)
+        # Recorded, not invoked: this double produces no CaptureResult for a
+        # guard to inspect. The guard's own behaviour is proved against the
+        # real workflow in test_capture_workflow.py and test_capture_admission.py.
+        self.guards.append(publication_guard)
         if self._entered is not None:
             self._entered.set()
         if self._release is not None:
@@ -167,11 +176,56 @@ class _Recorder:
         return [call for call in self.calls if call.get("status") == status]
 
 
+class _OpenGate:
+    """An admission controller double that admits every trigger.
+
+    The behaviour of the real gate is proved in ``test_capture_admission.py``;
+    the tests in this module are about the queue, the worker and what is
+    published, so they run over a gate that never refuses. It still counts
+    reservations, so a test can prove the worker released what it took.
+    """
+
+    def __init__(self, *, maximum_capture_bytes: int = 16 * 1024 * 1024) -> None:
+        self.maximum_capture_bytes = maximum_capture_bytes
+        self.minimum_free_bytes = 1
+        self.in_flight = 0
+        self.admissions = 0
+        self.releases = 0
+
+    def _decision(self, admitted: bool) -> AdmissionDecision:
+        return AdmissionDecision(
+            admitted=admitted,
+            reason=None,
+            evaluated_at=_EVALUATED_AT,
+            hourly_count=self.in_flight,
+            hourly_limit=10,
+            daily_count=self.in_flight,
+            daily_limit=50,
+            storage_free_bytes=10**9,
+            storage_reserve_ok=True,
+            minimum_free_bytes=self.minimum_free_bytes,
+            maximum_capture_bytes=self.maximum_capture_bytes,
+        )
+
+    def evaluate(self) -> AdmissionDecision:
+        return self._decision(True)
+
+    def admit(self) -> AdmissionDecision:
+        self.in_flight += 1
+        self.admissions += 1
+        return self._decision(True)
+
+    def release(self) -> None:
+        self.in_flight -= 1
+        self.releases += 1
+
+
 def _service(
     workflow: Any,
     *,
     recorder: Any = None,
     state: EventCaptureRuntimeState | None = None,
+    admission: Any = None,
 ) -> tuple[EventCaptureService, EventCaptureRuntimeState, _Recorder]:
     """Build an enabled service over doubles."""
     runtime_state = state or EventCaptureRuntimeState(enabled=True)
@@ -180,6 +234,7 @@ def _service(
         workflow,
         runtime_state,
         DATABASE_PATH,
+        admission=admission if admission is not None else _OpenGate(),
         recorder=observation_recorder,
     )
     return service, runtime_state, observation_recorder
@@ -1059,10 +1114,16 @@ def test_the_capture_workflow_also_runs_off_the_event_loop() -> None:
 
         class _ThreadAwareWorkflow(_FakeWorkflow):
             def capture(
-                self, *, extra_metadata: dict[str, Any] | None = None
+                self,
+                *,
+                extra_metadata: dict[str, Any] | None = None,
+                publication_guard: Any = None,
             ) -> Capture:
                 thread_ids.append(threading.get_ident())
-                return super().capture(extra_metadata=extra_metadata)
+                return super().capture(
+                    extra_metadata=extra_metadata,
+                    publication_guard=publication_guard,
+                )
 
         service, _, recorder = _service(_ThreadAwareWorkflow())
         loop_thread = threading.get_ident()

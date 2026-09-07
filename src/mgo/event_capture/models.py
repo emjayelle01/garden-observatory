@@ -24,6 +24,11 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
+from mgo.event_capture.admission import (
+    AdmissionDecision,
+    AdmissionState,
+    SuppressionReason,
+)
 from mgo.motion.models import MotionResult, MotionStatus
 
 
@@ -52,6 +57,7 @@ class EventCaptureErrorCategory(StrEnum):
     BACKEND_FAILURE = "backend_failure"
     WRITE_FAILURE = "write_failure"
     ARCHIVE_FAILURE = "archive_failure"
+    OVERSIZE_CAPTURE = "oversize_capture"
     UNEXPECTED = "unexpected"
 
 
@@ -75,6 +81,10 @@ SAFE_ERROR_MESSAGES: dict[EventCaptureErrorCategory, str] = {
     ),
     EventCaptureErrorCategory.ARCHIVE_FAILURE: (
         "Capture completed but metadata could not be archived."
+    ),
+    EventCaptureErrorCategory.OVERSIZE_CAPTURE: (
+        "Motion-triggered capture exceeded the reserved size and was not "
+        "published."
     ),
     EventCaptureErrorCategory.UNEXPECTED: (
         "Motion-triggered capture failed unexpectedly."
@@ -164,6 +174,27 @@ class EventCaptureStatus:
     last_capture_id: str | None
     last_capture_at: datetime | None
     last_error: str | None
+    # Task 14.5 admission and suppression state. Every field defaults so the
+    # pre-existing constructions of this snapshot keep working; the values are
+    # the facts of the *last admission evaluation*, never a fresh probe -- the
+    # status endpoint must stay as cheap and as side-effect free as it was.
+    admission_state: AdmissionState = AdmissionState.DISABLED
+    total_triggers_suppressed: int = 0
+    last_suppression_reason: SuppressionReason | None = None
+    last_suppressed_at: datetime | None = None
+    hourly_count: int = 0
+    hourly_limit: int | None = None
+    hourly_remaining: int | None = None
+    daily_count: int = 0
+    daily_limit: int | None = None
+    daily_remaining: int | None = None
+    storage_reserve_ok: bool | None = None
+    storage_free_bytes: int | None = None
+    minimum_free_bytes: int | None = None
+    maximum_capture_bytes: int | None = None
+    last_admitted_at: datetime | None = None
+    worker_busy: bool = False
+    total_global_scene_changes: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         """Return the snapshot as JSON-compatible values.
@@ -171,7 +202,7 @@ class EventCaptureStatus:
         No filesystem path, no configuration value and no raw exception text
         appears here -- only counters, a bounded category message and
         timestamps rendered as ISO-8601 UTC, matching every other MGO status
-        endpoint.
+        endpoint. ``storage_free_bytes`` is a number, not a location.
         """
         return {
             "enabled": self.enabled,
@@ -185,6 +216,27 @@ class EventCaptureStatus:
             "last_capture_id": self.last_capture_id,
             "last_capture_at": _isoformat(self.last_capture_at),
             "last_error": self.last_error,
+            "admission_state": self.admission_state.value,
+            "total_triggers_suppressed": self.total_triggers_suppressed,
+            "last_suppression_reason": (
+                self.last_suppression_reason.value
+                if self.last_suppression_reason is not None
+                else None
+            ),
+            "last_suppressed_at": _isoformat(self.last_suppressed_at),
+            "hourly_count": self.hourly_count,
+            "hourly_limit": self.hourly_limit,
+            "hourly_remaining": self.hourly_remaining,
+            "daily_count": self.daily_count,
+            "daily_limit": self.daily_limit,
+            "daily_remaining": self.daily_remaining,
+            "storage_reserve_ok": self.storage_reserve_ok,
+            "storage_free_bytes": self.storage_free_bytes,
+            "minimum_free_bytes": self.minimum_free_bytes,
+            "maximum_capture_bytes": self.maximum_capture_bytes,
+            "last_admitted_at": _isoformat(self.last_admitted_at),
+            "worker_busy": self.worker_busy,
+            "total_global_scene_changes": self.total_global_scene_changes,
         }
 
 
@@ -220,9 +272,38 @@ class EventCaptureRuntimeState:
         self.last_capture_id: str | None = None
         self.last_capture_at: datetime | None = None
         self.last_error: str | None = None
+        # Task 14.5. The last admission decision is kept whole so the snapshot
+        # reports the counts the gate actually compared, not a re-derivation.
+        self.last_decision: AdmissionDecision | None = None
+        self.total_triggers_suppressed = 0
+        self.last_suppression_reason: SuppressionReason | None = None
+        self.last_suppressed_at: datetime | None = None
+        self.last_admitted_at: datetime | None = None
+        self.total_global_scene_changes = 0
+
+    def apply_decision(self, decision: AdmissionDecision) -> None:
+        """Remember the facts of an admission evaluation."""
+        self.last_decision = decision
+
+    def record_suppression(
+        self, reason: SuppressionReason, at: datetime
+    ) -> None:
+        """Count one suppressed trigger. Touches no database."""
+        self.total_triggers_suppressed += 1
+        self.last_suppression_reason = reason
+        self.last_suppressed_at = at
 
     def snapshot(self) -> EventCaptureStatus:
         """Return an immutable copy of the current state. Side-effect free."""
+        decision = self.last_decision
+        if not self.enabled:
+            admission_state = AdmissionState.DISABLED
+        elif decision is None:
+            admission_state = AdmissionState.UNKNOWN
+        elif decision.admitted:
+            admission_state = AdmissionState.OPEN
+        else:
+            admission_state = AdmissionState.SUPPRESSED
         return EventCaptureStatus(
             enabled=self.enabled,
             state=self.state,
@@ -235,6 +316,25 @@ class EventCaptureRuntimeState:
             last_capture_id=self.last_capture_id,
             last_capture_at=self.last_capture_at,
             last_error=self.last_error,
+            admission_state=admission_state,
+            total_triggers_suppressed=self.total_triggers_suppressed,
+            last_suppression_reason=self.last_suppression_reason,
+            last_suppressed_at=self.last_suppressed_at,
+            hourly_count=decision.hourly_count if decision else 0,
+            hourly_limit=decision.hourly_limit if decision else None,
+            hourly_remaining=decision.hourly_remaining if decision else None,
+            daily_count=decision.daily_count if decision else 0,
+            daily_limit=decision.daily_limit if decision else None,
+            daily_remaining=decision.daily_remaining if decision else None,
+            storage_reserve_ok=decision.storage_reserve_ok if decision else None,
+            storage_free_bytes=decision.storage_free_bytes if decision else None,
+            minimum_free_bytes=decision.minimum_free_bytes if decision else None,
+            maximum_capture_bytes=(
+                decision.maximum_capture_bytes if decision else None
+            ),
+            last_admitted_at=self.last_admitted_at,
+            worker_busy=self.state is EventCaptureState.CAPTURING,
+            total_global_scene_changes=self.total_global_scene_changes,
         )
 
 

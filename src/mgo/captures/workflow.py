@@ -30,13 +30,32 @@ Two properties are deliberate and load-bearing:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from mgo.camera.coordinator import CameraCoordinator
+from mgo.camera.models import CaptureResult
 from mgo.captures.archive import CaptureArchive
 from mgo.captures.models import Capture
 
 LOGGER = logging.getLogger(__name__)
+
+
+class CapturePublicationRefused(Exception):
+    """A publication guard declined to catalogue a captured file.
+
+    Raised only by a caller-supplied guard (Task 14.5: the automatic-capture
+    size ceiling). The workflow answers it by removing the file the *same
+    attempt* just created -- never any pre-existing media -- and re-raising, so
+    the refused capture leaves no image and no catalogue row behind.
+    """
+
+
+#: Inspects a verified capture *before* it is catalogued. It may raise
+#: :class:`CapturePublicationRefused`; anything else it raises is a defect and
+#: propagates unchanged.
+PublicationGuard = Callable[[CaptureResult], None]
 
 
 class CaptureWorkflow:
@@ -54,8 +73,17 @@ class CaptureWorkflow:
         self,
         *,
         extra_metadata: dict[str, Any] | None = None,
+        publication_guard: PublicationGuard | None = None,
     ) -> Capture:
         """Capture one still image, catalogue it, and return the record.
+
+        ``publication_guard`` (Task 14.5) runs between the camera transaction
+        and the archive write. If it raises
+        :class:`CapturePublicationRefused`, the freshly captured file is
+        removed and the refusal propagates; nothing is catalogued. It is the
+        one place a size ceiling can be enforced exactly, because it is the
+        only moment the real file size is known and nothing durable has yet
+        been written about it.
 
         Blocking: it runs a capture subprocess and a SQLite transaction, so
         callers on an event loop must run it in a worker thread.
@@ -81,6 +109,13 @@ class CaptureWorkflow:
         # returns.
         result = self._coordinator.capture_image()
 
+        if publication_guard is not None:
+            try:
+                publication_guard(result)
+            except CapturePublicationRefused:
+                self._discard_refused(result.absolute_path)
+                raise
+
         # The capture is complete and verified on disk and the camera-operation
         # lock has been released, so the database work below can neither hold
         # nor contend for the camera.
@@ -90,5 +125,24 @@ class CaptureWorkflow:
         )
         return record
 
+    @staticmethod
+    def _discard_refused(path: Path) -> None:
+        """Remove the file a refused capture just produced. Never raises.
 
-__all__ = ["CaptureWorkflow"]
+        This is the single exception to "a successful JPEG is never deleted",
+        and it is narrow on purpose: the file was created by *this* attempt,
+        milliseconds ago, has no catalogue row and was refused publication.
+        Leaving it would be an uncatalogued file that the storage floor was
+        never allowed to account for. A removal failure is logged; the refusal
+        still propagates, and the orphan is visible on disk for reconciliation.
+        """
+        try:
+            path.unlink()
+            LOGGER.warning("Removed refused capture %s before cataloguing", path)
+        except OSError:
+            LOGGER.warning(
+                "Could not remove refused capture %s", path, exc_info=True
+            )
+
+
+__all__ = ["CapturePublicationRefused", "CaptureWorkflow", "PublicationGuard"]

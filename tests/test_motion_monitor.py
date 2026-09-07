@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from mgo.core.config import MGOConfig, MotionConfig, load_config
-from mgo.motion.detector import AnalysisFrame, FrameDecodeError
+from mgo.motion.detector import AnalysisFrame, FrameComparison, FrameDecodeError
 from mgo.motion.frame_source import MockMotionFrameSource
 from mgo.motion.models import MotionResult, MotionStatus
 from mgo.motion.monitor import (
@@ -39,8 +39,11 @@ class _FakeDetector:
     a score strictly above ``motion_threshold``.
     """
 
-    def __init__(self, motion_threshold: float = 0.5) -> None:
+    def __init__(
+        self, motion_threshold: float = 0.5, global_threshold: float = 1.0
+    ) -> None:
         self._threshold = motion_threshold
+        self._global_threshold = global_threshold
 
     def decode(self, frame: bytes) -> AnalysisFrame:
         if frame == b"BAD":
@@ -56,8 +59,23 @@ class _FakeDetector:
         )
         return changed / 4
 
+    def compare(
+        self, baseline: AnalysisFrame, current: AnalysisFrame
+    ) -> FrameComparison:
+        # No compensation in the double: raw and compensated ratios agree, so
+        # the evaluator tests below reason about one number. Compensation is
+        # proved against the real detector in test_motion_detector.py.
+        ratio = self.score(baseline, current)
+        return FrameComparison(ratio=ratio, raw_ratio=ratio, luminance_shift=0.0)
+
     def is_motion(self, score: float) -> bool:
         return score > self._threshold
+
+    def is_global_change(self, score: float) -> bool:
+        # Above the ceiling the evaluator must say global_change, never motion.
+        # The double's ceiling is 1.0 so the pre-existing sequences below keep
+        # their meaning; the global tests in this module lower it explicitly.
+        return score > self._global_threshold
 
 
 class _Recorder:
@@ -396,6 +414,10 @@ def test_observer_payload_is_bounded_and_has_no_frame_bytes() -> None:
         "frames_available",
         "detail",
         "evaluated_at",
+        # Task 14.5 diagnostics: numbers, never frame bytes.
+        "raw_score",
+        "luminance_shift",
+        "global_change_threshold",
     }
     assert not any(isinstance(value, bytes) for value in payload.values())
 

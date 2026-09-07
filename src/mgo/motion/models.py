@@ -34,6 +34,12 @@ class MotionStatus(StrEnum):
       reference; no comparison was possible yet;
     * ``NO_MOTION`` -- the latest frame-to-frame change stayed within threshold;
     * ``MOTION_DETECTED`` -- the latest frame-to-frame change exceeded threshold;
+    * ``GLOBAL_CHANGE`` -- the latest change exceeded the *global* ceiling: an
+      exposure or lighting step, a covered lens, a camera knock or a frame
+      reset. It is deliberately not motion -- nothing in the scene is known to
+      have moved -- and it never triggers an automatic capture. The reference
+      is re-established on the new frame, so the next stable frame settles to
+      ``NO_MOTION`` (Task 14.5);
     * ``ERROR`` -- a frame could not be decoded or the detector failed.
     """
 
@@ -42,6 +48,7 @@ class MotionStatus(StrEnum):
     ESTABLISHING_BASELINE = "establishing_baseline"
     NO_MOTION = "no_motion"
     MOTION_DETECTED = "motion_detected"
+    GLOBAL_CHANGE = "global_change"
     ERROR = "error"
 
 
@@ -62,6 +69,12 @@ class MotionResult:
     (disabled, waiting, establishing a baseline, or error). ``detected`` is only
     ever ``True`` alongside :attr:`MotionStatus.MOTION_DETECTED`.
     ``frames_available`` reports whether a usable frame backed this evaluation.
+
+    Three diagnostic fields were added by Task 14.5, all with defaults so every
+    earlier construction keeps working. ``raw_score`` is the uncompensated
+    changed-pixel ratio; ``luminance_shift`` is the mean luminance change the
+    detector subtracted before scoring; ``global_change_threshold`` is the
+    ceiling above which a change is reported as ``GLOBAL_CHANGE``.
     """
 
     status: MotionStatus
@@ -71,6 +84,9 @@ class MotionResult:
     frames_available: bool
     detail: str
     evaluated_at: datetime
+    raw_score: float = 0.0
+    luminance_shift: float = 0.0
+    global_change_threshold: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "detail", _bounded(self.detail))
@@ -85,6 +101,9 @@ class MotionResult:
             "frames_available": self.frames_available,
             "detail": self.detail,
             "evaluated_at": self.evaluated_at.isoformat(),
+            "raw_score": self.raw_score,
+            "luminance_shift": self.luminance_shift,
+            "global_change_threshold": self.global_change_threshold,
         }
 
 
@@ -114,6 +133,7 @@ def default_motion_result(
             frames_available=False,
             detail="Motion detection is disabled by configuration.",
             evaluated_at=evaluated_at,
+            global_change_threshold=config.global_change_ratio_threshold,
         )
     return MotionResult(
         status=MotionStatus.WAITING_FOR_FRAMES,
@@ -123,4 +143,5 @@ def default_motion_result(
         frames_available=False,
         detail="Motion detection has not evaluated a frame yet.",
         evaluated_at=evaluated_at,
+        global_change_threshold=config.global_change_ratio_threshold,
     )

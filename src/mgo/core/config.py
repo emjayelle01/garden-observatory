@@ -193,6 +193,17 @@ class MotionConfig:
     production measurements. ``cooldown_seconds`` suppresses recording a
     *repeated* motion event that begins again within the window, without hiding
     the eventual return to no-motion.
+
+    ``global_change_ratio_threshold`` (Task 14.5) is the proportion of changed
+    pixels (0-1) *above* which a frame-to-frame change is treated as a
+    whole-frame event -- an exposure or lighting step, a covered lens, a frame
+    reset -- rather than localised motion. Such a frame reports
+    ``global_change``, never ``motion_detected``, and never triggers an
+    automatic capture. It must be strictly greater than
+    ``changed_pixel_ratio_threshold``. It defaults so every existing
+    construction of this object keeps working; the default (0.5) is a
+    "majority of the frame" ceiling derived from the Task 14.4 measurements
+    (whole-frame transitions of about 0.99 and 0.71) and is not field-calibrated.
     """
 
     enabled: bool
@@ -202,6 +213,7 @@ class MotionConfig:
     pixel_difference_threshold: int
     changed_pixel_ratio_threshold: float
     cooldown_seconds: float
+    global_change_ratio_threshold: float = 0.5
 
 
 SUPPORTED_NOTIFICATION_PROVIDERS = frozenset({"log", "null"})
@@ -223,6 +235,25 @@ class NotificationsConfig:
     provider: str
 
 
+#: The size reserved for one automatic still before it is admitted, and the
+#: largest file an automatic capture may publish. 16 MiB is several times the
+#: largest full-resolution IMX708 JPEG measured in Tasks 13.2 and 14.4 (about
+#: 2.5 MB average, 1,033,160 bytes for a dark scene), so it fails toward
+#: refusing a capture rather than toward breaching the free-space floor.
+DEFAULT_MAXIMUM_CAPTURE_BYTES = 16 * 1024 * 1024
+
+#: Upper bounds on the quota settings. One capture per second for an hour, and
+#: one per second for a day, are already far beyond anything the single-worker
+#: pipeline can produce; a larger value is a typo, not a policy.
+MAX_CAPTURES_PER_HOUR_LIMIT = 3600
+MAX_CAPTURES_PER_DAY_LIMIT = 86400
+
+#: The largest value SQLite and TOML both represent as an integer. The storage
+#: reserve is a sum of two configured values, and a sum that overflows would
+#: compare wrongly rather than fail loudly.
+_MAX_INT64 = 2**63 - 1
+
+
 @dataclass(frozen=True)
 class EventCaptureConfig:
     """Motion-triggered still-capture settings.
@@ -232,18 +263,41 @@ class EventCaptureConfig:
     on behaving exactly as it did, with no trigger queue, no background worker
     and no camera activity that nobody asked for.
 
-    There is only one setting. Queue length, retries, burst size, pre/post-roll,
-    event duration and retention are all *not* configurable here: the queue is
-    fixed at one pending trigger, there is no retry, and one motion transition
-    produces at most one still. Adding a knob for any of those would advertise a
-    behaviour this feature does not have.
+    Queue length, retries, burst size, pre/post-roll, event duration and
+    retention are all *not* configurable here: the queue is fixed at one
+    pending trigger, there is no retry, and one motion transition produces at
+    most one still. Adding a knob for any of those would advertise a behaviour
+    this feature does not have.
 
-    Enabling it requires ``camera.enabled``, ``preview.enabled``,
+    What *is* configurable (Task 14.5) are the hard safety limits, and every
+    one of them is **mandatory when the feature is enabled**:
+
+    * ``max_captures_per_hour`` -- automatic captures admitted in any rolling
+      3600-second window;
+    * ``max_captures_per_day`` -- automatic captures admitted in the current
+      UTC calendar day;
+    * ``minimum_free_bytes`` -- free space that must remain on the filesystem
+      holding ``camera.capture_directory`` *after* one more capture;
+    * ``maximum_capture_bytes`` -- the size reserved for one capture before it
+      is admitted, and the ceiling an automatic capture may publish. It has a
+      conservative default because a still's size is a property of the camera
+      rather than a policy choice; the other three have no default because a
+      guessed ceiling is a policy nobody reviewed.
+
+    The limits are ``None`` whenever the feature is disabled or the section is
+    absent, so a configuration written before they existed keeps loading. See
+    :func:`_validate_event_capture_limits`.
+
+    Enabling it also requires ``camera.enabled``, ``preview.enabled``,
     ``preview.auto_start``, ``preview.restore_after_capture`` and
     ``motion.enabled`` -- see :func:`_validate_event_capture_policy`.
     """
 
     enabled: bool
+    max_captures_per_hour: int | None = None
+    max_captures_per_day: int | None = None
+    minimum_free_bytes: int | None = None
+    maximum_capture_bytes: int = DEFAULT_MAXIMUM_CAPTURE_BYTES
 
 
 @dataclass(frozen=True)
@@ -442,6 +496,7 @@ _MOTION_DEFAULTS = {
     "pixel_difference_threshold": 20,
     "changed_pixel_ratio_threshold": 0.08,
     "cooldown_seconds": 5.0,
+    "global_change_ratio_threshold": 0.5,
 }
 
 #: Upper bounds for the analysis resolution. Motion analysis operates on a small
@@ -481,13 +536,87 @@ def _validate_motion_config(motion: MotionConfig) -> None:
     if motion.cooldown_seconds < 0:
         raise ValueError("Motion cooldown cannot be negative")
 
+    if not (0 < motion.global_change_ratio_threshold <= 1.0):
+        raise ValueError(
+            "Motion global change ratio threshold must be within (0, 1]"
+        )
+
+    # Strict ordering: the global ceiling has to sit above the motion floor,
+    # otherwise every motion would be a whole-frame event and nothing could
+    # ever trigger a capture.
+    if motion.global_change_ratio_threshold <= motion.changed_pixel_ratio_threshold:
+        raise ValueError(
+            "motion.global_change_ratio_threshold must be greater than "
+            "motion.changed_pixel_ratio_threshold"
+        )
+
 
 #: Sensible defaults for event capture when the ``[event_capture]`` section is
 #: absent, so configuration files written before Task 13.1 keep loading
 #: unchanged with motion-triggered capture disabled.
 _EVENT_CAPTURE_DEFAULTS = {
     "enabled": False,
+    "max_captures_per_hour": None,
+    "max_captures_per_day": None,
+    "minimum_free_bytes": None,
+    "maximum_capture_bytes": DEFAULT_MAXIMUM_CAPTURE_BYTES,
 }
+
+
+def _validate_event_capture_limits(event_capture: EventCaptureConfig) -> None:
+    """Validate the hard safety limits, rejecting an unbounded enablement.
+
+    The supplied limits are checked whenever they are *present*, enabled or
+    not, so a mistake is surfaced at the moment it is written rather than at
+    the moment someone turns the feature on. The last rule is the important
+    one: ``enabled = true`` with any mandatory limit missing is an automatic
+    capture pipeline with nothing to stop it, and is refused rather than
+    accepted with a guessed ceiling.
+
+    Every message names only the setting at fault: no configuration path, no
+    capture directory and no unrelated value appears in any of them.
+    """
+    hourly = event_capture.max_captures_per_hour
+    daily = event_capture.max_captures_per_day
+    floor = event_capture.minimum_free_bytes
+    reserve = event_capture.maximum_capture_bytes
+
+    if hourly is not None and not (1 <= hourly <= MAX_CAPTURES_PER_HOUR_LIMIT):
+        raise ValueError(
+            "event_capture.max_captures_per_hour must be between 1 and "
+            f"{MAX_CAPTURES_PER_HOUR_LIMIT}"
+        )
+
+    if daily is not None and not (1 <= daily <= MAX_CAPTURES_PER_DAY_LIMIT):
+        raise ValueError(
+            "event_capture.max_captures_per_day must be between 1 and "
+            f"{MAX_CAPTURES_PER_DAY_LIMIT}"
+        )
+
+    if floor is not None and floor < 1:
+        raise ValueError("event_capture.minimum_free_bytes must be at least 1")
+
+    if reserve < 1:
+        raise ValueError("event_capture.maximum_capture_bytes must be at least 1")
+
+    if floor is not None and floor + reserve > _MAX_INT64:
+        raise ValueError(
+            "event_capture.minimum_free_bytes plus "
+            "event_capture.maximum_capture_bytes exceeds the supported range"
+        )
+
+    if not event_capture.enabled:
+        return
+
+    for name, value in (
+        ("max_captures_per_hour", hourly),
+        ("max_captures_per_day", daily),
+        ("minimum_free_bytes", floor),
+    ):
+        if value is None:
+            raise ValueError(
+                f"event_capture.enabled = true requires event_capture.{name}"
+            )
 
 
 def _validate_event_capture_policy(
@@ -856,6 +985,12 @@ def parse_config_text(text: str) -> MGOConfig:
                 "cooldown_seconds", _MOTION_DEFAULTS["cooldown_seconds"]
             )
         ),
+        global_change_ratio_threshold=float(
+            motion_data.get(
+                "global_change_ratio_threshold",
+                _MOTION_DEFAULTS["global_change_ratio_threshold"],
+            )
+        ),
     )
     _validate_motion_config(motion)
 
@@ -863,13 +998,34 @@ def parse_config_text(text: str) -> MGOConfig:
     # before Task 13.1 continue to load; an absent section means the feature is
     # off, which is also its default when the section is present but empty.
     event_capture_data = raw.get("event_capture", {})
+    hourly_raw = event_capture_data.get(
+        "max_captures_per_hour", _EVENT_CAPTURE_DEFAULTS["max_captures_per_hour"]
+    )
+    daily_raw = event_capture_data.get(
+        "max_captures_per_day", _EVENT_CAPTURE_DEFAULTS["max_captures_per_day"]
+    )
+    floor_raw = event_capture_data.get(
+        "minimum_free_bytes", _EVENT_CAPTURE_DEFAULTS["minimum_free_bytes"]
+    )
     event_capture = EventCaptureConfig(
         enabled=bool(
             event_capture_data.get(
                 "enabled", _EVENT_CAPTURE_DEFAULTS["enabled"]
             )
         ),
+        max_captures_per_hour=int(hourly_raw) if hourly_raw is not None else None,
+        max_captures_per_day=int(daily_raw) if daily_raw is not None else None,
+        minimum_free_bytes=int(floor_raw) if floor_raw is not None else None,
+        maximum_capture_bytes=int(
+            event_capture_data.get(
+                "maximum_capture_bytes",
+                _EVENT_CAPTURE_DEFAULTS["maximum_capture_bytes"],
+            )
+        ),
     )
+    # The hard limits are validated before the cross-section policy so an
+    # enablement that is unbounded is refused for that reason first.
+    _validate_event_capture_limits(event_capture)
     # Cross-section: the whole camera/preview/motion chain has to be able to run
     # before automatic capture can, so this runs once those sections are built.
     _validate_event_capture_policy(event_capture, camera, preview, motion)

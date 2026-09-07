@@ -62,7 +62,12 @@ from mgo.core.health import collect_health, worst_status
 from mgo.core.health_monitor import run_health_monitor
 from mgo.core.identity import build_identity, get_application_version
 from mgo.core.observations import list_observations, record_observation
-from mgo.event_capture import EventCaptureRuntimeState, EventCaptureService
+from mgo.event_capture import (
+    CaptureAdmissionController,
+    EventCaptureRuntimeState,
+    EventCaptureService,
+    storage_floor_breached,
+)
 from mgo.motion import (
     BrokerFrameSource,
     FrameDifferenceDetector,
@@ -248,7 +253,15 @@ class DatabaseStatusResponse(BaseModel):
 
 
 class MotionStatusResponse(BaseModel):
-    """Typed, read-only projection of the latest motion-monitor state."""
+    """Typed, read-only projection of the latest motion-monitor state.
+
+    The three trailing fields were added by Task 14.5 and default, so a client
+    written against the earlier shape still reads every field it knew.
+    ``raw_score`` is the uncompensated changed-pixel ratio, ``luminance_shift``
+    the mean brightness change subtracted before scoring, and
+    ``global_change_threshold`` the ceiling above which a change is reported
+    as ``global_change`` rather than motion.
+    """
 
     enabled: bool
     status: str
@@ -258,6 +271,9 @@ class MotionStatusResponse(BaseModel):
     frames_available: bool
     detail: str
     evaluated_at: str
+    raw_score: float = 0.0
+    luminance_shift: float = 0.0
+    global_change_threshold: float | None = None
 
 
 class EventCaptureStatusResponse(BaseModel):
@@ -281,6 +297,28 @@ class EventCaptureStatusResponse(BaseModel):
     last_capture_id: str | None
     last_capture_at: str | None
     last_error: str | None
+    # Task 14.5 admission and suppression facts. Additive, with defaults, so
+    # the pre-existing shape is a strict subset of this one. Every value is the
+    # outcome of the *last admission evaluation* -- the endpoint never probes
+    # the filesystem or the catalogue itself. ``storage_free_bytes`` is a
+    # number; no path, directory or configuration location appears here.
+    admission_state: str = "disabled"
+    total_triggers_suppressed: int = 0
+    last_suppression_reason: str | None = None
+    last_suppressed_at: str | None = None
+    hourly_count: int = 0
+    hourly_limit: int | None = None
+    hourly_remaining: int | None = None
+    daily_count: int = 0
+    daily_limit: int | None = None
+    daily_remaining: int | None = None
+    storage_reserve_ok: bool | None = None
+    storage_free_bytes: int | None = None
+    minimum_free_bytes: int | None = None
+    maximum_capture_bytes: int | None = None
+    last_admitted_at: str | None = None
+    worker_busy: bool = False
+    total_global_scene_changes: int = 0
 
 
 class RetentionStatusResponse(BaseModel):
@@ -738,10 +776,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.event_capture_state = event_capture_state
     event_capture_service: EventCaptureService | None = None
     if config.event_capture.enabled:
+        # The admission gate (Task 14.5) is built from the same validated
+        # configuration that enabled the feature, so an enabled service can
+        # never exist without its limits. It counts durable catalogue rows,
+        # probes the filesystem holding the capture directory, and asks the
+        # camera readiness holder -- the one every other route reads -- before
+        # a trigger may touch the camera.
+        admission = CaptureAdmissionController(
+            config.event_capture,
+            cooldown_seconds=config.motion.cooldown_seconds,
+            database_path=config.storage.database_path,
+            capture_directory=config.camera.capture_directory,
+            camera_available=lambda: _current_camera_readiness(app).available,
+        )
         event_capture_service = EventCaptureService(
             capture_workflow,
             event_capture_state,
             config.storage.database_path,
+            admission=admission,
         )
     app.state.event_capture_service = event_capture_service
     # Retention (Task 14.1). Attached always, enabled or not, so
@@ -834,6 +886,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # captures nothing -- it only parks the worker on an empty queue.
         if event_capture_service is not None:
             event_capture_service.start()
+            # Publish the gate's facts once, from durable rows, so the status
+            # endpoint reports reconstructed counts rather than zeros after a
+            # restart. Off the loop: it reads the catalogue and the filesystem.
+            await asyncio.to_thread(event_capture_service.refresh_admission)
 
         if config.motion.enabled:
             # One material motion transition, two independent consumers. Each is
@@ -1054,6 +1110,9 @@ def motion_status(request: Request) -> MotionStatusResponse:
         frames_available=result.frames_available,
         detail=result.detail,
         evaluated_at=result.evaluated_at.isoformat(),
+        raw_score=result.raw_score,
+        luminance_shift=result.luminance_shift,
+        global_change_threshold=result.global_change_threshold,
     )
 
 
@@ -1104,6 +1163,24 @@ async def camera_capture(request: Request) -> dict[str, Any]:
     ordinary manual capture and never acquires a motion origin.
     """
     workflow = _capture_workflow(request.app)
+    # The one storage condition manual capture shares with automatic capture
+    # (Task 14.5): when a free-space floor is configured and the media
+    # filesystem is already below it -- or its free space cannot be established
+    # at all -- no capture may start. Manual capture applies no quota and no
+    # reservation; it only declines to make a bad situation worse. With no
+    # floor configured (the section absent, or automatic capture disabled) the
+    # route behaves exactly as it always has.
+    floor = config.event_capture.minimum_free_bytes
+    if floor is not None and await asyncio.to_thread(
+        storage_floor_breached, config.camera.capture_directory, floor
+    ):
+        raise HTTPException(
+            status_code=507,
+            detail=(
+                "Capture refused: the media filesystem is below the configured "
+                "free-space floor."
+            ),
+        )
     try:
         # One camera transaction, then one archive write, both off the event
         # loop. A capture failure raises before anything is archived; an archive
@@ -1179,6 +1256,35 @@ def event_capture_status(request: Request) -> EventCaptureStatusResponse:
             else None
         ),
         last_error=snapshot.last_error,
+        admission_state=snapshot.admission_state.value,
+        total_triggers_suppressed=snapshot.total_triggers_suppressed,
+        last_suppression_reason=(
+            snapshot.last_suppression_reason.value
+            if snapshot.last_suppression_reason is not None
+            else None
+        ),
+        last_suppressed_at=(
+            snapshot.last_suppressed_at.isoformat()
+            if snapshot.last_suppressed_at is not None
+            else None
+        ),
+        hourly_count=snapshot.hourly_count,
+        hourly_limit=snapshot.hourly_limit,
+        hourly_remaining=snapshot.hourly_remaining,
+        daily_count=snapshot.daily_count,
+        daily_limit=snapshot.daily_limit,
+        daily_remaining=snapshot.daily_remaining,
+        storage_reserve_ok=snapshot.storage_reserve_ok,
+        storage_free_bytes=snapshot.storage_free_bytes,
+        minimum_free_bytes=snapshot.minimum_free_bytes,
+        maximum_capture_bytes=snapshot.maximum_capture_bytes,
+        last_admitted_at=(
+            snapshot.last_admitted_at.isoformat()
+            if snapshot.last_admitted_at is not None
+            else None
+        ),
+        worker_busy=snapshot.worker_busy,
+        total_global_scene_changes=snapshot.total_global_scene_changes,
     )
 
 

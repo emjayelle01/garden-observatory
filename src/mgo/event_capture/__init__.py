@@ -24,6 +24,13 @@ exists and nothing here runs.
 
 from __future__ import annotations
 
+from mgo.event_capture.admission import (
+    AdmissionDecision,
+    AdmissionState,
+    CaptureAdmissionController,
+    SuppressionReason,
+    storage_floor_breached,
+)
 from mgo.event_capture.models import (
     SAFE_ERROR_MESSAGES,
     EventCaptureErrorCategory,
@@ -41,6 +48,8 @@ from mgo.event_capture.service import (
     QUEUE_CAPACITY,
     SUCCESS_STATUS,
     SUCCESS_SUMMARY,
+    SUPPRESSED_STATUS,
+    SUPPRESSED_SUMMARY,
     WORKER_TASK_NAME,
     EventCaptureService,
     classify_failure,
@@ -55,13 +64,20 @@ __all__ = [
     "SAFE_ERROR_MESSAGES",
     "SUCCESS_STATUS",
     "SUCCESS_SUMMARY",
+    "SUPPRESSED_STATUS",
+    "SUPPRESSED_SUMMARY",
     "WORKER_TASK_NAME",
+    "AdmissionDecision",
+    "AdmissionState",
+    "CaptureAdmissionController",
     "EventCaptureErrorCategory",
     "EventCaptureRuntimeState",
     "EventCaptureService",
     "EventCaptureState",
     "EventCaptureStatus",
     "MotionTrigger",
+    "SuppressionReason",
     "classify_failure",
     "safe_error_message",
+    "storage_floor_breached",
 ]
