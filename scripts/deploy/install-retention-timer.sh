@@ -60,6 +60,10 @@ timer_stamp="/var/lib/systemd/timers/stamp-${timer_unit}"
 
 dry_run=0
 enable_timer=0
+# Validation aid: make the SECOND publication fail so the rollback of the
+# first can be proved by the test suite. Refused with the default unit
+# directory, so it can never be used against a real host's systemd directory.
+fail_after_first_publish=0
 
 EX_USAGE=2
 EX_PRECONDITION=65
@@ -110,6 +114,7 @@ while [[ $# -gt 0 ]]; do
     --unit-directory) unit_directory="$2"; shift 2 ;;
     --enable)         enable_timer=1; shift ;;
     --dry-run)        dry_run=1; shift ;;
+    --fail-after-first-publish) fail_after_first_publish=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *)
       printf 'error: unknown option: %s\n\n' "$1" >&2
@@ -163,6 +168,10 @@ fi
 
 if (( enable_timer )) && (( developer_directory )); then
   fail "--enable is only valid with the default unit directory."
+fi
+
+if (( fail_after_first_publish )) && (( ! developer_directory )); then
+  fail "--fail-after-first-publish is a validation aid and is refused with the default unit directory."
 fi
 
 if (( ! dry_run )) && (( ! developer_directory )) && ! is_root; then
@@ -359,7 +368,7 @@ else
   fi
   note "published ${destination_service}"
 
-  if ! publish_one "${rendered_timer}" "${destination_timer}"; then
+  if (( fail_after_first_publish )) || ! publish_one "${rendered_timer}" "${destination_timer}"; then
     warn "could not publish ${destination_timer}; rolling back ${destination_service}"
     restore_one "${destination_service}" "${previous_service}"
     fail "publication failed; the previous pair was restored." "${EX_PUBLISH}"
@@ -397,7 +406,7 @@ fi
 
 # --- enable (explicit only) ------------------------------------------------------
 
-if (( enable_timer )); then
+if (( enable_timer )); then  # the only path that schedules anything
   step "Enable"
   command -v systemctl >/dev/null 2>&1 \
     || fail "systemctl is unavailable, so ${timer_unit} cannot be enabled." "${EX_ENABLE}"

@@ -563,7 +563,7 @@ def _scheduled_run(arguments: argparse.Namespace, stream: IO[str]) -> int:
     _require_explicit_configuration()
     config = _load_configuration()
 
-    if not config.retention.enabled:
+    if not config.retention.enabled:  # the scheduled gate
         _emit(
             {
                 "outcome": "skipped",

@@ -141,8 +141,10 @@ class QuotaLedger:
         with database_connection(self._database_path) as connection:
             rows = connection.execute(
                 """
-                SELECT captured_at_utc, extra_metadata,
-                       json_valid(extra_metadata) AS valid,
+                SELECT captured_at_utc,
+                       CASE WHEN json_valid(extra_metadata)
+                            THEN json_type(extra_metadata)
+                            ELSE NULL END AS kind,
                        CASE WHEN json_valid(extra_metadata)
                             THEN json_extract(extra_metadata, '$.origin')
                             ELSE NULL END AS origin
@@ -153,7 +155,12 @@ class QuotaLedger:
             ).fetchall()
         counted = 0
         for row in rows:
-            automatic = not int(row["valid"]) or row["origin"] == AUTOMATIC_ORIGIN
+            # Malformed JSON and valid JSON that is not an object both fail
+            # closed: the archive only ever writes an object, so anything else
+            # is a row this code cannot vouch for, and it counts.
+            automatic = (
+                row["kind"] != "object" or row["origin"] == AUTOMATIC_ORIGIN
+            )
             if automatic and _captured_at(row["captured_at_utc"], cutoff_utc):
                 counted += 1
         return counted
@@ -307,7 +314,13 @@ class CaptureAdmissionController:
         )
 
         reason: SuppressionReason | None = None
-        if newest is not None and now - newest < self._cooldown:
+        if (
+            self._cooldown > timedelta(0)
+            and newest is not None
+            and now - newest < self._cooldown
+        ):
+            # A newest capture stamped later than "now" gives a negative gap,
+            # which is inside any positive cooldown: a backwards clock waits.
             reason = SuppressionReason.COOLDOWN
         elif hourly >= self._hourly_limit:
             reason = SuppressionReason.HOURLY_LIMIT
