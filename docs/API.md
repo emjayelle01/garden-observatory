@@ -541,6 +541,31 @@ no timer, no startup deletion, no shutdown deletion. Task 14.1 is a software
 foundation and does not authorise production retention. See
 [`docs/Retention.md`](Retention.md).
 
+## Capture safety additions (Task 14.5)
+
+Two endpoints gained fields. Both changes are additive: every pre-existing
+field is still present, in the same position, with the same meaning, and
+every new field has a default, so a client built against the earlier shape
+reads a superset.
+
+`GET /event-capture/status` adds `admission_state` (`disabled`, `unknown`,
+`open`, `suppressed`), `total_triggers_suppressed`, `last_suppression_reason`,
+`last_suppressed_at`, `hourly_count`, `hourly_limit`, `hourly_remaining`,
+`daily_count`, `daily_limit`, `daily_remaining`, `storage_reserve_ok`,
+`storage_free_bytes`, `minimum_free_bytes`, `maximum_capture_bytes`,
+`last_admitted_at`, `worker_busy` and `total_global_scene_changes`. The
+values are the facts of the last admission evaluation; the request itself
+probes nothing. No path, directory or configuration location appears.
+
+`GET /motion/status` adds `raw_score`, `luminance_shift` and
+`global_change_threshold`, and `status` may now be `global_change`.
+
+`POST /camera/capture` answers **HTTP 507** when a `minimum_free_bytes`
+floor is configured and the media filesystem is already below it; with no
+floor configured its behaviour is unchanged.
+
+See `docs/Capture-Safety.md`.
+
 ## Compatibility promise
 
 - `/` keeps its exact three keys and their values. Only the *source* of

@@ -305,6 +305,35 @@ Consequences to keep in mind:
 - the detector does **not** filter wind, and does **not** distinguish birds from
   branches — object recognition and region-of-interest work are outside Task 4.
 
+## Whole-frame change filtering (Task 14.5)
+
+Task 14.4 recorded two `motion_detected` transitions with changed-pixel ratios
+of about 0.99 and 0.71 that settled to exactly 0.0 on the next frame — an
+exposure or lighting step, not a subject. Two changes address that, both
+described in full in `docs/Capture-Safety.md` §6:
+
+* **Compensation.** Before the noise floor is applied, the detector subtracts
+  the *median* per-pixel luminance difference between the reference and the
+  current frame. A uniform brightening cancels; a localised subject survives.
+  The median, not the mean, is load-bearing: a bright subject over part of
+  the frame moves the mean by more than the noise floor and would make every
+  unchanged background pixel read as changed.
+* **The ceiling.** `motion.global_change_ratio_threshold` (default 0.5, and
+  strictly greater than `changed_pixel_ratio_threshold`) is the proportion
+  above which a change is reported as **`global_change`** rather than motion.
+  The larger of the raw and compensated ratios is tested, so a uniform
+  exposure step is still surfaced rather than silently absorbed. A
+  `global_change` frame has `detected = false`, is never offered to event
+  capture, and advances the rolling reference so the next stable frame reads
+  `no_motion`.
+
+`GET /motion/status` gains `raw_score`, `luminance_shift` and
+`global_change_threshold`; the observation payload carries the same three
+values. The dashboard renders `global_change` as a warning.
+
+The default ceiling is not field-calibrated. Daylight commissioning is a
+later task.
+
 ## Limitations
 
 - It detects **frame-to-frame scene change only** — it cannot tell *what*

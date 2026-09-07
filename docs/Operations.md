@@ -525,6 +525,55 @@ This grants **filesystem** write access, not **database** write access: the
 connection is still opened through SQLite's `mode=ro` URI, so no statement it
 issues can modify, checkpoint or vacuum production data.
 
+### 4.5 The retention timer (Task 14.5)
+
+Scheduled retention has its own installer, unit and timer, kept separate from
+the identity installer on purpose: installing a *schedule for deletion* must
+never be a side effect of provisioning the runtime identity.
+
+```
+bash scripts/deploy/install-retention-timer.sh --dry-run      # any user
+sudo bash scripts/deploy/install-retention-timer.sh           # install only
+sudo bash scripts/deploy/install-retention-timer.sh --enable  # + schedule
+```
+
+The dry run renders the service from its template, validates both units
+(structurally everywhere; with `systemd-analyze verify` where it exists),
+compares them with what is installed and prints exactly what would change.
+Installing publishes the pair atomically and reloads the daemon. **Nothing is
+scheduled until `--enable` is passed**, and even then every run is decided by
+the configuration: with `[retention]` absent or disabled, a fired timer logs
+`skipped: retention_disabled` and deletes nothing.
+
+Commissioning prerequisites, in order: a fresh recovery set proven with
+`verify` and `restore-test`; a reviewed `[retention]` policy with at least one
+bound; `mgo-retention plan` inspected against that policy; the installer's dry
+run reviewed; install; one supervised `scheduled-run --execute` by hand as
+`mgo`; only then `--enable`. Monitoring is the journal of
+`mgo-retention.service` and `GET /retention/status`.
+
+Rollback and uninstall are root actions outside this installer: `systemctl
+disable --now mgo-retention.timer`, then remove the two unit files and
+`systemctl daemon-reload`. The installer never removes a unit.
+
+The retention run holds `<database directory>/.mgo-retention.lock` and yields
+to a fresh `<backup directory>/.mgo-backup.lock`; see `docs/Retention.md`
+§19.
+
+### 4.6 A recovery warning that applies to every set
+
+> A recovery set may contain a valid database snapshot and a configuration
+> snapshot that is inappropriate for the intended recovery target. Always
+> inspect and diff the configuration snapshot independently before activation.
+
+The database and the configuration in a set were captured together, but the
+decision to restore each is separate. A configuration that was correct for the
+moment the set was taken — a temporary test configuration, a candidate under
+validation — is not necessarily the configuration production should run
+afterwards. Compare the snapshot's `configuration_sha256` with the intended
+configuration before any activation, and treat a mismatch as a decision to
+make, not a detail to ignore.
+
 ## 5. Operator commands
 
 Run these on the Pi from the application root.

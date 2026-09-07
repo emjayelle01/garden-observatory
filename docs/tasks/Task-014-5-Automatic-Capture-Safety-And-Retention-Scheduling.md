@@ -196,13 +196,16 @@ a wind-driven afternoon cannot flood the timeline.
 
 ### 3.6 Global-change filter
 
-The detector compares luminance after subtracting the mean brightness shift
-between the two frames (uniform exposure steps cancel), then applies the
-existing changed-pixel ratio. If the compensated ratio exceeds
+The detector compares luminance after subtracting the *median* per-pixel
+brightness shift between the two frames (uniform exposure steps cancel; a
+bright subject over part of the frame leaves the median at zero, which is why
+the mean was rejected during implementation), then applies the existing
+changed-pixel ratio. If the larger of the raw and compensated ratios exceeds
 `global_change_ratio_threshold` the status is `global_change`: not motion,
 never enqueued, the reference is advanced to the new frame, and the next
 stable frame settles to `no_motion`. Localised motion remains detectable.
 Defaults are not field-calibrated; daylight commissioning is a later task.
+See `docs/Capture-Safety.md` §6.
 
 ### 3.7 Retention scheduling
 

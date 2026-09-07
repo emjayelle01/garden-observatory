@@ -884,6 +884,23 @@ Full semantics, policy, state machine, recovery, safety rules, the command
 contract and error categories live in
 [`docs/Retention.md`](docs/Retention.md).
 
+### Automatic capture safety and scheduled retention (Task 14.5)
+
+Automatic (motion-origin) capture now passes an admission gate before the
+camera is touched: a rolling-hour quota, a UTC-day quota and a free-space
+reserve on the media filesystem, all counted from durable catalogue rows so
+they survive a restart, plus a size ceiling enforced before a still is
+catalogued. Enabling `[event_capture]` **requires** the limits. The motion
+detector subtracts the median luminance shift before scoring and reports a
+whole-frame change as `global_change`, which is never a capture trigger.
+Retention gained a timer-safe `scheduled-run` subcommand, a cross-process
+lock, backup exclusion, hardened `mgo-retention.service`/`.timer` assets and
+an installer that never enables the timer without `--enable`. Everything
+ships **disabled**; production is unchanged. See
+[`docs/Capture-Safety.md`](docs/Capture-Safety.md) and
+[`docs/Retention.md`](docs/Retention.md) §19. Species recognition is still
+not implemented.
+
 ### `GET /retention/status`
 
 Read-only and inert: it reads application-managed state and never runs the

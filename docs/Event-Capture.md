@@ -473,6 +473,38 @@ No new database, no new table and **no migration**. Event capture reuses:
 None added. Standard library, the existing FastAPI/Pydantic stack and existing
 MGO modules only.
 
+## Admission control (Task 14.5)
+
+Automatic capture now passes an **admission gate** inside the worker before
+preview is released, before `rpicam-still` runs and before any file exists.
+The full contract — configuration, admission order, quota semantics, the
+storage reserve and publication ceiling, suppression reason codes and status
+fields — is `docs/Capture-Safety.md`. In brief:
+
+* enabling `[event_capture]` **requires** `max_captures_per_hour`,
+  `max_captures_per_day` and `minimum_free_bytes`; `maximum_capture_bytes`
+  defaults to 16 MiB. An absent section, or a disabled one, loads unchanged;
+* quotas are counted from durable `origin = "motion"` catalogue rows, so they
+  survive restart; one in-flight reservation is the only process-local state;
+* a refused trigger creates no image, no catalogue row and no lifecycle row;
+  it is counted, shown on `GET /event-capture/status`, and written to the
+  timeline (`status = suppressed`) only when the reason changes;
+* an admitted still larger than `maximum_capture_bytes` is withdrawn at the
+  publication boundary before it is catalogued (`oversize_capture`);
+* a `global_change` result from the motion monitor is never a trigger.
+
+`GET /event-capture/status` gains, additively: `admission_state`,
+`total_triggers_suppressed`, `last_suppression_reason`, `last_suppressed_at`,
+`hourly_count`, `hourly_limit`, `hourly_remaining`, `daily_count`,
+`daily_limit`, `daily_remaining`, `storage_reserve_ok`, `storage_free_bytes`,
+`minimum_free_bytes`, `maximum_capture_bytes`, `last_admitted_at`,
+`worker_busy` and `total_global_scene_changes`. Every value is the outcome
+of the last admission evaluation; the endpoint itself still touches nothing.
+
+The one change to *manual* capture: when a `minimum_free_bytes` floor is
+configured and the media filesystem is already below it, `POST /camera/capture`
+answers HTTP 507 and captures nothing.
+
 ## Limitations
 
 - It captures on **scene change**, not on a subject. Wind, leaves and shadows
