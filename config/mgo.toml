@@ -88,7 +88,7 @@ cooldown_seconds = 5.0
 # is reported as "global_change" — an exposure or lighting step, a covered lens,
 # a camera knock — never as motion, and it never triggers an automatic capture;
 # the scene is re-baselined instead. Must be greater than
-# changed_pixel_ratio_threshold. The detector also subtracts the mean luminance
+# changed_pixel_ratio_threshold. The detector also subtracts the median luminance
 # shift before scoring, so a uniform brightening below this ceiling reads as no
 # motion rather than as activity. Default 0.5 ("a majority of the frame") is
 # derived from the Task 14.4 measurements (whole-frame transitions of about

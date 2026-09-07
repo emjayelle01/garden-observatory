@@ -190,6 +190,18 @@ def _run(
     elif not set_config_env:
         monkeypatch.delenv(CONFIG_PATH_ENV, raising=False)
 
+    # Task 14.5A: a destructive run holds the backup lock, so it needs a backup
+    # directory to coordinate with. The deployment's own, never the canonical
+    # production location, and only for the command that executes.
+    if (
+        deployment is not None
+        and argv[:1] == ["run-once"]
+        and "--backup-directory" not in argv
+    ):
+        backups = deployment.root / "backups"
+        backups.mkdir(exist_ok=True)
+        argv = [*argv, "--backup-directory", str(backups)]
+
     out, err = io.StringIO(), io.StringIO()
     code = cli.main(argv, stdout=out, stderr=err)
     body = out.getvalue()

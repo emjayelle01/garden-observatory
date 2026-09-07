@@ -556,9 +556,11 @@ Rollback and uninstall are root actions outside this installer: `systemctl
 disable --now mgo-retention.timer`, then remove the two unit files and
 `systemctl daemon-reload`. The installer never removes a unit.
 
-The retention run holds `<database directory>/.mgo-retention.lock` and yields
-to a fresh `<backup directory>/.mgo-backup.lock`; see `docs/Retention.md`
-§19.
+The retention run holds `<database directory>/.mgo-retention.lock` **and**
+the backup's own `<backup directory>/.mgo-backup.lock` for its whole duration
+(Task 14.5A), so a backup and a retention run exclude each other with one
+atomic primitive whichever starts first; see `docs/Retention.md` §19.2. What
+retention cannot exclude is a deployment or a recovery — see §4.7.
 
 ### 4.6 A recovery warning that applies to every set
 
@@ -573,6 +575,38 @@ validation — is not necessarily the configuration production should run
 afterwards. Compare the snapshot's `configuration_sha256` with the intended
 configuration before any activation, and treat a mismatch as a decision to
 make, not a detail to ignore.
+
+### 4.7 Retention must be idle before any other maintenance (Task 14.5A)
+
+Scheduled retention excludes the backup by holding the backup's lock. It
+cannot exclude a **deployment**, a **recovery**, a **restore test** or
+**manual database maintenance**: the deployment lock is a root-owned `0600`
+`flock` the runtime account cannot observe, and the gateway does not consult
+the retention lock. Adding that coupling to the privileged gateway was
+judged out of scope for a capture-and-retention change; until it exists the
+exclusion is an operator gate, and it is mandatory:
+
+> Before `deploy-main`, `restart-api`, any application migration, the §6.2
+> recovery procedure, a `restore-test`, or any manual database maintenance,
+> prove that no retention run is executing and that none can start.
+
+```bash
+systemctl is-active mgo-retention.timer mgo-retention.service
+```
+
+```bash
+curl -fsS http://127.0.0.1:8000/retention/status
+```
+
+Required: the service reports `inactive`; `scheduled_lock_state` in the
+response is `idle`. `busy` means a run holds the lock in some process —
+wait for it to finish (a run is bounded to `TimeoutStartSec=600`).
+`unknown` means the lock's state could not be read — do not proceed until
+it can be. While the timer is enabled, stop it for the window
+(`sudo systemctl stop mgo-retention.timer`) and start it again afterwards, so
+a 04:00 firing cannot land inside the window; with the timer not enabled
+(production today) there is nothing to stop. The check is repeated in §5.7
+and at Stage D of §6.2.
 
 ## 5. Operator commands
 
@@ -821,6 +855,8 @@ advances the schema:
 
 * take a **fresh backup**, and
 * run `restore-test` against **that exact set**, and
+* prove scheduled retention is inactive and `idle`, and keep it so for the
+  window (§4.7), and
 * have an operator present for the whole window.
 
 `restore-test` proves a backup can be recovered *in isolation*. It does not
@@ -1143,7 +1179,17 @@ outage with live deployment authority still installed.
 
 #### Stage D -- stop the service and preserve the failed state
 
-Only now, and only after Stages A to C have all passed.
+Only now, and only after Stages A to C have all passed. First, §4.7: no
+retention run may be executing or able to start while the database is moved
+and restored.
+
+```bash
+systemctl is-active mgo-retention.timer mgo-retention.service
+```
+
+Both must report `inactive` (or the units must be absent). If the timer is
+enabled, stop it for the window with `sudo systemctl stop mgo-retention.timer`
+and record that it must be started again after Stage J.
 
 ```bash
 sudo systemctl stop mgo.service

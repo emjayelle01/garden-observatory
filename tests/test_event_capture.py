@@ -191,6 +191,7 @@ class _OpenGate:
         self.in_flight = 0
         self.admissions = 0
         self.releases = 0
+        self.outcomes: list[bool] = []
 
     def _decision(self, admitted: bool) -> AdmissionDecision:
         return AdmissionDecision(
@@ -215,9 +216,10 @@ class _OpenGate:
         self.admissions += 1
         return self._decision(True)
 
-    def release(self) -> None:
+    def release(self, *, succeeded: bool = False) -> None:
         self.in_flight -= 1
         self.releases += 1
+        self.outcomes.append(succeeded)
 
 
 def _service(

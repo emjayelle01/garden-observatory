@@ -216,9 +216,19 @@ def test_evaluate_reserves_nothing(tmp_path: Path) -> None:
     assert controller.in_flight == 0
 
 
-def test_a_failed_capture_releases_its_reservation(tmp_path: Path) -> None:
-    """A capture that produced no row must not consume quota forever."""
-    controller, _, _ = _controller(tmp_path, config=_config(hourly=1, daily=1))
+def test_a_failed_capture_keeps_its_reservation_for_the_window(
+    tmp_path: Path,
+) -> None:
+    """An admitted attempt that produced no row still counts -- until it ages out.
+
+    Task 14.5A: the reservation is durable and is removed only by a committed
+    catalogue row. A failure keeps the marker, so a camera that fails on every
+    attempt cannot be hammered inside the window; the window then expires it,
+    exactly as it would a row.
+    """
+    controller, _, clock = _controller(
+        tmp_path, config=_config(hourly=1, daily=2), cooldown=0
+    )
 
     first = controller.admit()
     assert first.admitted
@@ -226,17 +236,45 @@ def test_a_failed_capture_releases_its_reservation(tmp_path: Path) -> None:
     assert blocked.admitted is False
     assert blocked.reason is SuppressionReason.HOURLY_LIMIT
 
-    controller.release()  # the attempt failed; no row was written
+    controller.release(succeeded=False)  # the attempt failed; no row was written
 
+    assert controller.in_flight == 0
+    still_blocked = controller.admit()
+    assert still_blocked.admitted is False
+    assert still_blocked.reason is SuppressionReason.HOURLY_LIMIT
+    assert still_blocked.hourly_count == 1
+
+    clock.advance(hours=1, seconds=1)
     again = controller.admit()
     assert again.admitted is True
+    assert again.hourly_count == 1  # the new reservation alone
+    assert again.daily_count == 2  # the failed attempt still counts for the day
 
 
-def test_release_never_goes_negative(tmp_path: Path) -> None:
-    controller, _, _ = _controller(tmp_path)
-    controller.release()
-    controller.release()
+def test_a_catalogued_capture_hands_its_count_to_the_row(tmp_path: Path) -> None:
+    """On success the marker goes and the row carries the count: never two."""
+    controller, database, clock = _controller(
+        tmp_path, config=_config(hourly=2, daily=2), cooldown=0
+    )
+    admitted = controller.admit()
+    assert admitted.admitted
+    _insert(database, clock.now)  # the archive committed the row
+
+    controller.release(succeeded=True)
+
     assert controller.in_flight == 0
+    assert list(controller.reservation_directory.iterdir()) == []
+    decision = controller.evaluate()
+    assert decision.hourly_count == 1
+    assert decision.daily_count == 1
+
+
+def test_release_with_nothing_held_is_a_no_op(tmp_path: Path) -> None:
+    controller, _, _ = _controller(tmp_path)
+    controller.release(succeeded=False)
+    controller.release(succeeded=True)
+    assert controller.in_flight == 0
+    assert not controller.reservation_directory.exists()
 
 
 # --- rolling hour ----------------------------------------------------------------

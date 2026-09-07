@@ -302,8 +302,11 @@ class RetentionService:
         if lock_path is None and database_path is not None:
             lock_path = database_path.parent / RETENTION_LOCK_FILENAME
         self._lock_path = lock_path
-        # Where a running backup announces itself. Retention yields to it:
-        # a fresh lock file there means "skip, do not delete anything now".
+        # The backup's own lock file. A run HOLDS it (Task 14.5A) rather than
+        # reading its age, so backup and retention exclude each other with one
+        # atomic primitive. ``None`` declines every run: the CLI and the
+        # application both supply it, and a construction that does not has
+        # nothing to exclude against.
         self._backup_lock_path = backup_lock_path
         self._stale_lock_after_seconds = stale_lock_after_seconds
 
@@ -385,31 +388,25 @@ class RetentionService:
             return self._declined(RetentionErrorCategory.BUSY)
 
         file_lock: OperationLock | None = None
+        backup_lock: OperationLock | RetentionErrorCategory | None = None
         try:
-            # The backup check and the file lock both happen BEFORE the state
-            # holder is marked running and before anything is read: a declined
-            # run must look exactly like a run that never started, because it
-            # never did.
-            if self._backup_in_progress():
-                LOGGER.warning(
-                    "Retention run skipped; a database backup is in progress"
-                )
-                return self._declined(RetentionErrorCategory.BACKUP_IN_PROGRESS)
-
+            # Both locks are taken BEFORE the state holder is marked running
+            # and before anything is read: a declined run must look exactly
+            # like a run that never started, because it never did.
             file_lock = self._acquire_file_lock()
             if file_lock is None:
                 return self._declined(RetentionErrorCategory.LOCK_UNAVAILABLE)
 
-            # The backup could have started between the check above and the
-            # lock. Check again now that nothing else can start a retention
-            # run; a backup that begins after this point runs alongside a
-            # retention run that holds no database transaction across any
-            # filesystem operation, which SQLite's backup API tolerates.
-            if self._backup_in_progress():
-                LOGGER.warning(
-                    "Retention run skipped; a database backup started meanwhile"
-                )
-                return self._declined(RetentionErrorCategory.BACKUP_IN_PROGRESS)
+            # Mutual exclusion with the backup (Task 14.5A) is the backup's
+            # own O_EXCL lock file, held by this run for its whole duration.
+            # Two processes cannot both create that file, whichever starts
+            # first, so a backup cannot begin while this run holds it and this
+            # run cannot begin while a backup holds it. Reading the lock's
+            # age, which this used to do, was check-then-act: a backup that
+            # started a moment after the check ran alongside the deletion.
+            backup_lock = self._acquire_backup_lock()
+            if isinstance(backup_lock, RetentionErrorCategory):
+                return self._declined(backup_lock)
 
             self._state.mark_running()
             # ``_execute`` converts every ordinary failure into a result, so the
@@ -424,12 +421,40 @@ class RetentionService:
                 error=result.error_message,
             )
         finally:
+            # Released in reverse order of acquisition: the backup lock first,
+            # so a backup may start the moment the destructive section ends.
+            if isinstance(backup_lock, OperationLock):
+                backup_lock.release()
             if file_lock is not None:
                 file_lock.release()
             # Released last, so the state a waiting caller can observe is
             # already the finished state rather than a stale ``running``.
             self._run_lock.release()
         return result
+
+    def cross_process_lock_state(self) -> str:
+        """Report the retention file lock as ``idle``, ``busy`` or ``unknown``.
+
+        A report for the status endpoint (Task 14.5A), never a decision: it
+        stats one file and reads nothing else. ``busy`` is a lock file younger
+        than the stale threshold -- a run in some process; ``idle`` is no lock
+        file, or one older than the threshold, which the next run reclaims;
+        ``unknown`` is a lock whose age cannot be read, or no lock location at
+        all. An operator preparing a deployment treats anything but ``idle``
+        as "wait".
+        """
+        if self._lock_path is None:
+            return "unknown"
+        try:
+            exists = self._lock_path.exists()
+        except OSError:
+            return "unknown"
+        if not exists:
+            return "idle"
+        age = lock_age_seconds(self._lock_path)
+        if age is None:
+            return "unknown"
+        return "busy" if age < self._stale_lock_after_seconds else "idle"
 
     @staticmethod
     def _declined(category: RetentionErrorCategory) -> RetentionRunResult:
@@ -445,29 +470,60 @@ class RetentionService:
             error_category=category,
         )
 
-    def _backup_in_progress(self) -> bool:
-        """Return whether a fresh backup lock exists. Fails closed.
+    def _acquire_backup_lock(self) -> OperationLock | RetentionErrorCategory:
+        """Take the backup's lock for this run, or say why the run declines.
 
-        A lock file younger than the stale threshold is a running backup. A
-        lock whose age cannot be read is treated as running: the only way to
-        be wrong in that direction is to delete nothing tonight. No backup
-        lock path configured means no backup is looked for -- that is the
-        caller's explicit choice, made where the paths are known.
+        The lock is the backup's own file, at the backup directory, acquired
+        with the same ``O_CREAT|O_EXCL`` call and the same age-based stale
+        reclamation the backup uses. Every way this can fail declines the
+        run:
+
+        * no backup lock location configured -- ``LOCK_UNAVAILABLE``. There is
+          nothing to exclude against, and a run that cannot prove exclusion
+          is not allowed to delete;
+        * the backup directory does not exist, or is not a directory --
+          ``LOCK_UNAVAILABLE``. This run never creates the backup directory:
+          that is the backup installer's job, and creating it here would be a
+          write outside retention's own state;
+        * the lock is held, whether by a backup or by another retention
+          process, or its age cannot be read -- ``BACKUP_IN_PROGRESS``;
+        * the lock cannot be created -- ``LOCK_UNAVAILABLE``.
         """
         path = self._backup_lock_path
         if path is None:
-            return False
+            LOGGER.error(
+                "Retention run refused; no backup lock location is configured"
+            )
+            return RetentionErrorCategory.LOCK_UNAVAILABLE
         try:
-            exists = path.exists()
+            directory_present = path.parent.is_dir()
         except OSError:
-            LOGGER.exception("The backup lock could not be inspected")
-            return True
-        if not exists:
-            return False
-        age = lock_age_seconds(path)
-        if age is None:
-            return True
-        return age < self._stale_lock_after_seconds
+            directory_present = False
+        if not directory_present:
+            LOGGER.error(
+                "Retention run refused; the backup directory is absent, so a "
+                "backup cannot be excluded"
+            )
+            return RetentionErrorCategory.LOCK_UNAVAILABLE
+        backup = OperationLock(
+            path,
+            operation="retention",
+            stale_after_seconds=self._stale_lock_after_seconds,
+        )
+        try:
+            backup.acquire()
+        except OperationError as exc:
+            if exc.code is ErrorCode.BACKUP_LOCKED:
+                LOGGER.warning(
+                    "Retention run skipped; the backup lock is held (%s)",
+                    exc.message,
+                )
+                return RetentionErrorCategory.BACKUP_IN_PROGRESS
+            LOGGER.error("Retention run refused; the backup lock could not be created")
+            return RetentionErrorCategory.LOCK_UNAVAILABLE
+        if backup.reclaimed_stale_lock:
+            LOGGER.warning("An abandoned backup lock was reclaimed by retention")
+        return backup
 
     def _acquire_file_lock(self) -> OperationLock | None:
         """Take the cross-process retention lock, or return ``None``.

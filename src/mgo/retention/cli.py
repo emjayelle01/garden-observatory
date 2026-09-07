@@ -492,6 +492,7 @@ def _run_once(arguments: argparse.Namespace, stream: IO[str]) -> int:
     says more eligible work remains: that is a fact for the operator, not a
     trigger.
     """
+    backup_directory = _absolute_backup_directory(arguments.backup_directory)
     config = _destructive_preconditions(arguments, REFUSAL_MISSING_EXECUTE)
 
     if not config.retention.enabled:
@@ -499,7 +500,10 @@ def _run_once(arguments: argparse.Namespace, stream: IO[str]) -> int:
 
     _require_current_schema(config.storage.database_path)
 
-    result = _build_service(config).run_once()
+    # One service, one run. The service is bound to a name only so the single
+    # call below is unmistakably single: nothing here loops on the result.
+    service = _build_service(config, backup_directory=backup_directory)
+    result = service.run_once()
 
     _emit(
         {
@@ -697,6 +701,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Without it the command refuses before touching anything."
         ),
     )
+    run_once.add_argument(
+        "--backup-directory",
+        default=None,
+        help=(
+            "Absolute path of the backup directory whose lock this run takes "
+            "for its duration, so it can never overlap a backup. Defaults to "
+            "the canonical production backup location; the directory must "
+            "exist."
+        ),
+    )
 
     scheduled = subcommands.add_parser(
         "scheduled-run",
@@ -726,9 +740,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--backup-directory",
         default=None,
         help=(
-            "Absolute path of the backup directory whose lock a running backup "
-            "holds. Retention skips while that lock is fresh. Defaults to the "
-            "canonical production backup location."
+            "Absolute path of the backup directory whose lock this run takes "
+            "for its duration, so it can never overlap a backup. Retention "
+            "skips while a backup holds it. Defaults to the canonical "
+            "production backup location; the directory must exist."
         ),
     )
 

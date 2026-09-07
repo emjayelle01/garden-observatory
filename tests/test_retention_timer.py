@@ -195,9 +195,14 @@ def test_the_service_makes_no_network_connection() -> None:
     assert _service()["RestrictAddressFamilies"] == ["AF_UNIX"]
 
 
-def test_the_service_writes_only_the_database_and_capture_directories() -> None:
-    assert _service()["ReadWritePaths"] == ["@DATABASE_DIR@ @CAPTURE_DIR@"]
-    assert "@BACKUP_DIR@" not in _service()["ReadWritePaths"][0]
+def test_the_service_writes_only_the_database_capture_and_backup_lock_paths() -> None:
+    """Task 14.5A: the backup directory is writable so the run can HOLD the
+    backup's O_EXCL lock for its duration; nothing else was added."""
+    assert _service()["ReadWritePaths"] == [
+        "@DATABASE_DIR@ @CAPTURE_DIR@ @BACKUP_DIR@"
+    ]
+    for forbidden in ("@CONFIG_PATH@", "@APP_ROOT@", "/etc", "/usr", "/opt"):
+        assert forbidden not in _service()["ReadWritePaths"][0]
 
 
 def test_the_service_run_is_bounded() -> None:

@@ -484,11 +484,14 @@ fields — is `docs/Capture-Safety.md`. In brief:
 * enabling `[event_capture]` **requires** `max_captures_per_hour`,
   `max_captures_per_day` and `minimum_free_bytes`; `maximum_capture_bytes`
   defaults to 16 MiB. An absent section, or a disabled one, loads unchanged;
-* quotas are counted from durable `origin = "motion"` catalogue rows, so they
-  survive restart; one in-flight reservation is the only process-local state;
+* quotas are counted from durable `origin = "motion"` catalogue rows plus
+  durable reservation markers written beside the database *before* the camera
+  is touched (Task 14.5A), so they survive a restart and a crash at any point;
+  nothing about the quota lives only in process memory;
 * a refused trigger creates no image, no catalogue row and no lifecycle row;
   it is counted, shown on `GET /event-capture/status`, and written to the
-  timeline (`status = suppressed`) only when the reason changes;
+  timeline (`status = suppressed`) only when the reason changes and at most
+  once a minute however the reasons alternate (Task 14.5A);
 * an admitted still larger than `maximum_capture_bytes` is withdrawn at the
   publication boundary before it is catalogued (`oversize_capture`);
 * a `global_change` result from the motion monitor is never a trigger.

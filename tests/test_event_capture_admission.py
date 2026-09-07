@@ -98,6 +98,9 @@ class _ScriptedGate:
         self.evaluate_calls = 0
         self.releases = 0
         self.events: list[str] = []
+        # What the worker said about each attempt on release: True only for a
+        # committed catalogue row (Task 14.5A).
+        self.outcomes: list[bool] = []
 
     def _next(self) -> AdmissionDecision:
         item = self._script[0] if len(self._script) == 1 else self._script.pop(0)
@@ -117,9 +120,10 @@ class _ScriptedGate:
             self.in_flight += 1
         return decision
 
-    def release(self) -> None:
+    def release(self, *, succeeded: bool) -> None:
         self.releases += 1
         self.in_flight -= 1
+        self.outcomes.append(succeeded)
         self.events.append("release")
 
 
@@ -174,13 +178,28 @@ async def _until(predicate: Any, *, message: str, timeout: float = 10.0) -> None
         await asyncio.sleep(0.005)
 
 
+class _Monotonic:
+    """An injected monotonic clock; tests advance it, never sleep on it."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 def _service(
-    gate: _ScriptedGate, workflow: _Workflow
+    gate: _ScriptedGate, workflow: _Workflow, monotonic: _Monotonic | None = None
 ) -> tuple[EventCaptureService, EventCaptureRuntimeState, _Recorder]:
     state = EventCaptureRuntimeState(enabled=True)
     recorder = _Recorder()
     service = EventCaptureService(
-        workflow, state, DATABASE_PATH, admission=gate, recorder=recorder
+        workflow,  # type: ignore[arg-type]
+        state,
+        DATABASE_PATH,
+        admission=gate,  # type: ignore[arg-type]
+        recorder=recorder,
+        monotonic=monotonic if monotonic is not None else _Monotonic(),
     )
     return service, state, recorder
 
@@ -352,9 +371,14 @@ def test_the_guard_refuses_only_above_the_reservation() -> None:
 
 
 def test_identical_suppressions_are_counted_but_recorded_once() -> None:
+    """Identical reasons write one row -- and it is the *reason memory* that
+    stops the rest, not the rate bound: the clock is advanced well past the
+    record interval between triggers, so only the memory can be at work."""
+
     async def _main() -> tuple[EventCaptureRuntimeState, _Recorder]:
         gate = _ScriptedGate(_decision(False, SuppressionReason.STORAGE_RESERVE))
-        service, state, recorder = _service(gate, _Workflow(gate=gate))
+        monotonic = _Monotonic()
+        service, state, recorder = _service(gate, _Workflow(gate=gate), monotonic)
         service.start()
         try:
             for index in range(4):
@@ -363,6 +387,7 @@ def test_identical_suppressions_are_counted_but_recorded_once() -> None:
                     lambda index=index: state.total_triggers_suppressed == index + 1,
                     message="not suppressed",
                 )
+                monotonic.now += 120.0
         finally:
             await service.shutdown()
         return state, recorder
@@ -379,13 +404,17 @@ def test_identical_suppressions_are_counted_but_recorded_once() -> None:
 
 
 def test_a_change_of_reason_is_recorded_again() -> None:
+    """A different reason is news -- once the record interval has passed
+    (Task 14.5A bounds the rate; the interval is advanced explicitly here)."""
+
     async def _main() -> _Recorder:
         gate = _ScriptedGate(
             _decision(False, SuppressionReason.HOURLY_LIMIT),
             _decision(False, SuppressionReason.HOURLY_LIMIT),
             _decision(False, SuppressionReason.STORAGE_RESERVE),
         )
-        service, state, recorder = _service(gate, _Workflow(gate=gate))
+        monotonic = _Monotonic()
+        service, state, recorder = _service(gate, _Workflow(gate=gate), monotonic)
         service.start()
         try:
             for index in range(3):
@@ -394,6 +423,7 @@ def test_a_change_of_reason_is_recorded_again() -> None:
                     lambda index=index: state.total_triggers_suppressed == index + 1,
                     message="not suppressed",
                 )
+                monotonic.now += 60.0
         finally:
             await service.shutdown()
         return recorder
@@ -411,13 +441,16 @@ def test_an_admitted_capture_resets_the_suppression_run() -> None:
             _decision(True),
             _decision(False, SuppressionReason.HOURLY_LIMIT),
         )
-        service, state, recorder = _service(gate, _Workflow(gate=gate))
+        monotonic = _Monotonic()
+        service, state, recorder = _service(gate, _Workflow(gate=gate), monotonic)
         service.start()
         try:
             assert service.submit(_motion(seconds=0))
             await _until(lambda: state.total_triggers_suppressed == 1, message="1")
+            monotonic.now += 60.0
             assert service.submit(_motion(seconds=10))
             await _until(lambda: state.total_captures_succeeded == 1, message="2")
+            monotonic.now += 60.0
             assert service.submit(_motion(seconds=20))
             await _until(lambda: state.total_triggers_suppressed == 2, message="3")
         finally:

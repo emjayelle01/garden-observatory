@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -80,6 +81,12 @@ FAILURE_STATUS = "failed"
 FAILURE_SUMMARY = "Motion-triggered still capture failed"
 SUPPRESSED_STATUS = "suppressed"
 SUPPRESSED_SUMMARY = "Motion-triggered still capture suppressed"
+
+#: The shortest interval between two persisted suppression observations,
+#: whatever the reasons do (Task 14.5A). Sixty seconds bounds a blockade that
+#: alternates reasons on every trigger to at most 1,440 rows a day, against
+#: the health monitor's own steady rate; identical repeats still write none.
+SUPPRESSION_RECORD_INTERVAL_SECONDS = 60.0
 
 #: The worker's asyncio task name, in the same ``mgo-`` family as every other
 #: application-owned task so shutdown auditing can see it.
@@ -147,6 +154,7 @@ class EventCaptureService:
         *,
         admission: CaptureAdmissionController,
         recorder: ObservationRecorder = record_observation,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._workflow = workflow
         self._state = state
@@ -157,10 +165,16 @@ class EventCaptureService:
         # validated configuration that enabled the feature.
         self._admission = admission
         self._recorder = recorder
+        self._monotonic = monotonic
         # The reason of the last suppression that was *written to the timeline*
         # (not merely counted), so identical repeats are counted but not
         # persisted. Reset by every admitted capture.
         self._last_recorded_suppression: SuppressionReason | None = None
+        # When the last suppression observation was written, on the monotonic
+        # clock (Task 14.5A). A change of reason is persisted only once this
+        # interval has passed, so reasons that alternate cannot write faster
+        # than a fixed, bounded rate however often they alternate.
+        self._last_suppression_recorded_at: float | None = None
         self._queue: asyncio.Queue[MotionTrigger | _Stop] = asyncio.Queue(
             maxsize=QUEUE_CAPACITY
         )
@@ -327,9 +341,13 @@ class EventCaptureService:
         writing its timeline entry.
         """
         # Admission first, off the loop, before anything touches the camera.
-        # The controller holds one reservation for an admitted trigger; it is
-        # released in the ``finally`` below whatever the attempt's outcome, and
-        # by then a successful capture is already a durable catalogue row.
+        # The controller writes one durable reservation for an admitted
+        # trigger. It is released in the ``finally`` below whatever the
+        # outcome, and told whether the attempt ended as a committed catalogue
+        # row: only then is the marker removed, because only then does a row
+        # carry the count. Every other ending keeps the marker, so a JPEG the
+        # archive could not catalogue -- or a crash between the camera and the
+        # catalogue -- is still counted by the next process (Task 14.5A).
         try:
             decision = await asyncio.to_thread(self._admission.admit)
         except Exception:
@@ -347,17 +365,20 @@ class EventCaptureService:
             return
 
         self._state.state = EventCaptureState.CAPTURING
+        catalogued = False
         try:
             capture = await asyncio.to_thread(
                 self._workflow.capture,
                 extra_metadata=trigger.capture_metadata(),
                 publication_guard=self._refuse_oversize,
             )
+            # The workflow returns only after the archive has committed.
+            catalogued = True
         except Exception as error:
             await self._handle_failure(trigger, error)
             return
         finally:
-            self._admission.release()
+            self._admission.release(succeeded=catalogued)
         await self._handle_success(trigger, capture)
 
     def _refuse_oversize(self, result: CaptureResult) -> None:
@@ -380,13 +401,18 @@ class EventCaptureService:
         reason: SuppressionReason,
         decision: AdmissionDecision | None,
     ) -> None:
-        """Count a refused trigger and record it on a change of reason.
+        """Count a refused trigger and record it on a bounded change of reason.
 
         Nothing was captured, so the runtime state stays wherever it was
         (``IDLE`` or ``ERROR``); a suppression is not a capture failure. The
-        timeline gets one row when the reason differs from the last recorded
-        one, and none for an identical repeat -- the counters on the status
-        endpoint carry the repeats.
+        counters on the status endpoint move on every suppression. The
+        timeline gets a row only when the reason differs from the last one
+        recorded *and* at least :data:`SUPPRESSION_RECORD_INTERVAL_SECONDS`
+        have passed since the last row: an identical repeat writes nothing,
+        and reasons that alternate -- ``hourly_limit``, ``storage_reserve``,
+        ``hourly_limit`` -- write at most one row per interval (Task 14.5A).
+        A recovery to an admitted capture is observable through the capture's
+        own ``captured`` observation.
         """
         at = decision.evaluated_at if decision is not None else trigger.evaluated_at
         self._state.record_suppression(reason, at)
@@ -397,7 +423,16 @@ class EventCaptureService:
         )
         if reason == self._last_recorded_suppression:
             return
+        now = self._monotonic()
+        last = self._last_suppression_recorded_at
+        if last is not None and now - last < SUPPRESSION_RECORD_INTERVAL_SECONDS:
+            # Counted and reported on the status endpoint; not persisted. The
+            # memory of the last *recorded* reason is deliberately left alone,
+            # so the next row -- once the interval has passed -- is written for
+            # whatever the reason is then.
+            return
         self._last_recorded_suppression = reason
+        self._last_suppression_recorded_at = now
 
         payload = trigger.observation_payload()
         payload["reason"] = reason.value
@@ -548,6 +583,7 @@ __all__ = [
     "SUCCESS_SUMMARY",
     "SUPPRESSED_STATUS",
     "SUPPRESSED_SUMMARY",
+    "SUPPRESSION_RECORD_INTERVAL_SECONDS",
     "WORKER_TASK_NAME",
     "EventCaptureService",
     "classify_failure",

@@ -98,13 +98,18 @@ RestrictAddressFamilies=AF_UNIX
 PrivateDevices=yes
 
 # --- writable paths ---------------------------------------------------------
-# ProtectSystem=strict makes the whole filesystem read-only, so the two
+# ProtectSystem=strict makes the whole filesystem read-only, so the three
 # locations this job legitimately writes are named explicitly, and nothing
-# else -- not the backup directory, not the configuration, not the checkout.
+# else -- not the configuration, not the checkout, not any other unit.
 #
 # @DATABASE_DIR@ holds the lifecycle table this job transitions, the WAL and
 # shm sidecars SQLite needs even to read, and the retention lock file.
 #
-# @CAPTURE_DIR@ is where managed media is unlinked. The backup directory is
-# deliberately NOT writable: the job only reads the age of the backup lock.
-ReadWritePaths=@DATABASE_DIR@ @CAPTURE_DIR@
+# @CAPTURE_DIR@ is where managed media is unlinked.
+#
+# @BACKUP_DIR@ holds the backup's own O_EXCL lock file, which this job takes
+# for the duration of its run (Task 14.5A): a backup and a retention run can
+# never both hold it, whichever starts first. The job creates and removes
+# that one dot-file and reads nothing else there; the recovery sets are
+# never opened, and the retention code has no path that names them.
+ReadWritePaths=@DATABASE_DIR@ @CAPTURE_DIR@ @BACKUP_DIR@

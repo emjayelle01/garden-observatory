@@ -1,9 +1,10 @@
 """Tests for scheduled retention execution (Task 14.5).
 
 The service side: the cross-process retention lock beside the database, the
-backup-lock conflict check, and the structured outcomes a run reports when it
-correctly declines to start. The command side: ``scheduled-run`` and how it
-reports skips, executions and refusals.
+backup lock the run *holds* for its duration (Task 14.5A; the interleaving
+proofs live in ``test_retention_mutual_exclusion.py``), and the structured
+outcomes a run reports when it correctly declines to start. The command side:
+``scheduled-run`` and how it reports skips, executions and refusals.
 
 Every test operates on a temporary database and capture root under
 ``tmp_path``. Nothing here references a production path, and the destructive
@@ -254,11 +255,24 @@ def test_a_stale_backup_lock_does_not_block(tmp_path: Path) -> None:
     assert result.deleted_count == 1
 
 
-def test_no_backup_lock_means_no_backup(tmp_path: Path) -> None:
+def test_no_backup_lock_location_means_no_run(tmp_path: Path) -> None:
+    """Task 14.5A: a service with nothing to exclude against declines."""
     harness = _Harness(tmp_path)
-    harness.add_managed("old")
+    media = harness.add_managed("old")
+    service = RetentionService(
+        harness.config,
+        RetentionRepository(harness.database_path, clock=lambda: NOW),
+        RetentionRuntimeState(enabled=True),
+        harness.root,
+        clock=lambda: NOW,
+        database_path=harness.database_path,
+    )
 
-    assert harness.service.run_once().executed is True
+    result = service.run_once()
+
+    assert result.executed is False
+    assert result.error_category is RetentionErrorCategory.LOCK_UNAVAILABLE
+    assert media.exists()
 
 
 def test_a_backup_lock_whose_age_cannot_be_read_blocks(
@@ -267,34 +281,42 @@ def test_a_backup_lock_whose_age_cannot_be_read_blocks(
     harness = _Harness(tmp_path)
     harness.add_managed("old")
     harness.hold_backup_lock()
-    monkeypatch.setattr("mgo.retention.service.lock_age_seconds", lambda path: None)
+    monkeypatch.setattr("mgo.operations.locking._age_seconds", lambda path: None)
 
     result = harness.service.run_once()
 
     assert result.error_category is RetentionErrorCategory.BACKUP_IN_PROGRESS
 
 
-def test_a_backup_starting_after_the_lock_is_still_respected(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The check runs again once the retention lock is held."""
+def test_the_run_holds_the_backup_lock_for_its_whole_duration(tmp_path: Path) -> None:
+    """Task 14.5A: not a check, a hold. While the run executes, the backup's
+    lock file exists and names retention; a backup starting at any instant
+    inside the run finds it taken. Both locks are gone afterwards."""
     harness = _Harness(tmp_path)
     media = harness.add_managed("old")
-    calls = {"n": 0}
-    original = harness.service._backup_in_progress
+    harness.add_managed("recent", days_old=1)  # the preservation floor keeps one
+    seen: list[dict[str, Any]] = []
+    original = harness.service._execute
 
-    def flapping() -> bool:
-        calls["n"] += 1
-        if calls["n"] == 2:
-            harness.hold_backup_lock()
+    def spying_execute() -> Any:
+        seen.append(
+            json.loads(
+                (harness.backup_directory / BACKUP_LOCK_FILENAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
         return original()
 
-    monkeypatch.setattr(harness.service, "_backup_in_progress", flapping)
+    harness.service._execute = spying_execute  # type: ignore[method-assign]
 
     result = harness.service.run_once()
 
-    assert result.error_category is RetentionErrorCategory.BACKUP_IN_PROGRESS
-    assert media.exists()
+    assert result.executed is True
+    assert not media.exists()
+    assert len(seen) == 1
+    assert seen[0]["operation"] == "retention"
+    assert not (harness.backup_directory / BACKUP_LOCK_FILENAME).exists()
     assert not harness.lock_path.exists()
 
 
@@ -579,16 +601,20 @@ def test_run_once_also_yields_to_a_backup(tmp_path: Path) -> None:
     config = _write_configuration(
         tmp_path, harness, retention="enabled = true\nmax_age_days = 30"
     )
-    # run-once looks in the canonical production backup directory, which does
-    # not exist on this host, so it cannot see this test's lock; prove the
-    # service-level behaviour through the service instead.
     harness.hold_backup_lock()
-    assert harness.service.run_once().error_category is (
-        RetentionErrorCategory.BACKUP_IN_PROGRESS
-    )
-    assert media.exists()
+
     code, payload, _ = _run(
-        ["run-once", "--execute"], environment={cli.CONFIG_PATH_ENV: str(config)}
+        [
+            "run-once",
+            "--execute",
+            "--backup-directory",
+            str(harness.backup_directory),
+        ],
+        environment={cli.CONFIG_PATH_ENV: str(config)},
     )
-    assert code in (cli.EXIT_SUCCESS, cli.EXIT_RETENTION_ERROR)
+
+    assert code == cli.EXIT_RETENTION_ERROR
     assert payload is not None
+    assert payload["executed"] is False
+    assert payload["error_category"] == "backup_in_progress"
+    assert media.exists()

@@ -85,7 +85,8 @@ Options:
   --config PATH          Production configuration    (default: /etc/garden-observatory/mgo.toml)
   --database-dir PATH    Database directory          (default: /var/lib/garden-observatory/db)
   --capture-dir PATH     Capture media directory     (default: /var/lib/garden-observatory/media/captures)
-  --backup-dir PATH      Backup root whose lock a running backup holds
+  --backup-dir PATH      Backup root whose lock the retention run holds for
+                         its duration, so it can never overlap a backup
                          (default: /var/backups/garden-observatory)
   --unit-directory PATH  Where to publish the units  (default: /etc/systemd/system)
                          A non-default value is a developer validation aid:
@@ -134,20 +135,43 @@ step() { printf '\n== %s\n' "$*"; }
 is_root() { [[ "$(id -u)" == "0" ]]; }
 
 require_absolute() {
+  # Absolute, and made only of characters that survive both the sed
+  # renderer and a systemd directive value unchanged: no '|' (the sed
+  # delimiter), no '&' (sed's "the match"), no backslash (a sed escape --
+  # '\n' would become a real newline and a second directive), no newline, and
+  # no whitespace (an unquoted ExecStart= argument would split on it).
   local label="$1" value="$2"
   [[ "${value}" == /* ]] || fail "${label} must be an absolute path."
   case "${value}" in
-    *'|'*|*$'\n'*) fail "${label} contains a character the unit renderer cannot carry." ;;
+    *'|'*|*'&'*|*\\*|*[[:space:]]*) fail "${label} contains a character the unit renderer cannot carry." ;;
   esac
 }
 
+require_account_name() {
+  # A plain account name and nothing else: it is substituted into User= and
+  # Group=, so anything that is not a name is a directive injection.
+  local label="$1" value="$2"
+  [[ "${value}" =~ ^[A-Za-z_][A-Za-z0-9_.-]{0,31}$ ]] || fail "${label} must be a plain account name."
+}
+
+canonical_path() {
+  # The physical, normalised form of a path that need not exist yet: symlinks
+  # in existing components resolved, '.' and '..' folded, trailing separators
+  # dropped. The default-directory decision is made on this form, so no
+  # spelling of the real unit directory can pass as a developer directory.
+  realpath -m -- "$1"
+}
+
 require_no_symlink_component() {
-  # Every existing component of the destination path must be a real
-  # directory, so a symlink cannot redirect the publication elsewhere.
-  local path="$1"
+  # Every existing component of the destination path, as supplied, must be
+  # a real directory, so a symlink cannot redirect the publication elsewhere.
+  local path="$1" current="$1"
+  while [[ -n "${current}" && "${current}" != "/" ]]; do
+    [[ ! -L "${current}" ]] || fail "${current} is a symlink; refusing to publish through it."
+    current="${current%/*}"
+  done
   [[ -e "${path}" ]] || return 0
-  [[ ! -L "${path}" ]] || fail "$1 is a symlink; refusing to publish through it."
-  [[ -d "${path}" ]] || fail "$1 is not a directory."
+  [[ -d "${path}" ]] || fail "${path} is not a directory."
 }
 
 # --- preconditions ---------------------------------------------------------
@@ -159,9 +183,20 @@ for value_label in "--app-root:${app_root}" "--config:${config_path}" \
   "--backup-dir:${backup_dir}" "--unit-directory:${unit_directory}"; do
   require_absolute "${value_label%%:*}" "${value_label#*:}"
 done
+require_account_name "--user" "${service_user}"
+require_account_name "--group" "${service_group}"
+
+# The unit directory is compared in canonical form (Task 14.5A): a trailing
+# separator, a '.' or '..' component, or a symlink to the real directory is
+# still the real directory, and must get the real directory's rules --
+# root required, ownership enforced, the validation aid refused.
+command -v realpath >/dev/null 2>&1 || fail "realpath is required to validate --unit-directory."
+require_no_symlink_component "${unit_directory}"
+unit_directory="$(canonical_path "${unit_directory}")" || fail "--unit-directory could not be resolved."
+canonical_default_unit_directory="$(canonical_path "${default_unit_directory}")" || canonical_default_unit_directory="${default_unit_directory}"
 
 developer_directory=0
-if [[ "${unit_directory}" != "${default_unit_directory}" ]]; then
+if [[ "${unit_directory}" != "${canonical_default_unit_directory}" ]]; then
   developer_directory=1
   note "non-default unit directory: ownership will not be enforced and --enable is refused"
 fi
@@ -196,7 +231,6 @@ else
   fail "entry point ${entry_point} is absent or not executable; refusing to install a unit that cannot start."
 fi
 
-require_no_symlink_component "${unit_directory}"
 [[ -d "${unit_directory}" ]] || fail "unit directory does not exist: ${unit_directory}"
 
 for existing in "${unit_directory}/${service_unit}" "${unit_directory}/${timer_unit}"; do
@@ -346,10 +380,15 @@ publish_one() {
 }
 
 restore_one() {
-  # Put back what was there before this run, or remove what this run created.
-  local destination="$1" previous="$2"
+  # Put back what was there before this run -- bytes and mode -- or remove
+  # what this run created, so a rollback restores exact prior content or
+  # exact prior absence.
+  local destination="$1" previous="$2" previous_mode="$3"
   if [[ -f "${previous}" ]]; then
     publish_one "${previous}" "${destination}" || warn "could not restore ${destination}"
+    if [[ -n "${previous_mode}" ]]; then
+      chmod "${previous_mode}" "${destination}" || warn "could not restore the mode of ${destination}"
+    fi
   else
     rm -f -- "${destination}" || warn "could not remove ${destination}"
   fi
@@ -360,7 +399,11 @@ if (( ! changed )); then
 else
   previous_service="${staging}/previous/${service_unit}"
   previous_timer="${staging}/previous/${timer_unit}"
-  [[ -f "${destination_service}" ]] && cp -p "${destination_service}" "${previous_service}"
+  previous_service_mode=""
+  if [[ -f "${destination_service}" ]]; then
+    cp -p "${destination_service}" "${previous_service}"
+    previous_service_mode="$(stat -c '%a' "${destination_service}")" || previous_service_mode=""
+  fi
   [[ -f "${destination_timer}" ]] && cp -p "${destination_timer}" "${previous_timer}"
 
   if ! publish_one "${rendered_service}" "${destination_service}"; then
@@ -370,7 +413,7 @@ else
 
   if (( fail_after_first_publish )) || ! publish_one "${rendered_timer}" "${destination_timer}"; then
     warn "could not publish ${destination_timer}; rolling back ${destination_service}"
-    restore_one "${destination_service}" "${previous_service}"
+    restore_one "${destination_service}" "${previous_service}" "${previous_service_mode}"
     fail "publication failed; the previous pair was restored." "${EX_PUBLISH}"
   fi
   note "published ${destination_timer}"

@@ -2663,8 +2663,7 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'the-command-repeats-while-work-remains',
         RETENTION_CLI,
-        '    result = _build_service(config).run_once()',
-        '    service = _build_service(config)\n'
+        '    result = service.run_once()',
         '    result = service.run_once()\n'
         '    while result.more_work_remains:\n'
         '        result = service.run_once()',
@@ -2780,6 +2779,7 @@ MUTATIONS: tuple[Mutation, ...] = (
 #: stops binding changes no status field until the day the SD card fills or
 #: the wrong file goes. The suites named here fail when the bound is removed.
 CAPTURE_ADMISSION = "src/mgo/event_capture/admission.py"
+CAPTURE_WORKFLOW = "src/mgo/captures/workflow.py"
 EVENT_CAPTURE_MODELS = "src/mgo/event_capture/models.py"
 MOTION_DETECTOR = "src/mgo/motion/detector.py"
 MOTION_MONITOR = "src/mgo/motion/monitor.py"
@@ -2793,6 +2793,11 @@ RETENTION_SCHEDULING_SUITE = "tests/test_retention_scheduling.py"
 RETENTION_TIMER_SUITE = "tests/test_retention_timer.py"
 CAPTURE_LIMITS_CONFIG_SUITE = "tests/test_event_capture_limits_config.py"
 CAPTURE_SAFETY_API_SUITE = "tests/test_capture_safety_api.py"
+# Task 14.5A review suites.
+CAPTURE_DURABILITY_SUITE = "tests/test_capture_admission_durability.py"
+EVENT_CAPTURE_TELEMETRY_SUITE = "tests/test_event_capture_telemetry_bounds.py"
+RETENTION_EXCLUSION_SUITE = "tests/test_retention_mutual_exclusion.py"
+RETENTION_TIMER_HOSTILE_SUITE = "tests/test_retention_timer_hostile_input.py"
 
 TASK_14_5_MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
@@ -2825,20 +2830,39 @@ TASK_14_5_MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'quota-forgets-the-catalogue-on-restart',
         CAPTURE_ADMISSION,
-        '            hourly = self._ledger.count_since(now - HOUR) + self._in_flight',
-        '            hourly = self._in_flight',
+        '            hourly = self._ledger.count_since(hourly_cutoff)',
+        '            hourly = 0',
         'a_new_process_reconstructs_the_count_from_rows',
-        'The hourly count is process-local and resets on restart.',
+        'The hourly count ignores the catalogue and resets on restart.',
         suite=CAPTURE_ADMISSION_SUITE,
     ),
     Mutation(
         'reservation-ignored',
         CAPTURE_ADMISSION,
-        '            self._in_flight += 1',
+        '            hourly += self._reservations.count_since(hourly_cutoff)',
         '            pass',
         'two_concurrent_admissions_cannot_both_pass'
-        ' or a_failed_capture_releases_its_reservation',
+        ' or a_failed_capture_keeps_its_reservation_for_the_window',
         'Two concurrent admissions both pass under a limit of one.',
+        suite=CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'reservation-not-durable',
+        CAPTURE_ADMISSION,
+        '                self._held.append(self._reservations.reserve(now))',
+        '                pass',
+        'a_crash_after_the_camera_and_before_the_row_still_counts'
+        ' or two_concurrent_admissions_cannot_both_pass',
+        'The reservation is never written to disk; a crash resets the quota.',
+        suite=CAPTURE_ADMISSION_SUITE + " " + CAPTURE_DURABILITY_SUITE,
+    ),
+    Mutation(
+        'daily-reservations-ignored',
+        CAPTURE_ADMISSION,
+        '            daily += self._reservations.count_since(daily_cutoff)',
+        '            pass',
+        'a_failed_capture_keeps_its_reservation_for_the_window',
+        'A failed attempt counts for the hour but not for the day.',
         suite=CAPTURE_ADMISSION_SUITE,
     ),
     Mutation(
@@ -2903,9 +2927,40 @@ TASK_14_5_MUTATIONS: tuple[Mutation, ...] = (
         EVENT_CAPTURE_SERVICE,
         '        self._last_recorded_suppression = reason',
         '        pass',
-        'identical_suppressions_are_counted_but_recorded_once',
-        'Every identical suppression writes an observation.',
-        suite=EVENT_CAPTURE_ADMISSION_SUITE,
+        'identical_suppressions_are_counted_but_recorded_once'
+        ' or identical_reasons_write_nothing_even_after_the_interval',
+        'Every identical suppression writes an observation once the rate bound '
+        'has passed.',
+        suite=EVENT_CAPTURE_ADMISSION_SUITE + " " + EVENT_CAPTURE_TELEMETRY_SUITE,
+    ),
+    Mutation(
+        'alternating-suppressions-flood-the-timeline',
+        EVENT_CAPTURE_SERVICE,
+        '        if last is not None and now - last'
+        ' < SUPPRESSION_RECORD_INTERVAL_SECONDS:',
+        '        if False:',
+        'alternating_reasons_are_persisted_at_a_bounded_rate',
+        'Reasons that alternate write an observation on every trigger.',
+        suite=EVENT_CAPTURE_TELEMETRY_SUITE,
+    ),
+    Mutation(
+        'failed-attempt-forgets-its-reservation',
+        EVENT_CAPTURE_SERVICE,
+        '            self._admission.release(succeeded=catalogued)',
+        '            self._admission.release(succeeded=True)',
+        'a_failed_attempt_keeps_its_reservation'
+        ' or an_oversize_still_keeps_its_reservation',
+        'A failed capture releases its durable reservation as if it had a row.',
+        suite=EVENT_CAPTURE_TELEMETRY_SUITE,
+    ),
+    Mutation(
+        'refused-cleanup-follows-a-link',
+        CAPTURE_WORKFLOW,
+        '        if not stat.S_ISREG(details.st_mode):',
+        '        if False:',
+        'a_refused_capture_that_is_not_a_regular_file_is_left_alone',
+        'The oversize cleanup unlinks whatever sits at the capture path.',
+        suite=CAPTURE_DURABILITY_SUITE,
     ),
     Mutation(
         'global-change-becomes-a-trigger',
@@ -3029,11 +3084,31 @@ TASK_14_5_MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'backup-conflict-ignored',
         RETENTION_SERVICE,
-        '        return age < self._stale_lock_after_seconds',
-        '        return False',
-        'a_fresh_backup_lock_skips_the_run',
+        '            if isinstance(backup_lock, RetentionErrorCategory):',
+        '            if False:',
+        'a_fresh_backup_lock_skips_the_run'
+        ' or a_backup_cannot_start_while_retention_runs',
         'Retention runs while a backup holds its lock.',
-        suite=RETENTION_SCHEDULING_SUITE,
+        suite=RETENTION_SCHEDULING_SUITE + " " + RETENTION_EXCLUSION_SUITE,
+    ),
+    Mutation(
+        'backup-lock-not-held-during-the-run',
+        RETENTION_SERVICE,
+        '            backup.acquire()',
+        '            pass',
+        'a_backup_cannot_start_while_retention_runs'
+        ' or a_fresh_backup_lock_skips_the_run',
+        'Retention never takes the backup lock, so a backup can start mid-run.',
+        suite=RETENTION_SCHEDULING_SUITE + " " + RETENTION_EXCLUSION_SUITE,
+    ),
+    Mutation(
+        'retention-without-a-backup-location-runs',
+        RETENTION_SERVICE,
+        '        if not directory_present:',
+        '        if False:',
+        'an_absent_backup_directory_refuses_to_run',
+        'A service with no backup directory to exclude against deletes anyway.',
+        suite=RETENTION_EXCLUSION_SUITE,
     ),
     Mutation(
         'installer-enables-the-timer-implicitly',
@@ -3048,11 +3123,65 @@ TASK_14_5_MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'installer-rollback-omitted',
         RETENTION_TIMER_INSTALLER,
-        '    restore_one "${destination_service}" "${previous_service}"',
+        '    restore_one "${destination_service}" "${previous_service}"'
+        ' "${previous_service_mode}"',
         '    :',
         'a_failed_second_publication_restores_the_previous_pair',
         'A half-published pair is left behind after a failure.',
         suite=RETENTION_TIMER_SUITE,
+    ),
+    # Task 14.5A. The four below are the installer's refusals of hostile
+    # input, each proved by a test that runs the shipped installer -- or a
+    # private copy of it beside a deliberately malformed template -- under
+    # bash against a temporary directory.
+    Mutation(
+        'installer-default-directory-spelling-bypass',
+        RETENTION_TIMER_INSTALLER,
+        'unit_directory="$(canonical_path "${unit_directory}")"'
+        ' || fail "--unit-directory could not be resolved."',
+        ':',
+        'the_validation_aid_is_refused_for_every_spelling_of_the_default_directory',
+        'A trailing slash or a dot component makes the real unit directory a '
+        '"developer" directory: no root, no ownership, the failure seam armed.',
+        suite=RETENTION_TIMER_HOSTILE_SUITE,
+    ),
+    Mutation(
+        'installer-account-name-unchecked',
+        RETENTION_TIMER_INSTALLER,
+        'require_account_name "--user" "${service_user}"',
+        ':',
+        'an_account_name_that_is_not_a_name_is_refused',
+        'A --user value carrying a newline becomes a second unit directive.',
+        suite=RETENTION_TIMER_HOSTILE_SUITE,
+    ),
+    Mutation(
+        'installer-renderer-escapes-accepted',
+        RETENTION_TIMER_INSTALLER,
+        "    *'|'*|*'&'*|*\\\\*|*[[:space:]]*) fail"
+        ' "${label} contains a character the unit renderer cannot carry." ;;',
+        "    *'|'*) fail"
+        ' "${label} contains a character the unit renderer cannot carry." ;;',
+        'a_backslash_sequence_in_a_path_cannot_inject_a_directive',
+        'A backslash-n in a path renders as a newline and a new directive.',
+        suite=RETENTION_TIMER_HOSTILE_SUITE,
+    ),
+    Mutation(
+        'installer-placeholder-check-removed',
+        RETENTION_TIMER_INSTALLER,
+        "if grep -q '@[A-Z_]*@' \"${rendered_service}\"; then",
+        'if false; then',
+        'a_template_with_an_unknown_placeholder_is_refused',
+        'A unit with an unsubstituted placeholder is published.',
+        suite=RETENTION_TIMER_HOSTILE_SUITE,
+    ),
+    Mutation(
+        'installer-structure-check-removed',
+        RETENTION_TIMER_INSTALLER,
+        'validate_unit_structure "${rendered_service}" service',
+        ':',
+        'a_template_missing_a_hardening_directive_is_refused',
+        'A service unit without its hardening directives is published.',
+        suite=RETENTION_TIMER_HOSTILE_SUITE,
     ),
 )
 

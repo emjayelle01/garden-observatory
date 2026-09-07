@@ -72,8 +72,8 @@ class MotionResult:
 
     Three diagnostic fields were added by Task 14.5, all with defaults so every
     earlier construction keeps working. ``raw_score`` is the uncompensated
-    changed-pixel ratio; ``luminance_shift`` is the mean luminance change the
-    detector subtracted before scoring; ``global_change_threshold`` is the
+    changed-pixel ratio; ``luminance_shift`` is the median per-pixel luminance
+    change the detector subtracted before scoring; ``global_change_threshold`` is the
     ceiling above which a change is reported as ``GLOBAL_CHANGE``.
     """
 

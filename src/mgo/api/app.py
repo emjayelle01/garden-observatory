@@ -8,6 +8,7 @@ import queue
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import TracebackType
 from typing import Any
 
@@ -50,7 +51,7 @@ from mgo.captures import (
 from mgo.core.camera import CameraReadiness, CameraState, default_readiness
 from mgo.core.camera_detection import build_detector
 from mgo.core.camera_monitor import perform_camera_check, run_camera_monitor
-from mgo.core.config import load_config
+from mgo.core.config import SYSTEM_BACKUP_DIRECTORY, load_config
 from mgo.core.database import apply_migrations
 from mgo.core.database_health import (
     DatabaseHealth,
@@ -85,6 +86,7 @@ from mgo.notifications import (
     build_notification_manager,
     create_event,
 )
+from mgo.operations.backup import LOCK_FILENAME as BACKUP_LOCK_FILENAME
 from mgo.retention import (
     RetentionRepository,
     RetentionRuntimeState,
@@ -258,7 +260,7 @@ class MotionStatusResponse(BaseModel):
     The three trailing fields were added by Task 14.5 and default, so a client
     written against the earlier shape still reads every field it knew.
     ``raw_score`` is the uncompensated changed-pixel ratio, ``luminance_shift``
-    the mean brightness change subtracted before scoring, and
+    the median per-pixel brightness change subtracted before scoring, and
     ``global_change_threshold`` the ceiling above which a change is reported
     as ``global_change`` rather than motion.
     """
@@ -341,6 +343,12 @@ class RetentionStatusResponse(BaseModel):
     last_run_deleted_count: int
     last_run_bytes_reclaimed: int
     last_error: str | None
+    # Task 14.5A. Whether the cross-process retention lock beside the database
+    # looks held right now: ``idle``, ``busy`` or ``unknown``. A report from
+    # one ``stat`` call, additive with a default, so the earlier shape is a
+    # subset of this one. An operator preparing a deployment or a recovery
+    # treats anything but ``idle`` as "wait".
+    scheduled_lock_state: str = "unknown"
 
 
 def _capture_service(app: FastAPI) -> CaptureService:
@@ -812,6 +820,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         retention_state,
         config.camera.capture_directory,
         database_path=config.storage.database_path,
+        # The same backup lock the CLI takes (Task 14.5A): should anything in
+        # this process ever run retention, it excludes the backup exactly as
+        # the timer does. Nothing here calls run_once().
+        backup_lock_path=Path(str(SYSTEM_BACKUP_DIRECTORY)) / BACKUP_LOCK_FILENAME,
     )
     camera_detector = build_detector(config.camera.backend)
 
@@ -1308,9 +1320,21 @@ def retention_status(request: Request) -> RetentionStatusResponse:
 
     ``last_error`` is one of a fixed set of category messages. It never carries
     an exception message, a traceback, a media path or the capture directory.
+
+    ``scheduled_lock_state`` (Task 14.5A) is the one exception to "reads one
+    holder": it stats the retention lock file beside the database, so an
+    operator can see whether a scheduled run is executing in another process.
+    It reads nothing else, creates nothing and takes no lock.
     """
     snapshot = _retention_state(request.app).snapshot()
+    service = getattr(request.app.state, "retention_service", None)
+    lock_state = (
+        service.cross_process_lock_state()
+        if isinstance(service, RetentionService)
+        else "unknown"
+    )
     return RetentionStatusResponse(
+        scheduled_lock_state=lock_state,
         enabled=snapshot.enabled,
         state=snapshot.state.value,
         total_runs=snapshot.total_runs,

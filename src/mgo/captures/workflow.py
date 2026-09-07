@@ -30,6 +30,8 @@ Two properties are deliberate and load-bearing:
 from __future__ import annotations
 
 import logging
+import os
+import stat
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -49,7 +51,11 @@ class CapturePublicationRefused(Exception):
     size ceiling). The workflow answers it by removing the file the *same
     attempt* just created -- never any pre-existing media -- and re-raising, so
     the refused capture leaves no image and no catalogue row behind.
+    ``discarded`` records whether that removal succeeded; ``None`` until the
+    workflow has tried.
     """
+
+    discarded: bool | None = None
 
 
 #: Inspects a verified capture *before* it is catalogued. It may raise
@@ -112,8 +118,8 @@ class CaptureWorkflow:
         if publication_guard is not None:
             try:
                 publication_guard(result)
-            except CapturePublicationRefused:
-                self._discard_refused(result.absolute_path)
+            except CapturePublicationRefused as refusal:
+                refusal.discarded = self._discard_refused(result.absolute_path)
                 raise
 
         # The capture is complete and verified on disk and the camera-operation
@@ -126,23 +132,53 @@ class CaptureWorkflow:
         return record
 
     @staticmethod
-    def _discard_refused(path: Path) -> None:
+    def _discard_refused(path: Path) -> bool:
         """Remove the file a refused capture just produced. Never raises.
 
         This is the single exception to "a successful JPEG is never deleted",
         and it is narrow on purpose: the file was created by *this* attempt,
         milliseconds ago, has no catalogue row and was refused publication.
-        Leaving it would be an uncatalogued file that the storage floor was
-        never allowed to account for. A removal failure is logged; the refusal
-        still propagates, and the orphan is visible on disk for reconciliation.
+        The path is the one the capture service built from the configured
+        capture directory and a fixed-format timestamp name, so it is beneath
+        the capture root by construction; what is checked here (Task 14.5A)
+        is that the object at that path is still a plain regular file --
+        never a symlink, never a directory -- because ``unlink`` is the one
+        destructive call in this module and it must not be aimed at anything
+        this attempt did not make.
+
+        Returns whether the file is gone. A failure is logged at error level;
+        the refusal still propagates, the orphan stays counted by the durable
+        reservation and by the free-space probe, and it is visible on disk
+        for reconciliation.
         """
         try:
-            path.unlink()
-            LOGGER.warning("Removed refused capture %s before cataloguing", path)
+            details = os.lstat(path)
+        except FileNotFoundError:
+            return True
         except OSError:
-            LOGGER.warning(
-                "Could not remove refused capture %s", path, exc_info=True
+            LOGGER.error(
+                "Could not inspect refused capture %s; leaving it in place",
+                path,
+                exc_info=True,
             )
+            return False
+        if not stat.S_ISREG(details.st_mode):
+            LOGGER.error(
+                "Refused capture %s is not a regular file; refusing to remove it",
+                path,
+            )
+            return False
+        try:
+            path.unlink()
+        except OSError:
+            LOGGER.error(
+                "Could not remove refused capture %s; it remains counted",
+                path,
+                exc_info=True,
+            )
+            return False
+        LOGGER.warning("Removed refused capture %s before cataloguing", path)
+        return True
 
 
 __all__ = ["CapturePublicationRefused", "CaptureWorkflow", "PublicationGuard"]

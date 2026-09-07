@@ -225,3 +225,46 @@ See `docs/Capture-Safety.md` §6.
 
 With the current production configuration (`[retention]` absent) an installed
 timer performs no deletion: the run skips with `retention_disabled`.
+
+---
+
+## 4. Task 14.5A — independent review corrections (2026-09-07)
+
+An adversarial review of PR #16 at `cd10340` re-derived every safety claim
+above from the code and found four defects, each reproduced deterministically
+before it was fixed. The fixes are additive commits on the same branch; the
+original five commits are untouched. Two §2 decisions are revised below.
+
+| # | Finding | Severity | Correction |
+| --- | --- | --- | --- |
+| A | The in-flight reservation was a process-local counter. A crash after `rpicam-still` wrote the JPEG and before the catalogue row was committed left an uncounted file, and the next process admitted again under a limit of one (reproduced: `attempt 2 admitted: True`). §3.3 "failed captures do not count" made an archive-failure loop bounded only by the storage floor. | Critical | **Durable reservation ledger**: a marker file beside the database, `O_EXCL`, flushed before the camera is touched, removed only when the archive has committed. Rows plus unreleased markers are the count; failed attempts count for the window; markers older than every window are swept. Ten crash boundaries are an executable table. |
+| B | Suppression observations were written on every *change* of reason, so reasons that alternate wrote one row per trigger (reproduced: 200 triggers, 200 rows). | High | A 60-second monotonic minimum between suppression rows, on top of the reason-change rule. Counters are unchanged; identical repeats still write nothing. |
+| C | Backup exclusion read the backup lock's *age* before and after taking the retention lock. A backup starting after the second check acquired its lock and ran alongside the deletion (reproduced). | Critical | The retention run now **holds the backup's own `O_EXCL` lock** for its duration. Mutual, whichever starts first; stale reclamation, unreadable metadata, process death and separate processes are all executable. `run-once` gained `--backup-directory`; a service with no backup location, or an absent backup directory, declines. The unit's `ReadWritePaths` gains the backup directory for that one file. |
+| D | The installer compared `--unit-directory` as a string, so `/etc/systemd/system/`, `/etc/systemd/./system` and a symlink to the real directory were "developer" directories: no root requirement, no ownership, and the `--fail-after-first-publish` seam armed. `--user`/`--group` were unvalidated and a backslash-`n` in any path rendered as a real newline and a second directive (reproduced: `ExecStartPre=/bin/evil` in the rendered unit). | High | Canonical comparison via `realpath -m`; symlink refusal on every component as supplied; account names validated; `|`, `&`, backslash and whitespace refused in paths; rollback restores the previous mode. |
+
+Lesser corrections: the oversize cleanup now refuses to unlink anything that
+is not a regular file and surfaces a cleanup failure on the refusal; the two
+"mean luminance" docstrings say median; `GET /retention/status` reports
+`scheduled_lock_state`; the lock refusal names the holder.
+
+**§2 decision 12 is withdrawn.** Reading a lock's age is not exclusion.
+**§2 decision 14 stands, for a different reason**: no migration, because the
+reservation must be durable *independently of the catalogue* — it must be
+writable while the database is failing and must survive a database restore
+— which a table in that database cannot be. Migration 004 remains free.
+
+**Residual limitation, decided not to block merge.** Retention cannot yield
+to a deployment or a §6.2 recovery: the deployment lock is a root-only
+`flock` with no observable state, and coupling the privileged gateway to the
+retention lock was judged out of scope for this change. The contract is an
+operator gate (`docs/Operations.md` §4.7, §5.7, Stage D), enforceable today
+because the timer is not installed or enabled in production; the task that
+enables the timer must carry that gate, and a later gateway change may
+automate it.
+
+**Mutation register.** The two installer gaps reported as unmutatable are
+closed: the placeholder check and the structural validation are mutated and
+detected by tests that copy the installer beside a deliberately malformed
+template (`tests/test_retention_timer_hostile_input.py`). Twelve entries
+were added and four re-anchored; the CRLF check is provable only on Linux
+because the MSYS `grep` normalises carriage returns, and is a Pi gate.

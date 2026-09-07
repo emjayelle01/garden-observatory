@@ -76,17 +76,19 @@ class LockInfo:
         }
 
 
-def _read_token(path: Path) -> str | None:
-    """Return the token recorded in a lock file, or ``None`` if unreadable.
+def _read_field(path: Path, field: str) -> str | None:
+    """Return one string field of a lock file, or ``None`` if unreadable.
 
-    A lock file that is missing, truncated, not JSON or missing its token is
-    reported as ``None`` rather than raising: the caller only ever uses the
-    answer to decide "is this still mine?", and an unreadable lock is certainly
-    not ours.
+    A lock file that is missing, truncated, not JSON or missing the field is
+    reported as ``None`` rather than raising: the callers only ever use the
+    answer to decide "is this still mine?" or to name the holder in a
+    message, and an unreadable lock is certainly not ours.
     """
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):
+        # ``ValueError`` covers bytes that are not UTF-8: a lock file's
+        # content is never trusted, so a corrupt one is simply "not ours".
         return None
     try:
         payload = json.loads(raw)
@@ -94,8 +96,22 @@ def _read_token(path: Path) -> str | None:
         return None
     if not isinstance(payload, dict):
         return None
-    token = payload.get("token")
-    return token if isinstance(token, str) else None
+    value = payload.get(field)
+    return value if isinstance(value, str) else None
+
+
+def _read_token(path: Path) -> str | None:
+    """Return the token recorded in a lock file, or ``None`` if unreadable."""
+    return _read_field(path, "token")
+
+
+def lock_holder_operation(path: Path) -> str | None:
+    """Return the operation name a lock file records, or ``None``.
+
+    Diagnostic only (Task 14.5A): the backup and the retention run now share
+    one lock file, and a refusal should say which of them holds it.
+    """
+    return _read_field(path, "operation")
 
 
 def _age_seconds(path: Path) -> float | None:
@@ -110,9 +126,11 @@ def _age_seconds(path: Path) -> float | None:
 def lock_age_seconds(path: Path) -> float | None:
     """Return how old a lock file is, or ``None`` if that cannot be read.
 
-    Public so another job can ask "is that lock fresh?" without acquiring it.
-    Retention uses it to yield to a running backup (Task 14.5): it never takes
-    the backup lock, it only reads its age, so it cannot disturb the backup.
+    Public so a status report can say whether a lock looks fresh without
+    acquiring it. It is a *report*, never an exclusion decision: Task 14.5A
+    replaced the age-based backup check with acquisition of the backup lock
+    itself, because reading an age is check-then-act and cannot exclude a
+    run that starts a moment later.
     """
     return _age_seconds(path)
 
@@ -170,9 +188,10 @@ class OperationLock:
         age = _age_seconds(self._path)
         if age is None or age < self._stale_after_seconds:
             held_for = "unknown" if age is None else f"{age:.0f}s"
+            holder = lock_holder_operation(self._path) or self._operation
             raise OperationError(
                 ErrorCode.BACKUP_LOCKED,
-                f"Another {self._operation} operation is already running "
+                f"Another {holder} operation is already running "
                 f"(lock held for {held_for} at {self._path.name}). "
                 "No second run was started.",
             )
@@ -273,5 +292,6 @@ __all__ = [
     "LockInfo",
     "OperationLock",
     "lock_age_seconds",
+    "lock_holder_operation",
     "operation_lock",
 ]

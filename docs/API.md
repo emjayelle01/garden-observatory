@@ -564,6 +564,12 @@ probes nothing. No path, directory or configuration location appears.
 floor is configured and the media filesystem is already below it; with no
 floor configured its behaviour is unchanged.
 
+`GET /retention/status` adds `scheduled_lock_state` (Task 14.5A): `idle`,
+`busy` or `unknown`, from one `stat` of the retention lock beside the
+database. Additive, with a default; every earlier field is unchanged. It is
+the operator's signal that no scheduled retention run is executing before a
+deployment or a recovery (`docs/Operations.md` §4.7).
+
 See `docs/Capture-Safety.md`.
 
 ## Compatibility promise

@@ -27,6 +27,7 @@ import pytest
 from mgo.core.config import RetentionConfig
 from mgo.core.database import apply_migrations, database_connection
 from mgo.core.observations import list_observations
+from mgo.operations.backup import LOCK_FILENAME as BACKUP_LOCK_FILENAME
 from mgo.retention.models import RetentionRuntimeState
 from mgo.retention.repository import (
     RetentionCatalogueError,
@@ -62,7 +63,12 @@ def _service(
     enabled: bool = False,
     state: RetentionRuntimeState | None = None,
 ) -> RetentionService:
-    """Build a retention service pointed at the given database and root."""
+    """Build a retention service pointed at the given database and root.
+
+    The backup lock location is named but never created: nothing in this
+    module runs retention, and a read-only preview must not add a directory.
+    """
+    backup_directory = capture_root.parent / "backups"
     return RetentionService(
         _config(enabled=enabled),
         RetentionRepository(database_path),
@@ -70,6 +76,7 @@ def _service(
         capture_root,
         clock=lambda: NOW,
         database_path=database_path,
+        backup_lock_path=backup_directory / BACKUP_LOCK_FILENAME,
     )
 
 
