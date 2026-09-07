@@ -19,8 +19,9 @@ Documentation=https://github.com/emjayelle01/garden-observatory
 # 02:30 with up to 30 minutes of randomised delay and a 15-minute ceiling, so
 # it is finished by 03:15 at the latest; 04:00 leaves a clear margin and is
 # still well before dawn, when the garden -- and the camera -- become busy.
-# The margin is a courtesy, not the guarantee: the run skips whenever the
-# backup's lock file is fresh, however the two schedules drift.
+# The margin is a courtesy, not the guarantee: the run holds the backup's own
+# lock for its duration, so the two can never overlap however the schedules
+# drift.
 OnCalendar=*-*-* 04:00:00
 
 # A short spread. Fifteen minutes cannot reach back into the backup window and

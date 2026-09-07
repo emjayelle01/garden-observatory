@@ -12,7 +12,7 @@
 #   @DATABASE_DIR@   database directory (default: /var/lib/garden-observatory/db)
 #   @CAPTURE_DIR@    capture media directory
 #                    (default: /var/lib/garden-observatory/media/captures)
-#   @BACKUP_DIR@     backup root whose lock a running backup holds
+#   @BACKUP_DIR@     backup root whose lock the run holds for its duration
 #                    (default: /var/backups/garden-observatory)
 #
 # It is a ONE-SHOT job triggered by mgo-retention.timer. It runs the
@@ -29,8 +29,9 @@ Documentation=https://github.com/emjayelle01/garden-observatory
 
 # Ordered after the backup when both are queued at once (a reboot catch-up,
 # for instance), so the backup goes first. Ordering is a courtesy; exclusion
-# is the lock: the run skips while the backup's lock file is fresh, and holds
-# its own lock beside the database so two retention runs cannot overlap.
+# is the lock: the run HOLDS the backup's own lock file for its duration, so
+# a backup and a retention run can never overlap whichever starts first, and
+# holds its own lock beside the database so two retention runs cannot either.
 # Deliberately NO Requires=, Wants= or BindsTo=: nothing here can start or
 # affect another unit.
 After=mgo-backup.service mgo.service

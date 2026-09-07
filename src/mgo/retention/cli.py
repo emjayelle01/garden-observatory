@@ -328,10 +328,11 @@ def _build_service(
     Creating these objects opens no connection, reads no catalogue and touches
     no file: the repository holds a path, and the service holds a lock.
 
-    ``backup_directory`` names where a running backup announces itself. The
-    scheduled command passes the directory the timer was installed with; the
-    manual command uses the canonical production location, so an operator's
-    ``run-once`` also yields to the nightly backup.
+    ``backup_directory`` names the backup lock a run holds for its duration
+    (Task 14.5A). The scheduled command passes the directory the timer was
+    installed with; ``run-once`` accepts the same option and both default to
+    the canonical production location, so an operator's manual run excludes
+    the nightly backup exactly as the timer does.
     """
     backup_root = (
         backup_directory
