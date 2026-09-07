@@ -363,7 +363,8 @@ _DASHBOARD_PAGE = """<!DOCTYPE html>
     "waiting_for_frames": "s-neutral",
     "establishing_baseline": "s-neutral",
     "no_motion": "s-healthy",
-    "motion_detected": "s-active"
+    "motion_detected": "s-active",
+    "global_change": "s-warning"
   };
 
   // A textual glyph accompanies every status so state is never conveyed by

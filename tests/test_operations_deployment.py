@@ -235,10 +235,20 @@ def test_the_api_unit_keeps_its_identity_and_camera_access() -> None:
 
 
 def test_no_worker_service_was_invented() -> None:
-    """The recorded decision: a worker unit needs a real worker first."""
+    """The recorded decision: a worker unit needs a real worker first.
+
+    Task 14.5 added ``mgo-retention.service.template``. It is not a worker: it
+    is a timer-triggered ``Type=oneshot`` job that runs the existing
+    ``mgo-retention`` command once and exits, exactly like the backup unit.
+    ``tests/test_retention_timer.py`` proves that shape.
+    """
     units = sorted(path.name for path in DEPLOY.glob("*.service.template"))
 
-    assert units == ["mgo-backup.service.template", "mgo.service.template"]
+    assert units == [
+        "mgo-backup.service.template",
+        "mgo-retention.service.template",
+        "mgo.service.template",
+    ]
 
 
 def test_no_unit_is_a_placeholder_that_merely_stays_alive() -> None:

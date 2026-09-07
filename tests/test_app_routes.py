@@ -264,6 +264,9 @@ analysis_interval_seconds = 0.2
 
 [event_capture]
 enabled = {event_capture}
+max_captures_per_hour = 10
+max_captures_per_day = 50
+minimum_free_bytes = 1
 
 [retention]
 enabled = {retention}

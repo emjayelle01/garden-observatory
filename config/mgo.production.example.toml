@@ -96,6 +96,10 @@ pixel_difference_threshold = 20
 # Default 0.08 is based on real IMX708 production measurements; tune per site.
 changed_pixel_ratio_threshold = 0.08
 cooldown_seconds = 5.0
+# Whole-frame change ceiling (Task 14.5): above it a change is "global_change",
+# never motion and never a capture trigger. Must exceed
+# changed_pixel_ratio_threshold. Not field-calibrated; see docs/Motion-Detection.md.
+global_change_ratio_threshold = 0.5
 
 [event_capture]
 # Motion-triggered still capture (Task 13.1). When enabled, a material
@@ -121,6 +125,17 @@ cooldown_seconds = 5.0
 # preview.restore_after_capture and motion.enabled to all be true; asking for it
 # with any of them off is rejected at load time. See docs/Event-Capture.md.
 enabled = false
+# Hard safety limits (Task 14.5), ALL MANDATORY when enabled = true. See
+# docs/Capture-Safety.md. These are illustrative values, not an accepted
+# operating policy: the per-hour and per-day ceilings bound a windy afternoon
+# (Task 13.2 measured about 3 captures a minute unbounded), the free-space floor
+# keeps 2 GiB on the SD card after every admitted capture, and the reservation
+# is several times the largest measured still. A trigger that would breach any
+# of them is refused before the camera is touched.
+max_captures_per_hour = 20
+max_captures_per_day = 120
+minimum_free_bytes = 2147483648
+maximum_capture_bytes = 16777216
 
 [retention]
 # Capture-media retention (Task 14.1). This is the SOFTWARE FOUNDATION for

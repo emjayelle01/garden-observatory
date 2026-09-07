@@ -23,12 +23,19 @@ each one stealing the camera again. So:
 * **No retry.** A failed attempt is recorded truthfully and abandoned. Motion is
   a renewable trigger; retrying a capture of a moment that has passed produces
   evidence of nothing.
+* **Admission before the camera (Task 14.5).** The worker asks the
+  :class:`~mgo.event_capture.admission.CaptureAdmissionController` before it
+  releases preview or invokes the still camera. A refused trigger creates no
+  image, no catalogue row and no lifecycle row; it is counted, reported on the
+  status endpoint, and recorded in the timeline only when the *reason*
+  changes, so a windy afternoon under quota cannot flood the observations.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -39,10 +46,16 @@ from mgo.camera.exceptions import (
     CaptureTimeoutError,
     CaptureWriteError,
 )
+from mgo.camera.models import CaptureResult
 from mgo.captures.archive import CaptureArchiveError
 from mgo.captures.models import Capture
-from mgo.captures.workflow import CaptureWorkflow
+from mgo.captures.workflow import CapturePublicationRefused, CaptureWorkflow
 from mgo.core.observations import Observation, record_observation
+from mgo.event_capture.admission import (
+    AdmissionDecision,
+    CaptureAdmissionController,
+    SuppressionReason,
+)
 from mgo.event_capture.models import (
     EventCaptureErrorCategory,
     EventCaptureRuntimeState,
@@ -66,6 +79,14 @@ SUCCESS_STATUS = "captured"
 SUCCESS_SUMMARY = "Motion-triggered still captured"
 FAILURE_STATUS = "failed"
 FAILURE_SUMMARY = "Motion-triggered still capture failed"
+SUPPRESSED_STATUS = "suppressed"
+SUPPRESSED_SUMMARY = "Motion-triggered still capture suppressed"
+
+#: The shortest interval between two persisted suppression observations,
+#: whatever the reasons do (Task 14.5A). Sixty seconds bounds a blockade that
+#: alternates reasons on every trigger to at most 1,440 rows a day, against
+#: the health monitor's own steady rate; identical repeats still write none.
+SUPPRESSION_RECORD_INTERVAL_SECONDS = 60.0
 
 #: The worker's asyncio task name, in the same ``mgo-`` family as every other
 #: application-owned task so shutdown auditing can see it.
@@ -82,6 +103,7 @@ QUEUE_CAPACITY = 1
 _CAMERA_ERROR_CATEGORIES: tuple[
     tuple[type[BaseException], EventCaptureErrorCategory], ...
 ] = (
+    (CapturePublicationRefused, EventCaptureErrorCategory.OVERSIZE_CAPTURE),
     (CameraUnavailableError, EventCaptureErrorCategory.CAMERA_UNAVAILABLE),
     (CaptureTimeoutError, EventCaptureErrorCategory.CAPTURE_TIMEOUT),
     (BackendCaptureError, EventCaptureErrorCategory.BACKEND_FAILURE),
@@ -130,12 +152,29 @@ class EventCaptureService:
         state: EventCaptureRuntimeState,
         database_path: Path,
         *,
+        admission: CaptureAdmissionController,
         recorder: ObservationRecorder = record_observation,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._workflow = workflow
         self._state = state
         self._database_path = database_path
+        # Required, not optional: a service without a gate is the unbounded
+        # pipeline Task 14.4 found, and there is deliberately no way to build
+        # one. The application constructs the controller from the same
+        # validated configuration that enabled the feature.
+        self._admission = admission
         self._recorder = recorder
+        self._monotonic = monotonic
+        # The reason of the last suppression that was *written to the timeline*
+        # (not merely counted), so identical repeats are counted but not
+        # persisted. Reset by every admitted capture.
+        self._last_recorded_suppression: SuppressionReason | None = None
+        # When the last suppression observation was written, on the monotonic
+        # clock (Task 14.5A). A change of reason is persisted only once this
+        # interval has passed, so reasons that alternate cannot write faster
+        # than a fixed, bounded rate however often they alternate.
+        self._last_suppression_recorded_at: float | None = None
         self._queue: asyncio.Queue[MotionTrigger | _Stop] = asyncio.Queue(
             maxsize=QUEUE_CAPACITY
         )
@@ -147,6 +186,18 @@ class EventCaptureService:
     def status(self) -> EventCaptureStatus:
         """Return an immutable snapshot of the runtime state."""
         return self._state.snapshot()
+
+    def refresh_admission(self) -> AdmissionDecision:
+        """Re-evaluate the gate without reserving, and publish the facts.
+
+        Blocking (it reads the catalogue and probes the filesystem), so the
+        application calls it from a worker thread -- once after startup, so
+        the status endpoint reports counts reconstructed from durable rows
+        rather than zeros, and never from the request path.
+        """
+        decision = self._admission.evaluate()
+        self._state.apply_decision(decision)
+        return decision
 
     def start(self) -> None:
         """Create the single worker task and begin accepting triggers.
@@ -179,6 +230,16 @@ class EventCaptureService:
         which transitions reach here at all; this service adds no second
         cooldown of its own.
         """
+        if result.status is MotionStatus.GLOBAL_CHANGE:
+            # A whole-frame event is deliberately not a trigger, and it is not
+            # counted as one received; it is counted as *suppressed* so an
+            # operator can see how often the scene re-baselined. No database
+            # write: the motion observer already persisted the transition.
+            self._state.total_global_scene_changes += 1
+            self._state.record_suppression(
+                SuppressionReason.GLOBAL_SCENE_CHANGE, result.evaluated_at
+            )
+            return False
         if result.status is not MotionStatus.MOTION_DETECTED:
             return False
         if not self._accepting:
@@ -279,16 +340,120 @@ class EventCaptureService:
         meaningful: a second trigger cannot start while the first is still
         writing its timeline entry.
         """
+        # Admission first, off the loop, before anything touches the camera.
+        # The controller writes one durable reservation for an admitted
+        # trigger. It is released in the ``finally`` below whatever the
+        # outcome, and told whether the attempt ended as a committed catalogue
+        # row: only then is the marker removed, because only then does a row
+        # carry the count. Every other ending keeps the marker, so a JPEG the
+        # archive could not catalogue -- or a crash between the camera and the
+        # catalogue -- is still counted by the next process (Task 14.5A).
+        try:
+            decision = await asyncio.to_thread(self._admission.admit)
+        except Exception:
+            LOGGER.exception("Motion-triggered capture admission failed")
+            decision = None
+        if decision is None:
+            await self._handle_suppression(
+                trigger, SuppressionReason.ADMISSION_ERROR, None
+            )
+            return
+        self._state.apply_decision(decision)
+        if not decision.admitted:
+            reason = decision.reason or SuppressionReason.ADMISSION_ERROR
+            await self._handle_suppression(trigger, reason, decision)
+            return
+
         self._state.state = EventCaptureState.CAPTURING
+        catalogued = False
         try:
             capture = await asyncio.to_thread(
                 self._workflow.capture,
                 extra_metadata=trigger.capture_metadata(),
+                publication_guard=self._refuse_oversize,
             )
+            # The workflow returns only after the archive has committed.
+            catalogued = True
         except Exception as error:
             await self._handle_failure(trigger, error)
             return
+        finally:
+            self._admission.release(succeeded=catalogued)
         await self._handle_success(trigger, capture)
+
+    def _refuse_oversize(self, result: CaptureResult) -> None:
+        """Publication guard: refuse a still larger than the reservation.
+
+        The admission gate reserved ``maximum_capture_bytes`` of free space; a
+        file larger than that could take the filesystem below the configured
+        floor, so it is refused before it is catalogued. The workflow removes
+        the refused file -- the one this attempt just created, never
+        pre-existing media.
+        """
+        if result.filesize_bytes > self._admission.maximum_capture_bytes:
+            raise CapturePublicationRefused(
+                "Motion-triggered capture exceeded the reserved size"
+            )
+
+    async def _handle_suppression(
+        self,
+        trigger: MotionTrigger,
+        reason: SuppressionReason,
+        decision: AdmissionDecision | None,
+    ) -> None:
+        """Count a refused trigger and record it on a bounded change of reason.
+
+        Nothing was captured, so the runtime state stays wherever it was
+        (``IDLE`` or ``ERROR``); a suppression is not a capture failure. The
+        counters on the status endpoint move on every suppression. The
+        timeline gets a row only when the reason differs from the last one
+        recorded *and* at least :data:`SUPPRESSION_RECORD_INTERVAL_SECONDS`
+        have passed since the last row: an identical repeat writes nothing,
+        and reasons that alternate -- ``hourly_limit``, ``storage_reserve``,
+        ``hourly_limit`` -- write at most one row per interval (Task 14.5A).
+        A recovery to an admitted capture is observable through the capture's
+        own ``captured`` observation.
+        """
+        at = decision.evaluated_at if decision is not None else trigger.evaluated_at
+        self._state.record_suppression(reason, at)
+        LOGGER.info(
+            "Motion-triggered capture suppressed (reason=%s, suppressed=%d)",
+            reason.value,
+            self._state.total_triggers_suppressed,
+        )
+        if reason == self._last_recorded_suppression:
+            return
+        now = self._monotonic()
+        last = self._last_suppression_recorded_at
+        if last is not None and now - last < SUPPRESSION_RECORD_INTERVAL_SECONDS:
+            # Counted and reported on the status endpoint; not persisted. The
+            # memory of the last *recorded* reason is deliberately left alone,
+            # so the next row -- once the interval has passed -- is written for
+            # whatever the reason is then.
+            return
+        self._last_recorded_suppression = reason
+        self._last_suppression_recorded_at = now
+
+        payload = trigger.observation_payload()
+        payload["reason"] = reason.value
+        if decision is not None:
+            payload["hourly_count"] = decision.hourly_count
+            payload["hourly_limit"] = decision.hourly_limit
+            payload["daily_count"] = decision.daily_count
+            payload["daily_limit"] = decision.daily_limit
+            payload["storage_reserve_ok"] = decision.storage_reserve_ok
+        try:
+            await self._record_observation(
+                kind=OBSERVATION_KIND,
+                source=OBSERVATION_SOURCE,
+                status=SUPPRESSED_STATUS,
+                summary=SUPPRESSED_SUMMARY,
+                payload=payload,
+            )
+        except Exception:
+            LOGGER.exception(
+                "The event-capture suppression observation could not be recorded"
+            )
 
     async def _record_observation(self, **fields: Any) -> None:
         """Write one event-capture observation off the event loop.
@@ -314,8 +479,18 @@ class EventCaptureService:
         self._state.total_captures_succeeded += 1
         self._state.last_capture_id = str(capture.id)
         self._state.last_capture_at = capture.captured_at_utc
+        self._state.last_admitted_at = capture.captured_at_utc
         self._state.last_error = None
         self._state.state = EventCaptureState.IDLE
+        # An admitted capture ends any run of identical suppressions: the next
+        # refusal, whatever its reason, is news again.
+        self._last_recorded_suppression = None
+        # Re-publish the gate's facts now that the new row exists, so the
+        # status endpoint shows the count the next trigger will face.
+        try:
+            await asyncio.to_thread(self.refresh_admission)
+        except Exception:
+            LOGGER.exception("Admission state could not be refreshed")
         LOGGER.info(
             "Motion-triggered capture %s archived as %s",
             capture.filename,
@@ -357,6 +532,13 @@ class EventCaptureService:
         self._state.total_captures_failed += 1
         self._state.last_error = message
         self._state.state = EventCaptureState.ERROR
+        if category is EventCaptureErrorCategory.OVERSIZE_CAPTURE:
+            # A refused publication is also a suppression: the still existed
+            # for a moment and was withdrawn, which the operator should see in
+            # the same place every other refusal appears.
+            self._state.record_suppression(
+                SuppressionReason.OVERSIZE_CAPTURE, trigger.evaluated_at
+            )
         # The raw exception is logged with its traceback here and *only* here.
         # It is arbitrary application data -- it may carry a path, a command
         # line, a username or an environment value -- so nothing derived from it
@@ -399,6 +581,9 @@ __all__ = [
     "QUEUE_CAPACITY",
     "SUCCESS_STATUS",
     "SUCCESS_SUMMARY",
+    "SUPPRESSED_STATUS",
+    "SUPPRESSED_SUMMARY",
+    "SUPPRESSION_RECORD_INTERVAL_SECONDS",
     "WORKER_TASK_NAME",
     "EventCaptureService",
     "classify_failure",

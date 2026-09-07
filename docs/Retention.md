@@ -924,11 +924,128 @@ cannot be a retention candidate.
 
 ## 18. Deferred
 
-Not implemented, and each requiring its own task: automatic retention
-scheduling, a service timer, a periodic deletion loop, disk-pressure emergency
+Not implemented, and each requiring its own task: production enablement of
+the retention timer (the assets exist, see §19), a periodic deletion loop
+inside the API process, disk-pressure emergency
 deletion, manual-capture and unknown-origin deletion policies, an image
 serving/download API, thumbnails, bird detection, species classification,
 ROI/feeder masking, burst capture, pre-roll/post-roll, video recording,
 visit/session grouping, notification attachments, Telegram/email delivery,
 production enablement, physical retention validation, long-duration unattended
 validation and camera hardware hardening.
+
+---
+
+## 19. Scheduled execution (Task 14.5)
+
+Retention can now be run unattended, and the contract is fail-closed at every
+step. Nothing in this section changes what §1–§17 promise: the policy, the
+managed set, the safety boundary and the deletion state machine are exactly
+as reviewed.
+
+### 19.1 `scheduled-run`
+
+`mgo-retention scheduled-run --execute [--backup-directory PATH]` is the
+subcommand the timer invokes. It keeps every gate `run-once` has — the
+explicit `--execute` flag, an absolute `MGO_CONFIG_PATH` as supplied, and the
+schema gate — and makes the same single call into the service. What differs
+is how a run that *correctly declined to start* is reported:
+
+| Condition | `outcome` | `reason` | Exit |
+| --- | --- | --- | --- |
+| `retention.enabled = false` | `skipped` | `retention_disabled` | 0 |
+| another retention process holds the lock | `skipped` | `lock_unavailable` or `retention_busy` | 0 |
+| a database backup is in progress | `skipped` | `backup_in_progress` | 0 |
+| the run started | `executed` | — | 0, or 4 on a safety refusal |
+| a gate refused (`--execute` missing, relative configuration, wrong schema) | — | — | 2 or 3 |
+
+A skip is not silent: the structured document names the reason and the
+journal carries it. It is merely not a failed unit. **With the production
+configuration as deployed (`[retention]` absent), every scheduled run skips
+as `retention_disabled` and deletes nothing.**
+
+`--backup-directory` must be absolute as supplied, for the same reason the
+configuration path must be, and the directory must already exist: a run never
+creates it. Both `scheduled-run` and `run-once` accept it (Task 14.5A) and
+both default to the canonical production backup location, so an operator's
+manual run holds the same lock the nightly backup does.
+
+### 19.2 Locks
+
+Two locks now guard a run, taken in this order and released in reverse:
+
+1. the **process lock** (§12), unchanged;
+2. the **cross-process file lock** `<database directory>/.mgo-retention.lock`,
+   an `O_CREAT|O_EXCL` file with the same age-based stale reclamation as the
+   backup lock. The timer and an operator's shell are different processes,
+   and the process lock cannot see across them. The database directory is
+   chosen because every retention execution already needs it writable. A lock
+   that cannot be taken or created declines the run with `lock_unavailable`;
+   a service constructed with no lock location declines every run.
+
+Then, still before anything is read, the run **takes the backup's own lock**
+(`<backup directory>/.mgo-backup.lock`) and holds it until the run ends
+(Task 14.5A). That file is the backup's `O_CREAT|O_EXCL` primitive, acquired
+here with the same call and the same age-based stale reclamation, so a
+backup and a retention run can never both hold it whichever starts first:
+
+| Interleaving | Outcome |
+| --- | --- |
+| retention starts, then a backup starts at any instant during the run | the backup's acquisition fails (`Another retention operation is already running`) and it exits without publishing; retention completes |
+| a backup starts, then retention starts | retention skips with `backup_in_progress` and deletes nothing |
+| both start in the same instant | exactly one creates the file; the other declines |
+| a stale backup lock (older than the threshold) | reclaimed, as the backup itself would |
+| a backup lock whose content or age cannot be read | treated as held; retention skips |
+| a process dies holding either lock | the file survives; the next run respects it until it is stale, then reclaims it |
+| timer catch-up after a reboot | `After=mgo-backup.service` orders the pair; the lock decides if ordering is not enough |
+| no backup lock location, or the backup directory absent | retention declines with `lock_unavailable` |
+
+The earlier design *read the backup lock's age* before and after taking the
+retention lock. The Task 14.5A review showed that to be check-then-act: a
+backup starting a moment after the second check ran alongside the deletion.
+The interleavings above are executable, in-process and across real
+processes: `tests/test_retention_mutual_exclusion.py`.
+
+What is **not** excluded, and why: the deployment lock
+(`/run/lock/mgo-deployment.lock`) is a root-owned `0600` `flock` whose
+holder cannot be observed by the runtime account — its modification time
+never changes — so retention cannot yield to a deployment, and the gateway
+does not consult the retention lock. A restore test never touches media.
+The contract for those is therefore an operator gate, stated in
+`docs/Operations.md` §4.7: before a deployment, a recovery, a restore test
+or manual database maintenance, the retention timer must be inactive or
+proven idle, using `GET /retention/status` → `scheduled_lock_state`, which
+reports the retention lock as `idle`, `busy` or `unknown`.
+
+### 19.3 Units and timer
+
+`scripts/deploy/mgo-retention.service.template` renders to a `Type=oneshot`
+unit running as the `mgo` account with the backup unit's full hardening set,
+no network, no devices, and `ReadWritePaths` limited to the database
+directory, the capture directory and the backup directory. The last is there
+for exactly one file — the backup lock the run holds (§19.2); the retention
+code has no path that names a recovery set. It carries no `[Install]`
+section; only the timer is ever enabled.
+
+`scripts/deploy/mgo-retention.timer` fires at 04:00 local time with a
+15-minute randomised delay, `AccuracySec=1m` and `Persistent=true`, and is
+ordered `After=mgo-backup.service`. The backup window (02:30 plus up to 30
+minutes, 15-minute ceiling) is finished by 03:15; the margin is a courtesy,
+the lock is the guarantee.
+
+### 19.4 Installing and enabling are two decisions
+
+`scripts/deploy/install-retention-timer.sh` renders, validates and publishes
+the pair atomically (a same-filesystem temporary and `mv -T`), verifies bytes,
+type and mode afterwards, rolls the first unit back if the second cannot be
+published, is idempotent, and supports an exact non-root `--dry-run`. **It
+never enables or starts the timer unless `--enable` is passed**, and then it
+seeds the persistence stamp first so enabling cannot trigger a catch-up run.
+Root is required to install into the real unit directory. Full commissioning
+steps are in `docs/Operations.md` §4.5.
+
+### 19.5 Still not done
+
+Physical validation of a deletion on the Pi, an operating policy (the bounds
+remain commented out in every tracked configuration), and enabling the timer
+in production are each separate decisions and separate tasks.

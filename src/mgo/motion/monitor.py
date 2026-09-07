@@ -51,6 +51,7 @@ _STATUS_SUMMARIES: dict[MotionStatus, str] = {
     MotionStatus.ESTABLISHING_BASELINE: "Motion baseline established",
     MotionStatus.NO_MOTION: "No motion detected",
     MotionStatus.MOTION_DETECTED: "Motion detected in the camera scene",
+    MotionStatus.GLOBAL_CHANGE: "Whole-frame change; scene re-baselined",
     MotionStatus.ERROR: "Motion detection error",
 }
 
@@ -98,7 +99,12 @@ class _MotionEvaluator:
       legitimately keeps reading as ``motion_detected``;
     * **preserved** across a bad/failed frame, so a single decode error does not
       corrupt the reference with invalid data;
-    * **reset** when frames become unavailable, so recovery re-establishes it.
+    * **reset** when frames become unavailable, so recovery re-establishes it;
+    * **re-established on a global change** (Task 14.5): a frame whose
+      compensated change exceeds the global ceiling becomes the new reference
+      exactly as a motion frame would, so an exposure step is absorbed in one
+      cycle and the next stable frame reads ``no_motion``. What differs is the
+      *verdict*: it is reported as ``global_change``, never as motion.
 
     There is deliberately no time-based refresh and no maximum-motion timeout:
     the reference advances because another frame was analysed, never because a
@@ -175,13 +181,40 @@ class _MotionEvaluator:
                 evaluated_at=now,
             )
 
-        score = self._detector.score(self._reference, current)
-        detected = self._detector.is_motion(score)
+        comparison = self._detector.compare(self._reference, current)
+        score = comparison.ratio
+        global_threshold = self._config.global_change_ratio_threshold
         # Rolling reference: the current frame is always adopted as the reference
-        # for the next comparison, whether or not motion was detected. This is
-        # what lets a lasting change settle to no_motion once it stops changing.
+        # for the next comparison, whether the verdict is no motion, motion or a
+        # global change. This is what lets a lasting change settle to no_motion
+        # once it stops changing, and what lets an exposure step be absorbed in
+        # exactly one cycle.
         self._reference = current
-        if detected:
+        # The global ceiling is tested FIRST, and against the LARGER of the raw
+        # and compensated ratios. A uniform exposure step compensates to almost
+        # nothing, but it still changed every pixel; reporting it as a global
+        # change keeps the diagnostic honest and keeps the reference reset
+        # explicit. A change that exceeds the ceiling also exceeds the motion
+        # threshold, and the whole point is that such a frame is never motion.
+        if self._detector.is_global_change(max(score, comparison.raw_ratio)):
+            return MotionResult(
+                status=MotionStatus.GLOBAL_CHANGE,
+                detected=False,
+                score=score,
+                threshold=threshold,
+                frames_available=True,
+                detail=(
+                    f"Compensated changed-pixel ratio {score:.4f} exceeded the "
+                    f"global-change ceiling {global_threshold:.4f} (raw "
+                    f"{comparison.raw_ratio:.4f}, luminance shift "
+                    f"{comparison.luminance_shift:+.1f}); scene re-baselined."
+                ),
+                evaluated_at=now,
+                raw_score=comparison.raw_ratio,
+                luminance_shift=comparison.luminance_shift,
+                global_change_threshold=global_threshold,
+            )
+        if self._detector.is_motion(score):
             return MotionResult(
                 status=MotionStatus.MOTION_DETECTED,
                 detected=True,
@@ -193,6 +226,9 @@ class _MotionEvaluator:
                     f"exceeded threshold {threshold:.4f}."
                 ),
                 evaluated_at=now,
+                raw_score=comparison.raw_ratio,
+                luminance_shift=comparison.luminance_shift,
+                global_change_threshold=global_threshold,
             )
         return MotionResult(
             status=MotionStatus.NO_MOTION,
@@ -205,6 +241,9 @@ class _MotionEvaluator:
                 f"stayed within threshold {threshold:.4f}."
             ),
             evaluated_at=now,
+            raw_score=comparison.raw_ratio,
+            luminance_shift=comparison.luminance_shift,
+            global_change_threshold=global_threshold,
         )
 
 
@@ -272,6 +311,8 @@ def _log_transition(previous: MotionStatus | None, current: MotionStatus) -> Non
         return
     if current is MotionStatus.MOTION_DETECTED:
         LOGGER.info("Motion detected in the camera scene")
+    elif current is MotionStatus.GLOBAL_CHANGE:
+        LOGGER.info("Whole-frame change in the camera scene; re-baselined")
     elif current is MotionStatus.NO_MOTION and previous is (
         MotionStatus.MOTION_DETECTED
     ):

@@ -76,7 +76,14 @@ def _configuration(
     )
     if event_capture is None:
         return text
-    return f"{text}\n[event_capture]\nenabled = {str(event_capture).lower()}\n"
+    # The Task 14.5 hard limits are always written when the section is: they
+    # are mandatory for an enabled feature, and harmless for a disabled one.
+    return (
+        f"{text}\n[event_capture]\nenabled = {str(event_capture).lower()}\n"
+        "max_captures_per_hour = 10\n"
+        "max_captures_per_day = 50\n"
+        "minimum_free_bytes = 1\n"
+    )
 
 
 # --- default-disabled behaviour ---------------------------------------------

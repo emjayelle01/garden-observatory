@@ -32,6 +32,25 @@ _REQUIRED_FIELDS = {
     "last_capture_id",
     "last_capture_at",
     "last_error",
+    # Task 14.5 additions. Additive: every pre-existing field above is still
+    # present and still means what it meant.
+    "admission_state",
+    "total_triggers_suppressed",
+    "last_suppression_reason",
+    "last_suppressed_at",
+    "hourly_count",
+    "hourly_limit",
+    "hourly_remaining",
+    "daily_count",
+    "daily_limit",
+    "daily_remaining",
+    "storage_reserve_ok",
+    "storage_free_bytes",
+    "minimum_free_bytes",
+    "maximum_capture_bytes",
+    "last_admitted_at",
+    "worker_busy",
+    "total_global_scene_changes",
 }
 
 

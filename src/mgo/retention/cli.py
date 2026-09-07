@@ -50,13 +50,23 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import IO, Any, NoReturn
 
-from mgo.core.config import CONFIG_PATH_ENV, MGOConfig, load_config
+from mgo.core.config import (
+    CONFIG_PATH_ENV,
+    SYSTEM_BACKUP_DIRECTORY,
+    MGOConfig,
+    load_config,
+)
 from mgo.core.database import (
     CURRENT_SCHEMA_VERSION,
     DatabaseError,
     read_schema_version,
 )
-from mgo.retention.models import RetentionPlan, RetentionRuntimeState
+from mgo.operations.backup import LOCK_FILENAME as BACKUP_LOCK_FILENAME
+from mgo.retention.models import (
+    RetentionErrorCategory,
+    RetentionPlan,
+    RetentionRuntimeState,
+)
 from mgo.retention.repository import (
     RetentionCatalogueError,
     RetentionRepository,
@@ -91,6 +101,12 @@ EXIT_UNEXPECTED = 5
 #: ride out on an operator-facing refusal.
 REFUSAL_MISSING_EXECUTE = (
     "Refusing to run: run-once requires the explicit --execute flag."
+)
+REFUSAL_MISSING_EXECUTE_SCHEDULED = (
+    "Refusing to run: scheduled-run requires the explicit --execute flag."
+)
+REFUSAL_RELATIVE_BACKUP_DIRECTORY = (
+    "Refusing to run: --backup-directory must be an absolute path."
 )
 REFUSAL_RETENTION_DISABLED = (
     "Refusing to run: retention is disabled in the selected configuration."
@@ -304,18 +320,32 @@ def _require_current_schema(database_path: Path) -> None:
         raise _Refusal(SCHEMA_REFUSAL, EXIT_SCHEMA)
 
 
-def _build_service(config: MGOConfig) -> RetentionService:
+def _build_service(
+    config: MGOConfig, *, backup_directory: Path | None = None
+) -> RetentionService:
     """Construct the retention service from configuration. Inert.
 
     Creating these objects opens no connection, reads no catalogue and touches
     no file: the repository holds a path, and the service holds a lock.
+
+    ``backup_directory`` names the backup lock a run holds for its duration
+    (Task 14.5A). The scheduled command passes the directory the timer was
+    installed with; ``run-once`` accepts the same option and both default to
+    the canonical production location, so an operator's manual run excludes
+    the nightly backup exactly as the timer does.
     """
+    backup_root = (
+        backup_directory
+        if backup_directory is not None
+        else Path(str(SYSTEM_BACKUP_DIRECTORY))
+    )
     return RetentionService(
         config.retention,
         RetentionRepository(config.storage.database_path),
         RetentionRuntimeState(enabled=config.retention.enabled),
         config.camera.capture_directory,
         database_path=config.storage.database_path,
+        backup_lock_path=backup_root / BACKUP_LOCK_FILENAME,
     )
 
 
@@ -423,6 +453,23 @@ def _plan(arguments: argparse.Namespace, stream: IO[str]) -> int:
     return EXIT_SUCCESS
 
 
+def _destructive_preconditions(
+    arguments: argparse.Namespace, refusal_missing_execute: str
+) -> MGOConfig:
+    """Gates A and B, then the configuration read, for a destructive command.
+
+    Shared by ``run-once`` and ``scheduled-run`` so the two cannot drift: the
+    explicit ``--execute`` flag (gate A) and an absolute ``MGO_CONFIG_PATH``
+    as supplied (gate B) are both checked before any file is read. Only the
+    refusal sentence for a missing flag differs, because it names the command.
+    """
+    if not arguments.execute:
+        raise _Refusal(refusal_missing_execute, EXIT_REFUSED)
+
+    _require_explicit_configuration()
+    return _load_configuration()
+
+
 def _run_once(arguments: argparse.Namespace, stream: IO[str]) -> int:
     """Execute exactly one bounded retention run.
 
@@ -446,18 +493,18 @@ def _run_once(arguments: argparse.Namespace, stream: IO[str]) -> int:
     says more eligible work remains: that is a fact for the operator, not a
     trigger.
     """
-    if not arguments.execute:
-        raise _Refusal(REFUSAL_MISSING_EXECUTE, EXIT_REFUSED)
-
-    _require_explicit_configuration()
-    config = _load_configuration()
+    backup_directory = _absolute_backup_directory(arguments.backup_directory)
+    config = _destructive_preconditions(arguments, REFUSAL_MISSING_EXECUTE)
 
     if not config.retention.enabled:
         raise _Refusal(REFUSAL_RETENTION_DISABLED, EXIT_REFUSED)
 
     _require_current_schema(config.storage.database_path)
 
-    result = _build_service(config).run_once()
+    # One service, one run. The service is bound to a name only so the single
+    # call below is unmistakably single: nothing here loops on the result.
+    service = _build_service(config, backup_directory=backup_directory)
+    result = service.run_once()
 
     _emit(
         {
@@ -484,9 +531,118 @@ def _run_once(arguments: argparse.Namespace, stream: IO[str]) -> int:
     )
 
 
+#: The declined outcomes a scheduled run reports as a *skip* rather than a
+#: failure. Each is a deliberate refusal to start -- nothing was touched -- and
+#: a timer that fires every night must not turn "correctly did nothing" into
+#: a failed unit. Everything else keeps its non-zero exit code.
+SCHEDULED_SKIP_REASONS: dict[RetentionErrorCategory | None, str] = {
+    RetentionErrorCategory.BUSY: "retention_busy",
+    RetentionErrorCategory.BACKUP_IN_PROGRESS: "backup_in_progress",
+    RetentionErrorCategory.LOCK_UNAVAILABLE: "lock_unavailable",
+}
+
+
+def _absolute_backup_directory(raw: str | None) -> Path | None:
+    """Validate the optional ``--backup-directory`` as supplied.
+
+    Absolute as written, for the same reason the configuration path must be:
+    the timer runs from a working directory an operator did not choose, and a
+    relative value would name a different place from a different shell.
+    """
+    if raw is None:
+        return None
+    if not Path(raw).is_absolute():
+        raise _Refusal(REFUSAL_RELATIVE_BACKUP_DIRECTORY, EXIT_REFUSED)
+    return Path(raw)
+
+
+def _scheduled_run(arguments: argparse.Namespace, stream: IO[str]) -> int:
+    """Execute one retention run the way a timer needs it executed (Task 14.5).
+
+    The same gates as ``run-once`` -- the explicit ``--execute`` flag and an
+    absolute ``MGO_CONFIG_PATH`` -- and the same single call into the service.
+    What differs is the *reporting* of a run that correctly declined to start:
+
+    * ``retention.enabled = false`` is an ``outcome`` of ``skipped`` with reason
+      ``retention_disabled`` and exit ``0``. With the production configuration
+      as deployed, this is the nightly result, and it deletes nothing;
+    * a held retention lock, a running backup or an unavailable lock are
+      ``skipped`` with their reason and exit ``0``;
+    * a run that started is ``executed`` (exit ``0``, or the retention error
+      code if it stopped on a safety refusal); a wrong schema is still refused.
+
+    Skipping is not silent: the structured document says exactly why, and the
+    journal carries it. It is merely not a failure.
+    """
+    backup_directory = _absolute_backup_directory(arguments.backup_directory)
+    config = _destructive_preconditions(
+        arguments, REFUSAL_MISSING_EXECUTE_SCHEDULED
+    )
+
+    if config.retention.enabled is False:  # the scheduled gate
+        _emit(
+            {
+                "outcome": "skipped",
+                "reason": "retention_disabled",
+                "executed": False,
+                "enabled": False,
+                "deleted_count": 0,
+                "bytes_reclaimed": 0,
+            },
+            stream,
+        )
+        return EXIT_SUCCESS
+
+    _require_current_schema(config.storage.database_path)
+
+    result = _build_service(config, backup_directory=backup_directory).run_once()
+
+    if not result.executed:
+        reason = SCHEDULED_SKIP_REASONS.get(result.error_category)
+        if reason is not None:
+            _emit(
+                {
+                    "outcome": "skipped",
+                    "reason": reason,
+                    "executed": False,
+                    "enabled": True,
+                    "deleted_count": 0,
+                    "bytes_reclaimed": 0,
+                },
+                stream,
+            )
+            return EXIT_SUCCESS
+
+    _emit(
+        {
+            "outcome": "executed" if result.executed else "declined",
+            "executed": result.executed,
+            "enabled": result.enabled,
+            "candidate_count": result.candidate_count,
+            "deleted_count": result.deleted_count,
+            "bytes_reclaimed": result.bytes_reclaimed,
+            "recovered_count": result.recovered_count,
+            "more_work_remains": result.more_work_remains,
+            "error_category": (
+                result.error_category.value
+                if result.error_category is not None
+                else None
+            ),
+            "error_message": result.error_message,
+        },
+        stream,
+    )
+    return (
+        EXIT_RETENTION_ERROR
+        if result.error_category is not None
+        else EXIT_SUCCESS
+    )
+
+
 _COMMANDS = {
     "plan": _plan,
     "run-once": _run_once,
+    "scheduled-run": _scheduled_run,
 }
 
 
@@ -544,6 +700,51 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Required. Confirms that this invocation may delete capture media. "
             "Without it the command refuses before touching anything."
+        ),
+    )
+    run_once.add_argument(
+        "--backup-directory",
+        default=None,
+        help=(
+            "Absolute path of the backup directory whose lock this run takes "
+            "for its duration, so it can never overlap a backup. Defaults to "
+            "the canonical production backup location; the directory must "
+            "exist."
+        ),
+    )
+
+    scheduled = subcommands.add_parser(
+        "scheduled-run",
+        help=(
+            "Execute one bounded retention run for a timer. Skips cleanly "
+            "when retention is disabled, busy or a backup is running."
+        ),
+        description=(
+            "The subcommand mgo-retention.service invokes. Identical gates to "
+            "run-once and the same single run, but a run that correctly "
+            "declines to start -- retention disabled, another run holding "
+            "the lock, a backup in progress -- is reported as a structured "
+            "skip with exit 0 rather than as a failed unit. It never repeats "
+            "because more work remains, and never runs when retention is "
+            "disabled in the configuration."
+        ),
+    )
+    scheduled.add_argument(
+        "--execute",
+        action="store_true",
+        help=(
+            "Required. Confirms that this invocation may delete capture media. "
+            "Without it the command refuses before touching anything."
+        ),
+    )
+    scheduled.add_argument(
+        "--backup-directory",
+        default=None,
+        help=(
+            "Absolute path of the backup directory whose lock this run takes "
+            "for its duration, so it can never overlap a backup. Retention "
+            "skips while a backup holds it. Defaults to the canonical "
+            "production backup location; the directory must exist."
         ),
     )
 
@@ -606,7 +807,10 @@ __all__ = [
     "EXIT_UNEXPECTED",
     "REFUSAL_CONFIGURATION_INVALID",
     "REFUSAL_INVALID_ARGUMENTS",
+    "REFUSAL_MISSING_EXECUTE_SCHEDULED",
+    "REFUSAL_RELATIVE_BACKUP_DIRECTORY",
     "REFUSAL_RELATIVE_CONFIG",
+    "SCHEDULED_SKIP_REASONS",
     "build_parser",
     "main",
 ]

@@ -111,6 +111,8 @@ class RetentionErrorCategory(StrEnum):
     FINALIZATION_FAILED = "finalization_failed"
     CATALOGUE_INVALID = "catalogue_invalid"
     BUSY = "busy"
+    BACKUP_IN_PROGRESS = "backup_in_progress"
+    LOCK_UNAVAILABLE = "lock_unavailable"
     UNEXPECTED = "unexpected"
 
 
@@ -145,6 +147,12 @@ SAFE_ERROR_MESSAGES: dict[RetentionErrorCategory, str] = {
     ),
     RetentionErrorCategory.BUSY: (
         "A retention run is already in progress."
+    ),
+    RetentionErrorCategory.BACKUP_IN_PROGRESS: (
+        "A database backup is in progress; retention did not run."
+    ),
+    RetentionErrorCategory.LOCK_UNAVAILABLE: (
+        "The retention lock could not be taken; retention did not run."
     ),
     RetentionErrorCategory.UNEXPECTED: (
         "The retention run failed unexpectedly."

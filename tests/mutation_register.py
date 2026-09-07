@@ -2290,8 +2290,8 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'an-overlapping-run-stops-reporting-busy',
         RETENTION_SERVICE,
-        '                error_category=RetentionErrorCategory.BUSY,',
-        '                error_category=None,',
+        '            return self._declined(RetentionErrorCategory.BUSY)',
+        '            return self._declined(None)',
         'a_busy_run_deletes_nothing_and_records_nothing',
         'A refused run is indistinguishable from one that found nothing to do.',
         suite=RETENTION_SERVICE_SUITE,
@@ -2663,8 +2663,7 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'the-command-repeats-while-work-remains',
         RETENTION_CLI,
-        '    result = _build_service(config).run_once()',
-        '    service = _build_service(config)\n'
+        '    result = service.run_once()',
         '    result = service.run_once()\n'
         '    while result.more_work_remains:\n'
         '        result = service.run_once()',
@@ -2774,3 +2773,416 @@ MUTATIONS: tuple[Mutation, ...] = (
         suite=RETENTION_CLI_SUITE,
     ),
 )
+
+#: Task 14.5 sources. Everything below is a *bound* -- a check that stops a
+#: capture, a deletion or a timer from happening -- and a bound that silently
+#: stops binding changes no status field until the day the SD card fills or
+#: the wrong file goes. The suites named here fail when the bound is removed.
+CAPTURE_ADMISSION = "src/mgo/event_capture/admission.py"
+CAPTURE_WORKFLOW = "src/mgo/captures/workflow.py"
+EVENT_CAPTURE_MODELS = "src/mgo/event_capture/models.py"
+MOTION_DETECTOR = "src/mgo/motion/detector.py"
+MOTION_MONITOR = "src/mgo/motion/monitor.py"
+CONFIGURATION = "src/mgo/core/config.py"
+RETENTION_TIMER_INSTALLER = "scripts/deploy/install-retention-timer.sh"
+
+CAPTURE_ADMISSION_SUITE = "tests/test_capture_admission.py"
+EVENT_CAPTURE_ADMISSION_SUITE = "tests/test_event_capture_admission.py"
+MOTION_GLOBAL_CHANGE_SUITE = "tests/test_motion_global_change.py"
+RETENTION_SCHEDULING_SUITE = "tests/test_retention_scheduling.py"
+RETENTION_TIMER_SUITE = "tests/test_retention_timer.py"
+CAPTURE_LIMITS_CONFIG_SUITE = "tests/test_event_capture_limits_config.py"
+CAPTURE_SAFETY_API_SUITE = "tests/test_capture_safety_api.py"
+# Task 14.5A review suites.
+CAPTURE_DURABILITY_SUITE = "tests/test_capture_admission_durability.py"
+EVENT_CAPTURE_TELEMETRY_SUITE = "tests/test_event_capture_telemetry_bounds.py"
+RETENTION_EXCLUSION_SUITE = "tests/test_retention_mutual_exclusion.py"
+RETENTION_TIMER_HOSTILE_SUITE = "tests/test_retention_timer_hostile_input.py"
+
+TASK_14_5_MUTATIONS: tuple[Mutation, ...] = (
+    Mutation(
+        'event-capture-accepted-without-admission',
+        EVENT_CAPTURE_SERVICE,
+        '        if not decision.admitted:',
+        '        if False:',
+        'a_refused_trigger_never_reaches_the_workflow',
+        'A refused trigger reaches the camera anyway.',
+        suite=EVENT_CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'hourly-limit-off-by-one',
+        CAPTURE_ADMISSION,
+        '        elif hourly >= self._hourly_limit:',
+        '        elif hourly > self._hourly_limit:',
+        'the_hourly_limit_plus_one_is_refused',
+        'One more capture than the hourly limit is admitted.',
+        suite=CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'daily-limit-off-by-one',
+        CAPTURE_ADMISSION,
+        '        elif daily >= self._daily_limit:',
+        '        elif daily > self._daily_limit:',
+        'the_daily_limit_plus_one_is_refused',
+        'One more capture than the daily limit is admitted.',
+        suite=CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'quota-forgets-the-catalogue-on-restart',
+        CAPTURE_ADMISSION,
+        '            hourly = self._ledger.count_since(hourly_cutoff)',
+        '            hourly = 0',
+        'a_new_process_reconstructs_the_count_from_rows',
+        'The hourly count ignores the catalogue and resets on restart.',
+        suite=CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'reservation-ignored',
+        CAPTURE_ADMISSION,
+        '            hourly += self._reservations.count_since(hourly_cutoff)',
+        '            pass',
+        'two_concurrent_admissions_cannot_both_pass'
+        ' or a_failed_capture_keeps_its_reservation_for_the_window',
+        'Two concurrent admissions both pass under a limit of one.',
+        suite=CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'reservation-not-durable',
+        CAPTURE_ADMISSION,
+        '                self._held.append(self._reservations.reserve(now))',
+        '                pass',
+        'a_crash_after_the_camera_and_before_the_row_still_counts'
+        ' or two_concurrent_admissions_cannot_both_pass',
+        'The reservation is never written to disk; a crash resets the quota.',
+        suite=CAPTURE_ADMISSION_SUITE + " " + CAPTURE_DURABILITY_SUITE,
+    ),
+    Mutation(
+        'daily-reservations-ignored',
+        CAPTURE_ADMISSION,
+        '            daily += self._reservations.count_since(daily_cutoff)',
+        '            pass',
+        'a_failed_capture_keeps_its_reservation_for_the_window',
+        'A failed attempt counts for the hour but not for the day.',
+        suite=CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'storage-guard-comparison-inverted',
+        CAPTURE_ADMISSION,
+        '            and free - self._maximum_capture_bytes'
+        ' >= self._minimum_free_bytes',
+        '            and free - self._maximum_capture_bytes'
+        ' < self._minimum_free_bytes',
+        'one_byte_short_of_the_reserve_is_refused'
+        ' or free_space_exactly_at_the_reserve_is_admitted',
+        'A full filesystem admits and an empty one refuses.',
+        suite=CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'storage-probe-failure-treated-as-room',
+        CAPTURE_ADMISSION,
+        '            free is not None',
+        '            (free is not None or True)',
+        'a_failed_free_space_probe_refuses',
+        'A failed free-space probe admits a capture.',
+        suite=CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'manual-floor-probe-failure-treated-as-room',
+        CAPTURE_ADMISSION,
+        '    return free is None or free < minimum_free_bytes',
+        '    return free is not None and free < minimum_free_bytes',
+        'the_floor_is_breached_when_the_probe_fails',
+        'Manual capture proceeds when free space cannot be established.',
+        suite=CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'cooldown-ignored-by-admission',
+        CAPTURE_ADMISSION,
+        '            and now - newest < self._cooldown',
+        '            and False',
+        'a_capture_inside_the_cooldown_is_refused',
+        'The admission gate no longer spaces captures by the cooldown.',
+        suite=CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'oversize-still-published',
+        EVENT_CAPTURE_SERVICE,
+        '        if result.filesize_bytes > self._admission.maximum_capture_bytes:',
+        '        if False:',
+        'an_oversize_still_is_a_failure_and_a_suppression',
+        'A still larger than the reservation is catalogued.',
+        suite=EVENT_CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'oversize-ceiling-off-by-one',
+        EVENT_CAPTURE_SERVICE,
+        '        if result.filesize_bytes > self._admission.maximum_capture_bytes:',
+        '        if result.filesize_bytes >= self._admission.maximum_capture_bytes:',
+        'a_still_exactly_at_the_reservation_is_published',
+        'A still exactly at the reservation is refused.',
+        suite=EVENT_CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'suppressions-flood-the-timeline',
+        EVENT_CAPTURE_SERVICE,
+        '        self._last_recorded_suppression = reason',
+        '        pass',
+        'identical_suppressions_are_counted_but_recorded_once'
+        ' or identical_reasons_write_nothing_even_after_the_interval',
+        'Every identical suppression writes an observation once the rate bound '
+        'has passed.',
+        suite=EVENT_CAPTURE_ADMISSION_SUITE + " " + EVENT_CAPTURE_TELEMETRY_SUITE,
+    ),
+    Mutation(
+        'alternating-suppressions-flood-the-timeline',
+        EVENT_CAPTURE_SERVICE,
+        '        if last is not None and now - last'
+        ' < SUPPRESSION_RECORD_INTERVAL_SECONDS:',
+        '        if False:',
+        'alternating_reasons_are_persisted_at_a_bounded_rate',
+        'Reasons that alternate write an observation on every trigger.',
+        suite=EVENT_CAPTURE_TELEMETRY_SUITE,
+    ),
+    Mutation(
+        'failed-attempt-forgets-its-reservation',
+        EVENT_CAPTURE_SERVICE,
+        '            self._admission.release(succeeded=catalogued)',
+        '            self._admission.release(succeeded=True)',
+        'a_failed_attempt_keeps_its_reservation'
+        ' or an_oversize_still_keeps_its_reservation',
+        'A failed capture releases its durable reservation as if it had a row.',
+        suite=EVENT_CAPTURE_TELEMETRY_SUITE,
+    ),
+    Mutation(
+        'refused-cleanup-follows-a-link',
+        CAPTURE_WORKFLOW,
+        '        if not stat.S_ISREG(details.st_mode):',
+        '        if False:',
+        'a_refused_capture_that_is_not_a_regular_file_is_left_alone',
+        'The oversize cleanup unlinks whatever sits at the capture path.',
+        suite=CAPTURE_DURABILITY_SUITE,
+    ),
+    Mutation(
+        'global-change-becomes-a-trigger',
+        EVENT_CAPTURE_SERVICE,
+        '        if result.status is MotionStatus.GLOBAL_CHANGE:',
+        '        if False:',
+        'a_global_change_is_not_a_trigger',
+        'A whole-frame change is no longer counted as a suppression.',
+        suite=EVENT_CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'status-reports-a-refusal-as-open',
+        EVENT_CAPTURE_MODELS,
+        '            admission_state = AdmissionState.SUPPRESSED',
+        '            admission_state = AdmissionState.OPEN',
+        'a_refused_trigger_never_reaches_the_workflow',
+        'The status endpoint reports a suppressed gate as open.',
+        suite=EVENT_CAPTURE_ADMISSION_SUITE,
+    ),
+    Mutation(
+        'global-ceiling-ignored',
+        MOTION_MONITOR,
+        '        if self._detector.is_global_change(max(score, comparison.raw_ratio)):',
+        '        if False:',
+        'baseline_then_global_change_then_settles',
+        'A whole-frame change is reported as motion.',
+        suite=MOTION_GLOBAL_CHANGE_SUITE,
+    ),
+    Mutation(
+        'global-ceiling-tests-only-the-compensated-ratio',
+        MOTION_MONITOR,
+        '        if self._detector.is_global_change(max(score, comparison.raw_ratio)):',
+        '        if self._detector.is_global_change(score):',
+        'baseline_then_global_change_then_settles',
+        'A uniform exposure step is absorbed silently instead of reported.',
+        suite=MOTION_GLOBAL_CHANGE_SUITE,
+    ),
+    Mutation(
+        'global-change-never-detected',
+        MOTION_DETECTOR,
+        '        return score > self._global_threshold',
+        '        return False',
+        'the_global_ceiling_is_strictly_greater',
+        'The detector never reports a global change.',
+        suite=MOTION_GLOBAL_CHANGE_SUITE,
+    ),
+    Mutation(
+        'compensation-uses-the-mean',
+        MOTION_DETECTOR,
+        '        offset = _median_difference(differences)',
+        '        offset = round(sum(differences) / len(differences))',
+        'a_localised_subject_survives_compensation',
+        'A bright subject makes the whole background read as changed.',
+        suite=MOTION_GLOBAL_CHANGE_SUITE,
+    ),
+    Mutation(
+        'reference-not-reset-when-frames-vanish',
+        MOTION_MONITOR,
+        '        self._reference = None',
+        '        pass',
+        'recovery_after_preview_interruption_re_establishes_the_baseline',
+        'After an interruption the first new frame is compared to a stale one.',
+        suite=MOTION_GLOBAL_CHANGE_SUITE,
+    ),
+    Mutation(
+        'enabled-without-a-floor-is-accepted',
+        CONFIGURATION,
+        '        ("minimum_free_bytes", floor),',
+        '        ("minimum_free_bytes", floor or 1),',
+        'enabling_without_a_mandatory_limit_is_refused',
+        'Automatic capture can be enabled without a free-space floor.',
+        suite=CAPTURE_LIMITS_CONFIG_SUITE,
+    ),
+    Mutation(
+        'global-ceiling-may-equal-the-motion-threshold',
+        CONFIGURATION,
+        '    if motion.global_change_ratio_threshold'
+        ' <= motion.changed_pixel_ratio_threshold:',
+        '    if motion.global_change_ratio_threshold'
+        ' < motion.changed_pixel_ratio_threshold:',
+        'the_global_ceiling_must_exceed_the_motion_threshold',
+        'A ceiling equal to the motion threshold makes every motion global.',
+        suite=CAPTURE_LIMITS_CONFIG_SUITE,
+    ),
+    Mutation(
+        'manual-capture-ignores-the-floor',
+        APPLICATION,
+        '    if floor is not None and await asyncio.to_thread(',
+        '    if False and await asyncio.to_thread(',
+        'a_manual_capture_is_refused_below_the_floor',
+        'A manual capture proceeds on a filesystem below the floor.',
+        suite=CAPTURE_SAFETY_API_SUITE,
+    ),
+    Mutation(
+        'scheduled-run-executes-while-disabled',
+        RETENTION_CLI,
+        '    if config.retention.enabled is False:  # the scheduled gate',
+        '    if False:  # the scheduled gate',
+        'scheduled_run_skips_when_retention_is_disabled',
+        'The timer reaches the service with retention disabled.',
+        suite=RETENTION_SCHEDULING_SUITE,
+    ),
+    Mutation(
+        'scheduled-run-without-execute',
+        RETENTION_CLI,
+        '        arguments, REFUSAL_MISSING_EXECUTE_SCHEDULED',
+        '        argparse.Namespace(execute=True), REFUSAL_MISSING_EXECUTE_SCHEDULED',
+        'scheduled_run_requires_the_execute_flag',
+        'The scheduled command runs without its explicit execution gate.',
+        suite=RETENTION_SCHEDULING_SUITE,
+    ),
+    Mutation(
+        'retention-file-lock-bypassed',
+        RETENTION_SERVICE,
+        '            lock.acquire()',
+        '            pass',
+        'a_held_lock_declines_the_run_without_touching_anything',
+        'Two retention processes can delete at once.',
+        suite=RETENTION_SCHEDULING_SUITE,
+    ),
+    Mutation(
+        'backup-conflict-ignored',
+        RETENTION_SERVICE,
+        '            if isinstance(backup_lock, RetentionErrorCategory):',
+        '            if False:',
+        'a_fresh_backup_lock_skips_the_run'
+        ' or a_backup_cannot_start_while_retention_runs',
+        'Retention runs while a backup holds its lock.',
+        suite=RETENTION_SCHEDULING_SUITE + " " + RETENTION_EXCLUSION_SUITE,
+    ),
+    Mutation(
+        'backup-lock-not-held-during-the-run',
+        RETENTION_SERVICE,
+        '            backup.acquire()',
+        '            pass',
+        'a_backup_cannot_start_while_retention_runs'
+        ' or a_fresh_backup_lock_skips_the_run',
+        'Retention never takes the backup lock, so a backup can start mid-run.',
+        suite=RETENTION_SCHEDULING_SUITE + " " + RETENTION_EXCLUSION_SUITE,
+    ),
+    Mutation(
+        'retention-without-a-backup-location-runs',
+        RETENTION_SERVICE,
+        '        if not directory_present:',
+        '        if False:',
+        'an_absent_backup_directory_refuses_to_run',
+        'A service with no backup directory to exclude against deletes anyway.',
+        suite=RETENTION_EXCLUSION_SUITE,
+    ),
+    Mutation(
+        'installer-enables-the-timer-implicitly',
+        RETENTION_TIMER_INSTALLER,
+        'if (( enable_timer )); then  # the only path that schedules anything',
+        'if (( enable_timer )) || true; then  # the only path that schedules',
+        'the_installer_enables_only_on_explicit_request'
+        ' or an_install_publishes_the_pair_and_a_rerun_changes_nothing',
+        'Installing the units schedules retention without --enable.',
+        suite=RETENTION_TIMER_SUITE,
+    ),
+    Mutation(
+        'installer-rollback-omitted',
+        RETENTION_TIMER_INSTALLER,
+        '    restore_one "${destination_service}" "${previous_service}"'
+        ' "${previous_service_mode}"',
+        '    :',
+        'a_failed_second_publication_restores_the_previous_pair',
+        'A half-published pair is left behind after a failure.',
+        suite=RETENTION_TIMER_SUITE,
+    ),
+    # Task 14.5A. The four below are the installer's refusals of hostile
+    # input, each proved by a test that runs the shipped installer -- or a
+    # private copy of it beside a deliberately malformed template -- under
+    # bash against a temporary directory.
+    Mutation(
+        'installer-default-directory-spelling-bypass',
+        RETENTION_TIMER_INSTALLER,
+        'unit_directory="$(canonical_path "${unit_directory}")"'
+        ' || fail "--unit-directory could not be resolved."',
+        ':',
+        'the_validation_aid_is_refused_for_every_spelling_of_the_default_directory',
+        'A trailing slash or a dot component makes the real unit directory a '
+        '"developer" directory: no root, no ownership, the failure seam armed.',
+        suite=RETENTION_TIMER_HOSTILE_SUITE,
+    ),
+    Mutation(
+        'installer-account-name-unchecked',
+        RETENTION_TIMER_INSTALLER,
+        'require_account_name "--user" "${service_user}"',
+        ':',
+        'an_account_name_that_is_not_a_name_is_refused',
+        'A --user value carrying a newline becomes a second unit directive.',
+        suite=RETENTION_TIMER_HOSTILE_SUITE,
+    ),
+    Mutation(
+        'installer-renderer-escapes-accepted',
+        RETENTION_TIMER_INSTALLER,
+        "    *'|'*|*'&'*|*\\\\*|*[[:space:]]*) fail"
+        ' "${label} contains a character the unit renderer cannot carry." ;;',
+        "    *'|'*) fail"
+        ' "${label} contains a character the unit renderer cannot carry." ;;',
+        'a_backslash_sequence_in_a_path_cannot_inject_a_directive',
+        'A backslash-n in a path renders as a newline and a new directive.',
+        suite=RETENTION_TIMER_HOSTILE_SUITE,
+    ),
+    Mutation(
+        'installer-placeholder-check-removed',
+        RETENTION_TIMER_INSTALLER,
+        "if grep -q '@[A-Z_]*@' \"${rendered_service}\"; then",
+        'if false; then',
+        'a_template_with_an_unknown_placeholder_is_refused',
+        'A unit with an unsubstituted placeholder is published.',
+        suite=RETENTION_TIMER_HOSTILE_SUITE,
+    ),
+    Mutation(
+        'installer-structure-check-removed',
+        RETENTION_TIMER_INSTALLER,
+        'validate_unit_structure "${rendered_service}" service',
+        ':',
+        'a_template_missing_a_hardening_directive_is_refused',
+        'A service unit without its hardening directives is published.',
+        suite=RETENTION_TIMER_HOSTILE_SUITE,
+    ),
+)
+
+MUTATIONS = MUTATIONS + TASK_14_5_MUTATIONS

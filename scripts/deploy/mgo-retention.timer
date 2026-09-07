@@ -1,0 +1,45 @@
+# Matt's Garden Observatory — daily capture-media retention schedule
+# (Task 14.5).
+#
+# Installed verbatim to /etc/systemd/system/mgo-retention.timer by
+# scripts/deploy/install-retention-timer.sh. Like mgo-backup.timer it has no
+# placeholders: nothing in a schedule depends on where the checkout lives.
+#
+# Installing this file schedules NOTHING. The installer writes the pair and
+# stops; enabling and starting the timer is a separate, explicit root action
+# (--enable), and even then every run is decided by the configuration file --
+# with retention disabled there, a fired timer deletes nothing.
+
+[Unit]
+Description=Daily Matt's Garden Observatory capture-media retention
+Documentation=https://github.com/emjayelle01/garden-observatory
+
+[Timer]
+# 04:00 in the Pi's LOCAL timezone (Africa/Johannesburg). The backup fires at
+# 02:30 with up to 30 minutes of randomised delay and a 15-minute ceiling, so
+# it is finished by 03:15 at the latest; 04:00 leaves a clear margin and is
+# still well before dawn, when the garden -- and the camera -- become busy.
+# The margin is a courtesy, not the guarantee: the run holds the backup's own
+# lock for its duration, so the two can never overlap however the schedules
+# drift.
+OnCalendar=*-*-* 04:00:00
+
+# A short spread. Fifteen minutes cannot reach back into the backup window and
+# is enough to avoid writing the same SD-card region at the same second daily.
+RandomizedDelaySec=15m
+
+# A Raspberry Pi is not always powered. Persistent=true catches up a missed run
+# once the Pi is back. The installer seeds the timestamp file before enabling
+# the timer, so enabling it does NOT trigger an immediate catch-up run:
+# installing or enabling a schedule must never be the thing that starts a
+# retention run.
+Persistent=true
+
+# Retention does not need second accuracy; a looser value lets systemd batch
+# wake-ups and keeps the CPU asleep.
+AccuracySec=1m
+
+Unit=mgo-retention.service
+
+[Install]
+WantedBy=timers.target

@@ -27,6 +27,7 @@ import mgo.retention.service as service_module
 from mgo.core.config import RetentionConfig
 from mgo.core.database import apply_migrations, database_connection
 from mgo.core.observations import list_observations
+from mgo.operations.backup import LOCK_FILENAME as BACKUP_LOCK_FILENAME
 from mgo.retention.models import (
     RetentionErrorCategory,
     RetentionReason,
@@ -57,6 +58,11 @@ class _Harness:
             self.database_path, clock=lambda: NOW
         )
         self.state = RetentionRuntimeState(enabled=config.enabled)
+        # Task 14.5A: a run holds the backup's lock, so every executing
+        # service needs a backup directory to coordinate with.
+        self.backup_directory = tmp_path / "backups"
+        self.backup_directory.mkdir()
+        self.backup_lock_path = self.backup_directory / BACKUP_LOCK_FILENAME
         self.service = RetentionService(
             config,
             self.repository,
@@ -64,6 +70,7 @@ class _Harness:
             self.root,
             clock=lambda: NOW,
             database_path=self.database_path,
+            backup_lock_path=self.backup_lock_path,
         )
 
     def add(
@@ -538,6 +545,7 @@ def test_a_relative_capture_root_stops_the_run(
         Path("captures"),
         clock=lambda: NOW,
         database_path=harness.database_path,
+        backup_lock_path=harness.backup_lock_path,
     )
 
     result = service.run_once()

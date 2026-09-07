@@ -36,6 +36,8 @@ _REQUIRED_FIELDS = {
     "last_run_deleted_count",
     "last_run_bytes_reclaimed",
     "last_error",
+    # Task 14.5A, additive with a default: idle, busy or unknown.
+    "scheduled_lock_state",
 }
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)

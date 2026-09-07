@@ -245,7 +245,11 @@ def test_event_capture_configuration_behaviour_is_unchanged() -> None:
     with pytest.raises(ValueError, match=r"camera\.enabled"):
         parse_config_text(
             _configuration(
+                # The Task 14.5 hard limits are supplied so the policy rule
+                # under test is the one that fires, not the limit rule.
                 "\n[event_capture]\nenabled = true\n"
+                "max_captures_per_hour = 10\nmax_captures_per_day = 50\n"
+                "minimum_free_bytes = 1\n"
                 "\n[retention]\nenabled = true\nmax_age_days = 7\n"
             )
         )
