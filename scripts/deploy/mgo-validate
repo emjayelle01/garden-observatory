@@ -92,6 +92,20 @@ readonly MGO_PREVIEW_START_URL="http://127.0.0.1:8080/camera/preview/start"
 readonly MGO_SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 readonly MGO_ROOT_HOME="/root"
 
+# The umask under which application runtime files are published.
+#
+# Task 14.5C. sudo preserves the caller's umask, and the Task 14.5B wrapper
+# arrived with 0077: every file the fast-forward wrote -- and every file the
+# rollback then rewrote -- was created 0600 claude:mgo, unreadable by the
+# runtime account, while Git reported the tree clean because Git tracks only
+# the executable bit. The gateway, not its caller, owns the contract that
+# what it publishes can be read by the account that runs it, so the umask is
+# stated here and applied to exactly the operations that publish: the
+# working-tree transitions and the dependency sync. Nothing else inherits
+# it; the lock, the temporary directory and the approval temporary keep
+# their own explicit modes.
+readonly MGO_PUBLICATION_UMASK="0022"
+
 # The complete set of variables permitted to exist in the constructed
 # environment. Four are set deliberately below; the rest are what Bash itself
 # maintains and cannot be prevented from exporting.
@@ -466,6 +480,28 @@ git_admin() {
     local repository="$2"
     shift 2
     run_as_admin "$admin_account" git -C "$repository" "$@"
+}
+
+# Run a command that publishes runtime files, under the publication umask.
+#
+# A subshell, so the umask applies to this one command and is gone when it
+# returns: the surrounding gateway keeps whatever it inherited, and the
+# objects it creates for itself keep the explicit private modes they set at
+# their own creation. The runner underneath is the same one every Git and uv
+# invocation goes through; only the umask differs.
+publish_as_admin() {
+    (
+        umask "$MGO_PUBLICATION_UMASK"
+        run_as_admin "$@"
+    )
+}
+
+# Git that writes the working tree: the fast-forward and the reset.
+git_admin_publish() {
+    local admin_account="$1"
+    local repository="$2"
+    shift 2
+    publish_as_admin "$admin_account" git -C "$repository" "$@"
 }
 
 # --- control-plane lock ----------------------------------------------------
@@ -1237,7 +1273,7 @@ sync_environment() {
 
     # runuser preserves the working directory, so the change of directory
     # happens here in a subshell rather than through a nested shell command.
-    (cd "$repository" && run_as_admin "$admin_account" uv sync --frozen) \
+    (cd "$repository" && publish_as_admin "$admin_account" uv sync --frozen) \
         || return 1
 }
 
@@ -1280,6 +1316,16 @@ require_clean_after_sync() {
 # Import only. No lifespan is entered, no camera is opened, no stream is read
 # and nothing is written: this answers "can it load" and deliberately not
 # "does it work", which is what the restart and health check are for.
+#
+# "Nothing is written" includes bytecode. Every probe below runs the
+# interpreter with -B and PYTHONDONTWRITEBYTECODE=1, so a probe can never
+# leave a __pycache__ or a .pyc behind at whatever mode the moment produced
+# (Task 14.5C). The ownership of the checkout already denies the runtime
+# account the write; the flags make the promise the probe's own.
+#
+# It is asked three times per deployment: of the checkout as found, before
+# anything is fetched or moved; of the deployed target, before the restart;
+# and of the restored checkout, before a rollback is called successful.
 require_runtime_can_execute() {
     local runtime_account="$1"
     local repository="$2"
@@ -1305,7 +1351,8 @@ require_runtime_can_execute() {
         "PATH=/usr/bin:/bin" \
         "LC_ALL=C" \
         "MGO_CONFIG_PATH=$MGO_PRODUCTION_CONFIG" \
-        "$repository/.venv/bin/python" -c \
+        "PYTHONDONTWRITEBYTECODE=1" \
+        "$repository/.venv/bin/python" -B -c \
         'import mgo.core.config, mgo.api.app' \
         >/dev/null 2>&1 \
         || return 1
@@ -1345,7 +1392,8 @@ build_supported_schema() {
         "PATH=/usr/bin:/bin" \
         "LC_ALL=C" \
         "MGO_CONFIG_PATH=$MGO_PRODUCTION_CONFIG" \
-        "$repository/.venv/bin/python" -c \
+        "PYTHONDONTWRITEBYTECODE=1" \
+        "$repository/.venv/bin/python" -B -c \
         'from mgo.core.database import CURRENT_SCHEMA_VERSION
 print(CURRENT_SCHEMA_VERSION)' 2>/dev/null)" || return 1
 
@@ -1370,7 +1418,8 @@ database_schema_version() {
         "PATH=/usr/bin:/bin" \
         "LC_ALL=C" \
         "MGO_CONFIG_PATH=$MGO_PRODUCTION_CONFIG" \
-        "$repository/.venv/bin/python" -c "$MGO_SCHEMA_PROBE" 2>/dev/null)" \
+        "PYTHONDONTWRITEBYTECODE=1" \
+        "$repository/.venv/bin/python" -B -c "$MGO_SCHEMA_PROBE" 2>/dev/null)" \
         || return 1
 
     [[ "$value" =~ ^[0-9]+$ ]] || return 1
@@ -1715,19 +1764,28 @@ restore_checkout() {
     local repository="$2"
     local previous_sha="$3"
 
-    git_admin "$admin_account" "$repository" \
+    git_admin_publish "$admin_account" "$repository" \
         reset --hard "$previous_sha" >/dev/null
 }
 
-# Restore the checkout and environment, then prove both.
+# Restore the checkout and environment, then prove both -- and then prove the
+# runtime account can execute what was restored.
 #
 # Sets ROLLBACK_STAGE to the stage that failed so the operator is told where
 # restoration stopped rather than merely that it did.
+#
+# The commit coming back is not the runtime coming back. In the Task 14.5B
+# incident the restored tree was clean, at the right commit, on the right
+# branch -- and unreadable by the runtime account, so the next restart would
+# have failed. A rollback is complete only when the account that has to run
+# the restored build can load it; that is the "runtime" stage, and it is
+# asked after the content proofs and before any caller restarts anything.
 rollback_repository() {
     local admin_account="$1"
     local repository="$2"
     local previous_sha="$3"
     local branch="$4"
+    local runtime_account="$5"
     local head
     local current_branch
     local porcelain
@@ -1757,7 +1815,28 @@ rollback_repository() {
         ROLLBACK_STAGE="verification"
         return 1
     fi
+
+    if ! require_runtime_can_execute "$runtime_account" "$repository"; then
+        ROLLBACK_STAGE="runtime"
+        return 1
+    fi
     return 0
+}
+
+# A rollback that did not complete, reported by which half did not.
+#
+# Never returns. Content restored but runtime unreadable is the incident
+# shape, and it is named as such rather than folded into the stage list: an
+# operator reading "rollback failed at the runtime stage" would not know that
+# the commit and environment are already back and only the modes are wrong,
+# or that a restart is exactly the thing not to attempt.
+report_rollback_failure() {
+    if [[ "$ROLLBACK_STAGE" == "runtime" ]]; then
+        die "$EX_ROLLBACK" \
+            "deployment failed and rollback is INCOMPLETE: the previous commit and environment were restored, but the runtime account cannot execute the restored environment; production was NOT restored, the service is on whichever build it last loaded and must not be restarted, and the restored files must be made readable and executable by the runtime account before any restart or deployment"
+    fi
+    die "$EX_ROLLBACK" \
+        "deployment failed and rollback failed at the $ROLLBACK_STAGE stage; production was NOT restored"
 }
 
 # §16.1 — a failure after the fast-forward but before the restart.
@@ -1779,9 +1858,8 @@ fail_before_restart() {
     warn "restoring $previous_sha"
 
     if ! rollback_repository "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
-        "$previous_sha" "$MGO_BRANCH"; then
-        die "$EX_ROLLBACK" \
-            "deployment failed and rollback failed at the $ROLLBACK_STAGE stage; production was NOT restored"
+        "$previous_sha" "$MGO_BRANCH" "$MGO_RUNTIME_ACCOUNT"; then
+        report_rollback_failure
     fi
 
     # The service was never restarted, so it should still be the *same*
@@ -1876,11 +1954,12 @@ fail_after_restart() {
     warn "restoring $previous_sha"
 
     if ! rollback_repository "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
-        "$previous_sha" "$MGO_BRANCH"; then
-        die "$EX_ROLLBACK" \
-            "deployment failed and rollback failed at the $ROLLBACK_STAGE stage; production was NOT restored"
+        "$previous_sha" "$MGO_BRANCH" "$MGO_RUNTIME_ACCOUNT"; then
+        report_rollback_failure
     fi
 
+    # The restored build was proven loadable by the runtime account inside
+    # rollback_repository; only now is it started.
     # Exactly one restart, and no retry if it does not take. A rollback that
     # restarts in a loop turns one failed deployment into a flapping service.
     if ! restart_service "$MGO_SERVICE"; then
@@ -1970,6 +2049,19 @@ action_deploy_main() {
 
     require_uv_available "$MGO_ADMIN_ACCOUNT"
 
+    # The checkout as it stands must already be executable by the runtime
+    # account before anything is fetched or moved (Task 14.5C). A clean Git
+    # tree does not say so: Git tracks only the executable bit, so a checkout
+    # whose every source is 0600 is clean and unrunnable at once. Asked here,
+    # first, so that the answer is "the runtime cannot read the deployed
+    # files" rather than a schema probe that failed for a reason it cannot
+    # name, and so that a deployment never rolls back onto a build that was
+    # already unrunnable when it started. Nothing has been changed: the fetch,
+    # the fast-forward, the sync and the restart are all still ahead.
+    require_runtime_can_execute "$MGO_RUNTIME_ACCOUNT" "$MGO_REPOSITORY" \
+        || die "$EX_PRECONDITION" \
+            "the runtime account cannot execute the environment already deployed; nothing was fetched, moved, synchronised or restarted, and the deployed files must be made readable and executable by the runtime account before deploying again"
+
     # Captured while the *previous* build is still the checked-out one: after
     # the fast-forward there is no longer anything on disk that can answer this,
     # and it is the value every later rollback decision is measured against.
@@ -2038,7 +2130,7 @@ action_deploy_main() {
     # transaction therefore opens *before* the merge is invoked, not after it
     # succeeds.
     log "fast-forwarding $head -> $approved"
-    if ! git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
+    if ! git_admin_publish "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \
         merge --ff-only "$MGO_REMOTE/$MGO_BRANCH"; then
         fail_before_restart "the fast-forward failed" \
             "$head" "$previous_pid" "$previous_timestamp" "$previous_preview"

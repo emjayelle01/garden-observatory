@@ -3176,10 +3176,20 @@ EX_ROLLBACK = 78
 def _rollback_repository(
     checkout: Path, previous_sha: str, *, extra: str = ""
 ) -> subprocess.CompletedProcess[str]:
-    preamble = PASSTHROUGH_RUNNER + "sync_environment() { return 0; }\n" + extra
+    """Drive the shipped rollback against a temporary checkout.
+
+    The restored-runtime proof (Task 14.5C) is doubled to pass here; the
+    tests in ``test_deployment_umask_safety.py`` execute it for real.
+    """
+    preamble = (
+        PASSTHROUGH_RUNNER
+        + "sync_environment() { return 0; }\n"
+        + "require_runtime_can_execute() { return 0; }\n"
+        + extra
+    )
     call = (
         f'rollback_repository "claude" "{_posix(checkout)}" '
-        f'"{previous_sha}" "main" || true\n'
+        f'"{previous_sha}" "main" "mgo" || true\n'
         'printf "stage=%s\\n" "$ROLLBACK_STAGE"\n'
     )
     return call_gateway_function(call, preamble=preamble)

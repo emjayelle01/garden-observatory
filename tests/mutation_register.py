@@ -798,8 +798,8 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'sync-resolves',
         GATEWAY,
-        'run_as_admin "$admin_account" uv sync --frozen)',
-        'run_as_admin "$admin_account" uv sync)',
+        'publish_as_admin "$admin_account" uv sync --frozen)',
+        'publish_as_admin "$admin_account" uv sync)',
         'environment_sync_is_always_frozen',
         'Production drifts to versions nothing verified.',
     ),
@@ -1363,13 +1363,13 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'merge-failure-not-transactional',
         GATEWAY,
-        '    if ! git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \\\n'
+        '    if ! git_admin_publish "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \\\n'
         '        merge --ff-only "$MGO_REMOTE/$MGO_BRANCH"; then\n'
         '        fail_before_restart "the fast-forward failed" \\\n'
         '            "$head" "$previous_pid" "$previous_timestamp" '
         '"$previous_preview"\n'
         '    fi',
-        '    git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \\\n'
+        '    git_admin_publish "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \\\n'
         '        merge --ff-only "$MGO_REMOTE/$MGO_BRANCH" \\\n'
         '        || die "$EX_DEPLOY" "the fast-forward failed"',
         'failed_fast_forward_enters_the_rollback or post_mutation_failure',
@@ -3185,4 +3185,407 @@ TASK_14_5_MUTATIONS: tuple[Mutation, ...] = (
     ),
 )
 
-MUTATIONS = MUTATIONS + TASK_14_5_MUTATIONS
+# --- Task 14.5C: publication umask and rollback readability ------------------
+#
+# The Task 14.5B deployment (2026-09-07) was invoked from a wrapper whose umask
+# was 0077. sudo preserved it, the gateway set none of its own, and every file
+# the fast-forward wrote -- and the rollback rewrote -- was 0600, unreadable by
+# the runtime account, while Git reported the tree clean. Each entry below
+# removes one of the guards that now stand between a caller's umask and the
+# runtime account, or one of the proofs a rollback now has to pass before it
+# may be called successful.
+
+UMASK_SAFETY_SUITE = "tests/test_deployment_umask_safety.py"
+
+TASK_14_5C_MUTATIONS: tuple[Mutation, ...] = (
+    Mutation(
+        'publication-umask-removed',
+        GATEWAY,
+        '        umask "$MGO_PUBLICATION_UMASK"\n'
+        '        run_as_admin "$@"\n',
+        '        run_as_admin "$@"\n',
+        'restrictive_caller_publishes_a_readable_runtime',
+        "The caller's umask reaches every publication again: Task 14.5B.",
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'publication-umask-restrictive',
+        GATEWAY,
+        'readonly MGO_PUBLICATION_UMASK="0022"\n',
+        'readonly MGO_PUBLICATION_UMASK="0077"\n',
+        'restrictive_caller_publishes_a_readable_runtime',
+        'The gateway publishes unreadable files by its own choice.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'publication-umask-leaks-into-the-gateway',
+        GATEWAY,
+        'publish_as_admin() {\n'
+        '    (\n'
+        '        umask "$MGO_PUBLICATION_UMASK"\n'
+        '        run_as_admin "$@"\n'
+        '    )\n'
+        '}\n',
+        'publish_as_admin() {\n'
+        '    umask "$MGO_PUBLICATION_UMASK"\n'
+        '    run_as_admin "$@"\n'
+        '}\n',
+        'publication_umask_is_scoped_to_the_publication',
+        'The publication umask outlives the publication.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'forward-transition-not-published',
+        GATEWAY,
+        '    if ! git_admin_publish "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \\\n'
+        '        merge --ff-only',
+        '    if ! git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \\\n'
+        '        merge --ff-only',
+        'restrictive_caller_publishes_a_readable_runtime or every_wor'
+        'king_tree_publication_uses',
+        'The fast-forward writes under the inherited umask.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'rollback-transition-not-published',
+        GATEWAY,
+        '    git_admin_publish "$admin_account" "$repository" \\\n'
+        '        reset --hard',
+        '    git_admin "$admin_account" "$repository" \\\n'
+        '        reset --hard',
+        'pre_restart_rollback_restores_a_readable_runtime',
+        'The rollback rewrites the restored files unreadable: Task 14'
+        ".5B's second half.",
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'sync-not-published',
+        GATEWAY,
+        'publish_as_admin "$admin_account" uv sync --frozen)',
+        'run_as_admin "$admin_account" uv sync --frozen)',
+        'restrictive_caller_publishes_a_readable_runtime or every_wor'
+        'king_tree_publication_uses',
+        'Dependency artefacts are created under the inherited umask.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'current-runtime-preflight-skipped',
+        GATEWAY,
+        '    require_runtime_can_execute "$MGO_RUNTIME_ACCOUNT" "$MGO'
+        '_REPOSITORY" \\\n'
+        '        || die "$EX_PRECONDITION" \\\n'
+        '            "the runtime account cannot execute the environm'
+        'ent already deployed; nothing was fetched, moved, synchronis'
+        'ed or restarted, and the deployed files must be made readabl'
+        'e and executable by the runtime account before deploying again"\n',
+        '    :\n',
+        'unreadable_current_checkout_is_refused_before_any_repository_mutation',
+        'An already-unrunnable checkout is deployed over, and rolled back onto.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'current-runtime-preflight-after-mutation',
+        GATEWAY,
+        '    require_runtime_can_execute "$MGO_RUNTIME_ACCOUNT" "$MGO'
+        '_REPOSITORY" \\\n'
+        '        || die "$EX_PRECONDITION" \\\n'
+        '            "the runtime account cannot execute the environm'
+        'ent already deployed; nothing was fetched, moved, synchronis'
+        'ed or restarted, and the deployed files must be made readabl'
+        'e and executable by the runtime account before deploying again"\n'
+        '\n'
+        '    # Captured while the *previous* build is still the check'
+        'ed-out one: after\n'
+        '    # the fast-forward there is no longer anything on disk t'
+        'hat can answer this,\n'
+        '    # and it is the value every later rollback decision is m'
+        'easured against.\n'
+        '    # Established before a single mutation, so a build that '
+        'cannot answer stops\n'
+        '    # the deployment rather than a restart.\n'
+        '    baseline_schema="$(build_supported_schema "$MGO_RUNTIME_ACCOUNT" \\\n'
+        '        "$MGO_REPOSITORY")" \\\n'
+        '        || die "$EX_PRECONDITION" \\\n'
+        '            "the schema version supported by the deployed bu'
+        'ild could not be established"\n'
+        '    log "previous build expects schema $baseline_schema"\n'
+        '\n'
+        '    # Captured before anything moves. These are the only val'
+        'ues a rollback\n'
+        '    # will ever restore to; none of them can be supplied by a caller.\n'
+        '    head="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY"'
+        ' rev-parse HEAD)"\n'
+        '\n'
+        '    # A settled state, reconciled against the processes, bef'
+        'ore it becomes the\n'
+        '    # thing every later step measures itself against.\n'
+        '    previous_preview="$(read_stable_preview_state "$MGO_PREV'
+        'IEW_STATUS_URL")" \\\n'
+        '        || die "$EX_PRECONDITION" \\\n'
+        '            "the preview state is missing, ambiguous, transi'
+        'ent or unsupported"\n'
+        '    require_preview_baseline "$previous_preview" \\\n'
+        '        || die "$EX_PRECONDITION" \\\n'
+        '            "the reported preview state and the running prod'
+        'ucers disagree"\n'
+        '\n'
+        '    previous_pid="$(service_main_pid "$MGO_SERVICE")"\n'
+        '    previous_timestamp="$(service_active_enter_timestamp "$M'
+        'GO_SERVICE")"\n'
+        '    log "currently at commit $head"\n'
+        '    log "preview state before deployment: $previous_preview"\n'
+        '\n'
+        '    # 3-4. remote authority, proven before the fetch\n'
+        '    remote_sha="$(remote_branch_sha "$MGO_ADMIN_ACCOUNT" "$M'
+        'GO_REPOSITORY" \\\n'
+        '        "$MGO_REMOTE" "$MGO_BRANCH")"\n'
+        '    [[ "$remote_sha" =~ ^[0-9a-f]{40}$ ]] \\\n'
+        '        || die "$EX_PRECONDITION" "the remote branch could n'
+        'ot be resolved"\n'
+        '    [[ "$remote_sha" == "$approved" ]] \\\n'
+        '        || die "$EX_PRECONDITION" \\\n'
+        '            "$MGO_REMOTE/$MGO_BRANCH does not match the approved SHA"\n'
+        '\n'
+        '    # 5. fetch\n'
+        '    git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \\\n'
+        '        fetch --no-tags "$MGO_REMOTE" "$MGO_BRANCH" \\\n'
+        '        || die "$EX_PRECONDITION" "the fetch failed"\n',
+        '    # Captured while the *previous* build is still the check'
+        'ed-out one: after\n'
+        '    # the fast-forward there is no longer anything on disk t'
+        'hat can answer this,\n'
+        '    # and it is the value every later rollback decision is m'
+        'easured against.\n'
+        '    # Established before a single mutation, so a build that '
+        'cannot answer stops\n'
+        '    # the deployment rather than a restart.\n'
+        '    baseline_schema="$(build_supported_schema "$MGO_RUNTIME_ACCOUNT" \\\n'
+        '        "$MGO_REPOSITORY")" \\\n'
+        '        || die "$EX_PRECONDITION" \\\n'
+        '            "the schema version supported by the deployed bu'
+        'ild could not be established"\n'
+        '    log "previous build expects schema $baseline_schema"\n'
+        '\n'
+        '    # Captured before anything moves. These are the only val'
+        'ues a rollback\n'
+        '    # will ever restore to; none of them can be supplied by a caller.\n'
+        '    head="$(git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY"'
+        ' rev-parse HEAD)"\n'
+        '\n'
+        '    # A settled state, reconciled against the processes, bef'
+        'ore it becomes the\n'
+        '    # thing every later step measures itself against.\n'
+        '    previous_preview="$(read_stable_preview_state "$MGO_PREV'
+        'IEW_STATUS_URL")" \\\n'
+        '        || die "$EX_PRECONDITION" \\\n'
+        '            "the preview state is missing, ambiguous, transi'
+        'ent or unsupported"\n'
+        '    require_preview_baseline "$previous_preview" \\\n'
+        '        || die "$EX_PRECONDITION" \\\n'
+        '            "the reported preview state and the running prod'
+        'ucers disagree"\n'
+        '\n'
+        '    previous_pid="$(service_main_pid "$MGO_SERVICE")"\n'
+        '    previous_timestamp="$(service_active_enter_timestamp "$M'
+        'GO_SERVICE")"\n'
+        '    log "currently at commit $head"\n'
+        '    log "preview state before deployment: $previous_preview"\n'
+        '\n'
+        '    # 3-4. remote authority, proven before the fetch\n'
+        '    remote_sha="$(remote_branch_sha "$MGO_ADMIN_ACCOUNT" "$M'
+        'GO_REPOSITORY" \\\n'
+        '        "$MGO_REMOTE" "$MGO_BRANCH")"\n'
+        '    [[ "$remote_sha" =~ ^[0-9a-f]{40}$ ]] \\\n'
+        '        || die "$EX_PRECONDITION" "the remote branch could n'
+        'ot be resolved"\n'
+        '    [[ "$remote_sha" == "$approved" ]] \\\n'
+        '        || die "$EX_PRECONDITION" \\\n'
+        '            "$MGO_REMOTE/$MGO_BRANCH does not match the approved SHA"\n'
+        '\n'
+        '    # 5. fetch\n'
+        '    git_admin "$MGO_ADMIN_ACCOUNT" "$MGO_REPOSITORY" \\\n'
+        '        fetch --no-tags "$MGO_REMOTE" "$MGO_BRANCH" \\\n'
+        '        || die "$EX_PRECONDITION" "the fetch failed"\n'
+        '\n'
+        '    require_runtime_can_execute "$MGO_RUNTIME_ACCOUNT" "$MGO'
+        '_REPOSITORY" \\\n'
+        '        || die "$EX_PRECONDITION" \\\n'
+        '            "the runtime account cannot execute the environm'
+        'ent already deployed; nothing was fetched, moved, synchronis'
+        'ed or restarted, and the deployed files must be made readabl'
+        'e and executable by the runtime account before deploying again"\n',
+        'unreadable_current_checkout_is_refused_before_any_repository'
+        '_mutation or current_runtime_is_asked_before_the_previous_schema',
+        'The checkout is asked whether it runs only after the fetch has moved it.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'restored-runtime-validated-as-admin',
+        GATEWAY,
+        '    if ! require_runtime_can_execute "$runtime_account" "$re'
+        'pository"; then\n',
+        '    if ! require_runtime_can_execute "$admin_account" "$repo'
+        'sitory"; then\n',
+        'pre_restart_rollback_restores_a_readable_runtime',
+        'The owner can read its own 0600 files; the runtime account cannot.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'restored-runtime-not-validated',
+        GATEWAY,
+        '    if ! require_runtime_can_execute "$runtime_account" "$re'
+        'pository"; then\n'
+        '        ROLLBACK_STAGE="runtime"\n'
+        '        return 1\n'
+        '    fi\n'
+        '    return 0\n',
+        '    return 0\n',
+        'restored_runtime_that_cannot_execute_is_not_a_successful_rollback',
+        'A clean tree at the right commit is called a successful rollback again.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'rollback-success-before-runtime-proof',
+        GATEWAY,
+        '    if ! require_runtime_can_execute "$runtime_account" "$re'
+        'pository"; then\n'
+        '        ROLLBACK_STAGE="runtime"\n'
+        '        return 1\n'
+        '    fi\n'
+        '    return 0\n',
+        '    return 0\n'
+        '    if ! require_runtime_can_execute "$runtime_account" "$re'
+        'pository"; then\n'
+        '        ROLLBACK_STAGE="runtime"\n'
+        '        return 1\n'
+        '    fi\n',
+        'restored_runtime_that_cannot_execute_is_not_a_successful_rollback',
+        'Success is reported before the proof that would have refused it.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'restart-after-failed-restored-runtime',
+        GATEWAY,
+        '        "$previous_sha" "$MGO_BRANCH" "$MGO_RUNTIME_ACCOUNT"; then\n'
+        '        report_rollback_failure\n'
+        '    fi\n'
+        '\n'
+        '    # The restored build was proven loadable by the runtime '
+        'account inside\n',
+        '        "$previous_sha" "$MGO_BRANCH" "$MGO_RUNTIME_ACCOUNT"; then\n'
+        '        warn "rollback incomplete; restarting anyway"\n'
+        '    fi\n'
+        '\n'
+        '    # The restored build was proven loadable by the runtime '
+        'account inside\n',
+        'post_restart_rollback_whose_runtime_cannot_execute_is_not_restarted',
+        'An unrunnable restored build is started, and the service goes down.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'incomplete-rollback-reported-as-success',
+        GATEWAY,
+        '        die "$EX_ROLLBACK" \\\n'
+        '            "deployment failed and rollback is INCOMPLETE: ',
+        '        die "$EX_DEPLOY" \\\n'
+        '            "deployment failed; rollback succeeded: ',
+        'restored_runtime_that_cannot_execute_is_not_a_successful_rollback',
+        'The operator is told production is where it started.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'probe-bytecode-env-removed',
+        GATEWAY,
+        '        "PYTHONDONTWRITEBYTECODE=1" \\\n'
+        '        "$repository/.venv/bin/python" -B -c \\\n'
+        "        'import mgo.core.config, mgo.api.app' \\\n",
+        '        "$repository/.venv/bin/python" -B -c \\\n'
+        "        'import mgo.core.config, mgo.api.app' \\\n",
+        'runtime_validation_writes_no_bytecode',
+        'One of the two bytecode guards is gone.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'probe-bytecode-flag-removed',
+        GATEWAY,
+        '        "PYTHONDONTWRITEBYTECODE=1" \\\n'
+        '        "$repository/.venv/bin/python" -B -c \\\n'
+        "        'import mgo.core.config, mgo.api.app' \\\n",
+        '        "PYTHONDONTWRITEBYTECODE=1" \\\n'
+        '        "$repository/.venv/bin/python" -c \\\n'
+        "        'import mgo.core.config, mgo.api.app' \\\n",
+        'runtime_validation_writes_no_bytecode',
+        'The other bytecode guard is gone.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'probe-bytecode-writing-re-enabled',
+        GATEWAY,
+        '        "PYTHONDONTWRITEBYTECODE=1" \\\n'
+        '        "$repository/.venv/bin/python" -B -c \\\n'
+        "        'import mgo.core.config, mgo.api.app' \\\n",
+        '        "$repository/.venv/bin/python" -c \\\n'
+        "        'import mgo.core.config, mgo.api.app' \\\n",
+        'runtime_validation_writes_no_bytecode',
+        'The probe writes __pycache__ at whatever mode the moment produces.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'schema-probe-bytecode-flag-removed',
+        GATEWAY,
+        '        "$repository/.venv/bin/python" -B -c \\\n'
+        "        'from mgo.core.database import CURRENT_SCHEMA_VERSION\n",
+        '        "$repository/.venv/bin/python" -c \\\n'
+        "        'from mgo.core.database import CURRENT_SCHEMA_VERSION\n",
+        'runtime_validation_writes_no_bytecode or every_runtime_accou'
+        'nt_probe_disables_bytecode_writing',
+        'The schema probe writes bytecode.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'schema-advancement-refusal-weakened',
+        GATEWAY,
+        '    [[ "$actual_schema" == "$baseline_schema" ]]\n'
+        '}\n',
+        '    true\n'
+        '}\n',
+        'schema_advancement_refuses_rollback_and_leaves_a_readable_target',
+        'An advanced database is rolled back onto anyway.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'manual-recovery-exit-altered',
+        GATEWAY,
+        'readonly EX_MANUAL_RECOVERY=79 ',
+        'readonly EX_MANUAL_RECOVERY=70 ',
+        'schema_advancement_refuses_rollback_and_leaves_a_readable_target',
+        'A refused rollback is indistinguishable from a completed one.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'lock-created-under-publication-umask',
+        GATEWAY,
+        '        umask 0077\n'
+        '        set -C\n',
+        '        umask "$MGO_PUBLICATION_UMASK"\n'
+        '        set -C\n',
+        'sensitive_objects_do_not_inherit_the_publication_umask or pu'
+        'blication_umask_is_scoped_to_the_publication',
+        'The control-plane lock is created world-readable.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+    Mutation(
+        'tmpdir-created-under-publication-umask',
+        GATEWAY,
+        '        umask 0077\n'
+        '        mkdir -- "$path"\n',
+        '        umask 0022\n'
+        '        mkdir -- "$path"\n',
+        'sensitive_objects_do_not_inherit_the_publication_umask or pu'
+        'blication_umask_is_scoped_to_the_publication',
+        'The root temporary directory is created traversable by everyone.',
+        suite=UMASK_SAFETY_SUITE,
+    ),
+)
+
+MUTATIONS = MUTATIONS + TASK_14_5_MUTATIONS + TASK_14_5C_MUTATIONS

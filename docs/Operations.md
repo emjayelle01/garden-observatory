@@ -873,6 +873,61 @@ Backups also do not include capture media.
 
 ---
 
+## 5.8 Runtime readability is not Git cleanliness (Task 14.5C)
+
+On 2026-09-07 the Task 14.5B deployment of `b733d0b8` failed with exit 70 and
+the gateway reported `rollback succeeded; the service was never restarted`.
+Both statements were true and the second was not enough. The wrapper that
+invoked `sudo -n /usr/local/sbin/mgo-validate deploy-main` had set `umask 077`
+to protect its own log stage; `sudo` preserves the caller's umask; the gateway
+set none of its own; so every file the fast-forward wrote -- and every file the
+rollback then rewrote -- was `0600 claude:mgo`, which the `mgo` service account
+cannot read. Git reported the tree clean throughout, because Git tracks only the
+executable bit. The running service was unaffected (its modules were already in
+memory), but the next restart would have failed to import. Task 14.5B-R restored
+34 tracked files and 12 bytecode files to `0644` by an itemised root action,
+proved the import as `mgo`, and left the service on its original PID.
+
+That was the operational correction. The code correction is Task 14.5C, in
+`scripts/deploy/mgo-validate` (see `docs/Deployment-Gateway.md` §9b), and the
+contract it establishes is what an operator should now expect:
+
+- **The gateway sets its own publication umask (`0022`)** for the fast-forward,
+  the rollback reset and the dependency sync. Nothing about the invoking shell,
+  wrapper, `sudo` or profile can make the files it publishes unreadable to the
+  runtime account. Its private objects -- lock, temporary directory, approval
+  temporary -- keep their own restrictive modes; the publication umask is
+  scoped to the publication and nowhere else.
+- **Runtime validation happens three times**: of the checkout as found, before
+  anything is fetched or moved (a failure is exit 65 and changes nothing); of
+  the deployed target, before the restart; and of the restored checkout, after a
+  rollback and before that rollback is called successful or, on the
+  post-restart path, restarted.
+- **A clean Git tree proves nothing about readability.** `git status` after
+  the incident was empty. The gateway's proofs are now made as the runtime
+  account, by importing the application, with bytecode writing disabled.
+- **"Rollback succeeded" now includes executable, readable runtime proof.**
+  Content restored but runtime unreadable is reported as
+  `rollback is INCOMPLETE`, exit 78, and the message says that the service must
+  not be restarted until the restored files are readable by `mgo`. Treat it as
+  the incident shape: repair modes deliberately and itemised, as Task 14.5B-R
+  did, never with a recursive `chmod`.
+- **Validation writes no bytecode.** The probes run with `-B` and
+  `PYTHONDONTWRITEBYTECODE=1`; a validation cannot leave a `__pycache__` at an
+  unexpected mode.
+- **The schema-aware behaviour of §5.7 is unchanged.** Exit 79 still means the
+  rollback was refused and nothing was restored; the build retained after a
+  refusal is now guaranteed readable by `mgo` whatever the caller's umask.
+- **Deployment authority is still separate from §6.2 recovery authority.**
+  Nothing here lets the gateway restore a database or clear an approval on its
+  own; an incomplete rollback is an operator decision, made with the evidence
+  the gateway left in place.
+
+Until the corrected gateway is reviewed, merged and installed on `mgo-core`,
+the Task 14.5B deployment must not be retried: the installed gateway still
+inherits the caller's umask and still cannot tell a restored checkout from a
+runnable one.
+
 ## 6. Restore: the deliberate boundary
 
 **There is no `restore` command, and that is a design decision.**
