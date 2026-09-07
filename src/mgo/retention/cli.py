@@ -452,6 +452,23 @@ def _plan(arguments: argparse.Namespace, stream: IO[str]) -> int:
     return EXIT_SUCCESS
 
 
+def _destructive_preconditions(
+    arguments: argparse.Namespace, refusal_missing_execute: str
+) -> MGOConfig:
+    """Gates A and B, then the configuration read, for a destructive command.
+
+    Shared by ``run-once`` and ``scheduled-run`` so the two cannot drift: the
+    explicit ``--execute`` flag (gate A) and an absolute ``MGO_CONFIG_PATH``
+    as supplied (gate B) are both checked before any file is read. Only the
+    refusal sentence for a missing flag differs, because it names the command.
+    """
+    if not arguments.execute:
+        raise _Refusal(refusal_missing_execute, EXIT_REFUSED)
+
+    _require_explicit_configuration()
+    return _load_configuration()
+
+
 def _run_once(arguments: argparse.Namespace, stream: IO[str]) -> int:
     """Execute exactly one bounded retention run.
 
@@ -475,11 +492,7 @@ def _run_once(arguments: argparse.Namespace, stream: IO[str]) -> int:
     says more eligible work remains: that is a fact for the operator, not a
     trigger.
     """
-    if not arguments.execute:
-        raise _Refusal(REFUSAL_MISSING_EXECUTE, EXIT_REFUSED)
-
-    _require_explicit_configuration()
-    config = _load_configuration()
+    config = _destructive_preconditions(arguments, REFUSAL_MISSING_EXECUTE)
 
     if not config.retention.enabled:
         raise _Refusal(REFUSAL_RETENTION_DISABLED, EXIT_REFUSED)
@@ -556,14 +569,12 @@ def _scheduled_run(arguments: argparse.Namespace, stream: IO[str]) -> int:
     Skipping is not silent: the structured document says exactly why, and the
     journal carries it. It is merely not a failure.
     """
-    if not arguments.execute:
-        raise _Refusal(REFUSAL_MISSING_EXECUTE_SCHEDULED, EXIT_REFUSED)
-
     backup_directory = _absolute_backup_directory(arguments.backup_directory)
-    _require_explicit_configuration()
-    config = _load_configuration()
+    config = _destructive_preconditions(
+        arguments, REFUSAL_MISSING_EXECUTE_SCHEDULED
+    )
 
-    if not config.retention.enabled:  # the scheduled gate
+    if config.retention.enabled is False:  # the scheduled gate
         _emit(
             {
                 "outcome": "skipped",

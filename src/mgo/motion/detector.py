@@ -102,7 +102,7 @@ class MotionDetector(Protocol):
         ...
 
     def score(self, reference: AnalysisFrame, current: AnalysisFrame) -> float:
-        """Return the changed-pixel ratio (0-1) between two analysis frames."""
+        """Return the raw changed-pixel ratio (0-1) between two frames."""
         ...
 
     def compare(
@@ -181,12 +181,15 @@ class FrameDifferenceDetector:
         return AnalysisFrame(width=self._width, height=self._height, luma=luma)
 
     def score(self, reference: AnalysisFrame, current: AnalysisFrame) -> float:
-        """Return the compensated changed-pixel ratio (0-1) between two frames.
+        """Return the raw changed-pixel ratio (0-1) between two frames.
 
-        Kept as the one-number convenience every earlier caller used; it is
-        exactly :attr:`FrameComparison.ratio` from :meth:`compare`.
+        Unchanged from before Task 14.5: the uncompensated proportion of
+        pixels whose luminance moved by more than the noise floor, exactly
+        :attr:`FrameComparison.raw_ratio` from :meth:`compare`. The monitor
+        decides on :meth:`compare`; this one-number form stays for every
+        earlier caller and for the simulator's threshold contract.
         """
-        return self.compare(reference, current).ratio
+        return self.compare(reference, current).raw_ratio
 
     def compare(
         self, reference: AnalysisFrame, current: AnalysisFrame

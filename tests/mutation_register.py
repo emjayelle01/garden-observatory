@@ -2290,8 +2290,8 @@ MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'an-overlapping-run-stops-reporting-busy',
         RETENTION_SERVICE,
-        '                error_category=RetentionErrorCategory.BUSY,',
-        '                error_category=None,',
+        '            return self._declined(RetentionErrorCategory.BUSY)',
+        '            return self._declined(None)',
         'a_busy_run_deletes_nothing_and_records_nothing',
         'A refused run is indistinguishable from one that found nothing to do.',
         suite=RETENTION_SERVICE_SUITE,
@@ -3002,7 +3002,7 @@ TASK_14_5_MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'scheduled-run-executes-while-disabled',
         RETENTION_CLI,
-        '    if not config.retention.enabled:  # the scheduled gate',
+        '    if config.retention.enabled is False:  # the scheduled gate',
         '    if False:  # the scheduled gate',
         'scheduled_run_skips_when_retention_is_disabled',
         'The timer reaches the service with retention disabled.',
@@ -3011,8 +3011,8 @@ TASK_14_5_MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
         'scheduled-run-without-execute',
         RETENTION_CLI,
-        '        raise _Refusal(REFUSAL_MISSING_EXECUTE_SCHEDULED, EXIT_REFUSED)',
-        '        pass',
+        '        arguments, REFUSAL_MISSING_EXECUTE_SCHEDULED',
+        '        argparse.Namespace(execute=True), REFUSAL_MISSING_EXECUTE_SCHEDULED',
         'scheduled_run_requires_the_execute_flag',
         'The scheduled command runs without its explicit execution gate.',
         suite=RETENTION_SCHEDULING_SUITE,
