@@ -260,8 +260,13 @@ def test_the_parser_accepts_no_policy_or_target_options() -> None:
     assert not forbidden & set(text.split())
 
 
-def test_only_two_subcommands_exist() -> None:
-    """Exactly ``plan`` and ``run-once``; nothing deletes a named file.
+def test_only_three_subcommands_exist() -> None:
+    """Exactly ``plan``, ``run-once`` and ``scheduled-run``; nothing deletes a
+    named file.
+
+    ``scheduled-run`` (Task 14.5) is the timer's entry point: the same single
+    run as ``run-once`` behind the same ``--execute`` gate, differing only in
+    how a run that correctly declined to start is reported.
 
     Read off the parser's own choices rather than the help prose -- the help
     text legitimately contains the word "delete" while describing what
@@ -273,7 +278,7 @@ def test_only_two_subcommands_exist() -> None:
         if action.dest == "command" and action.choices:
             choices = set(action.choices)
 
-    assert choices == {"plan", "run-once"}
+    assert choices == {"plan", "run-once", "scheduled-run"}
     for forbidden in ("delete", "delete-file", "delete-capture", "purge", "rm"):
         assert forbidden not in choices
 

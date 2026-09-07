@@ -84,6 +84,16 @@ changed_pixel_ratio_threshold = 0.08
 # Suppresses recording a repeated motion event that restarts within this window
 # (seconds); the eventual return to no-motion is never hidden.
 cooldown_seconds = 5.0
+# Whole-frame change ceiling (0–1), Task 14.5. A frame-to-frame change above it
+# is reported as "global_change" — an exposure or lighting step, a covered lens,
+# a camera knock — never as motion, and it never triggers an automatic capture;
+# the scene is re-baselined instead. Must be greater than
+# changed_pixel_ratio_threshold. The detector also subtracts the mean luminance
+# shift before scoring, so a uniform brightening below this ceiling reads as no
+# motion rather than as activity. Default 0.5 ("a majority of the frame") is
+# derived from the Task 14.4 measurements (whole-frame transitions of about
+# 0.99 and 0.71) and is NOT field-calibrated; daylight commissioning may tune it.
+global_change_ratio_threshold = 0.5
 
 [event_capture]
 # Motion-triggered still capture. Disabled by default: no worker is created, no
@@ -103,10 +113,34 @@ cooldown_seconds = 5.0
 # survive a restart, and restore_after_capture returns the frame source after a
 # capture has taken the camera.
 #
-# There is deliberately nothing else to configure. The queue holds exactly one
-# pending trigger, there is no retry, and one transition produces at most one
-# still. See docs/Event-Capture.md.
+# The queue holds exactly one pending trigger, there is no retry, and one
+# transition produces at most one still. See docs/Event-Capture.md.
 enabled = false
+# Hard safety limits (Task 14.5). ALL THREE ARE MANDATORY when enabled = true;
+# an enabled section missing any of them is rejected at load time. They are
+# counted from the capture catalogue, so they survive a restart, and a trigger
+# that would breach one creates no image, no catalogue row and no lifecycle
+# row. Disabled here, they are inert; they are written out so an operator who
+# enables the feature sees what the enablement requires.
+#
+# max_captures_per_hour   automatic captures admitted in any rolling 3600 s
+#                         window (1–3600)
+# max_captures_per_day    automatic captures admitted in the current UTC
+#                         calendar day (1–86400)
+# minimum_free_bytes      free space that must remain on the filesystem holding
+#                         camera.capture_directory AFTER one more capture
+# maximum_capture_bytes   the size reserved for one capture before admission and
+#                         the largest file an automatic capture may publish
+#                         (default 16 MiB; a larger still is refused and removed
+#                         before it is catalogued)
+#
+# Manual capture (POST /camera/capture) applies no quota, but when a
+# minimum_free_bytes floor is configured and the media filesystem is already
+# below it, a manual capture is refused with HTTP 507 as well.
+max_captures_per_hour = 20
+max_captures_per_day = 120
+minimum_free_bytes = 2147483648
+maximum_capture_bytes = 16777216
 
 [retention]
 # Capture-media retention (Task 14.1). Disabled by default: no lifecycle row is

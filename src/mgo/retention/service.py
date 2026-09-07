@@ -39,6 +39,12 @@ from typing import Any
 
 from mgo.core.config import RetentionConfig
 from mgo.core.observations import Observation, record_observation
+from mgo.operations.errors import ErrorCode, OperationError
+from mgo.operations.locking import (
+    DEFAULT_STALE_AFTER_SECONDS,
+    OperationLock,
+    lock_age_seconds,
+)
 from mgo.retention.models import (
     CaptureLifecycleRecord,
     MediaLifecycleState,
@@ -58,6 +64,11 @@ from mgo.retention.repository import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+#: The cross-process retention lock, created beside the database by default.
+#: A dot-file, like the backup lock, so a directory listing of the database
+#: directory is not cluttered by a marker that exists for seconds a day.
+RETENTION_LOCK_FILENAME = ".mgo-retention.lock"
 
 Clock = Callable[[], datetime]
 ObservationRecorder = Callable[..., Observation]
@@ -265,6 +276,9 @@ class RetentionService:
         clock: Clock = _utc_now,
         recorder: ObservationRecorder = record_observation,
         database_path: Path | None = None,
+        lock_path: Path | None = None,
+        backup_lock_path: Path | None = None,
+        stale_lock_after_seconds: float = DEFAULT_STALE_AFTER_SECONDS,
     ) -> None:
         self._config = config
         self._repository = repository
@@ -278,6 +292,20 @@ class RetentionService:
         # a caller that waited would delete against a plan computed before the
         # run it waited for changed the catalogue underneath it.
         self._run_lock = threading.Lock()
+        # Cross-process mutual exclusion (Task 14.5). The scheduled timer and
+        # an operator's manual run are different processes; the thread lock
+        # above cannot see across them. The file lock lives beside the
+        # database by default -- the one directory every retention execution
+        # already needs writable -- and uses the same atomic O_EXCL mechanism
+        # as the backup. ``None`` is only meaningful when no database path is
+        # known either, which no production construction does.
+        if lock_path is None and database_path is not None:
+            lock_path = database_path.parent / RETENTION_LOCK_FILENAME
+        self._lock_path = lock_path
+        # Where a running backup announces itself. Retention yields to it:
+        # a fresh lock file there means "skip, do not delete anything now".
+        self._backup_lock_path = backup_lock_path
+        self._stale_lock_after_seconds = stale_lock_after_seconds
 
     # -- public API --------------------------------------------------------
 
@@ -354,18 +382,35 @@ class RetentionService:
             LOGGER.warning(
                 "Retention run refused; another run is already in progress"
             )
-            return RetentionRunResult(
-                executed=False,
-                enabled=True,
-                candidate_count=0,
-                deleted_count=0,
-                bytes_reclaimed=0,
-                recovered_count=0,
-                more_work_remains=False,
-                error_category=RetentionErrorCategory.BUSY,
-            )
+            return self._declined(RetentionErrorCategory.BUSY)
 
+        file_lock: OperationLock | None = None
         try:
+            # The backup check and the file lock both happen BEFORE the state
+            # holder is marked running and before anything is read: a declined
+            # run must look exactly like a run that never started, because it
+            # never did.
+            if self._backup_in_progress():
+                LOGGER.warning(
+                    "Retention run skipped; a database backup is in progress"
+                )
+                return self._declined(RetentionErrorCategory.BACKUP_IN_PROGRESS)
+
+            file_lock = self._acquire_file_lock()
+            if file_lock is None:
+                return self._declined(RetentionErrorCategory.LOCK_UNAVAILABLE)
+
+            # The backup could have started between the check above and the
+            # lock. Check again now that nothing else can start a retention
+            # run; a backup that begins after this point runs alongside a
+            # retention run that holds no database transaction across any
+            # filesystem operation, which SQLite's backup API tolerates.
+            if self._backup_in_progress():
+                LOGGER.warning(
+                    "Retention run skipped; a database backup started meanwhile"
+                )
+                return self._declined(RetentionErrorCategory.BACKUP_IN_PROGRESS)
+
             self._state.mark_running()
             # ``_execute`` converts every ordinary failure into a result, so the
             # two lines below always run and the holder can never be left
@@ -379,10 +424,81 @@ class RetentionService:
                 error=result.error_message,
             )
         finally:
+            if file_lock is not None:
+                file_lock.release()
             # Released last, so the state a waiting caller can observe is
             # already the finished state rather than a stale ``running``.
             self._run_lock.release()
         return result
+
+    @staticmethod
+    def _declined(category: RetentionErrorCategory) -> RetentionRunResult:
+        """A run that never started, with the reason it did not."""
+        return RetentionRunResult(
+            executed=False,
+            enabled=True,
+            candidate_count=0,
+            deleted_count=0,
+            bytes_reclaimed=0,
+            recovered_count=0,
+            more_work_remains=False,
+            error_category=category,
+        )
+
+    def _backup_in_progress(self) -> bool:
+        """Return whether a fresh backup lock exists. Fails closed.
+
+        A lock file younger than the stale threshold is a running backup. A
+        lock whose age cannot be read is treated as running: the only way to
+        be wrong in that direction is to delete nothing tonight. No backup
+        lock path configured means no backup is looked for -- that is the
+        caller's explicit choice, made where the paths are known.
+        """
+        path = self._backup_lock_path
+        if path is None:
+            return False
+        try:
+            exists = path.exists()
+        except OSError:
+            LOGGER.exception("The backup lock could not be inspected")
+            return True
+        if not exists:
+            return False
+        age = lock_age_seconds(path)
+        if age is None:
+            return True
+        return age < self._stale_lock_after_seconds
+
+    def _acquire_file_lock(self) -> OperationLock | None:
+        """Take the cross-process retention lock, or return ``None``.
+
+        ``None`` for a held lock *and* for a lock that cannot be created: a
+        retention run that cannot prove it is the only one is not allowed to
+        delete. No lock path at all is the same answer -- a service built
+        without a database path has nowhere to coordinate, and refuses.
+        """
+        if self._lock_path is None:
+            LOGGER.error("Retention run refused; no lock location is configured")
+            return None
+        lock = OperationLock(
+            self._lock_path,
+            operation="retention",
+            stale_after_seconds=self._stale_lock_after_seconds,
+        )
+        try:
+            lock.acquire()
+        except OperationError as exc:
+            if exc.code is ErrorCode.BACKUP_LOCKED:
+                LOGGER.warning(
+                    "Retention run refused; another retention process holds "
+                    "the lock"
+                )
+            else:
+                LOGGER.error("Retention run refused; the lock could not be created")
+            return None
+        if lock.reclaimed_stale_lock:
+            LOGGER.warning("An abandoned retention lock was reclaimed")
+        return lock
 
     # -- the run -----------------------------------------------------------
 

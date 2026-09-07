@@ -1,0 +1,110 @@
+# Matt's Garden Observatory — scheduled capture-media retention, systemd unit
+# TEMPLATE (Task 14.5).
+#
+# This file is a template, not an installed unit. The placeholders below are
+# substituted by scripts/deploy/install-retention-timer.sh, which renders it
+# to /etc/systemd/system/mgo-retention.service:
+#
+#   @APP_ROOT@       absolute path of the application checkout on the Pi
+#   @SERVICE_USER@   dedicated non-login runtime account (default: mgo)
+#   @SERVICE_GROUP@  primary runtime group (default: mgo)
+#   @CONFIG_PATH@    production configuration file
+#   @DATABASE_DIR@   database directory (default: /var/lib/garden-observatory/db)
+#   @CAPTURE_DIR@    capture media directory
+#                    (default: /var/lib/garden-observatory/media/captures)
+#   @BACKUP_DIR@     backup root whose lock a running backup holds
+#                    (default: /var/backups/garden-observatory)
+#
+# It is a ONE-SHOT job triggered by mgo-retention.timer. It runs the
+# repository's own retention command exactly once and exits. Whether it may
+# DELETE anything is decided entirely by the configuration file it is pointed
+# at: with retention disabled there -- as it is in production today -- every
+# run is a structured "skipped: retention_disabled" and touches nothing. It
+# never starts, stops or restarts mgo.service, never opens the camera and never
+# reads image content.
+
+[Unit]
+Description=Matt's Garden Observatory capture-media retention
+Documentation=https://github.com/emjayelle01/garden-observatory
+
+# Ordered after the backup when both are queued at once (a reboot catch-up,
+# for instance), so the backup goes first. Ordering is a courtesy; exclusion
+# is the lock: the run skips while the backup's lock file is fresh, and holds
+# its own lock beside the database so two retention runs cannot overlap.
+# Deliberately NO Requires=, Wants= or BindsTo=: nothing here can start or
+# affect another unit.
+After=mgo-backup.service mgo.service
+
+[Service]
+Type=oneshot
+
+# --- runtime identity ------------------------------------------------------
+# The same non-login account that owns the database and the media. No
+# SupplementaryGroups: this job needs no camera access.
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+
+# --- the job ---------------------------------------------------------------
+# The virtualenv entry point is invoked directly with an argument vector — no
+# shell is involved, so no value here can be word-split or interpreted. The
+# explicit --execute flag is the command's own gate; it is deliberately visible
+# here rather than hidden in a wrapper.
+WorkingDirectory=@APP_ROOT@
+Environment=MGO_CONFIG_PATH=@CONFIG_PATH@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@APP_ROOT@/.venv/bin/mgo-retention scheduled-run --execute --backup-directory @BACKUP_DIR@
+
+# A bounded run. One run deletes at most max_deletions_per_run files and
+# performs a handful of SQLite transactions; ten minutes is a generous ceiling
+# that still guarantees a wedged job cannot hold the retention lock until the
+# stale threshold.
+TimeoutStartSec=600
+
+# Never restart. A scheduled one-shot that failed will be tried again by the
+# timer tomorrow; retrying immediately would repeat the same refusal.
+Restart=no
+
+# --- politeness -------------------------------------------------------------
+Nice=10
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+
+# --- least privilege -------------------------------------------------------
+UMask=0027
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+# Retention makes no network connection of any kind.
+RestrictAddressFamilies=AF_UNIX
+
+# The job never opens a camera, so the real device nodes are hidden.
+PrivateDevices=yes
+
+# --- writable paths ---------------------------------------------------------
+# ProtectSystem=strict makes the whole filesystem read-only, so the two
+# locations this job legitimately writes are named explicitly, and nothing
+# else -- not the backup directory, not the configuration, not the checkout.
+#
+# @DATABASE_DIR@ holds the lifecycle table this job transitions, the WAL and
+# shm sidecars SQLite needs even to read, and the retention lock file.
+#
+# @CAPTURE_DIR@ is where managed media is unlinked. The backup directory is
+# deliberately NOT writable: the job only reads the age of the backup lock.
+ReadWritePaths=@DATABASE_DIR@ @CAPTURE_DIR@

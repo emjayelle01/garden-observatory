@@ -107,6 +107,16 @@ def _age_seconds(path: Path) -> float | None:
     return max(0.0, datetime.now(UTC).timestamp() - modified)
 
 
+def lock_age_seconds(path: Path) -> float | None:
+    """Return how old a lock file is, or ``None`` if that cannot be read.
+
+    Public so another job can ask "is that lock fresh?" without acquiring it.
+    Retention uses it to yield to a running backup (Task 14.5): it never takes
+    the backup lock, it only reads its age, so it cannot disturb the backup.
+    """
+    return _age_seconds(path)
+
+
 class OperationLock:
     """An exclusive, non-blocking lock over one operations job.
 
@@ -262,5 +272,6 @@ __all__ = [
     "LOCK_FILE_MODE",
     "LockInfo",
     "OperationLock",
+    "lock_age_seconds",
     "operation_lock",
 ]
