@@ -393,6 +393,73 @@ It is a probe, not a rehearsal: import only. No lifespan is entered, no camera
 is opened, no stream is read and nothing is written. A failed probe takes the
 pre-restart rollback path.
 
+## 9b. The publication umask, and runtime readability (Task 14.5C)
+
+**The gateway owns the umask its runtime files are created under. The
+caller's umask is not trusted.** `sudo` preserves the invoking shell's umask,
+and the Task 14.5B deployment of 2026-09-07 was invoked from a wrapper that
+had set `umask 077`: every file the fast-forward wrote was created
+`0600 claude:mgo`, the runtime probe found that `mgo` could not import the
+application, the gateway restored the previous commit -- rewriting the same
+files under the same umask -- and reported `rollback succeeded`. The service
+survived only because it was never restarted; the restored checkout was as
+unreadable to `mgo` as the deployed one, and Task 14.5B-R repaired 46 files by
+hand before any restart could be risked.
+
+**A clean Git tree does not prove runtime readability.** Git tracks the
+executable bit and nothing else, so a checkout whose every source is `0600` is
+clean, at the right commit, on the right branch -- and unrunnable. Every
+rollback proof the gateway had was a Git proof.
+
+What the gateway now does:
+
+- **Publication umask `0022`**, stated as the constant
+  `MGO_PUBLICATION_UMASK` and applied in one subshell (`publish_as_admin`) to
+  exactly the operations that publish runtime files: the fast-forward, the
+  rollback reset and the frozen dependency sync. The subshell is the scope: the
+  gateway's own shell keeps whatever umask it inherited, and the objects it
+  creates for itself -- the control-plane lock (`0600`), the root temporary
+  directory (`0700`), the approval temporary (`mktemp`, then
+  `chmod --reference`) -- keep the explicit private modes they always had.
+  Nothing is made less restrictive by this change.
+- **Runtime validation before mutation.** Before the fetch, before the
+  fast-forward and before the previous build is even asked what schema it
+  supports, `deploy-main` proves the checkout *as found* is executable by the
+  runtime account. If it is not, the deployment stops with exit **65** and the
+  message names runtime unreadability; nothing was fetched, moved,
+  synchronised or restarted, and the service is left running. An
+  already-unrunnable checkout is never deployed over, and never rolled back
+  onto.
+- **Runtime validation before restart**, as before (§9a), of the deployed
+  target.
+- **Runtime validation after rollback.** `rollback_repository` gains a
+  fourth stage, `runtime`, after the checkout, environment and verification
+  stages: the restored checkout must import as the runtime account before the
+  rollback is called successful, and -- on the post-restart path -- before the
+  restored build is restarted. Content restored but runtime unreadable is
+  reported as an **INCOMPLETE** rollback, exit **78**, in words that say which
+  half happened and that a restart is the thing not to attempt.
+- **No bytecode.** Every probe that imports the application as the runtime
+  account runs the interpreter with `-B` and `PYTHONDONTWRITEBYTECODE=1`, so a
+  validation can never leave a `__pycache__` or a `.pyc` behind at whatever
+  mode the moment produced.
+
+What it does not do: it does not `chmod` anything, recursively or otherwise. A
+gateway that repaired modes after the fact would be asserting ownership of
+files it did not create; the fix is the mode the files are created with. It
+also does not change the schema-aware recovery contract (§11, `docs/Operations.md`
+§5.7): the exit-79 refusal is unchanged, and a caller umask of `0077` can no
+longer leave the build retained after a refusal unreadable, because that build
+was published under the gateway's umask.
+
+The whole of this is executed, not described, by
+`tests/test_deployment_umask_safety.py`: the real `action_deploy_main`, sourced,
+driven from a caller whose umask is `0077` against a disposable upstream,
+checkout and interpreter launcher, with a simulated runtime account that is
+refused by mode bits -- real ones where the kernel honours umask, modelled from
+the recorded umask where it does not, and the two checked against each other
+wherever both exist.
+
 ## 10. Preview-state preservation
 
 `preview.auto_start` is `false` in production, so a restart leaves preview
@@ -509,10 +576,14 @@ failing rolls back too.
 | After the fast-forward, before the restart | Checkout and environment restored; the service is **not** restarted and the preview is **not** touched, because nothing disturbed them | 70 |
 | At or after the restart | Checkout and environment restored, the service restarted **once**, health proven, preview returned to its recorded state | 70 |
 | The rollback itself | Evidence preserved, no loop, no repeated restart, the failed stage named, and no claim that production was restored | 78 |
+| The restored checkout cannot be executed by `mgo` | Commit and environment are back; the rollback is reported **INCOMPLETE**, the service is not restarted by the handler, and the message says the restored files must be made readable before any restart or deployment | 78 |
 
 A successful rollback still reports failure. `deployment failed; rollback
 succeeded` means production is where it started — not that the deployment
-worked.
+worked. Since Task 14.5C "where it started" includes **executable by the
+runtime account**: a rollback is successful only after the restored checkout
+has imported as `mgo`, and a rollback whose content came back but whose runtime
+did not is a failed rollback (§9b).
 
 A pre-restart rollback proves rather more than that the commit came back. The
 service was never restarted, so it should still be the *same* process, still
@@ -522,6 +593,9 @@ including untracked files, no stash, no operation in progress, the unchanged
 PID and activation timestamp, an active service, an exact-200 health response,
 the preview state matching the captured baseline, and the producer count
 matching it. Any one of those failing means the rollback is incomplete: **78**.
+Before any of them, the restored checkout has already imported as the runtime
+account; a post-restart rollback restarts the restored build only after that
+proof (§9b).
 
 Exit codes: **64** bad request or unusable approval, **65** precondition
 failure, **75** another control-plane action holds the lock, **70** deployment
@@ -807,10 +881,10 @@ adds nothing but a friendlier name and a clear error when the gateway is absent.
 | ---- | ------- | ---------- |
 | 0 | Success. From `clear-approval` specifically, also the **already-clear** outcomes: the approval file was absent, or was already empty. Both are success and neither is a write | Nothing. That is the state `clear-approval` exists to produce |
 | 64 | Bad request — an unsupported action, an extra argument, or a caller who is not root by way of `claude`. Also, for the actions that **require** approval (`show-approval`, `deploy-main`, `restart-api`), an approval file that is missing, empty, malformed or unsafely permissioned. For `clear-approval` a missing or empty approval is exit **0** instead, and 64 means only that the approval *object* is unsafe to clear — a symlink, not a regular file, not root-owned, or group- or world-writable — and nothing was modified | Fix the approval file; the message says which property failed |
-| 65 | A precondition failed — dirty tree, wrong branch, stash, operation in progress, wrong remote, service down, remote SHA does not match the approval, not a fast-forward, or an unsafe lock or temporary directory. From `clear-approval`, also: the cleared object could not be published, and the approval was left exactly as it was. From the **installer**, also: stale transaction state from a run that did not finish | Resolve the named condition. Nothing was deployed. For stale transaction state, inspect `/run/mgo-validate-install` and remove the leftover workspace deliberately |
+| 65 | A precondition failed — dirty tree, wrong branch, stash, operation in progress, wrong remote, service down, remote SHA does not match the approval, not a fast-forward, an unsafe lock or temporary directory, or **the checkout as found cannot be executed by the runtime account** (nothing was fetched, moved or restarted; make the deployed files readable to `mgo` first — §9b). From `clear-approval`, also: the cleared object could not be published, and the approval was left exactly as it was. From the **installer**, also: stale transaction state from a run that did not finish | Resolve the named condition. Nothing was deployed. For stale transaction state, inspect `/run/mgo-validate-install` and remove the leftover workspace deliberately |
 | 70 | The deployment failed and production was restored | Read the reason, fix it, deploy again. Production is where it started |
 | 75 | Another control-plane action holds the lock. `deploy-main`, `restart-api`, `clear-approval` and the installer all contend for it; `show-approval` never does | Wait for the other action to finish and look at what it is doing. Nothing was changed |
-| 78 | The deployment failed **and** the rollback failed | **Stop.** The message names the stage that failed. Do not re-run the gateway; inspect the checkout, the service and the journal by hand |
+| 78 | The deployment failed **and** the rollback failed, or is **INCOMPLETE**: the previous commit and environment are back but the runtime account cannot execute them | **Stop.** The message names the stage that failed. Do not re-run the gateway and do not restart the service; inspect the checkout, the service and the journal by hand. For an incomplete rollback, the restored files must be made readable and executable by `mgo` (compare the Task 14.5B-R repair) before any restart or deployment |
 | 79 | The deployment failed after the restart and rollback was **REFUSED**, because the database no longer records the schema the previous build supports. Nothing was restored, restarted or touched | **Stop and use `docs/Operations.md` §6.2**, the post-schema-advancement recovery procedure. §6.1 is the wrong procedure for this failure and will be undone by re-migration |
 
 The gateway never retries by itself and never loops. One deployment attempt, at
@@ -847,6 +921,10 @@ The suite in `tests/test_deployment_gateway.py` executes the shipped shell
 rather than describing it: it sources `scripts/deploy/mgo-validate` in a real
 Bash process and calls the real functions against temporary directories,
 temporary Git repositories and recorded command doubles.
+`tests/test_deployment_umask_safety.py` (Task 14.5C) drives the whole
+`deploy-main` transaction the same way, from a caller whose umask is `0077`,
+and maps the gateway's fixed production path onto a disposable checkout at
+every seam through which it leaves the process.
 
 `scripts/deploy/update-main.sh` is the one entry point where that approach is
 not safe on its own. The wrapper's whole job is to resolve a fixed host path
