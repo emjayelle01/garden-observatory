@@ -414,10 +414,53 @@ def test_a_template_that_grew_an_install_section_is_refused(tmp_path: Path) -> N
     assert list(units.iterdir()) == []
 
 
+def _with_one_carriage_return(template: str) -> str:
+    """The shipped template, valid in every respect but one: a single CR.
+
+    It sits at the end of the ``Description=`` line, which no structural check
+    anchors. The structural checks run before the carriage-return check and
+    match whole lines, so a template that is CRLF throughout is refused as
+    ``missing [Unit] section`` before the CR check is ever reached -- which is
+    what the earlier form of this fixture did on Linux (Task 14.5E). A fixture
+    that carries two defects cannot say which one a refusal was for.
+    """
+    description = next(
+        line for line in template.splitlines() if line.startswith("Description=")
+    )
+    assert template.count(description + "\n") == 1
+    return template.replace(description + "\n", description + "\r\n")
+
+
 @needs_bash
 def test_a_template_with_carriage_returns_is_refused(tmp_path: Path) -> None:
     """The check is GNU grep's; the MSYS build normalises CRLF before matching,
     so this is provable only on a Linux host -- the Pi validation gate."""
+    if os.name == "nt":
+        pytest.skip("MSYS grep normalises carriage returns; proven on Linux")
+    template = _with_one_carriage_return(TEMPLATE.read_text(encoding="utf-8"))
+    assert template.count("\r") == 1
+    installer = _private_copy(tmp_path, template)
+    units = _units(tmp_path)
+
+    result = _run(
+        installer, "--unit-directory", _posix(units), "--app-root", _app_root(tmp_path)
+    )
+
+    assert result.returncode == 65, result.stdout + result.stderr
+    assert "carriage returns" in result.stderr
+    assert "missing" not in result.stderr
+    assert "is required" not in result.stderr
+    assert list(units.iterdir()) == []
+
+
+@needs_bash
+def test_a_template_that_is_crlf_throughout_is_refused_before_the_cr_check(
+    tmp_path: Path,
+) -> None:
+    """The companion: CRLF on every line is *also* structurally invalid, since
+    ``[Unit]\\r`` is not ``[Unit]``, and structure is checked first. Refused,
+    nothing published, and the refusal names the structure -- so the test above
+    has to isolate the carriage return to prove the CR check at all."""
     if os.name == "nt":
         pytest.skip("MSYS grep normalises carriage returns; proven on Linux")
     template = TEMPLATE.read_text(encoding="utf-8").replace("\n", "\r\n")
@@ -428,8 +471,34 @@ def test_a_template_with_carriage_returns_is_refused(tmp_path: Path) -> None:
         installer, "--unit-directory", _posix(units), "--app-root", _app_root(tmp_path)
     )
 
-    assert result.returncode == 65
-    assert "carriage returns" in result.stderr
+    assert result.returncode == 65, result.stdout + result.stderr
+    assert "missing [Unit] section" in result.stderr
+    assert list(units.iterdir()) == []
+
+
+@needs_bash
+def test_a_template_without_its_unit_section_is_refused_for_its_structure(
+    tmp_path: Path,
+) -> None:
+    """Structural invalidity on its own, with no carriage return anywhere, is
+    refused independently of the CR check -- on every host."""
+    lines = [
+        line
+        for line in TEMPLATE.read_text(encoding="utf-8").splitlines()
+        if line != "[Unit]"
+    ]
+    template = "\n".join(lines) + "\n"
+    assert "\r" not in template
+    installer = _private_copy(tmp_path, template)
+    units = _units(tmp_path)
+
+    result = _run(
+        installer, "--unit-directory", _posix(units), "--app-root", _app_root(tmp_path)
+    )
+
+    assert result.returncode == 65, result.stdout + result.stderr
+    assert "missing [Unit] section" in result.stderr
+    assert "carriage returns" not in result.stderr
     assert list(units.iterdir()) == []
 
 

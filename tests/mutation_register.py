@@ -3588,4 +3588,122 @@ TASK_14_5C_MUTATIONS: tuple[Mutation, ...] = (
     ),
 )
 
-MUTATIONS = MUTATIONS + TASK_14_5_MUTATIONS + TASK_14_5C_MUTATIONS
+# --- Task 14.5E: restart-api asks the runtime account before service control -
+#
+# PR #17 taught deploy-main to ask the runtime account before anything moves,
+# but restart-api still went from "the checkout is the approved commit" to
+# `systemctl restart`. Against the Task 14.5B checkout -- clean, approved and
+# unreadable by mgo -- that would have stopped a serving process and started
+# one that could not import. Each entry below removes, moves, redirects or
+# ignores the preflight, or changes what it reports, and each must be caught by
+# a scenario that drives the shipped action against a real checkout with the
+# service seam recorded.
+
+RESTART_PREFLIGHT_SUITE = "tests/test_deployment_restart_preflight.py"
+
+_RESTART_PREFLIGHT_REFUSAL = (
+    '            "the runtime account cannot read or execute the deployed '
+    'environment; the service was not restarted and is still running the '
+    'process it was found with; the deployed files must be made readable and '
+    'executable by the runtime account before restarting"\n'
+)
+
+_RESTART_PREFLIGHT = (
+    '    require_runtime_can_execute "$MGO_RUNTIME_ACCOUNT" "$MGO_REPOSITORY" \\\n'
+    '        || die "$EX_PRECONDITION" \\\n'
+    + _RESTART_PREFLIGHT_REFUSAL
+)
+
+_RESTART = (
+    '    log "restarting $MGO_SERVICE at $approved"\n'
+    '    restart_service "$MGO_SERVICE"\n'
+)
+
+TASK_14_5E_MUTATIONS: tuple[Mutation, ...] = (
+    Mutation(
+        'restart-preflight-removed',
+        GATEWAY,
+        _RESTART_PREFLIGHT,
+        '    true \\\n'
+        '        || die "$EX_PRECONDITION" \\\n'
+        + _RESTART_PREFLIGHT_REFUSAL,
+        'unreadable_source_is_refused_before_service_control',
+        'restart-api restarts an unreadable checkout: the Task 14.5B shape.',
+        suite=RESTART_PREFLIGHT_SUITE,
+    ),
+    Mutation(
+        'restart-preflight-after-service-control',
+        GATEWAY,
+        _RESTART_PREFLIGHT + '\n' + _RESTART,
+        _RESTART + '\n' + _RESTART_PREFLIGHT,
+        'unreadable_source_is_refused_before_service_control or probe_ru'
+        'ns_after_every_precondition_and_before_the_restart',
+        'The runtime is asked after the service has already been restarted.',
+        suite=RESTART_PREFLIGHT_SUITE,
+    ),
+    Mutation(
+        'restart-preflight-as-admin-account',
+        GATEWAY,
+        _RESTART_PREFLIGHT,
+        _RESTART_PREFLIGHT.replace('"$MGO_RUNTIME_ACCOUNT"', '"$MGO_ADMIN_ACCOUNT"'),
+        'probe_runs_as_the_runtime_account or unreadable_source_is_refused',
+        'The probe asks the account that owns the files, not the one that '
+        'runs them.',
+        suite=RESTART_PREFLIGHT_SUITE,
+    ),
+    Mutation(
+        'restart-preflight-as-root',
+        GATEWAY,
+        _RESTART_PREFLIGHT,
+        _RESTART_PREFLIGHT.replace('"$MGO_RUNTIME_ACCOUNT"', '"root"'),
+        'probe_runs_as_the_runtime_account or unreadable_source_is_refused',
+        'The probe asks root, which can read anything.',
+        suite=RESTART_PREFLIGHT_SUITE,
+    ),
+    Mutation(
+        'restart-preflight-failure-ignored',
+        GATEWAY,
+        _RESTART_PREFLIGHT,
+        _RESTART_PREFLIGHT.replace('|| die "$EX_PRECONDITION" \\', '|| warn \\'),
+        'unreadable_source_is_refused_before_service_control',
+        'The refusal is logged and the restart proceeds.',
+        suite=RESTART_PREFLIGHT_SUITE,
+    ),
+    Mutation(
+        'restart-proceeds-after-failed-preflight',
+        GATEWAY,
+        _RESTART_PREFLIGHT,
+        _RESTART_PREFLIGHT.replace(
+            '|| die "$EX_PRECONDITION" \\',
+            '|| { restart_service "$MGO_SERVICE"; die "$EX_PRECONDITION" \\',
+        ).replace('before restarting"\n', 'before restarting"; }\n'),
+        'unreadable_source_is_refused_before_service_control',
+        'Exit 65 as documented, and the service was restarted anyway.',
+        suite=RESTART_PREFLIGHT_SUITE,
+    ),
+    Mutation(
+        'restart-preflight-exit-status-altered',
+        GATEWAY,
+        _RESTART_PREFLIGHT,
+        _RESTART_PREFLIGHT.replace('"$EX_PRECONDITION"', '"$EX_DEPLOY"'),
+        'unreadable_source_is_refused_before_service_control',
+        'A refused restart reports as a failed and rolled-back deployment.',
+        suite=RESTART_PREFLIGHT_SUITE,
+    ),
+    Mutation(
+        'restart-preflight-bytecode-suppression-removed',
+        GATEWAY,
+        '        "PYTHONDONTWRITEBYTECODE=1" \\\n'
+        '        "$repository/.venv/bin/python" -B -c \\\n'
+        "        'import mgo.core.config, mgo.api.app' \\\n",
+        '        "$repository/.venv/bin/python" -c \\\n'
+        "        'import mgo.core.config, mgo.api.app' \\\n",
+        'probe_runs_as_the_runtime_account_and_writes_no_bytecode',
+        'The restart preflight writes __pycache__ into the deployed tree.',
+        suite=RESTART_PREFLIGHT_SUITE,
+    ),
+)
+
+MUTATIONS = (
+    MUTATIONS + TASK_14_5_MUTATIONS + TASK_14_5C_MUTATIONS + TASK_14_5E_MUTATIONS
+)

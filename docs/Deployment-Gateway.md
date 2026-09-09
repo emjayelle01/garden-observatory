@@ -136,7 +136,7 @@ repository.
 | `show-approval` | Prints the approved SHA on stdout, alone | Anything else |
 | `clear-approval` | Empties the approval file, revoking deployment authority | Installs, replaces or widens an approval; prints the SHA; touches the checkout, service, database, configuration, backups or media |
 | `deploy-main` | Deploys `origin/main` at the approved SHA, transactionally | Deploys any other ref, merges, rebases, resets forward, pushes |
-| `restart-api` | Restarts the service at the already-deployed approved SHA, on **whatever branch is checked out** | Fetches, merges, syncs, starts preview, captures |
+| `restart-api` | Restarts the service at the already-deployed approved SHA, on **whatever branch is checked out**, after proving the runtime account can execute it (§9a) | Fetches, merges, syncs, starts preview, captures; touches the service when the runtime account cannot execute the checkout |
 
 `clear-approval` was added by Task 14.3D, for the manual recovery in
 `docs/Operations.md` §6.2. After a deployment fails past the restart and
@@ -390,8 +390,26 @@ missing module or an unreadable path surfaces as `203/EXEC` or an `ImportError`
 instead of in the deployment.
 
 It is a probe, not a rehearsal: import only. No lifespan is entered, no camera
-is opened, no stream is read and nothing is written. A failed probe takes the
+is opened, no stream is read and nothing is written -- not even bytecode: every
+probe runs the deployed interpreter with `-B` and `PYTHONDONTWRITEBYTECODE=1`,
+so a validation can never leave a `__pycache__` behind at whatever mode the
+moment produced. In `deploy-main` a failed probe of the target takes the
 pre-restart rollback path.
+
+**`restart-api` makes the same probe, at the last point before service
+control (Task 14.5E).** Every other check `restart-api` has is a question to
+Git, and Git tracks only the executable bit: the checkout Task 14.5B left
+behind was the approved commit, clean, on the right branch, tracking the right
+upstream -- and every source in it was `0600`, unreadable by `mgo`. A restart
+would have stopped a process that was serving and started one that could not
+import, with the diagnosis in the journal after the outage. So after the
+approval, the repository preconditions and the unit check, and before the
+`systemctl restart`, the runtime account is asked. A refusal is exit **65**
+with a message that says the service was not restarted and is still running
+the process it was found with. No stop, no restart, no reload, no signal and
+no health wait follow it; the repository, the environment, the configuration,
+the database and the approval are exactly as they were. **A clean Git tree
+does not prove restart safety**, and the gateway no longer takes it as proof.
 
 ## 9b. The publication umask, and runtime readability (Task 14.5C)
 
@@ -881,7 +899,7 @@ adds nothing but a friendlier name and a clear error when the gateway is absent.
 | ---- | ------- | ---------- |
 | 0 | Success. From `clear-approval` specifically, also the **already-clear** outcomes: the approval file was absent, or was already empty. Both are success and neither is a write | Nothing. That is the state `clear-approval` exists to produce |
 | 64 | Bad request — an unsupported action, an extra argument, or a caller who is not root by way of `claude`. Also, for the actions that **require** approval (`show-approval`, `deploy-main`, `restart-api`), an approval file that is missing, empty, malformed or unsafely permissioned. For `clear-approval` a missing or empty approval is exit **0** instead, and 64 means only that the approval *object* is unsafe to clear — a symlink, not a regular file, not root-owned, or group- or world-writable — and nothing was modified | Fix the approval file; the message says which property failed |
-| 65 | A precondition failed — dirty tree, wrong branch, stash, operation in progress, wrong remote, service down, remote SHA does not match the approval, not a fast-forward, an unsafe lock or temporary directory, or **the checkout as found cannot be executed by the runtime account** (nothing was fetched, moved or restarted; make the deployed files readable to `mgo` first — §9b). From `clear-approval`, also: the cleared object could not be published, and the approval was left exactly as it was. From the **installer**, also: stale transaction state from a run that did not finish | Resolve the named condition. Nothing was deployed. For stale transaction state, inspect `/run/mgo-validate-install` and remove the leftover workspace deliberately |
+| 65 | A precondition failed — dirty tree, wrong branch, stash, operation in progress, wrong remote, service down, remote SHA does not match the approval, not a fast-forward, an unsafe lock or temporary directory, or **the checkout as found cannot be executed by the runtime account** (nothing was fetched, moved or restarted; make the deployed files readable to `mgo` first — §9b). From `restart-api`, the same runtime refusal means **the service was not restarted** and is still running the process it was found with (§9a); the approval is untouched. From `clear-approval`, also: the cleared object could not be published, and the approval was left exactly as it was. From the **installer**, also: stale transaction state from a run that did not finish | Resolve the named condition. Nothing was deployed. For stale transaction state, inspect `/run/mgo-validate-install` and remove the leftover workspace deliberately |
 | 70 | The deployment failed and production was restored | Read the reason, fix it, deploy again. Production is where it started |
 | 75 | Another control-plane action holds the lock. `deploy-main`, `restart-api`, `clear-approval` and the installer all contend for it; `show-approval` never does | Wait for the other action to finish and look at what it is doing. Nothing was changed |
 | 78 | The deployment failed **and** the rollback failed, or is **INCOMPLETE**: the previous commit and environment are back but the runtime account cannot execute them | **Stop.** The message names the stage that failed. Do not re-run the gateway and do not restart the service; inspect the checkout, the service and the journal by hand. For an incomplete rollback, the restored files must be made readable and executable by `mgo` (compare the Task 14.5B-R repair) before any restart or deployment |
