@@ -26,6 +26,7 @@ import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1934,7 +1935,57 @@ def test_an_overflowing_configuration_value_mutates_nothing(
 # Expanding it before the absolute test let it through.
 
 
-_TILDE_PATHS = ["~/mgo.toml", "~someone/mgo.toml", "~/deploy/mgo.toml"]
+#: The account named by the ``~user`` form. It does not exist on any host these
+#: tests run on, and must not need to: its home directory is answered below.
+_NAMED_ACCOUNT = "someone"
+
+_TILDE_PATHS = ["~/mgo.toml", f"~{_NAMED_ACCOUNT}/mgo.toml", "~/deploy/mgo.toml"]
+
+
+def _deterministic_homes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Make every ``~`` form expand inside ``tmp_path``, on either platform.
+
+    Task 14.5E. ``~`` is answered by ``HOME`` on POSIX and ``USERPROFILE`` on
+    Windows; both are pointed at a directory under ``tmp_path``, so no test
+    below reads the developer's real home. ``~user`` is where the platforms
+    part company. ``ntpath`` derives it from the current profile -- the
+    profile's parent joined with the name, provided ``USERNAME`` is the
+    profile's own last component -- and never asks whether the account exists.
+    ``posixpath`` asks the account database, and when the name is unknown it
+    returns the value unexpanded, which :meth:`Path.expanduser` turns into
+    ``RuntimeError``. That is why two of these tests failed on Linux and passed
+    on Windows: ``someone`` has no account on the Pi.
+
+    The tests must not depend on a named account existing on the host, so on
+    POSIX the lookup itself is answered here, for exactly the one name the tests
+    use, with a directory under ``tmp_path``. Every other name is refused,
+    which proves no real account is consulted. Nothing here changes what the
+    CLI does: the destructive gate refuses ``~`` forms *before* expanding them,
+    and these tests exist to show that the expansion it declines to perform
+    would have produced an absolute path.
+
+    Returns the directory ``~`` now expands to.
+    """
+    homes = tmp_path / "homes"
+    own = homes / "me"
+    named = homes / _NAMED_ACCOUNT
+    own.mkdir(parents=True)
+    named.mkdir()
+    monkeypatch.setenv("HOME", str(own))
+    monkeypatch.setenv("USERPROFILE", str(own))
+    monkeypatch.setenv("USERNAME", own.name)
+    try:
+        import pwd
+    except ImportError:  # Windows: ``~user`` is derived from USERPROFILE
+        return own
+
+    def getpwnam(name: str) -> Any:
+        if name == _NAMED_ACCOUNT:
+            return SimpleNamespace(pw_dir=str(named))
+        raise KeyError(name)
+
+    monkeypatch.setattr(pwd, "getpwnam", getpwnam)
+    return own
 
 
 @pytest.mark.parametrize("value", _TILDE_PATHS)
@@ -1958,16 +2009,23 @@ def test_a_tilde_configuration_path_is_refused(
 
 @pytest.mark.parametrize("value", _TILDE_PATHS)
 def test_a_tilde_path_would_otherwise_have_expanded_to_an_absolute_one(
-    value: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
     """The defect restated as a fact, so the refusal above cannot be vacuous.
 
     If ``expanduser()`` stopped producing an absolute path on this platform the
     old gate would have refused anyway, and the regression tests would be
-    proving nothing.
+    proving nothing. The expansion is made against homes this test owns, so
+    the fact holds on a host where the named account does not exist.
     """
+    home = _deterministic_homes(monkeypatch, tmp_path)
+
+    expanded = Path(value).expanduser()
+
     assert not Path(value).is_absolute()
-    assert Path(value).expanduser().is_absolute()
+    assert expanded.is_absolute()
+    assert home.parent in expanded.parents
+    assert tmp_path in expanded.parents
 
 
 @pytest.mark.parametrize("value", _TILDE_PATHS)
@@ -1993,6 +2051,7 @@ def test_the_tilde_refusal_does_not_echo_the_supplied_value(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
     """Operator-supplied text, including a home directory, is not repeated."""
+    home = _deterministic_homes(monkeypatch, tmp_path)
     _Deployment(tmp_path, enabled=True)
     monkeypatch.setenv(CONFIG_PATH_ENV, value)
 
@@ -2002,6 +2061,8 @@ def test_the_tilde_refusal_does_not_echo_the_supplied_value(
     assert value not in err.getvalue()
     assert str(Path(value).expanduser()) not in err.getvalue()
     assert str(Path.home()) not in err.getvalue()
+    assert str(home) not in err.getvalue()
+    assert _NAMED_ACCOUNT not in err.getvalue()
 
 
 def test_a_literal_absolute_path_still_executes(
@@ -2027,21 +2088,24 @@ def test_a_literal_absolute_path_still_executes(
 
 
 def test_the_general_resolver_still_expands_a_tilde(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``resolve_config_path`` is untouched: the stricter rule is CLI-only.
 
     The application at large may keep expanding ``~``; it is only the
-    destructive gate that needs an identity it cannot reinterpret.
+    destructive gate that needs an identity it cannot reinterpret. The home it
+    expands to is one this test owns.
     """
     from mgo.core.config import resolve_config_path
 
+    home = _deterministic_homes(monkeypatch, tmp_path)
     monkeypatch.setenv(CONFIG_PATH_ENV, "~/mgo.toml")
 
     resolved = resolve_config_path()
 
     assert resolved.is_absolute()
     assert "~" not in str(resolved)
+    assert resolved == (home / "mgo.toml").resolve()
     assert resolved == (Path.home() / "mgo.toml").resolve()
 
 

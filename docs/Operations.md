@@ -923,10 +923,58 @@ contract it establishes is what an operator should now expect:
   own; an incomplete rollback is an operator decision, made with the evidence
   the gateway left in place.
 
-Until the corrected gateway is reviewed, merged and installed on `mgo-core`,
-the Task 14.5B deployment must not be retried: the installed gateway still
-inherits the caller's umask and still cannot tell a restored checkout from a
-runnable one.
+Task 14.5C was proven on native Linux and merged as PR #17 on 2026-09-08
+(`eecc4286…`). Until that gateway is installed on `mgo-core` under its own
+authority, the Task 14.5B deployment must not be retried: the *installed*
+gateway still inherits the caller's umask and still cannot tell a restored
+checkout from a runnable one.
+
+## 5.9 `restart-api` validates the runtime before service control (Task 14.5E)
+
+The native-Linux review of PR #17 found one gap it had not closed:
+`restart-api` had no runtime preflight. Its preconditions -- approved SHA,
+named branch, clean tree, no stash, no operation in progress, one worktree,
+the right upstream at the same SHA -- are all questions to Git, and the Task
+14.5B checkout answered every one of them correctly while being unreadable by
+`mgo`. A `restart-api` against it would have stopped a serving process and
+started one that could not import.
+
+Task 14.5E closes that gap in `scripts/deploy/mgo-validate` (see
+`docs/Deployment-Gateway.md` §9a). What an operator should now expect:
+
+- **`restart-api` asks the runtime account first.** After the approval, the
+  repository preconditions and the unit check, and immediately before
+  `systemctl restart`, the gateway runs the same import probe `deploy-main`
+  makes: as `mgo`, with the deployed interpreter, the production configuration
+  selected, `-B` and `PYTHONDONTWRITEBYTECODE=1`, importing `mgo.core.config`
+  and `mgo.api.app` and starting nothing.
+- **A failed preflight leaves the service running.** Exit **65**, and the
+  message says the service was not restarted and is still running the process
+  it was found with. No stop, restart, reload or signal was issued and no
+  health wait ran. Repository, environment, configuration, database and
+  approval are untouched. Repair the modes deliberately and itemised, as Task
+  14.5B-R did, then restart again.
+- **A clean Git tree still proves nothing about restart safety.** `git status`
+  was empty throughout the incident. Only the runtime account's own import
+  answers the question, and the gateway now asks it on both privileged paths.
+- **Validation still writes no bytecode.** The restart preflight leaves no
+  `__pycache__` behind, at any mode.
+
+Task 14.5E also hardened the validation infrastructure the review ran on:
+the two retention CLI tilde tests use test-owned home directories and answer
+the `~user` lookup themselves, so they no longer need a named account to exist
+on the host; the installer's carriage-return test now carries exactly one CR,
+on a line no structural check anchors, with companions proving the structural
+refusal independently; and the mutation runner gives every candidate its own
+bytecode cache (`-B`, `PYTHONDONTWRITEBYTECODE=1` and a fresh
+`PYTHONPYCACHEPREFIX` per candidate), so two same-length mutations of one
+source inside one second can no longer share stale bytecode and report a
+survivor for code that was never run.
+
+**Production alignment remains a separate task.** Nothing in Task 14.5E
+installs a gateway, sets or clears an approval, or retries the Task 14.5B
+deployment; the installed gateway on `mgo-core` is still the pre-PR #17 one
+until an authorised alignment replaces it.
 
 ## 6. Restore: the deliberate boundary
 

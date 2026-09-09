@@ -534,7 +534,11 @@ class Deployment:
         path = self.checkout / relative
         if UMASK_ENFORCED:
             path.chmod(0o600)
-        with (self.ledger / "modes").open("a", encoding="utf-8") as ledger:
+        # LF explicitly: the ledger is read by Bash, and on Windows a text-mode
+        # newline would ride a CR into the mode field (Task 14.5E).
+        with (self.ledger / "modes").open(
+            "a", encoding="utf-8", newline="\n"
+        ) as ledger:
             ledger.write(f"{_posix(path)} 600\n")
 
     def run(

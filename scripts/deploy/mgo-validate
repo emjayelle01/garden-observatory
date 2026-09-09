@@ -2001,6 +2001,21 @@ action_restart_api() {
     systemctl cat "$MGO_SERVICE" >/dev/null 2>&1 \
         || die "$EX_PRECONDITION" "the service unit is not installed"
 
+    # The last point before service control (Task 14.5E). Every check above
+    # is a question to Git, and Git tracks only the executable bit: the
+    # checkout Task 14.5B left behind was the approved commit, clean, on the
+    # right branch -- and every source in it was 0600, unreadable by the
+    # account that runs it. A restart here would have stopped a service that
+    # was serving and started one that could not import, with the diagnosis
+    # in the journal after the outage. So the runtime account is asked
+    # first, with the same bytecode-free import probe deploy-main makes, and
+    # a refusal leaves the service exactly as it was found: no stop, no
+    # restart, no signal, no health wait. Nothing below can be reached
+    # without this answer.
+    require_runtime_can_execute "$MGO_RUNTIME_ACCOUNT" "$MGO_REPOSITORY" \
+        || die "$EX_PRECONDITION" \
+            "the runtime account cannot read or execute the deployed environment; the service was not restarted and is still running the process it was found with; the deployed files must be made readable and executable by the runtime account before restarting"
+
     log "restarting $MGO_SERVICE at $approved"
     restart_service "$MGO_SERVICE"
 
