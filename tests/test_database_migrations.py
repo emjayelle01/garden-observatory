@@ -118,7 +118,7 @@ def test_new_database_migrates_to_the_current_schema(tmp_path: Path) -> None:
 
     applied = apply_migrations(database_path)
 
-    assert applied == [1, 2, 3]
+    assert applied == [1, 2, 3, 4]
     assert read_schema_version(database_path) == CURRENT_SCHEMA_VERSION
 
 
@@ -135,11 +135,15 @@ def test_migration_creates_the_expected_tables_and_indexes(
         "observations",
         "captures",
         "capture_media_lifecycle",
+        "recognition_jobs",
+        "recognition_results",
     } <= _tables(database_path)
     indexes = _objects(database_path, "index")
     assert indexes >= _OBSERVATION_INDEXES
     assert "idx_captures_captured_at_utc" in indexes
     assert "idx_capture_media_lifecycle_state" in indexes
+    assert "idx_recognition_jobs_due" in indexes
+    assert "idx_recognition_jobs_lease" in indexes
 
 
 def test_current_schema_version_is_recorded(tmp_path: Path) -> None:
@@ -154,10 +158,11 @@ def test_current_schema_version_is_recorded(tmp_path: Path) -> None:
             "ORDER BY version"
         ).fetchall()
 
-    assert [int(row["version"]) for row in rows] == [1, 2, 3]
+    assert [int(row["version"]) for row in rows] == [1, 2, 3, 4]
     assert str(rows[0]["name"]) == "001_initial_observation_engine.sql"
     assert str(rows[1]["name"]) == "002_capture_archive.sql"
     assert str(rows[2]["name"]) == "003_capture_media_lifecycle.sql"
+    assert str(rows[3]["name"]) == "004_recognition_jobs.sql"
     assert all(str(row["applied_at"]) for row in rows)
 
 
@@ -186,7 +191,7 @@ def test_migration_is_idempotent(tmp_path: Path) -> None:
     second = apply_migrations(database_path)
     third = apply_migrations(database_path)
 
-    assert first == [1, 2, 3]
+    assert first == [1, 2, 3, 4]
     assert second == []
     assert third == []
     assert _tables(database_path) == before
@@ -245,8 +250,8 @@ def test_unversioned_legacy_database_is_adopted_without_data_loss(
 
     applied = apply_migrations(database_path)
 
-    # Version 1 was adopted (not re-run); 2 and 3 were actually applied.
-    assert applied == [2, 3]
+    # Version 1 was adopted (not re-run); 2, 3 and 4 were actually applied.
+    assert applied == [2, 3, 4]
     assert read_schema_version(database_path) == CURRENT_SCHEMA_VERSION
     after = list_observations(database_path)
     assert after == before
@@ -257,7 +262,7 @@ def test_unversioned_legacy_database_is_adopted_without_data_loss(
 def test_unversioned_version_two_database_is_adopted_then_migrated(
     tmp_path: Path,
 ) -> None:
-    """An unversioned version-2 database adopts at 2, then migrates to 3.
+    """An unversioned version-2 database adopts at 2, then migrates onward.
 
     This is the shape a real pre-Task-14.1 deployment presents, and it is the
     reason migration 003 adds a *new table* rather than a column on ``captures``:
@@ -275,8 +280,8 @@ def test_unversioned_version_two_database_is_adopted_then_migrated(
 
     applied = apply_migrations(database_path)
 
-    assert applied == [3]
-    assert read_schema_version(database_path) == 3
+    assert applied == [3, 4]
+    assert read_schema_version(database_path) == 4
     assert len(list_observations(database_path)) == 1
     assert "capture_media_lifecycle" in _tables(database_path)
 
@@ -284,28 +289,29 @@ def test_unversioned_version_two_database_is_adopted_then_migrated(
 def test_fully_unversioned_current_schema_is_adopted_at_the_top_version(
     tmp_path: Path,
 ) -> None:
-    """An unversioned database with all three tables adopts version 3 directly.
+    """An unversioned database with every current table adopts the top version.
 
     Nothing is executed against it: the tables already exist, so adoption only
     writes the missing history rows.
     """
-    database_path = tmp_path / "legacy-v3.db"
+    database_path = tmp_path / "legacy-v4.db"
     with database_connection(database_path) as connection:
         for name in (
             "001_initial_observation_engine",
             "002_capture_archive",
             "003_capture_media_lifecycle",
+            "004_recognition_jobs",
         ):
             connection.executescript(
                 (MIGRATIONS_DIRECTORY / f"{name}.sql").read_text(encoding="utf-8")
             )
         connection.execute("DROP TABLE schema_migrations")
-        _write_legacy_observation(connection, "legacy-3")
+        _write_legacy_observation(connection, "legacy-4")
 
     applied = apply_migrations(database_path)
 
     assert applied == []
-    assert read_schema_version(database_path) == 3
+    assert read_schema_version(database_path) == 4
     assert len(list_observations(database_path)) == 1
 
 
@@ -501,7 +507,11 @@ def test_failed_migration_preserves_existing_observations(
     (directory / "002_broken.sql").rename(
         directory / f"{CURRENT_SCHEMA_VERSION + 1:03d}_broken.sql"
     )
-    for name in ("002_capture_archive", "003_capture_media_lifecycle"):
+    for name in (
+        "002_capture_archive",
+        "003_capture_media_lifecycle",
+        "004_recognition_jobs",
+    ):
         (directory / f"{name}.sql").write_text(
             (MIGRATIONS_DIRECTORY / f"{name}.sql").read_text(encoding="utf-8"),
             encoding="utf-8",
@@ -565,7 +575,7 @@ def test_in_memory_database_is_handled_explicitly(tmp_path: Path) -> None:
 
     # The migration runner works against it, but it is per-connection and
     # transient, so it can never be opened read-only for a health check.
-    assert apply_migrations(memory_path) == [1, 2, 3]
+    assert apply_migrations(memory_path) == [1, 2, 3, 4]
     with pytest.raises(DatabaseError):
         connect_readonly(memory_path)
 
@@ -850,14 +860,15 @@ def test_a_canonical_unversioned_version_three_database_is_adopted(
 
     This is the control for the rejection cases below: without it they would
     only prove that the verifier refuses things, not that it still recognises
-    the schema it is meant to recognise.
+    the schema it is meant to recognise. Adopted at version 3, the database
+    then receives migration 004 like any other version-3 database.
     """
     database_path = _unversioned_v3(tmp_path, _CANONICAL_LIFECYCLE, "canonical")
 
     applied = apply_migrations(database_path)
 
-    assert applied == []
-    assert read_schema_version(database_path) == 3
+    assert applied == [4]
+    assert read_schema_version(database_path) == 4
     assert len(list_observations(database_path)) == 1
 
 

@@ -35,6 +35,7 @@ import mgo.retention.cli as cli
 import mgo.retention.service as service_module
 from mgo.core.config import CONFIG_PATH_ENV
 from mgo.core.database import (
+    CURRENT_SCHEMA_VERSION,
     MIGRATIONS_DIRECTORY,
     apply_migrations,
     database_connection,
@@ -520,11 +521,12 @@ def test_a_higher_schema_is_refused(
 ) -> None:
     """A database from a newer build is refused rather than acted on."""
     deployment = _Deployment(tmp_path, enabled=True)
+    future = CURRENT_SCHEMA_VERSION + 1
     with database_connection(deployment.database_path) as connection:
         connection.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) "
-            "VALUES (4, '004_from_the_future.sql', ?)",
-            (NOW.isoformat(),),
+            "VALUES (?, ?, ?)",
+            (future, f"{future:03d}_from_the_future.sql", NOW.isoformat()),
         )
 
     code, _, _ = _run(deployment, command, monkeypatch)

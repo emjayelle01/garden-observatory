@@ -177,8 +177,8 @@ endpoint predates Task 8 and its contract is unchanged.
   "database": {
     "status": "healthy",
     "accessible": true,
-    "schema_version": 3,
-    "expected_schema_version": 3,
+    "schema_version": 4,
+    "expected_schema_version": 4,
     "migration_status": "current",
     "integrity": "ok"
   },

@@ -43,6 +43,7 @@ The schema is versioned by **ordered, numbered SQL files** under `migrations/`:
 migrations/001_initial_observation_engine.sql
 migrations/002_capture_archive.sql
 migrations/003_capture_media_lifecycle.sql
+migrations/004_recognition_jobs.sql
 ```
 
 A file's version is the integer prefix of its name. Migrations are applied in
@@ -57,7 +58,7 @@ ascending version order, and each one that runs writes a row into the
 
 The database's **schema version** is simply `MAX(version)` from that table. The
 application's expected version is the constant
-`mgo.core.database.CURRENT_SCHEMA_VERSION`, currently **3**. A test asserts the
+`mgo.core.database.CURRENT_SCHEMA_VERSION`, currently **4**. A test asserts the
 constant stays in step with the migration files, so a new migration cannot land
 without moving the application's notion of "current".
 
@@ -154,8 +155,29 @@ database unrecognisable.
 means the media is present; a `deleted` row means the media was reclaimed while
 the capture record remains. See [`docs/Retention.md`](Retention.md).
 
-That is the entire schema. Tables for events, detections, sightings and reviews
-are **not** created in advance: each arrives with the task that implements it.
+Migration **004** (Task 15.1) adds the model-independent recognition queue:
+
+- `recognition_jobs` — one row per `(capture_id, pipeline_version)`, enforced by
+  `UNIQUE`; `capture_id` is `NOT NULL` and `REFERENCES captures(id)`; `CHECK`
+  constraints enforce the job-state and error-category vocabularies, lease and
+  finish-time coherence, attempt bounds, and a single UTC timestamp layout for
+  the columns the claim path compares
+- `recognition_results` — at most one row per job (`job_id` `UNIQUE`,
+  `REFERENCES recognition_jobs(id)`), with the outcome vocabulary and paired,
+  nullable model provenance
+- indexes on `(pipeline_version, state, next_attempt_at)` and
+  `(pipeline_version, state, lease_expires_at)` for the two claim paths
+
+Migration 004 is additive in the same way as 003: plain `CREATE TABLE`, and no
+existing table or index is altered. Legacy adoption verifies both recognition
+tables' keys, `NOT NULL` columns, foreign keys and safety-critical `CHECK` and
+`UNIQUE` constraints. Recognition connections carry a SQLite authorizer that
+denies writes to every other table. See [`docs/Recognition.md`](Recognition.md),
+including why a schema-4 database is refused by every schema-3 build.
+
+That is the entire schema. Tables for detections, candidates, sightings,
+reviews, encounters and notifications are **not** created in advance: each
+arrives with the task that implements it.
 
 ### When migrations run
 
@@ -361,8 +383,8 @@ top-level `status`:
   "database": {
     "status": "healthy",
     "accessible": true,
-    "schema_version": 3,
-    "expected_schema_version": 3,
+    "schema_version": 4,
+    "expected_schema_version": 4,
     "migration_status": "current",
     "integrity": "ok"
   },
@@ -385,13 +407,13 @@ The full result, following the same read-only pattern as `/camera/status`,
   "status": "healthy",
   "accessible": true,
   "database": "mgo.db",
-  "schema_version": 3,
-  "expected_schema_version": 3,
+  "schema_version": 4,
+  "expected_schema_version": 4,
   "migration_status": "current",
   "journal_mode": "wal",
   "foreign_keys": true,
   "integrity": "ok",
-  "detail": "Database is at schema version 3 with wal journalling and foreign keys enforced.",
+  "detail": "Database is at schema version 4 with wal journalling and foreign keys enforced.",
   "checked_at": "2026-07-27T10:00:00+00:00"
 }
 ```
