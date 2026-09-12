@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 import mgo.core.database as database_module
-from mgo.core.config import StorageConfig, load_config
+from mgo.core.config import PROJECT_ROOT, StorageConfig, load_config
 from mgo.core.database import (
     CURRENT_SCHEMA_VERSION,
     MIGRATIONS_DIRECTORY,
@@ -339,8 +339,11 @@ def test_the_previous_release_health_check_reports_the_database_ahead(
     """The schema-3 build's health check names the problem instead of guessing."""
     database_path = _populated_schema_three(tmp_path)
     apply_migrations(database_path)
+    # The tracked repository configuration by explicit path: bare load_config()
+    # honours MGO_CONFIG_PATH, so this test would otherwise inherit whatever
+    # configuration the developer's environment happens to select.
     config = replace(
-        load_config(),
+        load_config(PROJECT_ROOT / "config" / "mgo.toml"),
         storage=StorageConfig(
             data_directory=database_path.parent,
             log_directory=database_path.parent / "logs",
@@ -592,14 +595,28 @@ def test_a_job_cannot_be_removed_from_under_its_capture(database: Path) -> None:
         ("zulu timestamp", {"next_attempt_at": "2026-09-11T12:00:00.000000Z"}),
         ("second-precision timestamp", {"created_at": "2026-09-11T12:00:00+00:00"}),
         ("non-UTC offset", {"next_attempt_at": "2026-09-11T14:00:00.000000+02:00"}),
+        # A BLOB matches the GLOB pattern but sorts after every text value, so
+        # the claim path would never see it as due: the type is bounded too.
+        ("blob timestamp", {"next_attempt_at": sqlite3.Binary(STAMP.encode())}),
+        # length() stops at a NUL, so the shape check alone cannot see the
+        # bytes after it; the byte length is bounded as well. Both a compared
+        # column and a recorded one are covered: the claim path reads
+        # next_attempt_at as text, so its bound is the load-bearing one.
+        ("nul-suffixed retry time", {"next_attempt_at": STAMP + "\x00 and more"}),
+        ("nul-suffixed creation time", {"created_at": STAMP + "\x00 and more"}),
     ],
 )
 def test_an_incoherent_job_row_is_refused(
     database: Path, label: str, overrides: dict[str, object]
 ) -> None:
-    """Each variant breaks exactly one invariant the schema enforces itself."""
+    """Each variant breaks exactly one invariant the schema enforces itself.
+
+    ``match`` matters: every variant here must fail a ``CHECK``, so a future
+    DDL edit that made one refuse for a different reason -- ``NOT NULL``, a
+    foreign key, uniqueness -- would no longer prove what this test claims.
+    """
     with (
-        pytest.raises(sqlite3.IntegrityError),
+        pytest.raises(sqlite3.IntegrityError, match="CHECK"),
         database_connection(database) as connection,
     ):
         _insert_job(connection, **overrides)
@@ -705,7 +722,7 @@ def test_an_incoherent_result_row_is_refused(
     database: Path, label: str, overrides: dict[str, object]
 ) -> None:
     with (
-        pytest.raises(sqlite3.IntegrityError),
+        pytest.raises(sqlite3.IntegrityError, match="CHECK"),
         database_connection(database) as connection,
     ):
         _insert_result(connection, _succeeded_job(connection), **overrides)
@@ -785,8 +802,7 @@ def _canonical_004() -> str:
         ),
         pytest.param(
             "no failure-reason rule",
-            "CHECK (state NOT IN ('failed', 'skipped') "
-            "OR error_category IS NOT NULL)",
+            "CHECK (state NOT IN ('failed', 'skipped') OR error_category IS NOT NULL)",
             "CHECK (1)",
             id="no-failure-reason-rule",
         ),
@@ -807,6 +823,13 @@ def _canonical_004() -> str:
             "(state <> 'running' AND lease_owner IS NULL AND lease_expires_at IS NULL)",
             "(state <> 'running')",
             id="no-lease-coherence",
+        ),
+        pytest.param(
+            "no result integer bounds",
+            "CHECK (image_width IS NULL OR (typeof(image_width) = 'integer'"
+            " AND image_width > 0))",
+            "CHECK (1)",
+            id="no-result-integer-bounds",
         ),
     ],
 )

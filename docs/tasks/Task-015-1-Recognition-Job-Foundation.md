@@ -189,10 +189,12 @@ inspected, to confirm it dies for the intended reason rather than incidentally.
   The fixture now uses `CURRENT_SCHEMA_VERSION + 1`, so it cannot go stale
   again; the register's `the-schema-gate-accepts-any-version` mutation, which
   selects on that test, is still detected.
-- **Kept as specified, recorded as an open decision:** a job run while
+- **Kept as specified, and since approved in Task 15.1A:** a job run while
   retention holds a `pending_delete` intent is skipped; if retention later
-  cancels that intent the capture is not requeued automatically
-  (`docs/Recognition.md` §10).
+  cancels that intent the capture is not requeued automatically, terminal job
+  history stays immutable, and reprocessing is an explicit action or a new
+  pipeline version (`docs/Recognition.md` §10). Task 15.1A added the regression
+  test and the mutation entry that pin it.
 - **Existing gap outside scope, not changed:** retention's own metadata decoder
   (`mgo.retention.repository._parse_origin`) catches only `JSONDecodeError`, so
   the same pathological metadata ends a retention run through the service's

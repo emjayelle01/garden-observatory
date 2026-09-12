@@ -3721,6 +3721,7 @@ TASK_14_5E_MUTATIONS: tuple[Mutation, ...] = (
 
 MIGRATION_004 = "migrations/004_recognition_jobs.sql"
 RECOGNITION_ELIGIBILITY = "src/mgo/recognition/eligibility.py"
+RECOGNITION_RECONCILER = "src/mgo/recognition/reconciler.py"
 RECOGNITION_REPOSITORY = "src/mgo/recognition/repository.py"
 RECOGNITION_RUNNER = "src/mgo/recognition/runner.py"
 RECOGNITION_MODELS = "src/mgo/recognition/models.py"
@@ -4061,6 +4062,93 @@ TASK_15_1_MUTATIONS: tuple[Mutation, ...] = (
         'recognition_connections_cannot_write_capture_tables',
         'A recognition change can alter the catalogue it only ever reads.',
         suite=RECOGNITION_JOBS_SUITE,
+    ),
+    # --- Task 15.1A: the two approved decisions ------------------------------
+    #
+    # Both were approved rather than changed, so each now has a guard and a
+    # mutation: the watermark must be *supplied* (not merely compared), and a
+    # terminal job must stay terminal.
+    Mutation(
+        'recognition-watermark-acquires-a-default',
+        RECOGNITION_RECONCILER,
+        '        enrolment_watermark: datetime,',
+        '        enrolment_watermark: datetime = datetime.fromisoformat(\n'
+        '            "1970-01-01T00:00:00+00:00"\n'
+        '        ),',
+        'the_enrolment_watermark_must_be_supplied '
+        'or a_reconciler_without_a_watermark_cannot_be_built',
+        'Every historic capture is enrolled the first time reconciliation runs.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-rules-accept-a-naive-watermark',
+        RECOGNITION_ELIGIBILITY,
+        '    if enrolment_watermark.tzinfo is None:',
+        '    if False:',
+        'naive_watermark_is_refused_by_the_rules_directly',
+        'A direct caller gets a raw TypeError instead of a refusal.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-terminal-jobs-stop-blocking-re-enrolment',
+        RECOGNITION_REPOSITORY,
+        '        WHERE j.capture_id = c.id',
+        "        WHERE j.capture_id = c.id AND j.state IN ('pending', 'running')",
+        'cancelled_deletion_intent_does_not_reopen_a_skipped_job',
+        'A skipped or failed capture is silently requeued, rewriting history.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'recognition-unreadable-media-arm-narrowed',
+        RECOGNITION_ELIGIBILITY,
+        '    except (OSError, ValueError) as exc:',
+        '    except OSError as exc:',
+        'media_the_host_will_not_describe_is_ineligible',
+        'A path the platform will not describe aborts the whole pass.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-claim-keeps-the-previous-attempts-error',
+        RECOGNITION_REPOSITORY,
+        '        started_at = :now, error_category = NULL',
+        '        started_at = :now',
+        'reclaimed_job_does_not_carry_the_previous_attempt',
+        'A job running normally reports the error of its last failed attempt.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'adoption-stops-requiring-result-integer-bounds',
+        DATABASE,
+        "                for column in (\"image_width\", \"image_height\")",
+        "                for column in ()",
+        'unversioned_schema_four_table_without_its_guarantees_is_refused',
+        'A legacy results table is adopted and then accepts a negative size.',
+        suite=RECOGNITION_SCHEMA_SUITE,
+    ),
+    # The two halves of the timestamp hardening are registered separately,
+    # because each refuses a different escape: ``typeof`` refuses a BLOB that
+    # matches the shape, and the byte length refuses a NUL-padded value whose
+    # ``length()`` still reads 32. Removing one leaves the other standing, so a
+    # single entry over both would have been an equivalent mutant -- proven,
+    # when the length-only entry first survived.
+    Mutation(
+        'migration-004-timestamp-length-unbounded',
+        MIGRATION_004,
+        '            AND length(CAST(next_attempt_at AS BLOB)) = 32',
+        '            AND 1 = 1',
+        'incoherent_job_row_is_refused',
+        'A NUL-padded retry time is stored, and never comes due.',
+        suite=RECOGNITION_SCHEMA_SUITE,
+    ),
+    Mutation(
+        'migration-004-timestamp-type-unbounded',
+        MIGRATION_004,
+        "        CHECK (next_attempt_at IS NULL OR (typeof(next_attempt_at) = 'text'",
+        '        CHECK (next_attempt_at IS NULL OR (1 = 1',
+        'incoherent_job_row_is_refused',
+        'A BLOB retry time is stored, sorts after every text value and never '
+        'comes due.',
+        suite=RECOGNITION_SCHEMA_SUITE,
     ),
 )
 

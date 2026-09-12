@@ -37,7 +37,10 @@ from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 
-from mgo.recognition.models import RecognitionErrorCategory
+from mgo.recognition.models import (
+    RecognitionConfigurationError,
+    RecognitionErrorCategory,
+)
 from mgo.retention.models import RetentionErrorCategory
 from mgo.retention.policy import MANAGED_ORIGIN
 from mgo.retention.service import validate_media_file, validate_media_path
@@ -232,6 +235,15 @@ def evaluate_eligibility(
     Task 13.2 evidence -- are not backfilled by accident; enrolling them is a
     later, explicit operator decision made by supplying an earlier watermark.
     """
+    if enrolment_watermark.tzinfo is None:
+        # The reconciler already refuses this when it is built. A direct caller
+        # must not get past it either: the comparison below would raise
+        # TypeError rather than refuse the row, which is fail-closed but not a
+        # refusal anything can report. There is deliberately no default value.
+        raise RecognitionConfigurationError(
+            "The recognition enrolment watermark must be timezone-aware"
+        )
+
     metadata = _decode_metadata(capture.extra_metadata)
     if metadata is None:
         return IneligibilityReason.MALFORMED_METADATA

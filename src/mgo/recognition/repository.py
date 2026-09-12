@@ -186,7 +186,7 @@ _CLAIM_SQL = """
     UPDATE recognition_jobs
     SET state = 'running', attempt_count = attempt_count + 1,
         lease_owner = :lease_owner, lease_expires_at = :lease_expires_at,
-        started_at = :now
+        started_at = :now, error_category = NULL
     WHERE id = :id AND state = :observed_state
       AND attempt_count = :observed_attempts
 """

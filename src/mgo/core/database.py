@@ -98,6 +98,25 @@ _RECOGNITION_TIMESTAMP_GLOB = (
     ":[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'"
 )
 
+
+def _recognition_timestamp_check(column: str, *, nullable: bool) -> str:
+    """Return the normalised ``CHECK`` migration 004 puts on one timestamp.
+
+    The shape alone is not enough, which is why the type and the byte length
+    are bounded with it: a BLOB carrying the same characters matches the GLOB
+    but compares *after* every text value, and a NUL byte hides whatever
+    follows it from ``length()``. Either would break the claim path, which
+    compares these columns as text.
+    """
+    body = (
+        f"typeof({column})='text'andlength(cast({column}asblob))=32"
+        f"and{column}{_RECOGNITION_TIMESTAMP_GLOB}"
+    )
+    if nullable:
+        return f"check({column}isnullor({body}))"
+    return f"check({body})"
+
+
 @dataclass(frozen=True)
 class _TableShape:
     """What an unversioned table must look like before it may be adopted.
@@ -257,11 +276,11 @@ _VERSION_TABLE_SHAPES: dict[str, _TableShape] = {
             "attempt_count<max_attempts))",
             "check(state<>'succeeded'orerror_categoryisnull)",
             "check(statenotin('failed','skipped')orerror_categoryisnotnull)",
-            "next_attempt_atisnullornext_attempt_at" + _RECOGNITION_TIMESTAMP_GLOB,
-            "lease_expires_atisnullorlease_expires_at" + _RECOGNITION_TIMESTAMP_GLOB,
-            "check(created_at" + _RECOGNITION_TIMESTAMP_GLOB + ")",
-            "started_atisnullorstarted_at" + _RECOGNITION_TIMESTAMP_GLOB,
-            "finished_atisnullorfinished_at" + _RECOGNITION_TIMESTAMP_GLOB,
+            _recognition_timestamp_check("next_attempt_at", nullable=True),
+            _recognition_timestamp_check("lease_expires_at", nullable=True),
+            _recognition_timestamp_check("created_at", nullable=False),
+            _recognition_timestamp_check("started_at", nullable=True),
+            _recognition_timestamp_check("finished_at", nullable=True),
         ),
     ),
     "recognition_results": _TableShape(
@@ -309,7 +328,18 @@ _VERSION_TABLE_SHAPES: dict[str, _TableShape] = {
                     "label_set_sha256",
                 )
             ),
-            "check(created_at" + _RECOGNITION_TIMESTAMP_GLOB + ")",
+            _recognition_timestamp_check("created_at", nullable=False),
+            # The integer bounds, which the jobs table also declares. Without
+            # these a legacy results table would be adopted and then accept a
+            # fractional duration, a textual byte count or a negative size.
+            *(
+                f"check({column}isnullor(typeof({column})='integer'and{column}>=0))"
+                for column in ("inference_duration_ms", "peak_rss_bytes", "cpu_time_ms")
+            ),
+            *(
+                f"check({column}isnullor(typeof({column})='integer'and{column}>0))"
+                for column in ("image_width", "image_height")
+            ),
         ),
     ),
 }

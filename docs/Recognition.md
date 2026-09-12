@@ -96,6 +96,13 @@ configuration for it yet. Captures before it are not queued. The boundary is
 inclusive, and it is compared as an instant (stored offsets are converted), not
 as text.
 
+**Approved in Task 15.1A.** Both the reconciler and the eligibility rules refuse
+a naive watermark, and a test pins the *absence* of a default on both APIs: a
+default — the epoch, the earliest capture, "now" — would silently enrol all of
+history the first time reconciliation ran. Where the production value comes from
+is a later worker/deployment decision, and this task defines no configuration
+key for it.
+
 This is what stops the first run from silently backfilling history — including
 the protected Task 13.2 evidence (17 motion rows from before the watermark).
 Enrolling earlier captures is a future, explicit operator decision made by
@@ -131,15 +138,34 @@ versions, inference duration, peak RSS, CPU time, image width and height,
 Provenance is nullable field by field — the fake adapter and not-yet-existing
 pipeline stages cannot honestly supply it — but identities and digests are
 **paired** by `CHECK`, digests must be 64 lowercase hex characters, and the
-schema can hold complete provenance later. A failed, skipped or superseded job
-has no result; "the model crashed" can never be counted as "no bird".
+schema can hold complete provenance later. "The model crashed" can never be
+counted as "no bird", because a failure carries a category and no result.
 
 The database enforces, rather than trusts: both vocabularies, the error
-vocabulary, one job per `(capture_id, pipeline_version)`, one result per job,
-foreign keys, a lease existing exactly while `running`, a finish time exactly on
-terminal states, a pending job having a retry time and an attempt left, success
-carrying no error, failure and skip always carrying one, integer attempt counts
-within `max_attempts`, bounded identifier lengths, and a single timestamp layout.
+vocabulary, one job per `(capture_id, pipeline_version)`, **at most one** result
+per job, foreign keys, a lease existing exactly while `running`, a finish time
+exactly on terminal states, a pending job having a retry time and an attempt
+left, success carrying no error, failure and skip always carrying one, integer
+attempt counts within `max_attempts`, bounded identifier lengths, and a single
+timestamp layout of one fixed 32-byte text shape.
+
+Two limits of that enforcement are worth stating plainly rather than leaving to
+be discovered:
+
+- **"a result only for a succeeded job" is not a database property.** No
+  `CHECK` can span two tables, and there is no trigger. What holds it is that
+  `complete_success` is the only writer of `recognition_results`: it inserts the
+  result and sets `succeeded` in one transaction, under an owned claim, so
+  neither can exist without the other. Direct SQL could attach a result to a
+  `failed` job; nothing in the application does. A later reprocessing campaign
+  that marks a previously succeeded job `superseded` will legitimately leave a
+  result behind a non-succeeded job, and that task must decide whether the
+  result is re-pointed, kept as history, or removed.
+- **the foreign keys hold only while `PRAGMA foreign_keys` is on.** Every
+  recognition connection sets it (`connect_database`), so the application cannot
+  orphan a job. The bare `sqlite3` CLI defaults it *off*: this database must not
+  be hand-edited with the CLI, and `PRAGMA foreign_key_check` is the way to
+  confirm nothing has been.
 
 ## 5. Pipeline-version idempotency
 
@@ -264,9 +290,10 @@ transaction, and closes:
 No transaction is ever open while the adapter runs; a test opens a second
 connection with a zero busy timeout inside the adapter and takes the write lock
 immediately. The success update and the result insert share one transaction, so
-a reader never sees a succeeded job without its result, nor a result for a job
-that did not succeed; a fault injected into the result insert leaves the job
-`running` and recoverable.
+no reader sees a succeeded job without its result, and no result is written for a
+job that did not succeed — a guarantee of this one writer working under its owned
+claim rather than a constraint the database could enforce across tables (§4). A
+fault injected into the result insert leaves the job `running` and recoverable.
 
 Every recognition connection has foreign keys on, WAL requested, the standard
 bounded busy timeout, and a SQLite **authorizer that denies `INSERT`, `UPDATE`
@@ -300,8 +327,13 @@ skipped"), and it is deliberately kept: the media is still a retention candidate
 under the policy that selected it, and racing retention for it is the thing the
 rule forbids. Recognising such a capture later is an explicit action — a new
 pipeline version today, or a future operator requeue — not an automatic retry.
-Whether a `pending_delete` should instead defer the job until retention settles
-is recorded as an open decision for a later task.
+
+**Approved in Task 15.1A.** A terminal job is never automatically reopened or
+reset when retention cancels its deletion: terminal job history stays truthful
+and immutable, and no requeue-on-cancellation mechanism belongs in this
+foundation. A regression test pins it — the job row stays byte-for-byte
+unchanged, reconciliation does not offer the capture again under that pipeline
+version, and a different pipeline version still can.
 
 Recognition takes **no** retention or backup lock, never deletes, renames,
 edits or retains media, and is never a reason for retention to keep a file.
@@ -417,3 +449,5 @@ Decided in Task 15.1, within that contract (none changes it):
 | `open_media` also opens with `O_NONBLOCK` | a FIFO swapped in after validation fails the regular-file check instead of blocking the worker |
 | result values are bounded to SQLite's integer range and refuse NUL characters | an unbindable integer raises a non-`sqlite3` error, and SQLite's `length()` cannot see past a NUL |
 | heartbeat is a request callback; no worker-status table | the minimum the runner needs; status reporting is a later task |
+| a `pending_delete` that retention later cancels leaves the job terminal — **approved in Task 15.1A** | terminal history is truthful and immutable; reprocessing is explicit or a new pipeline version, never an automatic requeue |
+| the enrolment watermark has no default on either API and both refuse a naive value — **approved in Task 15.1A** | a default would silently enrol all history, including the protected Task 13.2 evidence |

@@ -867,6 +867,86 @@ def test_an_existing_result_is_unchanged_by_later_media_removal(
     assert (harness.job(), harness.results()) == before
 
 
+def test_a_cancelled_deletion_intent_does_not_reopen_a_skipped_job(
+    harness: _Harness,
+) -> None:
+    """Terminal history stays immutable even if retention changes its mind.
+
+    Retention withdraws a ``pending_delete`` intent when its revalidation or
+    its unlink fails, leaving the media on disk. A job already skipped for that
+    intent stays skipped: nothing reopens or resets it, and reconciliation does
+    not offer the capture again under the same pipeline version. Approved in
+    Task 15.1A -- reprocessing is an explicit action, or a new pipeline
+    version, never an automatic requeue.
+    """
+    media = harness.add("cap-1")
+    harness.enqueue("cap-1")
+    harness.add_lifecycle("cap-1", "pending_delete")
+    assert harness.run().status is RunStatus.SKIPPED
+    terminal = harness.job()
+    assert terminal["state"] == "skipped"
+    assert terminal["error_category"] == "media_missing"
+
+    # Retention's cancellation path: the intent is withdrawn, media untouched.
+    with database_connection(harness.database_path) as connection:
+        connection.execute(
+            "DELETE FROM capture_media_lifecycle WHERE capture_id = ?", ("cap-1",)
+        )
+    harness.clock.advance(timedelta(days=30))
+
+    reconciled = RecognitionReconciler(
+        harness.repository,
+        pipeline_version=PIPELINE,
+        capture_directory=harness.root,
+        enrolment_watermark=WATERMARK,
+        max_attempts=harness.max_attempts,
+    ).reconcile()
+
+    assert reconciled.examined == 0
+    assert reconciled.created == 0
+    assert harness.run().status is RunStatus.IDLE
+    assert harness.job() == terminal
+    assert harness.results() == []
+    assert media.read_bytes() == PAYLOAD
+
+    # The explicit route -- a new pipeline version -- is unaffected by all this.
+    harness.enqueue("cap-1", pipeline_version="fake-1")
+    assert (
+        harness.run(FakeRecognitionAdapter(pipeline_version="fake-1")).status
+        is RunStatus.SUCCEEDED
+    )
+    assert harness.job() == terminal
+    assert len(harness.results()) == 1
+
+
+def test_a_reclaimed_job_does_not_carry_the_previous_attempt_s_error(
+    harness: _Harness,
+) -> None:
+    """A running job reports no error, whatever its last attempt reported.
+
+    The retry writes the category onto the pending row so an operator can see
+    why it is waiting. Claiming it again must clear it: a job that is running
+    normally must never read as one that is currently failing, which is what a
+    later status view joining state and category would otherwise report.
+    """
+    harness.enqueue("cap-1")
+    first = harness.claim()
+    assert first is not None
+    harness.repository.record_failure(
+        first, RecognitionErrorCategory.TIMEOUT, retry_policy=RETRY
+    )
+    assert harness.job()["error_category"] == "timeout"
+
+    harness.clock.advance(timedelta(hours=1))
+    second = harness.claim()
+
+    assert second is not None
+    row = harness.job()
+    assert row["state"] == "running"
+    assert row["error_category"] is None
+    assert row["attempt_count"] == 2
+
+
 def test_a_tampered_catalogue_path_is_refused_at_run_time(harness: _Harness) -> None:
     """A queued job whose capture now points outside the root is never inferred."""
     harness.enqueue("cap-1")

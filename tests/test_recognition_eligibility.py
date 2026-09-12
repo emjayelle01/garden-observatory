@@ -13,6 +13,7 @@ retention's own safety boundary instead of a copy of it.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sqlite3
@@ -472,6 +473,66 @@ def test_a_naive_watermark_is_refused(harness: _Harness) -> None:
         harness.reconciler(watermark=datetime(2026, 9, 1))
 
 
+def test_a_naive_watermark_is_refused_by_the_rules_directly(
+    harness: _Harness,
+) -> None:
+    """The eligibility rules refuse it too, not only the reconciler.
+
+    Without this the comparison itself would raise ``TypeError`` for a direct
+    caller: fail-closed, but not a refusal anything can report.
+    """
+    root = resolve_capture_root(harness.root)
+    assert root is not None
+    capture = CatalogueCapture(
+        capture_id="cap-1",
+        filename="cap-1.jpg",
+        absolute_path=str(harness.root / "cap-1.jpg"),
+        captured_at_utc=NOW.isoformat(),
+        filesize_bytes=len(PAYLOAD),
+        extra_metadata='{"origin": "motion"}',
+        lifecycle_recorded=False,
+    )
+
+    with pytest.raises(RecognitionConfigurationError):
+        evaluate_eligibility(
+            capture,
+            capture_root=root,
+            enrolment_watermark=datetime(2026, 9, 1),
+        )
+
+
+def test_the_enrolment_watermark_must_be_supplied() -> None:
+    """There is no default watermark, and there must never be one.
+
+    A default -- the epoch, the earliest capture, "now" -- would silently
+    enrol every historic capture, including the protected Task 13.2 evidence,
+    the first time reconciliation ran. Task 15.1A approved this boundary: the
+    value is the operator's to supply, and where it comes from in production is
+    a later worker/deployment decision.
+    """
+    for function, name in (
+        (RecognitionReconciler.__init__, "enrolment_watermark"),
+        (evaluate_eligibility, "enrolment_watermark"),
+    ):
+        parameter = inspect.signature(function).parameters[name]
+        assert parameter.default is inspect.Parameter.empty, function
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, function
+
+
+def test_a_reconciler_without_a_watermark_cannot_be_built(
+    harness: _Harness,
+) -> None:
+    """Omitting it is a TypeError, not an implicit backfill."""
+    with pytest.raises(TypeError):
+        RecognitionReconciler(
+            harness.repository,
+            pipeline_version=PIPELINE,
+            capture_directory=harness.root,
+        )
+
+    assert harness.jobs() == []
+
+
 @pytest.mark.parametrize(
     "captured_at_text", ["2026-09-11T11:00:00", "yesterday", 20260911]
 )
@@ -647,14 +708,26 @@ def test_a_relative_path_is_ineligible_even_when_the_cwd_would_resolve_it(
     _assert_ineligible(harness, "cap-1", IneligibilityReason.UNSAFE_PATH)
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(PermissionError("denied"), id="os-error"),
+        pytest.param(ValueError("embedded null byte"), id="value-error"),
+    ],
+)
 def test_media_the_host_will_not_describe_is_ineligible(
-    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
-    """A ``stat`` refused by the host is not evidence the media is safe."""
+    """A ``stat`` the host refuses is not evidence the media is safe.
+
+    Both arms of the refusal are covered. An ``OSError`` is the account that
+    cannot reach the file; a ``ValueError`` is a path the platform will not
+    describe at all. Either refuses one row, and neither aborts the pass.
+    """
     harness.add("cap-1")
 
     def _refuse(path: Path) -> int:
-        raise PermissionError("denied")
+        raise error
 
     monkeypatch.setattr(retention_service, "_file_size", _refuse)
 
@@ -761,7 +834,11 @@ def test_concurrent_reconcilers_create_each_job_exactly_once(
         thread.start()
     for thread in threads:
         thread.join(timeout=60)
+        assert not thread.is_alive(), "a reconciler thread never finished"
 
+    # Every reconciler returned: without this a hung thread that created
+    # nothing would leave the two totals below still true.
+    assert len(reports) == 4
     assert errors == []
     assert sum(report.created for report in reports) == 40
     assert len(harness.jobs()) == 40

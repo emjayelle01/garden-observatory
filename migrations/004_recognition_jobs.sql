@@ -8,9 +8,12 @@
 --
 -- Work state and biological outcome are deliberately two tables. A job says
 -- what happened to an attempt to recognise one capture under one pipeline
--- version; a result says what that attempt concluded. A job that was skipped,
--- failed or superseded has no result, and a result exists only for a job that
--- succeeded -- at most one per job.
+-- version; a result says what that attempt concluded. This schema enforces
+-- AT MOST ONE result per job (job_id UNIQUE); "a result only for a job that
+-- succeeded" is not something a CHECK can express across two tables, and is
+-- held instead by recognition_results having exactly one writer, which inserts
+-- the result and sets 'succeeded' in the same transaction under an owned claim.
+-- See docs/Recognition.md section 4.
 --
 -- Additive only. No existing table is rebuilt, renamed or altered, so the
 -- version-3 schema beneath is byte-for-byte what it was.
@@ -22,11 +25,14 @@
 -- while the runner records version 4 over it.
 --
 -- Every timestamp is written as UTC ISO-8601 with microseconds and an explicit
--- "+00:00" offset, and the columns the claim path compares are constrained to
--- exactly that shape. Leases and retry times are compared as text inside
--- SQLite; the comparison is only an ordering of instants when every value has
--- one layout, so the database refuses any other layout rather than trusting
--- every writer to remember.
+-- "+00:00" offset. Leases and retry times are compared as TEXT inside SQLite,
+-- so each timestamp column is constrained to that shape AND to being text of
+-- exactly 32 bytes. All three parts are load-bearing: a BLOB carrying the same
+-- characters matches the GLOB but sorts after every text value, and a NUL byte
+-- hides whatever follows it from length() -- either would make a lease that can
+-- never expire or a retry time that is never due. What the shape cannot
+-- exclude is a value that looks like a stamp but is not an instant (month 99);
+-- no writer can produce one, and such a row would simply never come due.
 
 CREATE TABLE recognition_jobs (
     -- NOT NULL is explicit for the reason migration 003 records: a TEXT
@@ -47,17 +53,27 @@ CREATE TABLE recognition_jobs (
     max_attempts INTEGER NOT NULL
         CHECK (typeof(max_attempts) = 'integer' AND max_attempts BETWEEN 1 AND 100),
     next_attempt_at TEXT
-        CHECK (next_attempt_at IS NULL OR next_attempt_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'),
+        CHECK (next_attempt_at IS NULL OR (typeof(next_attempt_at) = 'text'
+            AND length(CAST(next_attempt_at AS BLOB)) = 32
+            AND next_attempt_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00')),
     lease_owner TEXT
         CHECK (lease_owner IS NULL OR length(lease_owner) BETWEEN 1 AND 128),
     lease_expires_at TEXT
-        CHECK (lease_expires_at IS NULL OR lease_expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'),
+        CHECK (lease_expires_at IS NULL OR (typeof(lease_expires_at) = 'text'
+            AND length(CAST(lease_expires_at AS BLOB)) = 32
+            AND lease_expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00')),
     created_at TEXT NOT NULL
-        CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'),
+        CHECK (typeof(created_at) = 'text'
+            AND length(CAST(created_at AS BLOB)) = 32
+            AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'),
     started_at TEXT
-        CHECK (started_at IS NULL OR started_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'),
+        CHECK (started_at IS NULL OR (typeof(started_at) = 'text'
+            AND length(CAST(started_at AS BLOB)) = 32
+            AND started_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00')),
     finished_at TEXT
-        CHECK (finished_at IS NULL OR finished_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'),
+        CHECK (finished_at IS NULL OR (typeof(finished_at) = 'text'
+            AND length(CAST(finished_at AS BLOB)) = 32
+            AND finished_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00')),
     -- A bounded vocabulary, never free text: no exception message and no
     -- path can be stored here.
     error_category TEXT
@@ -137,7 +153,9 @@ CREATE TABLE recognition_results (
     image_height INTEGER
         CHECK (image_height IS NULL OR (typeof(image_height) = 'integer' AND image_height > 0)),
     created_at TEXT NOT NULL
-        CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'),
+        CHECK (typeof(created_at) = 'text'
+            AND length(CAST(created_at AS BLOB)) = 32
+            AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'),
     CHECK ((detector_model_id IS NULL) = (detector_model_sha256 IS NULL)),
     CHECK ((classifier_model_id IS NULL) = (classifier_model_sha256 IS NULL)),
     CHECK ((label_set_id IS NULL) = (label_set_sha256 IS NULL)),
