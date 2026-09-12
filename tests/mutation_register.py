@@ -3704,6 +3704,458 @@ TASK_14_5E_MUTATIONS: tuple[Mutation, ...] = (
     ),
 )
 
+# --- Task 15.1 recognition job foundation --------------------------------------
+#
+# Recognition deletes nothing, but every guard below is still a *refusal*: a
+# check that stops a capture being put in front of a model, a second job or
+# result being created, or a worker writing over a claim it no longer holds. A
+# refusal is invisible while it works, which is exactly what a register is for.
+#
+# The media safety boundary is retention's own (``validate_media_path`` and
+# ``validate_media_file``), called rather than copied. The entries against
+# RETENTION_SERVICE below are therefore killed by *recognition* tests: they
+# prove the reuse is real, not decorative. Retention's own entries against the
+# same lines remain and are still killed by retention's suite.
+#
+# Every ``old`` is a single line, for the CRLF reason recorded above.
+
+MIGRATION_004 = "migrations/004_recognition_jobs.sql"
+RECOGNITION_ELIGIBILITY = "src/mgo/recognition/eligibility.py"
+RECOGNITION_RECONCILER = "src/mgo/recognition/reconciler.py"
+RECOGNITION_REPOSITORY = "src/mgo/recognition/repository.py"
+RECOGNITION_RUNNER = "src/mgo/recognition/runner.py"
+RECOGNITION_MODELS = "src/mgo/recognition/models.py"
+
+RECOGNITION_SCHEMA_SUITE = "tests/test_recognition_schema.py"
+RECOGNITION_ELIGIBILITY_SUITE = "tests/test_recognition_eligibility.py"
+RECOGNITION_JOBS_SUITE = "tests/test_recognition_jobs.py"
+
+_ADAPTER_CALL = '        result = adapter.recognise(request)'
+
+TASK_15_1_MUTATIONS: tuple[Mutation, ...] = (
+    # --- eligibility: which captures may ever be queued ---------------------
+    Mutation(
+        'recognition-enrols-any-origin',
+        RECOGNITION_ELIGIBILITY,
+        '    if metadata.get("origin") != MANAGED_ORIGIN:',
+        '    if metadata.get("origin") is None:',
+        'only_exactly_motion_origin_is_eligible',
+        'A manual or foreign-origin capture is put in front of a model.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-interprets-undecodable-metadata',
+        RECOGNITION_ELIGIBILITY,
+        '    if metadata is None:',
+        '    if False:',
+        'malformed_or_non_object_metadata_is_ineligible '
+        'or one_malformed_row_does_not_stop',
+        'One undecodable catalogue row aborts enrolment of every capture.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-watermark-ignored',
+        RECOGNITION_ELIGIBILITY,
+        '    if captured_at < enrolment_watermark:',
+        '    if False:',
+        'before_the_watermark_is_ineligible or protected_evidence',
+        'Every historical capture, protected evidence included, is backfilled.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-watermark-boundary-exclusive',
+        RECOGNITION_ELIGIBILITY,
+        '    if captured_at < enrolment_watermark:',
+        '    if captured_at <= enrolment_watermark:',
+        'exactly_at_the_watermark_is_eligible',
+        'The documented inclusive boundary and the enforced one disagree.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-enrols-media-retention-owns',
+        RECOGNITION_ELIGIBILITY,
+        '    if capture.lifecycle_recorded:',
+        '    if False:',
+        'capture_with_a_lifecycle_row_is_ineligible',
+        'Media retention has claimed or reclaimed is queued for inference.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-enqueue-skips-the-lifecycle-recheck',
+        RECOGNITION_REPOSITORY,
+        '          SELECT 1 FROM capture_media_lifecycle AS l '
+        'WHERE l.capture_id = c.id',
+        '          SELECT 1 WHERE 0',
+        'lifecycle_row_committed_during_reconciliation',
+        'A deletion intent committed mid-reconciliation still gets a job.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-relative-catalogue-path-accepted',
+        RETENTION_SERVICE,
+        '    if not candidate.is_absolute():',
+        '    if False:',
+        'relative_path_is_ineligible_even_when_the_cwd',
+        'Which file is inferred on depends on the working directory.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-traversal-accepted',
+        RETENTION_SERVICE,
+        '    if ".." in candidate.parts:',
+        '    if False:',
+        'traversal_is_ineligible_even_when_it_resolves_inside',
+        'A parent-directory path is trusted because it happens to resolve.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-containment-abandoned',
+        RETENTION_SERVICE,
+        '    if not _is_within(capture_root, _realpath(candidate.parent)):',
+        '    if False:',
+        'path_outside_the_capture_root_is_ineligible or legacy_shaped_path',
+        'A relocated or tampered row sends any file on the host to the model.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-symlinked-target-accepted',
+        RETENTION_SERVICE,
+        '    if _is_symlink(candidate):',
+        '    if False:',
+        'symlinked_target_is_ineligible',
+        'A link inside the capture root redirects inference outside it.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-non-regular-target-accepted',
+        RETENTION_SERVICE,
+        '    if not _is_regular_file(candidate):',
+        '    if False:',
+        'non_regular_target_is_ineligible',
+        'A device node or socket is opened as if it were a capture.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-filename-disagreement-accepted',
+        RETENTION_SERVICE,
+        '    if candidate.name != filename:',
+        '    if False:',
+        'filename_that_disagrees_with_the_path_is_ineligible',
+        'Two catalogue columns disagree and inference proceeds anyway.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-size-mismatch-accepted',
+        RETENTION_SERVICE,
+        '    if _file_size(candidate) != filesize_bytes:',
+        '    if False:',
+        'size_mismatch_is_ineligible',
+        'A file that is not the catalogued one is recognised under its id.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-missing-media-misclassified',
+        RETENTION_SERVICE,
+        '    if not _path_exists(Path(absolute_path)):',
+        '    if False:',
+        'media_is_missing_is_ineligible',
+        'Reclaimed media is reported as an unsafe path instead of missing.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    # --- idempotency and pipeline versions ----------------------------------
+    Mutation(
+        'recognition-enqueue-conflict-clause-removed',
+        RECOGNITION_REPOSITORY,
+        '    ON CONFLICT(capture_id, pipeline_version) DO NOTHING',
+        '',
+        'interleaved_second_reconciler or concurrent_reconcilers',
+        'Overlapping reconcilers crash on the duplicate instead of converging.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'migration-004-job-uniqueness-removed',
+        MIGRATION_004,
+        '    UNIQUE (capture_id, pipeline_version),',
+        '',
+        'second_job_for_the_same_capture_and_pipeline_is_refused',
+        'One capture can hold many jobs for one pipeline version.',
+        suite=RECOGNITION_SCHEMA_SUITE,
+    ),
+    Mutation(
+        'migration-004-one-result-per-job-removed',
+        MIGRATION_004,
+        '    job_id TEXT NOT NULL UNIQUE',
+        '    job_id TEXT NOT NULL',
+        'second_result_for_one_job_is_refused',
+        'One job can accumulate several conflicting results.',
+        suite=RECOGNITION_SCHEMA_SUITE,
+    ),
+    Mutation(
+        'migration-004-pipeline-version-dropped-from-uniqueness',
+        MIGRATION_004,
+        '    UNIQUE (capture_id, pipeline_version),',
+        '    UNIQUE (capture_id),',
+        'different_pipeline_version_is_a_distinct_job',
+        'Reprocessing under a new pipeline version becomes impossible.',
+        suite=RECOGNITION_SCHEMA_SUITE,
+    ),
+    Mutation(
+        'recognition-reconcile-ignores-pipeline-version',
+        RECOGNITION_REPOSITORY,
+        '          AND j.pipeline_version = :pipeline_version',
+        '          AND :pipeline_version IS NOT NULL',
+        'new_pipeline_version_is_queued_separately',
+        'A new pipeline version never receives jobs for processed captures.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-claim-ignores-pipeline-version',
+        RECOGNITION_REPOSITORY,
+        '    WHERE pipeline_version = :pipeline_version',
+        '    WHERE :pipeline_version IS NOT NULL',
+        'claims_are_separated_by_pipeline_version '
+        'or second_pipeline_version_is_processed_independently',
+        'A job is answered by a pipeline it was never queued for.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    # --- claims, leases and retries -----------------------------------------
+    #
+    # Replacing ``BEGIN IMMEDIATE`` with ``BEGIN DEFERRED`` on its own is an
+    # *equivalent* mutant, and was proven to survive when first registered:
+    # every recognition transaction's first statement is a write (the claim
+    # opens with the exhausted-lease sweep), and a write statement takes the
+    # reservation whether or not it matches a row. The property that matters
+    # is that the select and the update share one reserved transaction, so the
+    # entry below releases the reservation between them instead.
+    Mutation(
+        'recognition-claim-selects-outside-its-reservation',
+        RECOGNITION_REPOSITORY,
+        '                row = _select_claimable(',
+        '                connection.execute("COMMIT")\n'
+        '                connection.execute("BEGIN DEFERRED")\n'
+        '                row = _select_claimable(',
+        'competing_writer_is_held_off_between_select_and_update',
+        'Two workers can select the same job before either updates it.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'recognition-valid-lease-stolen',
+        RECOGNITION_REPOSITORY,
+        "         OR (state = 'running' AND lease_expires_at <= :now)",
+        "         OR (state = 'running' AND lease_expires_at IS NOT NULL)",
+        'valid_running_lease_cannot_be_stolen or claimed_exactly_once',
+        'A second worker takes a job another is still recognising.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'recognition-expired-lease-never-recovered',
+        RECOGNITION_REPOSITORY,
+        "         OR (state = 'running' AND lease_expires_at <= :now)",
+        "         OR (state = 'running' AND 0)",
+        'expired_lease_is_recovered or interrupted_worker_leaves',
+        'A crashed worker strands its job in running forever.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'recognition-retry-time-ignored',
+        RECOGNITION_REPOSITORY,
+        "            (state = 'pending' AND next_attempt_at <= :now)",
+        "            (state = 'pending' AND next_attempt_at IS NOT NULL)",
+        'retry_is_not_claimed_before_its_time',
+        'A failing job is retried in a tight loop with no backoff.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'recognition-retry-exhaustion-removed',
+        RECOGNITION_REPOSITORY,
+        '        if state is None and job.attempt_count >= job.max_attempts:',
+        '        if False:',
+        'retryable_failures_become_terminal or persistent_crash_ends_failed',
+        'The last attempt is requeued; only the schema CHECK refuses it, and '
+        'the failure is lost as an exception.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'recognition-exhausted-lease-never-ended',
+        RECOGNITION_REPOSITORY,
+        '      AND attempt_count >= max_attempts',
+        '      AND 0',
+        'expired_lease_on_the_final_attempt_ends_the_job',
+        'A job that kills its worker every time stays running forever.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'recognition-writes-ignore-claim-ownership',
+        RECOGNITION_REPOSITORY,
+        '    " AND lease_owner = :lease_owner AND attempt_count = :attempt_count"',
+        '    " AND :lease_owner IS NOT NULL AND :attempt_count IS NOT NULL"',
+        'worker_that_lost_its_lease_cannot_complete '
+        'or claim_is_taken_during_inference',
+        'A worker whose lease was taken over overwrites the new claim.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'recognition-stale-completion-still-inserts-a-result',
+        RECOGNITION_REPOSITORY,
+        '                if not still_owned:',
+        '                if False:',
+        'worker_that_lost_its_lease_cannot_complete '
+        'or stale_worker_cannot_overwrite',
+        'A worker that no longer holds a job still records a result for it.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    # --- terminal handling --------------------------------------------------
+    Mutation(
+        'recognition-missing-media-retried',
+        RECOGNITION_MODELS,
+        '            RecognitionErrorCategory.MEDIA_MISSING: '
+        'RecognitionJobState.SKIPPED,',
+        '            RecognitionErrorCategory.MEDIA_MISSING: None,',
+        'media_removed_after_reconciliation_is_skipped '
+        'or error_disposition_is_exactly',
+        'Reclaimed media is retried until it fails instead of being skipped.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'recognition-runner-ignores-a-late-lifecycle-row',
+        RECOGNITION_RUNNER,
+        '    if capture.lifecycle_recorded:',
+        '    if False:',
+        'lifecycle_row_added_after_reconciliation_skips_the_job',
+        'Media with a pending deletion intent is inferred on, racing retention.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    # --- transaction boundaries ---------------------------------------------
+    Mutation(
+        'recognition-adapter-runs-inside-a-write-transaction',
+        RECOGNITION_RUNNER,
+        _ADAPTER_CALL,
+        '        held = repository._connect()\n'
+        '        held.execute("BEGIN IMMEDIATE")\n'
+        '        try:\n'
+        '    ' + _ADAPTER_CALL + '\n'
+        '        finally:\n'
+        '            held.execute("ROLLBACK")\n'
+        '            held.close()',
+        'no_write_transaction_is_open_while_the_adapter_runs',
+        'Minutes of inference hold the write lock every other writer needs.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'recognition-result-and-success-committed-separately',
+        RECOGNITION_REPOSITORY,
+        '                _insert_result(connection, job_id=job.id, '
+        'result=result, created_at=now)',
+        '                connection.execute("COMMIT")\n'
+        '                connection.execute("BEGIN IMMEDIATE")\n'
+        '                _insert_result(connection, job_id=job.id, '
+        'result=result, created_at=now)',
+        'result_and_the_succeeded_state_commit_together',
+        'A job can be recorded succeeded with no result behind it.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'recognition-connections-may-write-capture-tables',
+        RECOGNITION_REPOSITORY,
+        '        connection.set_authorizer(_authorise)',
+        '        connection.set_authorizer(None)',
+        'recognition_connections_cannot_write_capture_tables',
+        'A recognition change can alter the catalogue it only ever reads.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    # --- Task 15.1A: the two approved decisions ------------------------------
+    #
+    # Both were approved rather than changed, so each now has a guard and a
+    # mutation: the watermark must be *supplied* (not merely compared), and a
+    # terminal job must stay terminal.
+    Mutation(
+        'recognition-watermark-acquires-a-default',
+        RECOGNITION_RECONCILER,
+        '        enrolment_watermark: datetime,',
+        '        enrolment_watermark: datetime = datetime.fromisoformat(\n'
+        '            "1970-01-01T00:00:00+00:00"\n'
+        '        ),',
+        'the_enrolment_watermark_must_be_supplied '
+        'or a_reconciler_without_a_watermark_cannot_be_built',
+        'Every historic capture is enrolled the first time reconciliation runs.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-rules-accept-a-naive-watermark',
+        RECOGNITION_ELIGIBILITY,
+        '    if enrolment_watermark.tzinfo is None:',
+        '    if False:',
+        'naive_watermark_is_refused_by_the_rules_directly',
+        'A direct caller gets a raw TypeError instead of a refusal.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-terminal-jobs-stop-blocking-re-enrolment',
+        RECOGNITION_REPOSITORY,
+        '        WHERE j.capture_id = c.id',
+        "        WHERE j.capture_id = c.id AND j.state IN ('pending', 'running')",
+        'cancelled_deletion_intent_does_not_reopen_a_skipped_job',
+        'A skipped or failed capture is silently requeued, rewriting history.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'recognition-unreadable-media-arm-narrowed',
+        RECOGNITION_ELIGIBILITY,
+        '    except (OSError, ValueError) as exc:',
+        '    except OSError as exc:',
+        'media_the_host_will_not_describe_is_ineligible',
+        'A path the platform will not describe aborts the whole pass.',
+        suite=RECOGNITION_ELIGIBILITY_SUITE,
+    ),
+    Mutation(
+        'recognition-claim-keeps-the-previous-attempts-error',
+        RECOGNITION_REPOSITORY,
+        '        started_at = :now, error_category = NULL',
+        '        started_at = :now',
+        'reclaimed_job_does_not_carry_the_previous_attempt',
+        'A job running normally reports the error of its last failed attempt.',
+        suite=RECOGNITION_JOBS_SUITE,
+    ),
+    Mutation(
+        'adoption-stops-requiring-result-integer-bounds',
+        DATABASE,
+        "                for column in (\"image_width\", \"image_height\")",
+        "                for column in ()",
+        'unversioned_schema_four_table_without_its_guarantees_is_refused',
+        'A legacy results table is adopted and then accepts a negative size.',
+        suite=RECOGNITION_SCHEMA_SUITE,
+    ),
+    # The two halves of the timestamp hardening are registered separately,
+    # because each refuses a different escape: ``typeof`` refuses a BLOB that
+    # matches the shape, and the byte length refuses a NUL-padded value whose
+    # ``length()`` still reads 32. Removing one leaves the other standing, so a
+    # single entry over both would have been an equivalent mutant -- proven,
+    # when the length-only entry first survived.
+    Mutation(
+        'migration-004-timestamp-length-unbounded',
+        MIGRATION_004,
+        '            AND length(CAST(next_attempt_at AS BLOB)) = 32',
+        '            AND 1 = 1',
+        'incoherent_job_row_is_refused',
+        'A NUL-padded retry time is stored, and never comes due.',
+        suite=RECOGNITION_SCHEMA_SUITE,
+    ),
+    Mutation(
+        'migration-004-timestamp-type-unbounded',
+        MIGRATION_004,
+        "        CHECK (next_attempt_at IS NULL OR (typeof(next_attempt_at) = 'text'",
+        '        CHECK (next_attempt_at IS NULL OR (1 = 1',
+        'incoherent_job_row_is_refused',
+        'A BLOB retry time is stored, sorts after every text value and never '
+        'comes due.',
+        suite=RECOGNITION_SCHEMA_SUITE,
+    ),
+)
+
 MUTATIONS = (
-    MUTATIONS + TASK_14_5_MUTATIONS + TASK_14_5C_MUTATIONS + TASK_14_5E_MUTATIONS
+    MUTATIONS
+    + TASK_14_5_MUTATIONS
+    + TASK_14_5C_MUTATIONS
+    + TASK_14_5E_MUTATIONS
+    + TASK_15_1_MUTATIONS
 )

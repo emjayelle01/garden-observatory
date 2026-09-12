@@ -136,7 +136,7 @@ def test_migration_003_creates_the_lifecycle_table(tmp_path: Path) -> None:
 
     assert "capture_media_lifecycle" in tables
     assert "idx_capture_media_lifecycle_state" in indexes
-    assert read_schema_version(database_path) == 3
+    assert read_schema_version(database_path) == 4
 
 
 def test_migration_003_is_additive_to_the_captures_table(tmp_path: Path) -> None:
@@ -210,8 +210,8 @@ def test_a_version_two_database_upgrades_preserving_every_row(
 
     applied = apply_migrations(database_path)
 
-    assert applied == [3]
-    assert read_schema_version(database_path) == 3
+    assert applied == [3, 4]
+    assert read_schema_version(database_path) == 4
     with database_connection(database_path) as connection:
         after = [
             tuple(row) for row in connection.execute("SELECT * FROM captures")

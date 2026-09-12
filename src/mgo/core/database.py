@@ -46,7 +46,7 @@ MIGRATIONS_DIRECTORY = PROJECT_ROOT / "migrations"
 #: It is an explicit constant rather than "whatever the highest file is" so a
 #: stray or half-finished migration file can never silently redefine what
 #: "current" means. A test asserts it stays in step with the migration files.
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 #: Bounded wait for a competing writer's lock before SQLite gives up with
 #: ``database is locked``. Five seconds comfortably covers the application's
@@ -88,7 +88,34 @@ _VERSION_TABLES: dict[int, tuple[str, ...]] = {
     1: ("observations",),
     2: ("captures",),
     3: ("capture_media_lifecycle",),
+    4: ("recognition_jobs", "recognition_results"),
 }
+
+#: The one timestamp layout the recognition claim path compares as text,
+#: normalised the way :func:`_normalised_definition` normalises stored DDL.
+_RECOGNITION_TIMESTAMP_GLOB = (
+    "glob'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]t[0-9][0-9]:[0-9][0-9]"
+    ":[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'"
+)
+
+
+def _recognition_timestamp_check(column: str, *, nullable: bool) -> str:
+    """Return the normalised ``CHECK`` migration 004 puts on one timestamp.
+
+    The shape alone is not enough, which is why the type and the byte length
+    are bounded with it: a BLOB carrying the same characters matches the GLOB
+    but compares *after* every text value, and a NUL byte hides whatever
+    follows it from ``length()``. Either would break the claim path, which
+    compares these columns as text.
+    """
+    body = (
+        f"typeof({column})='text'andlength(cast({column}asblob))=32"
+        f"and{column}{_RECOGNITION_TIMESTAMP_GLOB}"
+    )
+    if nullable:
+        return f"check({column}isnullor({body}))"
+    return f"check({body})"
+
 
 @dataclass(frozen=True)
 class _TableShape:
@@ -188,6 +215,131 @@ _VERSION_TABLE_SHAPES: dict[str, _TableShape] = {
             "check(reasonin('age','managed_bytes','age_and_managed_bytes'))",
             "check((state='pending_delete'anddeleted_at_utcisnull)"
             "or(state='deleted'anddeleted_at_utcisnotnull))",
+        ),
+    ),
+    # The recognition tables (Task 15.1) declare their safety-critical shape
+    # for the same reason the lifecycle table does: adoption trusts a table
+    # forever, and a job table without its uniqueness, vocabularies, integer
+    # attempt bounds, state coherence and timestamp layout would accept
+    # duplicate work, invented states and a running job with no lease --
+    # permanently. Identifier length bounds and indexes are not verified,
+    # matching the lifecycle precedent.
+    "recognition_jobs": _TableShape(
+        columns=frozenset(
+            {
+                "id",
+                "capture_id",
+                "pipeline_version",
+                "camera_id",
+                "state",
+                "attempt_count",
+                "max_attempts",
+                "next_attempt_at",
+                "lease_owner",
+                "lease_expires_at",
+                "created_at",
+                "started_at",
+                "finished_at",
+                "error_category",
+            }
+        ),
+        primary_key=("id",),
+        not_null=frozenset(
+            {
+                "id",
+                "capture_id",
+                "pipeline_version",
+                "state",
+                "attempt_count",
+                "max_attempts",
+                "created_at",
+            }
+        ),
+        foreign_keys=(("capture_id", "captures", "id"),),
+        required_sql=(
+            "unique(capture_id,pipeline_version)",
+            "check(statein('pending','running','succeeded','failed','skipped',"
+            "'superseded'))",
+            "check(error_categoryisnullorerror_categoryin('media_missing',"
+            "'unsafe_path','size_mismatch','decode_error','model_unavailable',"
+            "'timeout','resource_limit','unexpected'))",
+            "check(typeof(attempt_count)='integer'andattempt_count>=0)",
+            "check(typeof(max_attempts)='integer'andmax_attemptsbetween1and100)",
+            "check(attempt_count<=max_attempts)",
+            "check((state='running'andlease_ownerisnotnulland"
+            "lease_expires_atisnotnullandstarted_atisnotnull)or"
+            "(state<>'running'andlease_ownerisnullandlease_expires_atisnull))",
+            "check((statein('pending','running')andfinished_atisnull)or"
+            "(statein('succeeded','failed','skipped','superseded')and"
+            "finished_atisnotnull))",
+            "check(state<>'pending'or(next_attempt_atisnotnulland"
+            "attempt_count<max_attempts))",
+            "check(state<>'succeeded'orerror_categoryisnull)",
+            "check(statenotin('failed','skipped')orerror_categoryisnotnull)",
+            _recognition_timestamp_check("next_attempt_at", nullable=True),
+            _recognition_timestamp_check("lease_expires_at", nullable=True),
+            _recognition_timestamp_check("created_at", nullable=False),
+            _recognition_timestamp_check("started_at", nullable=True),
+            _recognition_timestamp_check("finished_at", nullable=True),
+        ),
+    ),
+    "recognition_results": _TableShape(
+        columns=frozenset(
+            {
+                "id",
+                "job_id",
+                "outcome",
+                "detector_model_id",
+                "detector_model_sha256",
+                "classifier_model_id",
+                "classifier_model_sha256",
+                "label_set_id",
+                "label_set_sha256",
+                "taxonomy_id",
+                "taxonomy_version",
+                "preprocessing_version",
+                "thresholds_version",
+                "inference_duration_ms",
+                "peak_rss_bytes",
+                "cpu_time_ms",
+                "image_width",
+                "image_height",
+                "created_at",
+            }
+        ),
+        primary_key=("id",),
+        not_null=frozenset({"id", "job_id", "outcome", "created_at"}),
+        foreign_keys=(("job_id", "recognition_jobs", "id"),),
+        required_sql=(
+            "job_idtextnotnulluniquereferencesrecognition_jobs(id)",
+            "check(outcomein('species','uncertain','unknown_species','no_bird',"
+            "'person_present_only'))",
+            "check((detector_model_idisnull)=(detector_model_sha256isnull))",
+            "check((classifier_model_idisnull)=(classifier_model_sha256isnull))",
+            "check((label_set_idisnull)=(label_set_sha256isnull))",
+            "check((taxonomy_idisnull)=(taxonomy_versionisnull))",
+            "check((image_widthisnull)=(image_heightisnull))",
+            *(
+                f"{digest}isnullor(length({digest})=64and{digest}"
+                "notglob'*[^0-9a-f]*')"
+                for digest in (
+                    "detector_model_sha256",
+                    "classifier_model_sha256",
+                    "label_set_sha256",
+                )
+            ),
+            _recognition_timestamp_check("created_at", nullable=False),
+            # The integer bounds, which the jobs table also declares. Without
+            # these a legacy results table would be adopted and then accept a
+            # fractional duration, a textual byte count or a negative size.
+            *(
+                f"check({column}isnullor(typeof({column})='integer'and{column}>=0))"
+                for column in ("inference_duration_ms", "peak_rss_bytes", "cpu_time_ms")
+            ),
+            *(
+                f"check({column}isnullor(typeof({column})='integer'and{column}>0))"
+                for column in ("image_width", "image_height")
+            ),
         ),
     ),
 }
