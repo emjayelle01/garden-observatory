@@ -118,7 +118,56 @@ completion, capture-write denial, and all six new Task 15.1A entries.
 
 ## 6. Native-Linux evidence (`mgo-core`)
 
-PI_RERUN_PLACEHOLDER
+Host `mgo-core`, as the unprivileged `claude` account, using the already
+installed production virtual environment read-only (`-B`,
+`PYTHONDONTWRITEBYTECODE=1`, a private `PYTHONPYCACHEPREFIX`, `MGO_CONFIG_PATH`
+unset). Python 3.13.5, pytest 9.1.1, SQLite 3.46.1, `nproc` 4. No package was
+installed and no environment modified.
+
+Everything ran inside one temporary stage under `/tmp` (a tmpfs), from a shallow
+HTTPS clone of the branch, with pytest's `--basetemp` inside that stage:
+
+| Run | Stage | Result |
+|-----|-------|--------|
+| As-submitted head `60a406fc` | `/tmp/mgo-task-015-1a-qgEv7lSu` | POSIX-only tests **3 passed** (not skipped); focused recognition + migrations **295 passed**; schema-4 regression (retention, retention CLI, database, captures) **255 passed** |
+| Corrected head `be4121b2` | `/tmp/mgo-task-015-1a-aGt1FG6v` | POSIX-only tests **3 passed**; focused recognition + migrations **305 passed**; schema-4 regression **255 passed** |
+
+**Import-path proof** (both runs): `mgo` resolved to
+`<stage>/repo/src/mgo/__init__.py` and the adapter to
+`<stage>/repo/src/mgo/recognition/adapter.py` — never the production checkout at
+`/opt/garden-observatory`. `O_NOFOLLOW` and `O_NONBLOCK` both present.
+
+**The three tests that skip on Windows ran here and passed:**
+
+- `test_a_real_symlink_is_ineligible_on_posix` — a real symlink inside the
+  capture root, pointing outside it, with a matching catalogued size, so
+  containment, existence, type and size all pass and only the symlink rule can
+  refuse it;
+- `test_open_media_refuses_a_real_symlink_on_posix` — `O_NOFOLLOW` refuses the
+  open with `ELOOP`; without it the target is a regular file of the expected
+  size and nothing would have objected;
+- `test_open_media_refuses_a_real_fifo_without_blocking_on_posix` — a real FIFO
+  with no writer: the open does not block (asserted by a worker thread that must
+  have finished) and the refusal is `unsafe_path` from the `S_ISREG` check.
+
+**Non-interference, before and after both runs:** identical boot id
+(`8fe870b8-…`), `mgo.service` active with the same `MainPID=679879`,
+`NRestarts=0` and unchanged `ActiveEnterTimestamp` (Thu 2026-09-10 15:21:42
+SAST), one `rpicam-vid` preview still owned by `mgo`, no backup or retention
+lock present at any point, load 0.14 → 0.51 → 0.34, SoC 51.2 → 56.2 → 51.2 °C,
+`/tmp` 1% throughout. The production database, configuration, media and API were
+never touched; both timers were left exactly as found (backup and retention both
+enabled and active, next elapse Sun 02:35 and 04:11 SAST, neither due during
+testing).
+
+**Cleanup, proven:** each stage was verified before deletion (resolved path,
+matches the Task 15.1A pattern, directly under `/tmp`, not `/tmp` itself, not a
+symlink, a directory, no process referencing it), removed with
+`find -xdev -delete` plus `rmdir`, and confirmed gone — `ls -d
+/tmp/mgo-task-015-1a-*` reports none remaining and `/tmp` returned to 896K.
+Unrelated `/tmp` entries — including earlier tasks' `mgo-task-014-*` stages, the
+systemd private directories and this session's own `ssh-*` agent socket — were
+listed only and deliberately left in place.
 
 ## 7. Limitations
 
@@ -134,4 +183,22 @@ PI_RERUN_PLACEHOLDER
 
 ## 8. Merge recommendation
 
-MERGE_RECOMMENDATION_PLACEHOLDER
+**Recommended for merge**, on the evidence above: the architecture matches the
+Task 15.0 contract, both open decisions are settled and pinned by tests, the
+POSIX protections are proven on the hardware the code will run on, every defect
+found in review is corrected on the branch, and every local gate passes on the
+corrected tree.
+
+Merging is still Matthew's decision and this task does not perform it. Two
+things to carry forward, neither of which blocks the merge:
+
+1. **Schema 4 is a one-way step for the deployed build.** A schema-3 build
+   refuses a schema-4 database, the gateway's schema-aware recovery will refuse
+   the automatic repository rollback once production is migrated, and a
+   schema-4 build's backup verification refuses a schema-3 recovery set. A
+   fresh schema-3 recovery set taken immediately before deployment, verified by
+   the schema-3 build that produced it, is the prerequisite — under separate
+   authority.
+2. **Finding 12** (legacy adoption satisfied by constraint text inside a
+   double-quoted literal) is pre-existing Task 14.1 behaviour shared with the
+   version-3 lifecycle shape, and is raised as its own task.
